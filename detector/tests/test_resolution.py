@@ -136,3 +136,14 @@ def test_resolution_is_order_independent() -> None:
     kept_ab = resolve([a, b], specificity={"AAA": 50, "BBB": 50}).spans[0]
     kept_ba = resolve([b, a], specificity={"AAA": 50, "BBB": 50}).spans[0]
     assert kept_ab == kept_ba
+
+
+def test_same_type_merge_prefers_untouchable_metadata() -> None:
+    # A same-type merge must keep the checksum span's audit identity even when a
+    # confidence-1.0 model span sorts first and ties on confidence.
+    model = span(entity_type="IBAN", start=0, end=30, confidence=1.0, recognizer="ner:g", tier=1)
+    checksum = span(entity_type="IBAN", start=5, end=27, recognizer="catalog:iban")
+    result = resolve([model, checksum], specificity=SPEC)
+    (kept,) = result.spans
+    assert (kept.start, kept.end) == (0, 30)
+    assert kept.recognizer == "catalog:iban"

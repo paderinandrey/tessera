@@ -86,7 +86,11 @@ def _resolve_pair(
     untouchable: Callable[[Span], bool],
 ) -> tuple[Span, str]:
     if a.entity_type == b.entity_type:
-        winner = a if a.confidence >= b.confidence else b
+        # The checksum span's audit identity survives the merge (rule 1).
+        if untouchable(a) != untouchable(b):
+            winner = a if untouchable(a) else b
+        else:
+            winner = a if a.confidence >= b.confidence else b
         return _union(a, b, take_type_from=winner), "same-type-merge"
 
     for outer, inner in ((a, b), (b, a)):
