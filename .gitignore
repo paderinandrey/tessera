@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+
+# Rust
+target/
+
+# Private corpus must never enter the repository
+evaluation/private/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
