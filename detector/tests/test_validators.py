@@ -4,7 +4,17 @@ from tessera_detector.validators import VALIDATORS
 
 # Synthetic, checksum-valid documentation/test values — not attributable to any person.
 VALID = {
-    "iban": ["DE89370400440532013000", "DE89 3704 0044 0532 0130 00"],
+    "iban": [
+        "DE89370400440532013000",
+        "DE89 3704 0044 0532 0130 00",
+        # Structural validation, not bank-registry membership: the canonical
+        # Belgian example uses a fictional bank and must still validate.
+        "BE68 5390 0754 7034",
+        # Case must not matter.
+        "be68 5390 0754 7034",
+        # Letters in the BBAN body.
+        "GB29 NWBK 6016 1331 9268 19",
+    ],
     "credit_card": ["4111111111111111", "4111 1111 1111 1111"],
     "ch_avs": ["7569217076985", "756.9217.0769.85"],
     "fr_nir": [
@@ -23,7 +33,7 @@ VALID = {
 
 # Same values with the checksum broken (last digit changed).
 INVALID = {
-    "iban": ["DE89370400440532013001"],
+    "iban": ["DE89370400440532013001", "BE69 5390 0754 7034"],
     "credit_card": ["4111111111111112"],
     "ch_avs": ["7569217076984", "756.9217.0769.84"],
     "fr_nir": ["295109912611194", "199072A00400110"],

@@ -115,3 +115,34 @@ def test_identifiers_followed_by_digit_run_rejected() -> None:
     assert detect("NIR 2 95 10 99 126 111 93 456") == []
     assert detect("AVS 756.9217.0769.85.123") == []
     assert detect("Steuer-ID 36 574 261 809 77") == []
+
+
+def test_iban_followed_by_letter_token_still_detected() -> None:
+    # The greedy pattern swallows a following uppercase token ("BIC", bank codes);
+    # the candidate must shrink back to the valid IBAN instead of vanishing.
+    text = "Compte BE68 5390 0754 7034 BIC GKCCBEBB svp."
+    (span,) = detect(text)
+    assert span.entity_type == "IBAN"
+    assert text[span.start : span.end] == "BE68 5390 0754 7034"
+
+
+def test_lowercase_iban_detected() -> None:
+    text = "iban: be68 5390 0754 7034 merci"
+    (span,) = detect(text)
+    assert span.entity_type == "IBAN"
+    assert text[span.start : span.end] == "be68 5390 0754 7034"
+
+
+def test_iban_with_letter_groups_in_bban() -> None:
+    text = "Send to GB29 NWBK 6016 1331 9268 19 today."
+    (span,) = detect(text)
+    assert span.entity_type == "IBAN"
+    assert text[span.start : span.end] == "GB29 NWBK 6016 1331 9268 19"
+
+
+def test_iban_followed_by_digit_group_not_shrunk() -> None:
+    # A trailing digit group means the run may be a longer account/contract
+    # number; shrinking only discards letter-bearing tails (digit-run guard
+    # philosophy), so no span is emitted here.
+    text = "Ref BE68 5390 0754 7034 1234"
+    assert detect(text) == []

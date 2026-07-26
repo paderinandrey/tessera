@@ -34,16 +34,42 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
         validator = entry["validator"]
         if validator not in VALIDATORS:
             raise ValueError(f"identifier {entry['id']!r} names unknown validator {validator!r}")
+        flags = re.IGNORECASE if entry.get("case_insensitive") else re.NOFLAG
         rules.append(
             Rule(
                 id=entry["id"],
                 entity_type=entry["entity_type"],
                 tier=entry["tier"],
-                pattern=re.compile(entry["pattern"]),
+                pattern=re.compile(entry["pattern"], flags),
                 validator=validator,
             )
         )
     return tuple(rules)
+
+
+_TOKEN_SEPARATORS = " -."
+
+
+def _validate_shrinking(rule: Rule, candidate: str) -> str | None:
+    """Validate a candidate, shrinking greedy tails.
+
+    A greedy pattern can swallow a following letter token ("BE68 ... 7034 BIC"); the
+    full candidate then fails its checksum and the entity would vanish. On failure,
+    trailing separator-delimited tokens are stripped and revalidated — but only tokens
+    containing a letter: a trailing digit group means the run may be a window of a
+    longer number and must not produce a span (digit-run guard philosophy).
+    """
+    shrunk = False
+    while True:
+        if (not shrunk or rule.pattern.fullmatch(candidate)) and VALIDATORS[rule.validator](
+            candidate
+        ):
+            return candidate
+        cut = max(candidate.rfind(sep) for sep in _TOKEN_SEPARATORS)
+        if cut <= 0 or not any(ch.isalpha() for ch in candidate[cut + 1 :]):
+            return None
+        candidate = candidate[:cut]
+        shrunk = True
 
 
 class DeterministicDetector:
@@ -58,11 +84,11 @@ class DeterministicDetector:
         norm = normalize(text)
         spans = []
         for rule in self.rules:
-            validate = VALIDATORS[rule.validator]
             for match in rule.pattern.finditer(norm.text):
-                if not validate(match.group(0)):
+                validated = _validate_shrinking(rule, match.group(0))
+                if validated is None:
                     continue
-                start, end = norm.to_original(match.start(), match.end())
+                start, end = norm.to_original(match.start(), match.start() + len(validated))
                 spans.append(
                     Span(
                         entity_type=rule.entity_type,
