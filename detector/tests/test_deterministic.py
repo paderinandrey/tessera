@@ -100,3 +100,18 @@ def test_overseas_nir_detected() -> None:
     (span,) = detect(text)
     assert span.entity_type == "FR_NIR"
     assert text[span.start : span.end] == "1 90 01 971 01 001 91"
+
+
+def test_embedded_tails_of_longer_runs_rejected() -> None:
+    # A checksum-valid identifier embedded as the tail of a longer separated digit
+    # run is a window of a bigger number, not an entity (same guard as for cards).
+    assert detect("Vertrag 9 2 95 10 99 126 111 93") == []
+    assert detect("Konto 9 756.9217.0769.85") == []
+    assert detect("Nr 1 36 574 261 809") == []
+
+
+def test_identifiers_followed_by_digit_run_rejected() -> None:
+    # Continuation to the right means the match is a window of a longer number.
+    assert detect("NIR 2 95 10 99 126 111 93 456") == []
+    assert detect("AVS 756.9217.0769.85.123") == []
+    assert detect("Steuer-ID 36 574 261 809 77") == []

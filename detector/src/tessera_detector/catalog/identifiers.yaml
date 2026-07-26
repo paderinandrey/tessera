@@ -8,6 +8,12 @@
 
 version: 1
 
+# Digit-run guards: every numeric pattern is wrapped in lookarounds that reject a
+# match when the separated digit run continues to the left or right — a checksum-valid
+# window of a longer contract or account number is not an entity. Trade-off: a real
+# identifier directly followed by ` <digits>` is also rejected — revisit with corpus
+# data in the REQ-8 conflict-resolution pass.
+
 identifiers:
   - id: iban
     entity_type: IBAN
@@ -19,17 +25,13 @@ identifiers:
     entity_type: CREDIT_CARD
     tier: 1
     validator: credit_card
-    # The lookarounds keep a 13-19-digit window from being carved out of a longer
-    # separated digit run (e.g. a 20-digit contract number or an IBAN tail whose
-    # window happens to pass Luhn). Trade-off: a real card directly followed by
-    # ` <digits>` is also rejected — revisit with corpus data in the REQ-8 pass.
     pattern: '\b(?<!\d[ -])\d(?:[ -]?\d){12,18}(?![ -]?\d)\b'
 
   - id: ch_avs
     entity_type: CH_AVS
     tier: 1
     validator: ch_avs
-    pattern: '\b756[. ]?\d{4}[. ]?\d{4}[. ]?\d{2}\b'
+    pattern: '\b(?<!\d[. ])756[. ]?\d{4}[. ]?\d{4}[. ]?\d{2}(?![. ]?\d)\b'
 
   - id: fr_nir
     entity_type: FR_NIR
@@ -38,10 +40,10 @@ identifiers:
     # The birth-place segment admits metropolitan/Corsican grouping
     # (department 2 or 2A/2B + commune 3) and overseas grouping
     # (department 3 + commune 2).
-    pattern: '\b[12] ?\d{2} ?\d{2} ?(?:(?:\d{2}|2[AB]) ?\d{3}|\d{3} ?\d{2}) ?\d{3} ?\d{2}\b'
+    pattern: '\b(?<!\d )[12] ?\d{2} ?\d{2} ?(?:(?:\d{2}|2[AB]) ?\d{3}|\d{3} ?\d{2}) ?\d{3} ?\d{2}(?! ?\d)\b'
 
   - id: de_steuer_id
     entity_type: DE_STEUER_ID
     tier: 1
     validator: de_idnr
-    pattern: '\b\d{2} ?\d{3} ?\d{3} ?\d{3}\b'
+    pattern: '\b(?<!\d )\d{2} ?\d{3} ?\d{3} ?\d{3}(?! ?\d)\b'
