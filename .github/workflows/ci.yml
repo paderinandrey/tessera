@@ -16,7 +16,7 @@ jobs:
         working-directory: detector
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           working-directory: detector
       - run: uv sync --locked
