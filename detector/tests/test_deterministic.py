@@ -275,3 +275,18 @@ def test_punycode_tld_matched_completely() -> None:
     (span,) = detect(text)
     assert span.entity_type == "EMAIL"
     assert text[span.start : span.end] == "alice@example.xn--p1ai"
+
+
+def test_unicode_local_part_matched_completely() -> None:
+    # SMTPUTF8: a non-ASCII letter is part of the local part, not a boundary —
+    # emitting "lise@example.com" would leave the identifying prefix unredacted.
+    text = "Contact élise@example.com svp."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "élise@example.com"
+
+
+def test_domain_labels_reject_boundary_hyphens() -> None:
+    assert detect("Mail alice@-example.com bitte.") == []
+    assert detect("Mail alice@example-.com bitte.") == []
+    assert detect("Mail alice@example.com- bitte.") == []

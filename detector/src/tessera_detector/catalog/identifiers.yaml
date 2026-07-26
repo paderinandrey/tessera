@@ -72,8 +72,10 @@ identifiers:
     tier: 2
     confidence: 0.95
     specificity: 70
-    # Local part: RFC 5322 dot-atom — atext runs separated by single dots; the
-    # lookbehind rejects fragments of malformed addresses (leading/double dots).
-    # Domain: dotted labels, final label may be punycode but must contain a
-    # letter; the lookahead keeps the match from stopping mid-label.
-    pattern: '(?<![A-Za-z0-9.!#$%&''*+/=?^_`{|}~-])[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*(?![A-Za-z0-9-])'
+    # Local part: dot-atom of atext runs, with \w admitting SMTPUTF8 letters so
+    # an accented character is a continuation, never a boundary; the lookbehind
+    # rejects fragments of malformed addresses (leading/double dots).
+    # Domain: labels start/end alphanumeric with hyphens only inside; the final
+    # label must contain a letter (punycode allowed) and the lookahead keeps the
+    # match from stopping mid-label.
+    pattern: '(?<![\w.!#$%&''*+/=?^_`{|}~-])[\w!#$%&''*+/=?^_`{|}~-]+(?:\.[\w!#$%&''*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+(?=[A-Za-z0-9-]{0,63}[A-Za-z])[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?![A-Za-z0-9-])'
