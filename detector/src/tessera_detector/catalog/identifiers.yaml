@@ -72,5 +72,8 @@ identifiers:
     tier: 2
     confidence: 0.95
     specificity: 70
-    # Local part covers the full RFC 5322 atext set plus dots.
-    pattern: '[A-Za-z0-9.!#$%&''*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b'
+    # Local part: RFC 5322 dot-atom — atext runs separated by single dots; the
+    # lookbehind rejects fragments of malformed addresses (leading/double dots).
+    # Domain: dotted labels, final label may be punycode but must contain a
+    # letter; the lookahead keeps the match from stopping mid-label.
+    pattern: '(?<![A-Za-z0-9.!#$%&''*+/=?^_`{|}~-])[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z][A-Za-z0-9-]*(?![A-Za-z0-9-])'

@@ -244,3 +244,34 @@ identifiers:
 """
     with pytest.raises(ValueError, match="broken_conf"):
         DeterministicDetector(catalog)
+
+
+def test_checksum_validator_rules_must_keep_confidence_1() -> None:
+    # The untouchable invariant must not be configurable away: a rule backed by
+    # a checksum-grade validator cannot declare a lower confidence.
+    catalog = """
+version: 1
+identifiers:
+  - id: weak_iban
+    entity_type: IBAN
+    tier: 1
+    validator: iban
+    confidence: 0.9
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="weak_iban"):
+        DeterministicDetector(catalog)
+
+
+def test_malformed_dot_atoms_produce_no_span() -> None:
+    # RFC 5322 dot-atoms: every dot separates two non-empty atext runs.
+    assert detect("Kontakt alice..bob@example.com bitte.") == []
+    assert detect("Kontakt .alice@example.com bitte.") == []
+    assert detect("Kontakt alice.@example.com bitte.") == []
+
+
+def test_punycode_tld_matched_completely() -> None:
+    text = "Написать на alice@example.xn--p1ai срочно."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "alice@example.xn--p1ai"

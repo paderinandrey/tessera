@@ -46,3 +46,8 @@ VALIDATORS: dict[str, Callable[[str], bool]] = {
     "fr_nif": lambda v: _fr_nif.is_valid(_clean(v)),
     "de_idnr": lambda v: _de_idnr.is_valid(_clean(v)),
 }
+
+
+# Validators that verify a checksum (not merely structure). Rules backed by these
+# must keep confidence 1.0 — the untouchable invariant is not configurable away.
+CHECKSUM_VALIDATORS: frozenset[str] = frozenset(VALIDATORS)

@@ -14,7 +14,7 @@ import yaml
 from .normalize import normalize
 from .resolution import resolve
 from .spans import Span
-from .validators import VALIDATORS
+from .validators import CHECKSUM_VALIDATORS, VALIDATORS
 
 _DEFAULT_CATALOG = resources.files("tessera_detector") / "catalog" / "identifiers.yaml"
 
@@ -42,6 +42,13 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
             raise ValueError(
                 f"identifier {entry['id']!r} declares confidence {confidence} "
                 "outside the [0.0, 1.0] range"
+            )
+        if validator in CHECKSUM_VALIDATORS and confidence < 1.0:
+            # The reverse guard: checksum-backed spans are untouchable in
+            # resolution, and that invariant must not be configurable away.
+            raise ValueError(
+                f"identifier {entry['id']!r} uses checksum validator {validator!r} "
+                "and cannot declare a confidence below 1.0"
             )
         if validator is None and confidence >= 1.0:
             # Confidence 1.0 marks spans untouchable in resolution — a status
