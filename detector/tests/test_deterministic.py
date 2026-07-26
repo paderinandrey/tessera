@@ -1,3 +1,5 @@
+import pytest
+
 from tessera_detector.deterministic import DeterministicDetector
 from tessera_detector.spans import Span
 
@@ -194,3 +196,27 @@ def test_email_detected_without_checksum() -> None:
     assert text[span.start : span.end] == "Jean.Dupont@example-bank.CH"
     assert span.confidence == 0.95
     assert span.tier == 2
+
+
+def test_apostrophe_email_matched_completely() -> None:
+    # A dot-atom local part may contain an apostrophe; matching only the part
+    # after it would leave the identifying fragment unredacted.
+    text = "Mail an o'connor@example.com senden."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "o'connor@example.com"
+
+
+def test_validator_free_rule_requires_explicit_low_confidence() -> None:
+    # Confidence 1.0 marks a span untouchable in resolution; a pattern-only rule
+    # must not get that status by omission.
+    catalog = """
+version: 1
+identifiers:
+  - id: naked
+    entity_type: NAKED
+    tier: 2
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="naked"):
+        DeterministicDetector(catalog)

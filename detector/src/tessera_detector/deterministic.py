@@ -37,6 +37,14 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
         validator = entry.get("validator")
         if validator is not None and validator not in VALIDATORS:
             raise ValueError(f"identifier {entry['id']!r} names unknown validator {validator!r}")
+        confidence = entry.get("confidence", 1.0)
+        if validator is None and confidence >= 1.0:
+            # Confidence 1.0 marks spans untouchable in resolution — a status
+            # reserved for checksum-validated rules, never granted by omission.
+            raise ValueError(
+                f"identifier {entry['id']!r} has no validator and must declare "
+                "an explicit confidence below 1.0"
+            )
         flags = re.IGNORECASE if entry.get("case_insensitive") else re.NOFLAG
         rules.append(
             Rule(
@@ -46,7 +54,7 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
                 pattern=re.compile(entry["pattern"], flags),
                 validator=validator,
                 specificity=entry.get("specificity", 50),
-                confidence=entry.get("confidence", 1.0),
+                confidence=confidence,
             )
         )
     return tuple(rules)
