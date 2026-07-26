@@ -38,6 +38,8 @@ identifiers:
     entity_type: FR_NIR
     tier: 1
     validator: fr_nir
+    # Only affects the Corsican department letters: 2a/2b equal 2A/2B.
+    case_insensitive: true
     # The birth-place segment admits metropolitan/Corsican grouping
     # (department 2 or 2A/2B + commune 3) and overseas grouping
     # (department 3 + commune 2).

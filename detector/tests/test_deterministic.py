@@ -146,3 +146,10 @@ def test_iban_followed_by_digit_group_not_shrunk() -> None:
     # philosophy), so no span is emitted here.
     text = "Ref BE68 5390 0754 7034 1234"
     assert detect(text) == []
+
+
+def test_lowercase_corsican_nir_detected() -> None:
+    text = "NIR 1 99 07 2a 004 001 09 valide."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIR"
+    assert text[span.start : span.end] == "1 99 07 2a 004 001 09"

@@ -24,6 +24,8 @@ VALID = {
         "199072A00400109",
         "1 99 07 2A 004 001 09",
         "185082B12345611",
+        # Lowercase Corsican codes identify the same departments.
+        "1 99 07 2a 004 001 09",
         # Overseas departments group as three-digit department + two-digit commune.
         "190019710100191",
         "1 90 01 971 01 001 91",
