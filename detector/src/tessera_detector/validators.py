@@ -12,6 +12,7 @@ import schwifty.exceptions
 from stdnum import luhn
 from stdnum.ch import ssn as _ch_ssn
 from stdnum.de import idnr as _de_idnr
+from stdnum.fr import nif as _fr_nif
 from stdnum.fr import nir as _fr_nir
 
 _SEPARATORS = str.maketrans("", "", " .-")
@@ -42,5 +43,11 @@ VALIDATORS: dict[str, Callable[[str], bool]] = {
     "credit_card": _credit_card,
     "ch_avs": lambda v: _ch_ssn.is_valid(_clean(v)),
     "fr_nir": lambda v: _fr_nir.is_valid(_clean(v)),
+    "fr_nif": lambda v: _fr_nif.is_valid(_clean(v)),
     "de_idnr": lambda v: _de_idnr.is_valid(_clean(v)),
 }
+
+
+# Validators that verify a checksum (not merely structure). Rules backed by these
+# must keep confidence 1.0 — the untouchable invariant is not configurable away.
+CHECKSUM_VALIDATORS: frozenset[str] = frozenset(VALIDATORS)

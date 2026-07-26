@@ -1,3 +1,5 @@
+import pytest
+
 from tessera_detector.deterministic import DeterministicDetector
 from tessera_detector.spans import Span
 
@@ -68,7 +70,7 @@ def test_catalog_drives_entity_types() -> None:
     # The engine knows nothing about concrete identifiers: types come from the catalog.
     detector = DeterministicDetector()
     types = {rule.entity_type for rule in detector.rules}
-    assert {"IBAN", "CREDIT_CARD", "CH_AVS", "FR_NIR", "DE_STEUER_ID"} <= types
+    assert {"IBAN", "CREDIT_CARD", "CH_AVS", "FR_NIR", "DE_STEUER_ID", "FR_NIF", "EMAIL"} <= types
 
 
 def test_corsican_nir_detected() -> None:
@@ -171,3 +173,128 @@ def test_double_valid_nir_and_luhn_resolves_to_nir() -> None:
     (span,) = detect(text)
     assert span.entity_type == "FR_NIR"
     assert text[span.start : span.end] == "295100000000754"
+
+
+def test_fr_nif_detected() -> None:
+    text = "Numéro fiscal 07 01 987 765 493 (avis d'imposition)."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIF"
+    assert text[span.start : span.end] == "07 01 987 765 493"
+    assert span.confidence == 1.0
+
+
+def test_broken_nif_checksum_no_span() -> None:
+    assert detect("Numéro fiscal 07 01 987 765 432.") == []
+
+
+def test_email_detected_without_checksum() -> None:
+    # Pattern-only rule: no validator, catalog-provided confidence below 1.0,
+    # so the span is not untouchable in resolution.
+    text = "Contact: Jean.Dupont@example-bank.CH pour le dossier."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "Jean.Dupont@example-bank.CH"
+    assert span.confidence == 0.95
+    assert span.tier == 2
+
+
+def test_apostrophe_email_matched_completely() -> None:
+    # A dot-atom local part may contain an apostrophe; matching only the part
+    # after it would leave the identifying fragment unredacted.
+    text = "Mail an o'connor@example.com senden."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "o'connor@example.com"
+
+
+def test_validator_free_rule_requires_explicit_low_confidence() -> None:
+    # Confidence 1.0 marks a span untouchable in resolution; a pattern-only rule
+    # must not get that status by omission.
+    catalog = """
+version: 1
+identifiers:
+  - id: naked
+    entity_type: NAKED
+    tier: 2
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="naked"):
+        DeterministicDetector(catalog)
+
+
+def test_rfc_dot_atom_emails_matched_completely() -> None:
+    # All RFC 5322 atext characters are part of the local part; a partial match
+    # would leak the leading fragment and shift audit coordinates.
+    for local in ("alice&bob", "user=tag", "a!b#c$d%e", "x*y/z?w^v", "{tilde}~`pipe|"):
+        text = f"Von {local}@example.com gesendet."
+        (span,) = detect(text)
+        assert text[span.start : span.end] == f"{local}@example.com", local
+
+
+def test_out_of_range_confidence_rejected_at_load() -> None:
+    catalog = """
+version: 1
+identifiers:
+  - id: broken_conf
+    entity_type: X
+    tier: 1
+    validator: iban
+    confidence: -0.1
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="broken_conf"):
+        DeterministicDetector(catalog)
+
+
+def test_checksum_validator_rules_must_keep_confidence_1() -> None:
+    # The untouchable invariant must not be configurable away: a rule backed by
+    # a checksum-grade validator cannot declare a lower confidence.
+    catalog = """
+version: 1
+identifiers:
+  - id: weak_iban
+    entity_type: IBAN
+    tier: 1
+    validator: iban
+    confidence: 0.9
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="weak_iban"):
+        DeterministicDetector(catalog)
+
+
+def test_malformed_dot_atoms_produce_no_span() -> None:
+    # RFC 5322 dot-atoms: every dot separates two non-empty atext runs.
+    assert detect("Kontakt alice..bob@example.com bitte.") == []
+    assert detect("Kontakt .alice@example.com bitte.") == []
+    assert detect("Kontakt alice.@example.com bitte.") == []
+
+
+def test_punycode_tld_matched_completely() -> None:
+    text = "Написать на alice@example.xn--p1ai срочно."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "alice@example.xn--p1ai"
+
+
+def test_unicode_local_part_matched_completely() -> None:
+    # SMTPUTF8: a non-ASCII letter is part of the local part, not a boundary —
+    # emitting "lise@example.com" would leave the identifying prefix unredacted.
+    text = "Contact élise@example.com svp."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "élise@example.com"
+
+
+def test_domain_labels_reject_boundary_hyphens() -> None:
+    assert detect("Mail alice@-example.com bitte.") == []
+    assert detect("Mail alice@example-.com bitte.") == []
+    assert detect("Mail alice@example.com- bitte.") == []
+
+
+def test_domain_label_length_limit() -> None:
+    # DNS labels are at most 63 characters: 64 is malformed, 63 is fine.
+    assert detect(f"Mail alice@{'a' * 64}.com bitte.") == []
+    text = f"Mail alice@{'a' * 63}.com bitte."
+    (span,) = detect(text)
+    assert text[span.start : span.end] == f"alice@{'a' * 63}.com"
