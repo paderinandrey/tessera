@@ -11,27 +11,27 @@ def test_ascii_text_is_identity() -> None:
 
 def test_nbsp_becomes_space_and_offsets_map_back() -> None:
     # IBAN groups separated by U+00A0 — common in copy-pasted bank statements.
-    original = "IBAN: DE89 3704 0044 0532 0130 00."
+    original = "IBAN: DE89\u00a03704\u00a00044\u00a00532\u00a00130\u00a000."
     norm = normalize(original)
-    assert " " not in norm.text
+    assert "\u00a0" not in norm.text
     assert norm.text == "IBAN: DE89 3704 0044 0532 0130 00."
     # The IBAN occupies the same character positions in both strings here.
     start = norm.text.index("DE89")
     end = norm.text.index(".", start)
     assert norm.to_original(start, end) == (start, end)
-    assert original[start:end] == "DE89 3704 0044 0532 0130 00"
+    assert original[start:end] == "DE89\u00a03704\u00a00044\u00a00532\u00a00130\u00a000"
 
 
 def test_narrow_nbsp_becomes_space() -> None:
     # French digit grouping uses U+202F (narrow no-break space).
-    original = "2 95 10 99"
+    original = "2\u202f95\u202f10\u202f99"
     norm = normalize(original)
     assert norm.text == "2 95 10 99"
 
 
 def test_unicode_hyphen_unified() -> None:
     # U+2011 (non-breaking hyphen) in a double-barrelled name.
-    original = "Anne‑Marie"
+    original = "Anne\u2011Marie"
     norm = normalize(original)
     assert norm.text == "Anne-Marie"
     assert norm.to_original(0, len("Anne-Marie")) == (0, len(original))

@@ -8,10 +8,12 @@ came from, and spans are always reported in original coordinates.
 import unicodedata
 from dataclasses import dataclass
 
-# Unicode hyphen variants that NFKC does not fold to ASCII "-".
-_HYPHENS = frozenset("‐‑‒–−")
-# Space variants NFKC leaves alone (NBSP and narrow NBSP are already NFKC-folded).
-_SPACES = frozenset("  ")
+# Unicode hyphen variants that NFKC does not fold to ASCII "-": hyphen,
+# non-breaking hyphen, figure dash, en dash, minus sign.
+_HYPHENS = frozenset("\u2010\u2011\u2012\u2013\u2212")
+# Separators NFKC leaves alone (NBSP and narrow NBSP are already NFKC-folded):
+# line separator, paragraph separator.
+_SPACES = frozenset("\u2028\u2029")
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +25,9 @@ class NormalizedText:
     def to_original(self, start: int, end: int) -> tuple[int, int]:
         """Map a [start, end) span in normalized coordinates to original coordinates."""
         if not 0 <= start < end <= len(self.text):
-            raise ValueError(f"invalid normalized span [{start}, {end}) for text of length {len(self.text)}")
+            raise ValueError(
+                f"invalid normalized span [{start}, {end}) for text of length {len(self.text)}"
+            )
         return self._orig_index[start], self._orig_index[end - 1] + 1
 
 
@@ -40,4 +44,6 @@ def normalize(original: str) -> NormalizedText:
         for out in folded:
             chars.append(out)
             orig_index.append(i)
-    return NormalizedText(text="".join(chars), _orig_index=tuple(orig_index), _orig_len=len(original))
+    return NormalizedText(
+        text="".join(chars), _orig_index=tuple(orig_index), _orig_len=len(original)
+    )
