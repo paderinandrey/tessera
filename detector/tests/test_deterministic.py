@@ -31,9 +31,10 @@ def test_iban_with_nbsp_separators_detected() -> None:
 def test_broken_checksum_produces_no_span_at_all() -> None:
     # REQ-2 acceptance: a failed checksum drops the candidate entirely,
     # it does not lower confidence.
-    # (The last digit is 02, not 01: the 18-digit tail of the 01-variant happens to
-    # pass Luhn and would legitimately surface as a CREDIT_CARD candidate.)
     assert detect("IBAN DE89 3704 0044 0532 0130 02 invalide") == []
+    # The 18-digit tail of this variant passes Luhn; the digit-run boundary guard
+    # must keep it from surfacing as a CREDIT_CARD candidate.
+    assert detect("IBAN DE89 3704 0044 0532 0130 01 invalide") == []
     assert detect("Karte 4111 1111 1111 1112") == []
     assert detect("AVS 756.9217.0769.84") == []
 
@@ -44,6 +45,8 @@ def test_mixed_language_text_multiple_entities() -> None:
         "NIR 2 95 10 99 126 111 93, Steuer-ID 36 574 261 809."
     )
     spans = detect(text)
+    assert len(spans) == 4
+    assert {s.entity_type for s in spans} == {"CH_AVS", "CREDIT_CARD", "FR_NIR", "DE_STEUER_ID"}
     assert text[slice(*_bounds(spans_of_type(spans, "CH_AVS")))] == "756.9217.0769.85"
     assert text[slice(*_bounds(spans_of_type(spans, "CREDIT_CARD")))] == "4111 1111 1111 1111"
     assert text[slice(*_bounds(spans_of_type(spans, "FR_NIR")))] == "2 95 10 99 126 111 93"
@@ -66,3 +69,26 @@ def test_catalog_drives_entity_types() -> None:
     detector = DeterministicDetector()
     types = {rule.entity_type for rule in detector.rules}
     assert {"IBAN", "CREDIT_CARD", "CH_AVS", "FR_NIR", "DE_STEUER_ID"} <= types
+
+
+def test_corsican_nir_detected() -> None:
+    text = "NIR 1 99 07 2A 004 001 09 enregistré."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIR"
+    assert text[span.start : span.end] == "1 99 07 2A 004 001 09"
+
+
+def test_card_window_inside_longer_digit_run_rejected() -> None:
+    # A 20-digit contract number contains a 16-digit window that passes Luhn;
+    # a card candidate must not be carved out of a longer separated digit run.
+    text = "Vertragsnummer 4111 1111 1111 1111 1234"
+    assert detect(text) == []
+
+
+def test_luhn_passing_tail_of_valid_iban_yields_only_iban() -> None:
+    # The 18-digit BBAN of this checksum-valid IBAN also passes Luhn; the run
+    # continues left into the check digits, so no card window may be emitted.
+    text = "Zahlung auf DE62 3704 0044 0532 0130 01 bitte."
+    (span,) = detect(text)
+    assert span.entity_type == "IBAN"
+    assert text[span.start : span.end] == "DE62 3704 0044 0532 0130 01"

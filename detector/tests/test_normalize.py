@@ -60,3 +60,17 @@ def test_span_inside_expanded_char_maps_to_that_char() -> None:
     assert norm.to_original(0, 1) == (0, 1)
     assert norm.to_original(1, 2) == (0, 1)
     assert norm.to_original(2, 3) == (1, 2)
+
+
+def test_decomposed_sequences_compose() -> None:
+    # NFC/NFKC must see the whole combining sequence, not code points one by one:
+    # "Cafe" + U+0301 composes to "Café" (one char shorter than the original).
+    original = "Cafe\u0301 Zu\u0308rich"
+    norm = normalize(original)
+    assert norm.text == "Caf\u00e9 Z\u00fcrich"
+    # Span over composed "Café" covers the full original sequence incl. the accent.
+    assert norm.to_original(0, 4) == (0, 5)
+    # "Zürich" after the composition point maps back to its original coordinates.
+    n_start = norm.text.index("Z")
+    o_start, o_end = norm.to_original(n_start, n_start + 6)
+    assert original[o_start:o_end] == "Zu\u0308rich"
