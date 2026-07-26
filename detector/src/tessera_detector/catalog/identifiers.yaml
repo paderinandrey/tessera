@@ -43,7 +43,8 @@ identifiers:
     # The birth-place segment admits metropolitan/Corsican grouping
     # (department 2 or 2A/2B + commune 3) and overseas grouping
     # (department 3 + commune 2).
-    pattern: '\b(?<!\d )[12] ?\d{2} ?\d{2} ?(?:(?:\d{2}|2[AB]) ?\d{3}|\d{3} ?\d{2}) ?\d{3} ?\d{2}(?! ?\d)\b'
+    # Leading digit: 1/2 permanent, 3/4/7/8 provisional sex/status codes.
+    pattern: '\b(?<!\d )[123478] ?\d{2} ?\d{2} ?(?:(?:\d{2}|2[AB]) ?\d{3}|\d{3} ?\d{2}) ?\d{3} ?\d{2}(?! ?\d)\b'
 
   - id: de_steuer_id
     entity_type: DE_STEUER_ID

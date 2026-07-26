@@ -24,6 +24,9 @@ VALID = {
         "199072A00400109",
         "1 99 07 2A 004 001 09",
         "185082B12345611",
+        # Provisional identifiers use sex/status codes 3, 4, 7, 8.
+        "395109912611143",
+        "7 95 10 99 126 111 37",
         # Lowercase Corsican codes identify the same departments.
         "1 99 07 2a 004 001 09",
         # Overseas departments group as three-digit department + two-digit commune.

@@ -153,3 +153,11 @@ def test_lowercase_corsican_nir_detected() -> None:
     (span,) = detect(text)
     assert span.entity_type == "FR_NIR"
     assert text[span.start : span.end] == "1 99 07 2a 004 001 09"
+
+
+def test_provisional_nir_detected() -> None:
+    # Provisional identifiers carry sex/status codes 3, 4, 7 or 8.
+    text = "NIR provisoire 7 95 10 99 126 111 37 attribué."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIR"
+    assert text[span.start : span.end] == "7 95 10 99 126 111 37"
