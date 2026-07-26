@@ -20,6 +20,13 @@ _DEFAULT_CATALOG = resources.files("tessera_detector") / "catalog" / "identifier
 
 
 @dataclass(frozen=True, slots=True)
+class Boost:
+    value: float
+    window: int
+    triggers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Rule:
     id: str
     entity_type: str
@@ -28,6 +35,8 @@ class Rule:
     validator: str | None
     specificity: int
     confidence: float
+    threshold: float
+    boost: Boost | None
 
 
 def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
@@ -67,9 +76,36 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
                 validator=validator,
                 specificity=entry.get("specificity", 50),
                 confidence=confidence,
+                threshold=entry.get("threshold", 0.5),
+                boost=_load_boost(entry.get("boost")),
             )
         )
     return tuple(rules)
+
+
+def _load_boost(raw: object) -> Boost | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"boost must be a mapping, got {type(raw).__name__}")
+    value, window, triggers = raw.get("value"), raw.get("window"), raw.get("triggers")
+    if not isinstance(value, int | float) or not isinstance(window, int):
+        raise ValueError("boost requires a numeric 'value' and an integer 'window'")
+    if not isinstance(triggers, list) or not triggers:
+        raise ValueError("boost requires a non-empty 'triggers' list")
+    return Boost(
+        value=float(value),
+        window=window,
+        triggers=tuple(str(t).lower() for t in triggers),
+    )
+
+
+def _context_boosted(boost: Boost, text: str, start: int, end: int) -> bool:
+    """Look for a trigger within the +-window tokens around a candidate (REQ-7)."""
+    before = " ".join(text[:start].split()[-boost.window :])
+    after = " ".join(text[end:].split()[: boost.window])
+    window = f"{before} {after}".lower()
+    return any(trigger in window for trigger in boost.triggers)
 
 
 _TOKEN_SEPARATORS = " -."
@@ -114,15 +150,28 @@ class DeterministicDetector:
                 validated = _validate_shrinking(rule, match.group(0))
                 if validated is None:
                     continue
-                start, end = norm.to_original(match.start(), match.start() + len(validated))
+                n_end = match.start() + len(validated)
+                confidence, boosted = rule.confidence, False
+                if (
+                    rule.boost is not None
+                    and confidence < 1.0
+                    and _context_boosted(rule.boost, norm.text, match.start(), n_end)
+                ):
+                    # A boost must never fabricate checksum status (confidence 1.0).
+                    confidence = min(confidence + rule.boost.value, 0.99)
+                    boosted = True
+                if confidence < rule.threshold:
+                    continue
+                start, end = norm.to_original(match.start(), n_end)
                 spans.append(
                     Span(
                         entity_type=rule.entity_type,
                         start=start,
                         end=end,
-                        confidence=rule.confidence,
+                        confidence=confidence,
                         recognizer=f"catalog:{rule.id}",
                         tier=rule.tier,
+                        boosted=boosted,
                     )
                 )
         specificity = {rule.entity_type: rule.specificity for rule in self.rules}

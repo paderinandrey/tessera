@@ -79,3 +79,18 @@ identifiers:
     # label must contain a letter (punycode allowed) and the lookahead keeps the
     # match from stopping mid-label.
     pattern: '(?<![\w.!#$%&''*+/=?^_`{|}~-])[\w!#$%&''*+/=?^_`{|}~-]+(?:\.[\w!#$%&''*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?=[A-Za-z0-9-]{0,62}[A-Za-z])[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?![A-Za-z0-9-])'
+
+  # No checksum exists for the Steuernummer (structural validation only), so the
+  # rule starts below its threshold and only a nearby context trigger lifts it over.
+  - id: de_steuernummer
+    entity_type: DE_STEUERNUMMER
+    tier: 1
+    validator: de_stnr
+    confidence: 0.6
+    threshold: 0.7
+    specificity: 60
+    boost:
+      value: 0.2
+      window: 6
+      triggers: ["steuernummer", "st.-nr", "st-nr", "steuer-nr"]
+    pattern: '\b(?<!\d[ ./])(?:\d{2,3}/\d{3,4}/\d{4,5}|\d{13})(?![ ./]?\d)\b'

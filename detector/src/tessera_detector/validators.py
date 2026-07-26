@@ -12,6 +12,7 @@ import schwifty.exceptions
 from stdnum import luhn
 from stdnum.ch import ssn as _ch_ssn
 from stdnum.de import idnr as _de_idnr
+from stdnum.de import stnr as _de_stnr
 from stdnum.fr import nif as _fr_nif
 from stdnum.fr import nir as _fr_nir
 
@@ -45,9 +46,14 @@ VALIDATORS: dict[str, Callable[[str], bool]] = {
     "fr_nir": lambda v: _fr_nir.is_valid(_clean(v)),
     "fr_nif": lambda v: _fr_nif.is_valid(_clean(v)),
     "de_idnr": lambda v: _de_idnr.is_valid(_clean(v)),
+    # Structural validation only — the Steuernummer has no checksum; the catalog
+    # compensates with a low base confidence gated by context triggers.
+    "de_stnr": lambda v: _de_stnr.is_valid(v),
 }
 
 
 # Validators that verify a checksum (not merely structure). Rules backed by these
 # must keep confidence 1.0 — the untouchable invariant is not configurable away.
-CHECKSUM_VALIDATORS: frozenset[str] = frozenset(VALIDATORS)
+# de_stnr is structural only and is deliberately excluded: its rules declare a
+# sub-1.0 confidence and rely on context triggers.
+CHECKSUM_VALIDATORS: frozenset[str] = frozenset(VALIDATORS) - {"de_stnr"}
