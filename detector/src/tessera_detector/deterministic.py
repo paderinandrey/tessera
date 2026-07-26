@@ -12,6 +12,7 @@ from importlib import resources
 import yaml
 
 from .normalize import normalize
+from .resolution import resolve
 from .spans import Span
 from .validators import VALIDATORS
 
@@ -25,6 +26,7 @@ class Rule:
     tier: int
     pattern: re.Pattern[str]
     validator: str
+    specificity: int
 
 
 def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
@@ -42,6 +44,7 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
                 tier=entry["tier"],
                 pattern=re.compile(entry["pattern"], flags),
                 validator=validator,
+                specificity=entry.get("specificity", 50),
             )
         )
     return tuple(rules)
@@ -99,4 +102,5 @@ class DeterministicDetector:
                         tier=rule.tier,
                     )
                 )
-        return sorted(spans, key=lambda s: (s.start, s.end))
+        specificity = {rule.entity_type: rule.specificity for rule in self.rules}
+        return resolve(spans, specificity=specificity).spans

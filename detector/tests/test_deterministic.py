@@ -161,3 +161,13 @@ def test_provisional_nir_detected() -> None:
     (span,) = detect(text)
     assert span.entity_type == "FR_NIR"
     assert text[span.start : span.end] == "7 95 10 99 126 111 37"
+
+
+def test_double_valid_nir_and_luhn_resolves_to_nir() -> None:
+    # 295100000000754 is simultaneously a checksum-valid NIR and a Luhn-valid
+    # 15-digit run: both rules match the same range, resolution must pick the
+    # more specific FR_NIR (REQ-8) and emit exactly one span.
+    text = "Numéro 295100000000754 enregistré."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIR"
+    assert text[span.start : span.end] == "295100000000754"
