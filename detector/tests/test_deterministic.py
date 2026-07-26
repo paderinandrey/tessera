@@ -290,3 +290,11 @@ def test_domain_labels_reject_boundary_hyphens() -> None:
     assert detect("Mail alice@-example.com bitte.") == []
     assert detect("Mail alice@example-.com bitte.") == []
     assert detect("Mail alice@example.com- bitte.") == []
+
+
+def test_domain_label_length_limit() -> None:
+    # DNS labels are at most 63 characters: 64 is malformed, 63 is fine.
+    assert detect(f"Mail alice@{'a' * 64}.com bitte.") == []
+    text = f"Mail alice@{'a' * 63}.com bitte."
+    (span,) = detect(text)
+    assert text[span.start : span.end] == f"alice@{'a' * 63}.com"
