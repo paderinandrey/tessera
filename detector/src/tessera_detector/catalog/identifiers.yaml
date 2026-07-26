@@ -56,3 +56,20 @@ identifiers:
     validator: de_idnr
     specificity: 80
     pattern: '\b(?<!\d )\d{2} ?\d{3} ?\d{3} ?\d{3}(?! ?\d)\b'
+
+  - id: fr_nif
+    entity_type: FR_NIF
+    tier: 1
+    validator: fr_nif
+    specificity: 80
+    # 13 digits starting 0-3; common spacing 2-2-3-3-3.
+    pattern: '\b(?<!\d )[0-3]\d ?\d{2} ?\d{3} ?\d{3} ?\d{3}(?! ?\d)\b'
+
+  # Pattern-only rule: no checksum exists for emails, so no validator; the
+  # catalog-provided confidence stays below 1.0 and the span is not untouchable.
+  - id: email
+    entity_type: EMAIL
+    tier: 2
+    confidence: 0.95
+    specificity: 70
+    pattern: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b'

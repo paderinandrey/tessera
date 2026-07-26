@@ -68,7 +68,7 @@ def test_catalog_drives_entity_types() -> None:
     # The engine knows nothing about concrete identifiers: types come from the catalog.
     detector = DeterministicDetector()
     types = {rule.entity_type for rule in detector.rules}
-    assert {"IBAN", "CREDIT_CARD", "CH_AVS", "FR_NIR", "DE_STEUER_ID"} <= types
+    assert {"IBAN", "CREDIT_CARD", "CH_AVS", "FR_NIR", "DE_STEUER_ID", "FR_NIF", "EMAIL"} <= types
 
 
 def test_corsican_nir_detected() -> None:
@@ -171,3 +171,26 @@ def test_double_valid_nir_and_luhn_resolves_to_nir() -> None:
     (span,) = detect(text)
     assert span.entity_type == "FR_NIR"
     assert text[span.start : span.end] == "295100000000754"
+
+
+def test_fr_nif_detected() -> None:
+    text = "Numéro fiscal 07 01 987 765 493 (avis d'imposition)."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIF"
+    assert text[span.start : span.end] == "07 01 987 765 493"
+    assert span.confidence == 1.0
+
+
+def test_broken_nif_checksum_no_span() -> None:
+    assert detect("Numéro fiscal 07 01 987 765 432.") == []
+
+
+def test_email_detected_without_checksum() -> None:
+    # Pattern-only rule: no validator, catalog-provided confidence below 1.0,
+    # so the span is not untouchable in resolution.
+    text = "Contact: Jean.Dupont@example-bank.CH pour le dossier."
+    (span,) = detect(text)
+    assert span.entity_type == "EMAIL"
+    assert text[span.start : span.end] == "Jean.Dupont@example-bank.CH"
+    assert span.confidence == 0.95
+    assert span.tier == 2

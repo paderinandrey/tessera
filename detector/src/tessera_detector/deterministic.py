@@ -25,16 +25,17 @@ class Rule:
     entity_type: str
     tier: int
     pattern: re.Pattern[str]
-    validator: str
+    validator: str | None
     specificity: int
+    confidence: float
 
 
 def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
     catalog = yaml.safe_load(catalog_text)
     rules = []
     for entry in catalog["identifiers"]:
-        validator = entry["validator"]
-        if validator not in VALIDATORS:
+        validator = entry.get("validator")
+        if validator is not None and validator not in VALIDATORS:
             raise ValueError(f"identifier {entry['id']!r} names unknown validator {validator!r}")
         flags = re.IGNORECASE if entry.get("case_insensitive") else re.NOFLAG
         rules.append(
@@ -45,6 +46,7 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
                 pattern=re.compile(entry["pattern"], flags),
                 validator=validator,
                 specificity=entry.get("specificity", 50),
+                confidence=entry.get("confidence", 1.0),
             )
         )
     return tuple(rules)
@@ -62,11 +64,12 @@ def _validate_shrinking(rule: Rule, candidate: str) -> str | None:
     containing a letter: a trailing digit group means the run may be a window of a
     longer number and must not produce a span (digit-run guard philosophy).
     """
+    if rule.validator is None:
+        return candidate
+    validate = VALIDATORS[rule.validator]
     shrunk = False
     while True:
-        if (not shrunk or rule.pattern.fullmatch(candidate)) and VALIDATORS[rule.validator](
-            candidate
-        ):
+        if (not shrunk or rule.pattern.fullmatch(candidate)) and validate(candidate):
             return candidate
         cut = max(candidate.rfind(sep) for sep in _TOKEN_SEPARATORS)
         if cut <= 0 or not any(ch.isalpha() for ch in candidate[cut + 1 :]):
@@ -97,7 +100,7 @@ class DeterministicDetector:
                         entity_type=rule.entity_type,
                         start=start,
                         end=end,
-                        confidence=1.0,
+                        confidence=rule.confidence,
                         recognizer=f"catalog:{rule.id}",
                         tier=rule.tier,
                     )
