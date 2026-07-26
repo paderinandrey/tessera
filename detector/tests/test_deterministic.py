@@ -92,3 +92,11 @@ def test_luhn_passing_tail_of_valid_iban_yields_only_iban() -> None:
     (span,) = detect(text)
     assert span.entity_type == "IBAN"
     assert text[span.start : span.end] == "DE62 3704 0044 0532 0130 01"
+
+
+def test_overseas_nir_detected() -> None:
+    # Overseas birth places group as department(3) + commune(2), not 2 + 3.
+    text = "NIR 1 90 01 971 01 001 91 (Guadeloupe)."
+    (span,) = detect(text)
+    assert span.entity_type == "FR_NIR"
+    assert text[span.start : span.end] == "1 90 01 971 01 001 91"

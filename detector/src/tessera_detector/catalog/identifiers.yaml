@@ -35,8 +35,10 @@ identifiers:
     entity_type: FR_NIR
     tier: 1
     validator: fr_nir
-    # The department segment admits Corsican codes 2A/2B alongside two digits.
-    pattern: '\b[12] ?\d{2} ?\d{2} ?(?:\d{2}|2[AB]) ?\d{3} ?\d{3} ?\d{2}\b'
+    # The birth-place segment admits metropolitan/Corsican grouping
+    # (department 2 or 2A/2B + commune 3) and overseas grouping
+    # (department 3 + commune 2).
+    pattern: '\b[12] ?\d{2} ?\d{2} ?(?:(?:\d{2}|2[AB]) ?\d{3}|\d{3} ?\d{2}) ?\d{3} ?\d{2}\b'
 
   - id: de_steuer_id
     entity_type: DE_STEUER_ID
