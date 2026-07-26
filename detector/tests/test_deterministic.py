@@ -220,3 +220,27 @@ identifiers:
 """
     with pytest.raises(ValueError, match="naked"):
         DeterministicDetector(catalog)
+
+
+def test_rfc_dot_atom_emails_matched_completely() -> None:
+    # All RFC 5322 atext characters are part of the local part; a partial match
+    # would leak the leading fragment and shift audit coordinates.
+    for local in ("alice&bob", "user=tag", "a!b#c$d%e", "x*y/z?w^v", "{tilde}~`pipe|"):
+        text = f"Von {local}@example.com gesendet."
+        (span,) = detect(text)
+        assert text[span.start : span.end] == f"{local}@example.com", local
+
+
+def test_out_of_range_confidence_rejected_at_load() -> None:
+    catalog = """
+version: 1
+identifiers:
+  - id: broken_conf
+    entity_type: X
+    tier: 1
+    validator: iban
+    confidence: -0.1
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="broken_conf"):
+        DeterministicDetector(catalog)

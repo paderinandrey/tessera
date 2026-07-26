@@ -38,6 +38,11 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
         if validator is not None and validator not in VALIDATORS:
             raise ValueError(f"identifier {entry['id']!r} names unknown validator {validator!r}")
         confidence = entry.get("confidence", 1.0)
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError(
+                f"identifier {entry['id']!r} declares confidence {confidence} "
+                "outside the [0.0, 1.0] range"
+            )
         if validator is None and confidence >= 1.0:
             # Confidence 1.0 marks spans untouchable in resolution — a status
             # reserved for checksum-validated rules, never granted by omission.
