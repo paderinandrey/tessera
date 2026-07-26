@@ -114,3 +114,25 @@ def test_chain_of_overlaps_reaches_fixpoint() -> None:
     result = resolve([a, b, c], specificity=SPEC)
     (kept,) = result.spans
     assert (kept.start, kept.end) == (0, 25)
+
+
+def test_untouchable_beats_higher_specificity_on_partial_overlap() -> None:
+    # Rule 1 precedes rule 4: a lone checksum span never loses to a non-checksum
+    # span, even when the latter's type ranks higher in specificity.
+    nir = span(entity_type="FR_NIR", start=0, end=15, recognizer="catalog:fr_nir")
+    model = span(
+        entity_type="VERY_SPECIFIC", start=0, end=15, confidence=0.99, recognizer="ner:x", tier=2
+    )
+    result = resolve([model, nir], specificity={"VERY_SPECIFIC": 95, "FR_NIR": 80})
+    (kept,) = result.spans
+    assert kept.entity_type == "FR_NIR"
+
+
+def test_resolution_is_order_independent() -> None:
+    # Equal-range, equally scored spans must resolve identically regardless of
+    # input order (set() iteration order is hash-seed dependent).
+    a = span(entity_type="AAA", start=0, end=10, confidence=0.8, recognizer="ner:x", tier=2)
+    b = span(entity_type="BBB", start=0, end=10, confidence=0.8, recognizer="ner:y", tier=2)
+    kept_ab = resolve([a, b], specificity={"AAA": 50, "BBB": 50}).spans[0]
+    kept_ba = resolve([b, a], specificity={"AAA": 50, "BBB": 50}).spans[0]
+    assert kept_ab == kept_ba

@@ -38,6 +38,19 @@ class Resolution:
     trace: list[Decision] = field(default_factory=list)
 
 
+def _sort_key(span: Span) -> tuple[int, int, str, str, float, int, bool]:
+    # Total order: resolution outcomes must not depend on set() iteration order.
+    return (
+        span.start,
+        span.start - span.end,  # longer first
+        span.entity_type,
+        span.recognizer,
+        -span.confidence,
+        span.tier,
+        span.boosted,
+    )
+
+
 def _overlaps(a: Span, b: Span) -> bool:
     return a.start < b.end and b.start < a.end
 
@@ -84,6 +97,10 @@ def _resolve_pair(
                 )
             return outer, "nesting-outer-wins"
 
+    # Rule 1 precedes rule 4: a lone checksum span never loses to a non-checksum one.
+    if untouchable(a) != untouchable(b):
+        return (a if untouchable(a) else b), "untouchable-wins"
+
     spec_a = specificity.get(a.entity_type, 0)
     spec_b = specificity.get(b.entity_type, 0)
     if spec_a != spec_b:
@@ -100,7 +117,7 @@ def resolve(
     untouchable: Callable[[Span], bool] = _is_checksum,
 ) -> Resolution:
     specificity = specificity or {}
-    result = Resolution(spans=sorted(set(spans), key=lambda s: (s.start, -(s.end - s.start))))
+    result = Resolution(spans=sorted(set(spans), key=_sort_key))
     while True:
         conflict = next(
             (
@@ -120,5 +137,5 @@ def resolve(
         result.trace.append(Decision(rule=rule, kept=kept, dropped=dropped))
         result.spans = sorted(
             [s for k, s in enumerate(result.spans) if k not in (i, j)] + [kept],
-            key=lambda s: (s.start, -(s.end - s.start)),
+            key=_sort_key,
         )
