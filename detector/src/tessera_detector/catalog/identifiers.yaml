@@ -1,0 +1,53 @@
+# Identifier catalog — data, not code (MVP roadmap: the community growth lever).
+#
+# Each entry pairs a candidate pattern (matched against normalized text) with a named
+# checksum validator from tessera_detector.validators. A candidate that fails its
+# validator produces no span at all (REQ-2). Patterns may over-match; validators keep
+# precision. Adding a country identifier means adding an entry here plus, if needed,
+# one validator function.
+
+version: 1
+
+# Digit-run guards: every numeric pattern is wrapped in lookarounds that reject a
+# match when the separated digit run continues to the left or right — a checksum-valid
+# window of a longer contract or account number is not an entity. Trade-off: a real
+# identifier directly followed by ` <digits>` is also rejected — revisit with corpus
+# data in the REQ-8 conflict-resolution pass.
+
+identifiers:
+  - id: iban
+    entity_type: IBAN
+    tier: 1
+    validator: iban
+    case_insensitive: true
+    pattern: '\b[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]{4}){2,7}(?:[ -]?[A-Z0-9]{1,3})?\b'
+
+  - id: credit_card
+    entity_type: CREDIT_CARD
+    tier: 1
+    validator: credit_card
+    pattern: '\b(?<!\d[ -])\d(?:[ -]?\d){12,18}(?![ -]?\d)\b'
+
+  - id: ch_avs
+    entity_type: CH_AVS
+    tier: 1
+    validator: ch_avs
+    pattern: '\b(?<!\d[. ])756[. ]?\d{4}[. ]?\d{4}[. ]?\d{2}(?![. ]?\d)\b'
+
+  - id: fr_nir
+    entity_type: FR_NIR
+    tier: 1
+    validator: fr_nir
+    # Only affects the Corsican department letters: 2a/2b equal 2A/2B.
+    case_insensitive: true
+    # The birth-place segment admits metropolitan/Corsican grouping
+    # (department 2 or 2A/2B + commune 3) and overseas grouping
+    # (department 3 + commune 2).
+    # Leading digit: 1/2 permanent, 3/4/7/8 provisional sex/status codes.
+    pattern: '\b(?<!\d )[123478] ?\d{2} ?\d{2} ?(?:(?:\d{2}|2[AB]) ?\d{3}|\d{3} ?\d{2}) ?\d{3} ?\d{2}(?! ?\d)\b'
+
+  - id: de_steuer_id
+    entity_type: DE_STEUER_ID
+    tier: 1
+    validator: de_idnr
+    pattern: '\b(?<!\d )\d{2} ?\d{3} ?\d{3} ?\d{3}(?! ?\d)\b'
