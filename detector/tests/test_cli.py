@@ -1,6 +1,15 @@
+import json
 from pathlib import Path
 
-from tessera_detector.cli import FileReport, Finding, ScanReport, mask, render_text, scan
+from tessera_detector.cli import (
+    FileReport,
+    Finding,
+    ScanReport,
+    mask,
+    render_json,
+    render_text,
+    scan,
+)
 from tessera_detector.deterministic import DeterministicDetector
 
 
@@ -114,3 +123,28 @@ def test_render_text_sorts_summary_by_count_then_name() -> None:
 
 def test_render_text_empty_report() -> None:
     assert render_text(ScanReport(files=[], skipped=[])) == "Total: 0 files, 0 findings"
+
+
+def test_render_json_shape_and_masking() -> None:
+    payload = json.loads(render_json(_report()))
+    assert payload["summary"] == {
+        "files_scanned": 2,
+        "files_skipped": 0,
+        "total_findings": 2,
+        "by_type": {"FR_NIR": 1, "IBAN": 1},
+    }
+    finding = payload["files"][0]["findings"][0]
+    assert finding == {
+        "type": "FR_NIR",
+        "start": 12,
+        "end": 27,
+        "confidence": 0.98,
+        "recognizer": "catalog:fr_nir",
+        "masked_value": "1850…78",
+    }
+
+
+def test_render_json_show_values_uses_value_key() -> None:
+    finding = json.loads(render_json(_report(), show_values=True))["files"][0]["findings"][0]
+    assert finding["value"] == "185027512345678"
+    assert "masked_value" not in finding

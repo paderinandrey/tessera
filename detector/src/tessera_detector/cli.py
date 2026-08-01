@@ -4,6 +4,7 @@ Values are masked by default (first 4 + last 2 characters) so a report saved to
 a file or CI log is not itself a PII leak; --show-values prints them verbatim.
 """
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,3 +90,33 @@ def render_text(report: ScanReport, *, show_values: bool = False) -> str:
     if report.skipped:
         lines.append(f"Skipped: {len(report.skipped)} (not valid UTF-8)")
     return "\n".join(lines)
+
+
+def render_json(report: ScanReport, *, show_values: bool = False) -> str:
+    value_key = "value" if show_values else "masked_value"
+    payload = {
+        "files": [
+            {
+                "path": file.path,
+                "findings": [
+                    {
+                        "type": f.entity_type,
+                        "start": f.start,
+                        "end": f.end,
+                        "confidence": f.confidence,
+                        "recognizer": f.recognizer,
+                        value_key: f.value if show_values else mask(f.value),
+                    }
+                    for f in file.findings
+                ],
+            }
+            for file in report.files
+        ],
+        "summary": {
+            "files_scanned": len(report.files),
+            "files_skipped": len(report.skipped),
+            "total_findings": sum(len(file.findings) for file in report.files),
+            "by_type": dict(_type_counts(report)),
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
