@@ -48,7 +48,11 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
             raise ValueError(f"identifier {entry['id']!r} names unknown validator {validator!r}")
         confidence = entry.get("confidence", 1.0)
         threshold = entry.get("threshold", 0.5)
-        if not isinstance(threshold, int | float) or not 0.0 <= threshold <= 1.0:
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, int | float)
+            or not 0.0 <= threshold <= 1.0
+        ):
             raise ValueError(
                 f"identifier {entry['id']!r} declares threshold {threshold!r} "
                 "outside the [0.0, 1.0] range"
@@ -95,27 +99,38 @@ def _load_boost(raw: object) -> Boost | None:
     if not isinstance(raw, dict):
         raise ValueError(f"boost must be a mapping, got {type(raw).__name__}")
     value, window, triggers = raw.get("value"), raw.get("window"), raw.get("triggers")
-    if not isinstance(value, int | float) or not 0.0 <= value <= 1.0:
+    # isinstance(bool, int) holds in Python, and PyYAML loads bare true/false as bool.
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0.0 <= value <= 1.0:
         # The range check also rejects NaN (all comparisons are false) and inf.
         raise ValueError("boost 'value' must be a finite number in the [0.0, 1.0] range")
-    if not isinstance(window, int) or window < 1:
+    if isinstance(window, bool) or not isinstance(window, int) or window < 1:
         # A zero window would make the [-window:] slice scan the whole prefix.
         raise ValueError("boost 'window' must be a positive integer")
     if not isinstance(triggers, list) or not triggers:
         raise ValueError("boost requires a non-empty 'triggers' list")
-    # Triggers match as complete terms: "st-nr" must not fire inside "Post-Nr.".
-    alternatives = "|".join(rf"(?<!\w){re.escape(str(t))}(?!\w)" for t in triggers)
+    # Both triggers and the context window are canonicalized to \w+ token runs, so
+    # "st.-nr" and "St.-Nr." meet in the same form and punctuation never glues
+    # separate terms into one window token. Boundary lookarounds keep "st nr" from
+    # firing inside "post nr".
+    canonical = [_canonical(str(t)) for t in triggers]
+    if any(not t for t in canonical):
+        raise ValueError("boost 'triggers' must contain word characters")
+    alternatives = "|".join(rf"(?<!\w){re.escape(t)}(?!\w)" for t in canonical)
     return Boost(
         value=float(value),
         window=window,
-        triggers=re.compile(alternatives, re.IGNORECASE),
+        triggers=re.compile(alternatives),
     )
+
+
+def _canonical(text: str) -> str:
+    return " ".join(re.findall(r"\w+", text.lower()))
 
 
 def _context_boosted(boost: Boost, text: str, start: int, end: int) -> bool:
     """Look for a trigger within the +-window tokens around a candidate (REQ-7)."""
-    before = " ".join(text[:start].split()[-boost.window :])
-    after = " ".join(text[end:].split()[: boost.window])
+    before = " ".join(re.findall(r"\w+", text[:start].lower())[-boost.window :])
+    after = " ".join(re.findall(r"\w+", text[end:].lower())[: boost.window])
     return boost.triggers.search(f"{before} {after}") is not None
 
 

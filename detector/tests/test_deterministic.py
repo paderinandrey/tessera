@@ -332,6 +332,50 @@ identifiers:
     pattern: 'x+'
 """
     # window 0 would make [-window:] scan the whole prefix; NaN/inf poison Span.
-    for value, window in (("0.2", "0"), ("0.2", "-1"), (".nan", "6"), (".inf", "6"), ("-0.1", "6")):
+    for value, window in (
+        ("0.2", "0"),
+        ("0.2", "-1"),
+        (".nan", "6"),
+        (".inf", "6"),
+        ("-0.1", "6"),
+        # PyYAML loads true as bool, and bool is an int subclass.
+        ("true", "6"),
+        ("0.2", "true"),
+    ):
         with pytest.raises(ValueError, match=r"boost"):
             DeterministicDetector(template.format(value=value, window=window))
+
+
+def test_empty_or_punctuation_only_triggers_rejected() -> None:
+    template = """
+version: 1
+identifiers:
+  - id: bad_triggers
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: 0.7
+    boost:
+      value: 0.2
+      window: 6
+      triggers: [{triggers}]
+    pattern: 'x+'
+"""
+    for bad in ('""', '","'):
+        with pytest.raises(ValueError, match="trigger"):
+            DeterministicDetector(template.format(triggers=bad))
+
+
+def test_boolean_threshold_rejected() -> None:
+    catalog = """
+version: 1
+identifiers:
+  - id: bool_threshold
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: true
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="bool_threshold"):
+        DeterministicDetector(catalog)

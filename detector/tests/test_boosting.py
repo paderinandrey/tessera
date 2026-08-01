@@ -66,3 +66,8 @@ def test_13_digit_steuernummer_beats_card_rule() -> None:
     text = "Steuernummer 9181081508003 des Mandanten."
     (span,) = detect(text)
     assert span.entity_type == "DE_STEUERNUMMER"
+
+
+def test_window_counts_punctuation_separated_terms() -> None:
+    # Comma-glued terms are separate tokens: the trigger sits 7 tokens away.
+    assert detect("Steuernummer,a,b,c,d,e,f,g,181/815/08155") == []
