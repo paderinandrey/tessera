@@ -2,6 +2,8 @@
 
 A gold entity counts as found when a predicted span of the same type overlaps it
 with IoU >= 0.5; every gold entity matches at most one prediction and vice versa.
+The one-to-one assignment maximizes the number of matched pairs, so counts do not
+depend on entity order; higher IoU is only a preference among equal-size matchings.
 """
 
 from collections import defaultdict
@@ -56,23 +58,43 @@ def _iou(a_start: int, a_end: int, b_start: int, b_end: int) -> float:
 
 
 def evaluate_document(entities: list[EvalEntity], predictions: list[Span]) -> dict[str, Metrics]:
-    result: dict[str, Metrics] = defaultdict(Metrics)
-    matched_predictions: set[int] = set()
+    candidates: list[list[int]] = []
     for entity in entities:
-        best: tuple[float, int] | None = None
+        eligible: list[tuple[float, int]] = []
         for i, span in enumerate(predictions):
-            if i in matched_predictions or span.entity_type != entity.entity_type:
+            if span.entity_type != entity.entity_type:
                 continue
             iou = _iou(entity.start, entity.end, span.start, span.end)
-            if iou >= IOU_THRESHOLD and (best is None or iou > best[0]):
-                best = (iou, i)
-        if best is None:
-            result[entity.entity_type].fn += 1
-        else:
-            matched_predictions.add(best[1])
+            if iou >= IOU_THRESHOLD:
+                eligible.append((iou, i))
+        eligible.sort(key=lambda pair: pair[0], reverse=True)
+        candidates.append([index for _, index in eligible])
+
+    owner: dict[int, int] = {}
+
+    def claim(entity_index: int, visited: set[int]) -> bool:
+        for prediction_index in candidates[entity_index]:
+            if prediction_index in visited:
+                continue
+            visited.add(prediction_index)
+            current = owner.get(prediction_index)
+            if current is None or claim(current, visited):
+                owner[prediction_index] = entity_index
+                return True
+        return False
+
+    for entity_index in range(len(entities)):
+        claim(entity_index, set())
+
+    result: dict[str, Metrics] = defaultdict(Metrics)
+    matched_entities = set(owner.values())
+    for entity_index, entity in enumerate(entities):
+        if entity_index in matched_entities:
             result[entity.entity_type].tp += 1
+        else:
+            result[entity.entity_type].fn += 1
     for i, span in enumerate(predictions):
-        if i not in matched_predictions:
+        if i not in owner:
             result[span.entity_type].fp += 1
     return dict(result)
 

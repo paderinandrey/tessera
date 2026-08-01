@@ -50,6 +50,27 @@ def test_each_gold_matches_at_most_once() -> None:
     assert (result["IBAN"].tp, result["IBAN"].fp, result["IBAN"].fn) == (1, 1, 0)
 
 
+def test_matching_maximizes_pairs_over_greedy_iou() -> None:
+    # Gold A (0,20) prefers p1 (4,24), IoU 2/3, over p2 (0,13), IoU 0.65 — but p1
+    # is gold B's (8,28) only eligible match. Maximum matching pairs A-p2 and B-p1.
+    golds = [gold("IBAN", 0, 20), gold("IBAN", 8, 28)]
+    preds = [pred("IBAN", 4, 24), pred("IBAN", 0, 13)]
+    result = evaluate_document(golds, preds)
+    assert (result["IBAN"].tp, result["IBAN"].fp, result["IBAN"].fn) == (2, 0, 0)
+
+
+def test_matching_is_order_independent() -> None:
+    golds = [gold("IBAN", 0, 20), gold("IBAN", 8, 28)]
+    preds = [pred("IBAN", 4, 24), pred("IBAN", 0, 13)]
+    forward = evaluate_document(golds, preds)
+    reversed_golds = evaluate_document(list(reversed(golds)), preds)
+    assert (forward["IBAN"].tp, forward["IBAN"].fp, forward["IBAN"].fn) == (
+        reversed_golds["IBAN"].tp,
+        reversed_golds["IBAN"].fp,
+        reversed_golds["IBAN"].fn,
+    )
+
+
 def test_missed_entity_is_fn() -> None:
     result = evaluate_document([gold("FR_NIR", 0, 15)], [])
     assert result["FR_NIR"].fn == 1

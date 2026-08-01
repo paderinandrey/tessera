@@ -5,7 +5,7 @@ with checksum-valid synthetic identifiers. Identifiers are generated, never samp
 from real data; a fixed seed makes the output byte-identical between runs so the
 committed corpus can be diffed.
 
-Run from the repository root:  uv run --project detector python evaluation/generate.py
+Run from the repository root:  uv run --project detector --group eval python evaluation/generate.py
 """
 
 import json
