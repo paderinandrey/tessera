@@ -248,6 +248,18 @@ def test_render_json_counts_unreadable_entries() -> None:
     assert json.loads(render_json(report))["summary"]["files_unreadable"] == 1
 
 
+def test_scan_does_not_follow_file_symlinks(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "link.txt").symlink_to(outside / "secret.txt")
+    (root / "real.txt").write_text("mail: max.weber@example.de", encoding="utf-8")
+    report = scan(root, DeterministicDetector())
+    assert [f.path for f in report.files] == [str(root / "real.txt")]
+
+
 def test_scan_ignores_special_files(tmp_path: Path) -> None:
     # A FIFO must never be opened: read blocks forever waiting for a writer.
     os.mkfifo(tmp_path / "pipe.fifo")

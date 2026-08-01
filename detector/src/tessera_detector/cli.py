@@ -60,12 +60,12 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
         errors: list[OSError] = []
         found: list[Path] = []
         for dirpath, _dirnames, filenames in os.walk(path, onerror=errors.append):
-            # Regular files only: opening a FIFO (or a symlink to one) blocks
-            # forever waiting for a writer.
+            # Physical regular files only: a FIFO would block open() forever,
+            # and a symlink could pull content from outside the scan root.
             found.extend(
                 file
                 for name in filenames
-                if (file := Path(dirpath) / name).is_file()
+                if not (file := Path(dirpath) / name).is_symlink() and file.is_file()
             )
         report.unreadable.extend(sorted(str(e.filename) for e in errors if e.filename))
         files = sorted(found)
