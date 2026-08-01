@@ -187,3 +187,24 @@ def test_main_show_values_prints_verbatim(
     (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
     assert main(["scan", str(tmp_path), "--show-values"]) == 0
     assert "anna.keller@example.ch" in capsys.readouterr().out
+
+
+def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    fr = "Contact: anna.keller@example.ch pour le dossier."
+    de = "Bitte an max.weber@example.de schreiben."
+    (tmp_path / "a.txt").write_text(fr, encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.txt").write_text(de, encoding="utf-8")
+    (tmp_path / "zz.bin").write_bytes(b"\xff\xfe")
+    assert main(["scan", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == (
+        f"{tmp_path / 'a.txt'}\n"
+        "  EMAIL        9–31    0.95  anna…ch\n"
+        "\n"
+        f"{tmp_path / 'sub' / 'b.txt'}\n"
+        "  EMAIL        9–29    0.95  max.…de\n"
+        "\n"
+        "Total: 2 files, 2 findings\n"
+        "  EMAIL        2\n"
+        "Skipped: 1 (not valid UTF-8)\n"
+    )

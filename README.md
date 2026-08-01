@@ -45,6 +45,18 @@ tessera/
                annotated corpus stays private and never enters this repository.
 ```
 
+## CLI
+
+Point the detector at a folder (or file) of texts to see what would be redacted:
+
+```
+uv run --project detector tessera scan path/to/texts            # human-readable, values masked
+uv run --project detector tessera scan path/to/texts --json     # machine-readable
+```
+
+Found values are masked by default (`FR76…89`) so a saved report is not itself
+a PII leak; `--show-values` prints them verbatim.
+
 ## Evaluation
 
 The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic
