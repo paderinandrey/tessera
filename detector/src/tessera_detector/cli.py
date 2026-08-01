@@ -7,6 +7,7 @@ a file or CI log is not itself a PII leak; --show-values prints them verbatim.
 import argparse
 import json
 import os
+import stat as stat_module
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -47,6 +48,12 @@ class ScanReport:
     unreadable: list[str] = field(default_factory=list)
 
 
+def _display_path(path: Path) -> str:
+    # A filename with non-UTF-8 bytes reaches Python as lone surrogates, which
+    # crash any later encode of the report; make it printable, marking the bytes.
+    return str(path).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
     report = ScanReport(files=[], skipped=[])
     if path.is_file():
@@ -59,24 +66,32 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
         os.scandir(path).close()
         errors: list[OSError] = []
         found: list[Path] = []
+        unreadable: list[str] = []
         for dirpath, _dirnames, filenames in os.walk(path, onerror=errors.append):
-            # Physical regular files only: a FIFO would block open() forever,
-            # and a symlink could pull content from outside the scan root.
-            found.extend(
-                file
-                for name in filenames
-                if not (file := Path(dirpath) / name).is_symlink() and file.is_file()
-            )
-        report.unreadable.extend(sorted(str(e.filename) for e in errors if e.filename))
+            for name in filenames:
+                file = Path(dirpath) / name
+                try:
+                    # Explicit lstat: is_file() would silently swallow a failed
+                    # stat (readable but unsearchable directory, mode r--).
+                    mode = file.lstat().st_mode
+                except OSError:
+                    unreadable.append(_display_path(file))
+                    continue
+                # Physical regular files only: a FIFO would block open()
+                # forever, a symlink could pull content from outside the root.
+                if stat_module.S_ISREG(mode):
+                    found.append(file)
+        unreadable.extend(_display_path(Path(e.filename)) for e in errors if e.filename)
+        report.unreadable.extend(sorted(unreadable))
         files = sorted(found)
     for file in files:
         try:
             text = file.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            report.skipped.append(str(file))
+            report.skipped.append(_display_path(file))
             continue
         except OSError:
-            report.unreadable.append(str(file))
+            report.unreadable.append(_display_path(file))
             continue
         findings = [
             Finding(
@@ -89,7 +104,7 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
             )
             for span in resolve(detector.detect(text)).spans
         ]
-        report.files.append(FileReport(path=str(file), findings=findings))
+        report.files.append(FileReport(path=_display_path(file), findings=findings))
     return report
 
 

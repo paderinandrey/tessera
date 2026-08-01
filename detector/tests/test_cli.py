@@ -270,6 +270,37 @@ def test_scan_ignores_special_files(tmp_path: Path) -> None:
     assert report.unreadable == []
 
 
+def test_unsearchable_directory_entries_are_reported(tmp_path: Path) -> None:
+    # r without x: names list fine, stat on the entries fails — they must be
+    # counted as unreadable, not silently dropped.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    sub.chmod(0o444)
+    try:
+        report = scan(tmp_path, DeterministicDetector())
+    finally:
+        sub.chmod(0o755)
+    assert report.unreadable == [str(sub / "a.txt")]
+    assert report.files == []
+
+
+def test_surrogate_filenames_do_not_break_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    try:
+        raw = os.path.join(os.fsencode(tmp_path), b"caf\xe9.txt")
+        with open(raw, "wb") as handle:
+            handle.write(b"mail: anna.keller@example.ch")
+    except OSError:
+        pytest.skip("filesystem rejects non-UTF-8 filenames")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    out = capsys.readouterr().out
+    json.loads(out)
+    assert "\udce9" not in out
+    assert "�" in out
+
+
 def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     fr = "Contact: anna.keller@example.ch pour le dossier."
     de = "Bitte an max.weber@example.de schreiben."
