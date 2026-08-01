@@ -12,6 +12,9 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.scripts]
+tessera = "tessera_detector.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
@@ -33,6 +36,8 @@ target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# The scan report deliberately renders offset ranges with an en dash (12–27).
+allowed-confusables = ["–"]
 
 [tool.mypy]
 strict = true
