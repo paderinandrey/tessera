@@ -189,6 +189,19 @@ def test_main_show_values_prints_verbatim(
     assert "anna.keller@example.ch" in capsys.readouterr().out
 
 
+def test_main_unreadable_path_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    target = tmp_path / "locked.txt"
+    target.write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    target.chmod(0o000)
+    try:
+        assert main(["scan", str(target)]) == 2
+    finally:
+        target.chmod(0o644)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Permission denied" in captured.err
+
+
 def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     fr = "Contact: anna.keller@example.ch pour le dossier."
     de = "Bitte an max.weber@example.de schreiben."

@@ -135,7 +135,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.path.exists():
         print(f"tessera: {args.path}: no such file or directory", file=sys.stderr)
         return 2
-    report = scan(args.path, DeterministicDetector())
+    try:
+        report = scan(args.path, DeterministicDetector())
+    except OSError as error:
+        print(f"tessera: {args.path}: {error.strerror or error}", file=sys.stderr)
+        return 2
     for skipped in report.skipped:
         print(f"tessera: skipped {skipped}: not valid UTF-8", file=sys.stderr)
     render = render_json if args.as_json else render_text
