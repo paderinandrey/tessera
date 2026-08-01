@@ -112,7 +112,9 @@ def _load_boost(raw: object) -> Boost | None:
     # "st.-nr" and "St.-Nr." meet in the same form and punctuation never glues
     # separate terms into one window token. Boundary lookarounds keep "st nr" from
     # firing inside "post nr".
-    canonical = [_canonical(str(t)) for t in triggers]
+    if any(not isinstance(t, str) for t in triggers):
+        raise ValueError("boost 'triggers' entries must be strings")
+    canonical = [_canonical(t) for t in triggers]
     if any(not t for t in canonical):
         raise ValueError("boost 'triggers' must contain word characters")
     alternatives = "|".join(rf"(?<!\w){re.escape(t)}(?!\w)" for t in canonical)
@@ -129,9 +131,11 @@ def _canonical(text: str) -> str:
 
 def _context_boosted(boost: Boost, text: str, start: int, end: int) -> bool:
     """Look for a trigger within the +-window tokens around a candidate (REQ-7)."""
+    # The two contexts are searched separately: a multi-token trigger must occur
+    # contiguously on one side, never fabricated across the candidate itself.
     before = " ".join(re.findall(r"\w+", text[:start].lower())[-boost.window :])
     after = " ".join(re.findall(r"\w+", text[end:].lower())[: boost.window])
-    return boost.triggers.search(f"{before} {after}") is not None
+    return boost.triggers.search(before) is not None or boost.triggers.search(after) is not None
 
 
 _TOKEN_SEPARATORS = " -."

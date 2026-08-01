@@ -71,3 +71,9 @@ def test_13_digit_steuernummer_beats_card_rule() -> None:
 def test_window_counts_punctuation_separated_terms() -> None:
     # Comma-glued terms are separate tokens: the trigger sits 7 tokens away.
     assert detect("Steuernummer,a,b,c,d,e,f,g,181/815/08155") == []
+
+
+def test_multi_token_trigger_must_be_contiguous_on_one_side() -> None:
+    # "st" before and "nr" after the candidate must not concatenate into the
+    # canonical "st nr" trigger — it never occurs contiguously in the input.
+    assert detect("st 181/815/08155 nr") == []

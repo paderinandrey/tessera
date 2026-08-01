@@ -361,7 +361,7 @@ identifiers:
       triggers: [{triggers}]
     pattern: 'x+'
 """
-    for bad in ('""', '","'):
+    for bad in ('""', '","', 'true', '123'):
         with pytest.raises(ValueError, match="trigger"):
             DeterministicDetector(template.format(triggers=bad))
 
