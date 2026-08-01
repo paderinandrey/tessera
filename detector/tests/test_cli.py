@@ -133,6 +133,7 @@ def test_render_json_shape_and_masking() -> None:
     assert payload["summary"] == {
         "files_scanned": 2,
         "files_skipped": 0,
+        "files_unreadable": 0,
         "total_findings": 2,
         "by_type": {"FR_NIR": 1, "IBAN": 1},
     }
@@ -216,6 +217,34 @@ def test_main_unreadable_directory_exits_2(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "Permission denied" in captured.err
+
+
+def test_nested_unreadable_subdirectory_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "secret.txt").write_text("mail: max.weber@example.de", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        assert main(["scan", str(tmp_path)]) == 0
+    finally:
+        locked.chmod(0o755)
+    captured = capsys.readouterr()
+    assert "EMAIL" in captured.out
+    assert "Unreadable: 1" in captured.out
+    assert str(locked) in captured.err
+
+
+def test_render_text_reports_unreadable_entries() -> None:
+    report = ScanReport(files=[], skipped=[], unreadable=["dir/locked"])
+    assert render_text(report).endswith("Unreadable: 1")
+
+
+def test_render_json_counts_unreadable_entries() -> None:
+    report = ScanReport(files=[], skipped=[], unreadable=["dir/locked"])
+    assert json.loads(render_json(report))["summary"]["files_unreadable"] == 1
 
 
 def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

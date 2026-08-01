@@ -47,7 +47,12 @@ One `DeterministicDetector` per run. Per file: read as UTF-8 →
 The report shows post-resolution spans — what would actually be cut.
 
 A file that fails UTF-8 decoding is skipped with a warning on stderr and counted
-in the summary as skipped; it never aborts the run.
+in the summary as skipped; it never aborts the run. Likewise an unreadable nested
+file or subdirectory (permission denied) is reported — stderr warning, `Unreadable:`
+line in the text summary, `files_unreadable` in the JSON summary — never silently
+omitted: a partial scan that looks complete would defeat the report's purpose.
+Directory traversal uses `os.walk` with an error callback because `rglob` swallows
+enumeration errors. Exit 2 stays reserved for PATH itself being missing/unreadable.
 
 ## Masking
 

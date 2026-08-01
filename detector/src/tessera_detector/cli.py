@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .deterministic import DeterministicDetector
@@ -44,22 +44,33 @@ class FileReport:
 class ScanReport:
     files: list[FileReport]
     skipped: list[str]
+    unreadable: list[str] = field(default_factory=list)
 
 
 def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
+    report = ScanReport(files=[], skipped=[])
     if path.is_file():
+        # PATH itself must be readable: let the OSError reach main() -> exit 2.
+        path.open("rb").close()
         files = [path]
     else:
-        # rglob suppresses scan-time OSErrors; probe so an unreadable PATH
-        # surfaces as an error instead of an empty report.
+        # os.walk suppresses nothing here: the root probe raises for an
+        # unreadable PATH (exit 2), nested enumeration errors are reported.
         os.scandir(path).close()
-        files = sorted(p for p in path.rglob("*") if p.is_file())
-    report = ScanReport(files=[], skipped=[])
+        errors: list[OSError] = []
+        found: list[Path] = []
+        for dirpath, _dirnames, filenames in os.walk(path, onerror=errors.append):
+            found.extend(Path(dirpath) / name for name in filenames)
+        report.unreadable.extend(sorted(str(e.filename) for e in errors if e.filename))
+        files = sorted(found)
     for file in files:
         try:
             text = file.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             report.skipped.append(str(file))
+            continue
+        except OSError:
+            report.unreadable.append(str(file))
             continue
         findings = [
             Finding(
@@ -98,6 +109,8 @@ def render_text(report: ScanReport, *, show_values: bool = False) -> str:
         lines.append(f"  {entity_type:<12} {count}")
     if report.skipped:
         lines.append(f"Skipped: {len(report.skipped)} (not valid UTF-8)")
+    if report.unreadable:
+        lines.append(f"Unreadable: {len(report.unreadable)}")
     return "\n".join(lines)
 
 
@@ -124,6 +137,7 @@ def render_json(report: ScanReport, *, show_values: bool = False) -> str:
         "summary": {
             "files_scanned": len(report.files),
             "files_skipped": len(report.skipped),
+            "files_unreadable": len(report.unreadable),
             "total_findings": sum(len(file.findings) for file in report.files),
             "by_type": dict(_type_counts(report)),
         },
@@ -149,6 +163,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     for skipped in report.skipped:
         print(f"tessera: skipped {skipped}: not valid UTF-8", file=sys.stderr)
+    for unreadable in report.unreadable:
+        print(f"tessera: skipped {unreadable}: permission denied", file=sys.stderr)
     render = render_json if args.as_json else render_text
     print(render(report, show_values=args.show_values))
     return 0
