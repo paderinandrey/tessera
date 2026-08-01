@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from tessera_detector.cli import mask, scan
+from tessera_detector.cli import FileReport, Finding, ScanReport, mask, render_text, scan
 from tessera_detector.deterministic import DeterministicDetector
 
 
@@ -59,3 +59,58 @@ def test_scan_accepts_a_single_file(tmp_path: Path) -> None:
     report = scan(target, DeterministicDetector())
     assert [f.path for f in report.files] == [str(target)]
     assert report.files[0].findings[0].entity_type == "EMAIL"
+
+
+def _report() -> ScanReport:
+    return ScanReport(
+        files=[
+            FileReport(
+                path="letters/claim_07.txt",
+                findings=[
+                    Finding("FR_NIR", 12, 27, 0.98, "catalog:fr_nir", "185027512345678"),
+                    Finding("IBAN", 103, 130, 1.0, "catalog:iban", "FR7630006000011234567890189"),
+                ],
+            ),
+            FileReport(path="letters/empty.txt", findings=[]),
+        ],
+        skipped=[],
+    )
+
+
+def test_render_text_masks_values_and_summarizes() -> None:
+    assert render_text(_report()) == (
+        "letters/claim_07.txt\n"
+        "  FR_NIR       12–27   0.98  1850…78\n"
+        "  IBAN         103–130 1.00  FR76…89\n"
+        "\n"
+        "Total: 2 files, 2 findings\n"
+        "  FR_NIR       1\n"
+        "  IBAN         1"
+    )
+
+
+def test_render_text_show_values_prints_verbatim() -> None:
+    assert "FR7630006000011234567890189" in render_text(_report(), show_values=True)
+
+
+def test_render_text_sorts_summary_by_count_then_name() -> None:
+    report = ScanReport(
+        files=[
+            FileReport(
+                path="a.txt",
+                findings=[
+                    Finding("EMAIL", 0, 8, 0.95, "catalog:email", "a@bc.com"),
+                    Finding("IBAN", 10, 37, 1.0, "catalog:iban", "FR7630006000011234567890189"),
+                    Finding("IBAN", 40, 67, 1.0, "catalog:iban", "FR7630006000011234567890189"),
+                ],
+            )
+        ],
+        skipped=["a.bin"],
+    )
+    text = render_text(report)
+    assert text.index("IBAN         2") < text.index("EMAIL        1")
+    assert text.endswith("Skipped: 1 (not valid UTF-8)")
+
+
+def test_render_text_empty_report() -> None:
+    assert render_text(ScanReport(files=[], skipped=[])) == "Total: 0 files, 0 findings"

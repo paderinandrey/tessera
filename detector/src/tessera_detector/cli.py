@@ -4,6 +4,7 @@ Values are masked by default (first 4 + last 2 characters) so a report saved to
 a file or CI log is not itself a PII leak; --show-values prints them verbatim.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,3 +64,28 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
         ]
         report.files.append(FileReport(path=str(file), findings=findings))
     return report
+
+
+def _type_counts(report: ScanReport) -> list[tuple[str, int]]:
+    counts = Counter(f.entity_type for file in report.files for f in file.findings)
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+
+
+def render_text(report: ScanReport, *, show_values: bool = False) -> str:
+    lines: list[str] = []
+    for file in report.files:
+        if not file.findings:
+            continue
+        lines.append(file.path)
+        for f in file.findings:
+            value = f.value if show_values else mask(f.value)
+            span_range = f"{f.start}–{f.end}"
+            lines.append(f"  {f.entity_type:<12} {span_range:<7} {f.confidence:.2f}  {value}")
+        lines.append("")
+    total = sum(len(file.findings) for file in report.files)
+    lines.append(f"Total: {len(report.files)} files, {total} findings")
+    for entity_type, count in _type_counts(report):
+        lines.append(f"  {entity_type:<12} {count}")
+    if report.skipped:
+        lines.append(f"Skipped: {len(report.skipped)} (not valid UTF-8)")
+    return "\n".join(lines)
