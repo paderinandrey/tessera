@@ -104,3 +104,30 @@ def test_context_scan_is_char_bounded() -> None:
     # trigger and candidate pushes the trigger beyond the bounded character scan.
     blob = "y" * 2000
     assert detect(f"Steuernummer {blob} 181/815/08155") == []
+
+
+def test_boost_never_reduces_confidence() -> None:
+    # Base 0.995 with a trigger must stay 0.995, not drop to the 0.99 cap.
+    catalog = """
+version: 1
+identifiers:
+  - id: high_base
+    entity_type: HB
+    tier: 2
+    confidence: 0.995
+    threshold: 0.993
+    boost:
+      value: 0.1
+      window: 3
+      triggers: ["marker"]
+    pattern: 'xx+'
+"""
+    (span,) = DeterministicDetector(catalog).detect("marker xx")
+    assert span.confidence == 0.995
+
+
+def test_truncated_token_at_scan_cutoff_is_dropped() -> None:
+    # The scan slice starts inside "post-nr": the truncated "st-nr" fragment
+    # must not canonicalize into a complete "st nr" trigger.
+    text = "post-nr " + "y" * 377 + " 181/815/08155"
+    assert detect(text) == []

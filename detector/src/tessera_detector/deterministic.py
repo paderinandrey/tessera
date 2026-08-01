@@ -69,12 +69,13 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
                 f"identifier {entry['id']!r} uses checksum validator {validator!r} "
                 "and cannot declare a confidence below 1.0"
             )
-        if validator is None and confidence >= 1.0:
+        if (validator is None or validator not in CHECKSUM_VALIDATORS) and confidence >= 1.0:
             # Confidence 1.0 marks spans untouchable in resolution — a status
-            # reserved for checksum-validated rules, never granted by omission.
+            # reserved for checksum-validated rules, never granted by omission
+            # to pattern-only or structural-validator rules.
             raise ValueError(
-                f"identifier {entry['id']!r} has no validator and must declare "
-                "an explicit confidence below 1.0"
+                f"identifier {entry['id']!r} is not checksum-backed and must "
+                "declare an explicit confidence below 1.0"
             )
         flags = re.IGNORECASE if entry.get("case_insensitive") else re.NOFLAG
         rules.append(
@@ -137,14 +138,22 @@ def _context_boosted(boost: Boost, text: str, start: int, end: int) -> bool:
     # rescan the full text each time — the window is local by definition, and a
     # trigger pushed beyond ~64 chars per token is no longer context.
     reach = boost.window * _MAX_TOKEN_CHARS
-    prefix = text[max(0, start - reach) : start].lower()
-    before = " ".join(re.findall(r"\w+", prefix)[-boost.window :])
-    after = " ".join(re.findall(r"\w+", text[end : end + reach].lower())[: boost.window])
+    lo, hi = max(0, start - reach), min(len(text), end + reach)
+    before_tokens = re.findall(r"\w+", text[lo:start].lower())
+    if lo > 0 and _WORD.match(text[lo]) and _WORD.match(text[lo - 1]):
+        # The cutoff landed inside a word: the truncated fragment is not a token.
+        before_tokens = before_tokens[1:]
+    after_tokens = re.findall(r"\w+", text[end:hi].lower())
+    if hi < len(text) and _WORD.match(text[hi - 1]) and _WORD.match(text[hi]):
+        after_tokens = after_tokens[:-1]
+    before = " ".join(before_tokens[-boost.window :])
+    after = " ".join(after_tokens[: boost.window])
     return boost.triggers.search(before) is not None or boost.triggers.search(after) is not None
 
 
 _TOKEN_SEPARATORS = " -."
 _MAX_TOKEN_CHARS = 64
+_WORD = re.compile(r"\w")
 
 
 def _validate_shrinking(rule: Rule, candidate: str) -> str | None:
@@ -193,10 +202,13 @@ class DeterministicDetector:
                     and confidence < 1.0
                     and _context_boosted(rule.boost, norm.text, match.start(), n_end)
                 ):
-                    # A boost must never fabricate checksum status (confidence 1.0);
-                    # rounding keeps decimal catalog values comparable to thresholds
-                    # despite binary float addition (0.1 + 0.7 must reach 0.8).
-                    confidence = min(round(confidence + rule.boost.value, 9), 0.99)
+                    # A boost must never fabricate checksum status (confidence 1.0)
+                    # nor reduce a base already above the cap; rounding keeps decimal
+                    # catalog values comparable to thresholds despite binary float
+                    # addition (0.1 + 0.7 must reach 0.8).
+                    confidence = max(
+                        confidence, min(round(confidence + rule.boost.value, 9), 0.99)
+                    )
                     boosted = True
                 if confidence < rule.threshold:
                     continue

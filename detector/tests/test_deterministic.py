@@ -379,3 +379,19 @@ identifiers:
 """
     with pytest.raises(ValueError, match="bool_threshold"):
         DeterministicDetector(catalog)
+
+
+def test_structural_validator_requires_explicit_low_confidence() -> None:
+    # de_stnr is structural (no checksum): omitting confidence must not default
+    # the rule into untouchable status.
+    catalog = """
+version: 1
+identifiers:
+  - id: naked_stnr
+    entity_type: X
+    tier: 1
+    validator: de_stnr
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="naked_stnr"):
+        DeterministicDetector(catalog)
