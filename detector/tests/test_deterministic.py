@@ -314,3 +314,24 @@ identifiers:
     for bad in ("1.1", "-0.2", "'0.5'"):
         with pytest.raises(ValueError, match="bad_threshold"):
             DeterministicDetector(template.format(value=bad))
+
+
+def test_boost_window_and_value_validated_at_load() -> None:
+    template = """
+version: 1
+identifiers:
+  - id: bad_boost
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: 0.7
+    boost:
+      value: {value}
+      window: {window}
+      triggers: ["x"]
+    pattern: 'x+'
+"""
+    # window 0 would make [-window:] scan the whole prefix; NaN/inf poison Span.
+    for value, window in (("0.2", "0"), ("0.2", "-1"), (".nan", "6"), (".inf", "6"), ("-0.1", "6")):
+        with pytest.raises(ValueError, match=r"boost"):
+            DeterministicDetector(template.format(value=value, window=window))

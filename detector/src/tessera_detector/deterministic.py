@@ -95,8 +95,12 @@ def _load_boost(raw: object) -> Boost | None:
     if not isinstance(raw, dict):
         raise ValueError(f"boost must be a mapping, got {type(raw).__name__}")
     value, window, triggers = raw.get("value"), raw.get("window"), raw.get("triggers")
-    if not isinstance(value, int | float) or not isinstance(window, int):
-        raise ValueError("boost requires a numeric 'value' and an integer 'window'")
+    if not isinstance(value, int | float) or not 0.0 <= value <= 1.0:
+        # The range check also rejects NaN (all comparisons are false) and inf.
+        raise ValueError("boost 'value' must be a finite number in the [0.0, 1.0] range")
+    if not isinstance(window, int) or window < 1:
+        # A zero window would make the [-window:] slice scan the whole prefix.
+        raise ValueError("boost 'window' must be a positive integer")
     if not isinstance(triggers, list) or not triggers:
         raise ValueError("boost requires a non-empty 'triggers' list")
     # Triggers match as complete terms: "st-nr" must not fire inside "Post-Nr.".
