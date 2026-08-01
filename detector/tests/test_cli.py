@@ -301,6 +301,15 @@ def test_surrogate_filenames_do_not_break_output(
     assert "�" in out
 
 
+def test_scan_offsets_stay_in_original_crlf_coordinates(tmp_path: Path) -> None:
+    # Newline translation would silently shift every offset left of the raw file.
+    (tmp_path / "a.txt").write_bytes(b"line1\r\nmail: anna.keller@example.ch\r\n")
+    report = scan(tmp_path, DeterministicDetector())
+    finding = report.files[0].findings[0]
+    assert (finding.start, finding.end) == (13, 35)
+    assert finding.value == "anna.keller@example.ch"
+
+
 def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     fr = "Contact: anna.keller@example.ch pour le dossier."
     de = "Bitte an max.weber@example.de schreiben."

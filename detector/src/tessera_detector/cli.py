@@ -86,7 +86,9 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
         files = sorted(found)
     for file in files:
         try:
-            text = file.read_text(encoding="utf-8")
+            # newline="" disables universal-newline translation: collapsing
+            # \r\n would shift every offset out of original-text coordinates.
+            text = file.read_text(encoding="utf-8", newline="")
         except UnicodeDecodeError:
             report.skipped.append(_display_path(file))
             continue
