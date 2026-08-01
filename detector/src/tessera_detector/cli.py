@@ -6,6 +6,7 @@ a file or CI log is not itself a PII leak; --show-values prints them verbatim.
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -46,7 +47,13 @@ class ScanReport:
 
 
 def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
-    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+    if path.is_file():
+        files = [path]
+    else:
+        # rglob suppresses scan-time OSErrors; probe so an unreadable PATH
+        # surfaces as an error instead of an empty report.
+        os.scandir(path).close()
+        files = sorted(p for p in path.rglob("*") if p.is_file())
     report = ScanReport(files=[], skipped=[])
     for file in files:
         try:

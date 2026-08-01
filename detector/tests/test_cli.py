@@ -202,6 +202,22 @@ def test_main_unreadable_path_exits_2(tmp_path: Path, capsys: pytest.CaptureFixt
     assert "Permission denied" in captured.err
 
 
+def test_main_unreadable_directory_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        assert main(["scan", str(locked)]) == 2
+    finally:
+        locked.chmod(0o755)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Permission denied" in captured.err
+
+
 def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     fr = "Contact: anna.keller@example.ch pour le dossier."
     de = "Bitte an max.weber@example.de schreiben."
