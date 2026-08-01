@@ -21,5 +21,11 @@ jobs:
           working-directory: detector
       - run: uv sync --locked
       - run: uv run pytest
-      - run: uv run ruff check .
+      - run: uv run ruff check . ../evaluation
       - run: uv run mypy src
+      # The committed corpus must regenerate byte-identical (seeded) — this
+      # gates both generator determinism and corpus freshness.
+      - run: uv run --group eval python ../evaluation/generate.py
+      - run: git diff --exit-code ../evaluation/corpus
+      # Tier 1 recall gate (REQ-38): exits non-zero below target.
+      - run: uv run python ../evaluation/evaluate.py

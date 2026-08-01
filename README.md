@@ -45,6 +45,35 @@ tessera/
                annotated corpus stays private and never enters this repository.
 ```
 
+## Evaluation
+
+The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic
+identifiers, seeded generation) lives in `evaluation/` and is reproducible by anyone:
+
+```
+make corpus     # regenerates evaluation/corpus/public.jsonl byte-identically
+make evaluate   # per-type precision/recall/F1 + the Tier 1 recall gate (>= 0.99)
+```
+
+Current results on the public corpus (deterministic layer only):
+
+| Type | Precision | Recall | F1 |
+|---|---|---|---|
+| CH_AVS | 1.000 | 1.000 | 1.000 |
+| CREDIT_CARD | 1.000 | 1.000 | 1.000 |
+| DE_STEUERNUMMER | 1.000 | 1.000 | 1.000 |
+| DE_STEUER_ID | 1.000 | 1.000 | 1.000 |
+| EMAIL | 1.000 | 1.000 | 1.000 |
+| FR_NIF | 1.000 | 1.000 | 1.000 |
+| FR_NIR | 1.000 | 1.000 | 1.000 |
+| IBAN | 1.000 | 1.000 | 1.000 |
+
+> Perfect scores here mean the deterministic layer covers its own catalog, nothing
+> more: the corpus currently contains only catalog-backed types with clean formatting.
+> The numbers become meaningful as the corpus grows adversarial cases (noisy
+> formatting, near-misses, uncovered types) and the NER layer lands. A second,
+> manually annotated corpus on real texts stays private and is reported separately.
+
 ## Status
 
 Early development — Wave 0 (detector core). Not ready for production use.
