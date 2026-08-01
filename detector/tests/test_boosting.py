@@ -77,3 +77,30 @@ def test_multi_token_trigger_must_be_contiguous_on_one_side() -> None:
     # "st" before and "nr" after the candidate must not concatenate into the
     # canonical "st nr" trigger — it never occurs contiguously in the input.
     assert detect("st 181/815/08155 nr") == []
+
+
+def test_boost_addition_rounds_at_threshold() -> None:
+    # 0.1 + 0.7 must reach a 0.8 threshold despite binary float addition.
+    catalog = """
+version: 1
+identifiers:
+  - id: rounded
+    entity_type: ROUNDED
+    tier: 2
+    confidence: 0.1
+    threshold: 0.8
+    boost:
+      value: 0.7
+      window: 3
+      triggers: ["marker"]
+    pattern: 'xx+'
+"""
+    (span,) = DeterministicDetector(catalog).detect("marker xx")
+    assert span.confidence == 0.8
+
+
+def test_context_scan_is_char_bounded() -> None:
+    # The context window is local by definition: a single enormous token between
+    # trigger and candidate pushes the trigger beyond the bounded character scan.
+    blob = "y" * 2000
+    assert detect(f"Steuernummer {blob} 181/815/08155") == []

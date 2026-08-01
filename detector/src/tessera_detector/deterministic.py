@@ -133,12 +133,18 @@ def _context_boosted(boost: Boost, text: str, start: int, end: int) -> bool:
     """Look for a trigger within the +-window tokens around a candidate (REQ-7)."""
     # The two contexts are searched separately: a multi-token trigger must occur
     # contiguously on one side, never fabricated across the candidate itself.
-    before = " ".join(re.findall(r"\w+", text[:start].lower())[-boost.window :])
-    after = " ".join(re.findall(r"\w+", text[end:].lower())[: boost.window])
+    # The scan is character-bounded so long documents with many candidates do not
+    # rescan the full text each time — the window is local by definition, and a
+    # trigger pushed beyond ~64 chars per token is no longer context.
+    reach = boost.window * _MAX_TOKEN_CHARS
+    prefix = text[max(0, start - reach) : start].lower()
+    before = " ".join(re.findall(r"\w+", prefix)[-boost.window :])
+    after = " ".join(re.findall(r"\w+", text[end : end + reach].lower())[: boost.window])
     return boost.triggers.search(before) is not None or boost.triggers.search(after) is not None
 
 
 _TOKEN_SEPARATORS = " -."
+_MAX_TOKEN_CHARS = 64
 
 
 def _validate_shrinking(rule: Rule, candidate: str) -> str | None:
@@ -187,8 +193,10 @@ class DeterministicDetector:
                     and confidence < 1.0
                     and _context_boosted(rule.boost, norm.text, match.start(), n_end)
                 ):
-                    # A boost must never fabricate checksum status (confidence 1.0).
-                    confidence = min(confidence + rule.boost.value, 0.99)
+                    # A boost must never fabricate checksum status (confidence 1.0);
+                    # rounding keeps decimal catalog values comparable to thresholds
+                    # despite binary float addition (0.1 + 0.7 must reach 0.8).
+                    confidence = min(round(confidence + rule.boost.value, 9), 0.99)
                     boosted = True
                 if confidence < rule.threshold:
                     continue
