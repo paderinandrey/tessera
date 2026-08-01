@@ -4,7 +4,9 @@ Values are masked by default (first 4 + last 2 characters) so a report saved to
 a file or CI log is not itself a PII leak; --show-values prints them verbatim.
 """
 
+import argparse
 import json
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,3 +122,22 @@ def render_json(report: ScanReport, *, show_values: bool = False) -> str:
         },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="tessera", description="PII detection toolkit")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    scan_parser = subparsers.add_parser("scan", help="report what would be redacted, per type")
+    scan_parser.add_argument("path", type=Path, help="file or directory to scan")
+    scan_parser.add_argument("--json", action="store_true", dest="as_json", help="JSON output")
+    scan_parser.add_argument("--show-values", action="store_true", help="print values verbatim")
+    args = parser.parse_args(argv)
+    if not args.path.exists():
+        print(f"tessera: {args.path}: no such file or directory", file=sys.stderr)
+        return 2
+    report = scan(args.path, DeterministicDetector())
+    for skipped in report.skipped:
+        print(f"tessera: skipped {skipped}: not valid UTF-8", file=sys.stderr)
+    render = render_json if args.as_json else render_text
+    print(render(report, show_values=args.show_values))
+    return 0

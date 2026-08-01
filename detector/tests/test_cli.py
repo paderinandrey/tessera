@@ -1,10 +1,13 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from tessera_detector.cli import (
     FileReport,
     Finding,
     ScanReport,
+    main,
     mask,
     render_json,
     render_text,
@@ -148,3 +151,39 @@ def test_render_json_show_values_uses_value_key() -> None:
     finding = json.loads(render_json(_report(), show_values=True))["files"][0]["findings"][0]
     assert finding["value"] == "185027512345678"
     assert "masked_value" not in finding
+
+
+def test_main_scan_prints_text_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "EMAIL" in captured.out
+    assert "anna…ch" in captured.out
+    assert "anna.keller@example.ch" not in captured.out
+
+
+def test_main_scan_json_stdout_is_valid_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    (tmp_path / "b.bin").write_bytes(b"\xff\xfe")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["summary"]["files_skipped"] == 1
+    assert "b.bin" in captured.err
+
+
+def test_main_missing_path_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["scan", str(tmp_path / "nope")]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no such file or directory" in captured.err
+
+
+def test_main_show_values_prints_verbatim(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--show-values"]) == 0
+    assert "anna.keller@example.ch" in capsys.readouterr().out
