@@ -298,3 +298,100 @@ def test_domain_label_length_limit() -> None:
     text = f"Mail alice@{'a' * 63}.com bitte."
     (span,) = detect(text)
     assert text[span.start : span.end] == f"alice@{'a' * 63}.com"
+
+
+def test_out_of_range_or_non_numeric_threshold_rejected_at_load() -> None:
+    template = """
+version: 1
+identifiers:
+  - id: bad_threshold
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: {value}
+    pattern: 'x+'
+"""
+    for bad in ("1.1", "-0.2", "'0.5'"):
+        with pytest.raises(ValueError, match="bad_threshold"):
+            DeterministicDetector(template.format(value=bad))
+
+
+def test_boost_window_and_value_validated_at_load() -> None:
+    template = """
+version: 1
+identifiers:
+  - id: bad_boost
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: 0.7
+    boost:
+      value: {value}
+      window: {window}
+      triggers: ["x"]
+    pattern: 'x+'
+"""
+    # window 0 would make [-window:] scan the whole prefix; NaN/inf poison Span.
+    for value, window in (
+        ("0.2", "0"),
+        ("0.2", "-1"),
+        (".nan", "6"),
+        (".inf", "6"),
+        ("-0.1", "6"),
+        # PyYAML loads true as bool, and bool is an int subclass.
+        ("true", "6"),
+        ("0.2", "true"),
+    ):
+        with pytest.raises(ValueError, match=r"boost"):
+            DeterministicDetector(template.format(value=value, window=window))
+
+
+def test_empty_or_punctuation_only_triggers_rejected() -> None:
+    template = """
+version: 1
+identifiers:
+  - id: bad_triggers
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: 0.7
+    boost:
+      value: 0.2
+      window: 6
+      triggers: [{triggers}]
+    pattern: 'x+'
+"""
+    for bad in ('""', '","', 'true', '123'):
+        with pytest.raises(ValueError, match="trigger"):
+            DeterministicDetector(template.format(triggers=bad))
+
+
+def test_boolean_threshold_rejected() -> None:
+    catalog = """
+version: 1
+identifiers:
+  - id: bool_threshold
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: true
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="bool_threshold"):
+        DeterministicDetector(catalog)
+
+
+def test_structural_validator_requires_explicit_low_confidence() -> None:
+    # de_stnr is structural (no checksum): omitting confidence must not default
+    # the rule into untouchable status.
+    catalog = """
+version: 1
+identifiers:
+  - id: naked_stnr
+    entity_type: X
+    tier: 1
+    validator: de_stnr
+    pattern: 'x+'
+"""
+    with pytest.raises(ValueError, match="naked_stnr"):
+        DeterministicDetector(catalog)
