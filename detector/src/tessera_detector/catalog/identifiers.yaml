@@ -28,7 +28,9 @@ identifiers:
     tier: 1
     validator: credit_card
     specificity: 40
-    pattern: '\b(?<!\d[ -])\d(?:[ -]?\d){12,18}(?![ -]?\d)\b'
+    # 14-19 digits: 13-digit Visas are extinct, and dropping 13 removes the
+    # collision class with 13-digit tax numbers that happen to pass Luhn.
+    pattern: '\b(?<!\d[ -])\d(?:[ -]?\d){13,18}(?![ -]?\d)\b'
 
   - id: ch_avs
     entity_type: CH_AVS

@@ -25,7 +25,7 @@ def _clean(value: str) -> str:
 
 def _credit_card(value: str) -> bool:
     digits = _clean(value)
-    return 13 <= len(digits) <= 19 and digits.isdigit() and luhn.is_valid(digits)
+    return 14 <= len(digits) <= 19 and digits.isdigit() and luhn.is_valid(digits)
 
 
 def _iban(value: str) -> bool:

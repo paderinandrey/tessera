@@ -51,3 +51,18 @@ def test_boosted_confidence_never_reaches_untouchable() -> None:
     text = "Steuernummer 181/815/08155"
     (span,) = detect(text)
     assert span.confidence < 1.0
+
+
+def test_trigger_matches_complete_terms_only() -> None:
+    # "Post-Nr." contains the "st-nr" trigger as a substring; a boundary-aware
+    # match must not boost the structurally valid 13-digit candidate.
+    assert detect("Post-Nr. 9181081508155 im Anhang.") == []
+
+
+def test_13_digit_steuernummer_beats_card_rule() -> None:
+    # 9181081508003 is a structurally valid Steuernummer that also passes Luhn.
+    # Cards start at 14 digits (13-digit Visas are extinct), so the trigger-boosted
+    # tax number must win instead of an untouchable CREDIT_CARD span.
+    text = "Steuernummer 9181081508003 des Mandanten."
+    (span,) = detect(text)
+    assert span.entity_type == "DE_STEUERNUMMER"

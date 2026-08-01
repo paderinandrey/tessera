@@ -23,7 +23,7 @@ _DEFAULT_CATALOG = resources.files("tessera_detector") / "catalog" / "identifier
 class Boost:
     value: float
     window: int
-    triggers: tuple[str, ...]
+    triggers: re.Pattern[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +47,12 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
         if validator is not None and validator not in VALIDATORS:
             raise ValueError(f"identifier {entry['id']!r} names unknown validator {validator!r}")
         confidence = entry.get("confidence", 1.0)
+        threshold = entry.get("threshold", 0.5)
+        if not isinstance(threshold, int | float) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                f"identifier {entry['id']!r} declares threshold {threshold!r} "
+                "outside the [0.0, 1.0] range"
+            )
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(
                 f"identifier {entry['id']!r} declares confidence {confidence} "
@@ -76,7 +82,7 @@ def _load_rules(catalog_text: str) -> tuple[Rule, ...]:
                 validator=validator,
                 specificity=entry.get("specificity", 50),
                 confidence=confidence,
-                threshold=entry.get("threshold", 0.5),
+                threshold=threshold,
                 boost=_load_boost(entry.get("boost")),
             )
         )
@@ -93,10 +99,12 @@ def _load_boost(raw: object) -> Boost | None:
         raise ValueError("boost requires a numeric 'value' and an integer 'window'")
     if not isinstance(triggers, list) or not triggers:
         raise ValueError("boost requires a non-empty 'triggers' list")
+    # Triggers match as complete terms: "st-nr" must not fire inside "Post-Nr.".
+    alternatives = "|".join(rf"(?<!\w){re.escape(str(t))}(?!\w)" for t in triggers)
     return Boost(
         value=float(value),
         window=window,
-        triggers=tuple(str(t).lower() for t in triggers),
+        triggers=re.compile(alternatives, re.IGNORECASE),
     )
 
 
@@ -104,8 +112,7 @@ def _context_boosted(boost: Boost, text: str, start: int, end: int) -> bool:
     """Look for a trigger within the +-window tokens around a candidate (REQ-7)."""
     before = " ".join(text[:start].split()[-boost.window :])
     after = " ".join(text[end:].split()[: boost.window])
-    window = f"{before} {after}".lower()
-    return any(trigger in window for trigger in boost.triggers)
+    return boost.triggers.search(f"{before} {after}") is not None
 
 
 _TOKEN_SEPARATORS = " -."

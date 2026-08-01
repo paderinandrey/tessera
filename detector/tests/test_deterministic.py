@@ -298,3 +298,19 @@ def test_domain_label_length_limit() -> None:
     text = f"Mail alice@{'a' * 63}.com bitte."
     (span,) = detect(text)
     assert text[span.start : span.end] == f"alice@{'a' * 63}.com"
+
+
+def test_out_of_range_or_non_numeric_threshold_rejected_at_load() -> None:
+    template = """
+version: 1
+identifiers:
+  - id: bad_threshold
+    entity_type: X
+    tier: 2
+    confidence: 0.6
+    threshold: {value}
+    pattern: 'x+'
+"""
+    for bad in ("1.1", "-0.2", "'0.5'"):
+        with pytest.raises(ValueError, match="bad_threshold"):
+            DeterministicDetector(template.format(value=bad))
