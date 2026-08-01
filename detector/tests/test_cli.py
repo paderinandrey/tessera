@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,16 @@ def test_render_text_reports_unreadable_entries() -> None:
 def test_render_json_counts_unreadable_entries() -> None:
     report = ScanReport(files=[], skipped=[], unreadable=["dir/locked"])
     assert json.loads(render_json(report))["summary"]["files_unreadable"] == 1
+
+
+def test_scan_ignores_special_files(tmp_path: Path) -> None:
+    # A FIFO must never be opened: read blocks forever waiting for a writer.
+    os.mkfifo(tmp_path / "pipe.fifo")
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    report = scan(tmp_path, DeterministicDetector())
+    assert [f.path for f in report.files] == [str(tmp_path / "a.txt")]
+    assert report.skipped == []
+    assert report.unreadable == []
 
 
 def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

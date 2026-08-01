@@ -60,7 +60,13 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
         errors: list[OSError] = []
         found: list[Path] = []
         for dirpath, _dirnames, filenames in os.walk(path, onerror=errors.append):
-            found.extend(Path(dirpath) / name for name in filenames)
+            # Regular files only: opening a FIFO (or a symlink to one) blocks
+            # forever waiting for a writer.
+            found.extend(
+                file
+                for name in filenames
+                if (file := Path(dirpath) / name).is_file()
+            )
         report.unreadable.extend(sorted(str(e.filename) for e in errors if e.filename))
         files = sorted(found)
     for file in files:
