@@ -103,10 +103,9 @@ def test_an_article_9_mention_is_never_missed_by_the_whole_group(
 ) -> None:
     # Which of the eight labels wins is second-order; that some label fires is
     # what keeps the span from reaching the model provider unredacted.
-    article_9 = {
-        "HEALTH", "BIOMETRIC", "GENETIC", "ETHNICITY",
-        "POLITICAL_OPINION", "RELIGION", "TRADE_UNION", "SEXUAL_ORIENTATION",
-    }
+    # Taken from the configuration, not hardcoded: a list that drifts from
+    # ner.yaml would fail for the wrong reason.
+    article_9 = {t.entity_type for t in load_ner_types() if t.tier == 3}
     for text in (
         "Der Mandant Weber ist jüdisch und bittet um Rücksicht.",
         "Le dossier de Dupont, d'origine maghrébine, part au service juridique.",

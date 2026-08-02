@@ -59,10 +59,17 @@ ARTICLE_9_SLOTS = {
         },
     ),
     "political": (
-        "POLITICAL_OPINION",
+        "POLITICAL_AFFILIATION",
         {
             "fr": ["socialiste", "écologiste"],
             "de": ["Grünen", "CDU"],
+        },
+    ),
+    "opinion": (
+        "POLITICAL_OPINION",
+        {
+            "fr": ["antimilitariste", "eurosceptique", "monarchiste"],
+            "de": ["pazifistisch", "eurokritisch", "monarchistisch"],
         },
     ),
     "religion": (
@@ -100,6 +107,7 @@ FR_TEMPLATES = [
     "Le dossier de {person}, d'origine {ethnicity}, part au service juridique.",
     "L'accès au site a été enregistré par {biometric} pour {person}.",
     "Le dossier de {person} mentionne une orientation {orientation}.",
+    "Le salarié {person} se dit {opinion} lors de la réunion du comité.",
 ]
 
 DE_TEMPLATES = [
@@ -116,6 +124,7 @@ DE_TEMPLATES = [
     "Der Antrag von {person} nennt die Angabe {orientation}.",
     "Das Labor hat die {genetic} von {person} übermittelt.",
     "Die Personalakte von {person} nennt: Mitglied der {political}.",
+    "Der Mitarbeiter {person} bezeichnet sich in der Sitzung als {opinion}.",
 ]
 
 MIXED_TEMPLATES = [

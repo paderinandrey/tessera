@@ -101,13 +101,16 @@ Article 9 special categories, detected by the same layer at a lower threshold:
 | ETHNICITY | 1.000 | 0.500 | 0.667 |
 | GENETIC | 1.000 | 1.000 | 1.000 |
 | HEALTH | 0.800 | 1.000 | 0.889 |
+| POLITICAL_AFFILIATION | 0.800 | 1.000 | 0.889 |
 | POLITICAL_OPINION | 1.000 | 1.000 | 1.000 |
-| RELIGION | 0.667 | 1.000 | 0.800 |
+| RELIGION | 0.571 | 1.000 | 0.727 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
-| TRADE_UNION | 0.571 | 1.000 | 0.727 |
+| TRADE_UNION | 0.583 | 0.875 | 0.700 |
 
-**Article 9 coverage: 1.000 (40/40)** — every special-category mention in the corpus is
-caught by at least one of the eight labels, in both languages.
+**Article 9 coverage: 0.977 (43/44)** — nearly every special-category mention in the
+corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
+across nine detector types rather than eight: the regulation protects political opinions,
+and a stated view that names no party needs a label separate from `political party`.
 
 > Perfect scores on the catalog types mean the deterministic layer covers its own
 > catalog, nothing more: those corpus entries are checksum-valid identifiers with clean

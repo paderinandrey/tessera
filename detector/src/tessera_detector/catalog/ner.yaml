@@ -51,8 +51,16 @@ entities:
     tier: 3
     specificity: 35
 
-  - entity_type: POLITICAL_OPINION
+  - entity_type: POLITICAL_AFFILIATION
     label: political party
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  # Article 9 protects political opinions, not only party membership: a stated
+  # view that names no party needs a label of its own to have any chance.
+  - entity_type: POLITICAL_OPINION
+    label: political opinion
     threshold: 0.30
     tier: 3
     specificity: 35
