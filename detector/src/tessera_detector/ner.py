@@ -31,6 +31,7 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
     config = yaml.safe_load(config_text)
     types: list[NerType] = []
     seen: set[str] = set()
+    seen_labels: set[str] = set()
     for entry in config["entities"]:
         entity_type = entry["entity_type"]
         if entity_type in seen:
@@ -54,6 +55,11 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
         label = entry["label"]
         if not isinstance(label, str) or not label.strip():
             raise ValueError(f"ner type {entity_type!r} declares an empty label")
+        # The recognizer maps a model result back to its type by label, so a
+        # shared label would make every earlier type undetectable.
+        if label in seen_labels:
+            raise ValueError(f"ner type {entity_type!r} reuses the label {label!r}")
+        seen_labels.add(label)
         if "specificity" not in entry:
             raise ValueError(f"ner type {entity_type!r} declares no specificity")
         specificity = entry["specificity"]

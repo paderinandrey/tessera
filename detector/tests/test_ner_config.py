@@ -76,3 +76,23 @@ def test_duplicate_entity_types_are_rejected() -> None:
 """
     with pytest.raises(ValueError, match="PERSON"):
         load_ner_types(config)
+
+
+def test_duplicate_labels_are_rejected() -> None:
+    # Two types sharing a zero-shot label collapse in the recognizer's
+    # label->type map, making the earlier type undetectable.
+    config = """
+entities:
+  - entity_type: PERSON
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: 30
+  - entity_type: ORG
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: 10
+"""
+    with pytest.raises(ValueError, match="person"):
+        load_ner_types(config)
