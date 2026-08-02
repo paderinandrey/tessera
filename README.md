@@ -134,19 +134,20 @@ orientation — each clause gets its own label.
 > produces, which makes them easier to find than they would be in a real document; at
 > the same time a model that correctly spots an entity the synthetic gold does not
 > enumerate is scored as wrong. So `make evaluate` enforces the Tier 1 recall gate
-> (≥ 0.99) and the LOCATION precision gate (≥ 0.8), while ORG precision is reported
-> and warned about rather than enforced — a number that good on this corpus is not
-> evidence about real prose. PERSON precision is the honest weak spot and is not yet
+> (≥ 0.99), the Article 9 coverage gate (≥ 0.95) and the LOCATION over-masking gate
+> (≥ 0.8), while the strict per-type precisions are reported and warned about rather than
+> enforced. PERSON precision is the honest weak spot and is not gated.
+>
 > REQ-38's 0.8 precision target is an irritation metric — below it, clients say the service
 > ruins their text — so the binding gate measures **over-masking**: predictions that land on
-> no personal data at all. LOCATION scores 1.000 there (14/14 predictions cover a real gold
-> span) while its strict per-type precision reads 0.571, and the gap is entirely French
+> no personal data at all. LOCATION scores 1.000 there (12/12 predictions cover a real gold
+> span) while its strict per-type precision reads 0.667, and the gap is entirely French
 > surnames that are also place names — Lenoir, Fontaine, Mercier — where the model marks the
 > very span the gold calls PERSON. That span is redacted either way; only the placeholder's
 > type differs. ORG stays advisory because its over-masking is real rather than a labelling
 > disagreement: "Le laboratoire" and "service juridique" match no gold entity at all.
 >
-> ORG precision fell from 0.950 to 0.167 when this corpus gained entity-free
+> ORG precision fell from 0.950 to 0.154 when this corpus gained entity-free
 > business prose: the model finds organizations in "die Apotheke" and "convention
 > collective" that the gold does not enumerate. That is the negative examples doing their
 > job — the earlier number was measured on a corpus with almost nothing to get wrong.

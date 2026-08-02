@@ -17,8 +17,14 @@ here, misses are not"; REQ-1 (multi-layer detection); REQ-38 (target metrics).
   arithmetic, the other is a probabilistic reading of meaning. Blending them would let a
   model's good day flatter the checksum layer, and a model's bad day break a gate that
   today rests on arithmetic.
-- **Eight separate entity types**, not one umbrella type. A DPIA needs to know which
-  category was found, and per-category thresholds stay tunable.
+- **Separate entity types per category**, not one umbrella type. A DPIA needs to know
+  which category was found, and per-category thresholds stay tunable.
+
+**Revised during implementation: eleven types, not eight.** Article 9's text names pairs
+where one word does not cover the other — religious *or philosophical* beliefs, sex life
+*or* sexual orientation, and political *opinions* rather than party membership. Each
+clause needs its own zero-shot label to have any chance, so the eight categories became
+eleven detector types feeding the same legal group.
 - The gate target is **≥ 0.95**, binding when the model is available. High enough to
   catch a real regression, honest about not being checksum arithmetic.
 
@@ -33,7 +39,7 @@ now measures. Per-category numbers stay in the report, where a DPO can see them.
 
 ## Runtime approach
 
-The eight categories are added to `catalog/ner.yaml` and ride the existing single
+The categories are added to `catalog/ner.yaml` and ride the existing single
 inference pass. No second pass, no second model: the recognizer already carries per-type
 thresholds, and `predict_entities` is called with the lowest threshold across all types
 and then filters each result against its own type's threshold.
@@ -57,10 +63,13 @@ a second download and cache for no evidence of better quality.
 | BIOMETRIC | biometric data | 0.30 | 3 | 35 |
 | GENETIC | genetic data | 0.30 | 3 | 35 |
 | ETHNICITY | ethnic origin | 0.30 | 3 | 35 |
-| POLITICAL_OPINION | political party | 0.30 | 3 | 35 |
+| POLITICAL_AFFILIATION | political party | 0.30 | 3 | 35 |
+| POLITICAL_OPINION | political opinion | 0.30 | 3 | 35 |
 | RELIGION | religion | 0.30 | 3 | 35 |
 | TRADE_UNION | trade union | 0.30 | 3 | 35 |
 | SEXUAL_ORIENTATION | sexual orientation | 0.30 | 3 | 35 |
+| PHILOSOPHICAL_BELIEF | philosophical belief | 0.30 | 3 | 35 |
+| SEX_LIFE | sex life | 0.30 | 3 | 35 |
 
 **Tier 3** is the "separate tier" the requirement asks for — the free slot in the span
 schema, and a meaningful grouping: tier 1 is checksum-backed identifiers, tier 2 is
@@ -127,7 +136,7 @@ for this category.
 
 ## Testing
 
-- Configuration: the eight types load with the expected labels, thresholds, tier and
+- Configuration: every type loads with the expected label, thresholds, tier and
   specificity; every one is below the catalog's specificity floor of 40.
 - Resolution: an Article 9 span beats an overlapping ORG span, and loses to an
   overlapping checksum identifier. Tested with a fake recognizer, no weights needed.
