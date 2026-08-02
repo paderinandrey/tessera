@@ -38,11 +38,15 @@ inference pass. No second pass, no second model: the recognizer already carries 
 thresholds, and `predict_entities` is called with the lowest threshold across all types
 and then filters each result against its own type's threshold.
 
-One consequence to state plainly: a 0.30 threshold lowers that floor for every type, so
-the model returns more candidates per chunk and more of them are discarded by the
-per-type filter. The results are unchanged — PERSON still needs 0.70 — but each document
-costs somewhat more to process. A separate pass for Article 9 would isolate the floor at
-the price of doubling inference, which is the expensive part; a separate model would add
+**Revised during implementation: one inference pass per tier, not one for everything.**
+The single-pass design above loses Article 9 data, and the coverage gate caught it.
+GLiNER gives a span exactly one label, so the tiers bid against each other: `ver.di`
+is claimed by `organization` at 0.505, beating `trade union` at 0.445, and is then
+discarded by ORG's own 0.75 threshold. The Article 9 mention disappears because a
+quasi-identifier won the argmax and then failed its own bar — and span resolution cannot
+repair it, because only one span ever existed. Grouping the labels by tier and running
+one `predict_entities` call per group costs one inference per tier and keeps the
+categories from competing. A separate *model* per tier remains rejected: that would add
 a second download and cache for no evidence of better quality.
 
 ## Types
@@ -83,6 +87,10 @@ and the uniqueness of both entity types and labels.
 - **Article 9 coverage ≥ 0.95** — the share of gold Article 9 entities matched (IoU ≥ 0.5)
   by a prediction carrying *any* Article 9 type. Binding when the model is available,
   skipped with an explicit note when it is not, exactly like the existing NER gates.
+- **No blank language/category bucket** — every (language, category) pair with gold in the
+  corpus must have at least one covered span. The pooled ratio cannot see a category going
+  dark in one language; a per-bucket ratio cannot be met at these bucket sizes, where a
+  single miss out of two reads as 0.5. The two together say what one cannot.
 - **Article 9 precision is reported, never gated.** The requirement is explicit that
   false positives are tolerable and misses are not; gating precision would push the
   threshold back up and defeat the point.

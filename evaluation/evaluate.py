@@ -124,8 +124,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if not detector.ner_available:
         print(
-            f"NER layer off ({detector.ner_off_reason}): "
-            "the Article 9 coverage gate is skipped."
+            f"NER layer off ({detector.ner_off_reason}): the Article 9 coverage "
+            "and LOCATION over-masking gates are skipped."
         )
         return 0
     covered_total = sum(bucket[0] for bucket in article_9_buckets.values())
