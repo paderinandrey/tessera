@@ -16,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from tessera_detector.models import find_model
+from tessera_detector.ner import load_ner_types
 from tessera_detector.pipeline import Detector, build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
@@ -128,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     sizes = build_sizes(documents)
     deterministic = Detector()
     full = build_detector()
+    model_path = find_model() if full.ner_available else None
+    if model_path is not None:
+        from tessera_detector.ner import GlinerRecognizer
 
     timings: list[Timing] = []
     for size, text in sizes.items():
@@ -143,15 +148,22 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         )
-        recognizer = full.recognizer
-        if recognizer is not None:
-            timings.append(
-                Timing(
-                    "ner",
-                    size,
-                    measure(recognizer.detect, text, runs=args.runs, warmup=args.warmup),
+        if full.ner_available:
+            # One recognizer per tier, built from the public `types=` parameter
+            # and released before the next: the passes are what a regression
+            # lands in, and holding three ONNX sessions at once is needless.
+            for tier in sorted({t.tier for t in load_ner_types()}):
+                per_tier = GlinerRecognizer(
+                    model_path, types=tuple(t for t in load_ner_types() if t.tier == tier)
                 )
-            )
+                timings.append(
+                    Timing(
+                        f"ner tier {tier}",
+                        size,
+                        measure(per_tier.detect, text, runs=args.runs, warmup=args.warmup),
+                    )
+                )
+                del per_tier
         timings.append(
             Timing("total", size, measure(full.detect, text, runs=args.runs, warmup=args.warmup))
         )
