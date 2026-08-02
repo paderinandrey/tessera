@@ -108,3 +108,46 @@ def test_required_mode_reports_a_missing_ner_runtime(
     monkeypatch.setitem(sys.modules, "gliner", None)
     with pytest.raises(ModelUnavailable, match="ner"):
         build_detector(ner=True)
+
+
+def article_9(start: int, end: int, confidence: float = 0.4) -> Span:
+    return Span(
+        entity_type="TRADE_UNION",
+        start=start,
+        end=end,
+        confidence=confidence,
+        recognizer="ner:fake",
+        tier=3,
+    )
+
+
+def org(start: int, end: int, confidence: float = 0.8) -> Span:
+    return Span(
+        entity_type="ORG",
+        start=start,
+        end=end,
+        confidence=confidence,
+        recognizer="ner:fake",
+        tier=2,
+    )
+
+
+def test_article_9_span_outranks_an_overlapping_org() -> None:
+    # "Die Gewerkschaft ver.di": knowing it is a union membership mention is
+    # the more sensitive reading, and specificity 35 beats ORG's 10.
+    text = "Die Gewerkschaft ver.di hat geantwortet."
+    recognizer = FakeRecognizer(
+        [org(4, 23), article_9(4, 23)],
+        specificity={"ORG": 10, "TRADE_UNION": 35},
+    )
+    spans = Detector(recognizer=recognizer).detect(text)
+    assert [s.entity_type for s in spans] == ["TRADE_UNION"]
+
+
+def test_checksum_identifier_still_outranks_an_article_9_span() -> None:
+    text = "mail: anna.keller@example.ch"
+    recognizer = FakeRecognizer(
+        [article_9(6, 28, confidence=0.9)], specificity={"TRADE_UNION": 35}
+    )
+    spans = Detector(recognizer=recognizer).detect(text)
+    assert [(s.entity_type, s.start, s.end) for s in spans] == [("EMAIL", 6, 28)]
