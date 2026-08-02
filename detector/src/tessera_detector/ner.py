@@ -70,4 +70,36 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
     return tuple(types)
 
 
-__all__ = ["NerType", "load_ner_types"]
+# Boundaries to prefer when cutting, best first: a chunk that ends mid-entity
+# costs a detection, so cuts land on paragraph, line or word breaks.
+_BOUNDARIES = ("\n\n", "\n", " ")
+
+
+def chunks(text: str, *, size: int, overlap: int) -> list[tuple[int, str]]:
+    if size <= 0 or overlap < 0 or overlap >= size:
+        raise ValueError(f"invalid chunk window: size={size!r}, overlap={overlap!r}")
+    if not text:
+        return []
+    if len(text) <= size:
+        return [(0, text)]
+    result: list[tuple[int, str]] = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            # Only accept a boundary in the last quarter of the window: cutting
+            # too early would shrink chunks until progress stalls.
+            floor = start + (size * 3) // 4
+            for boundary in _BOUNDARIES:
+                cut = text.rfind(boundary, floor, end)
+                if cut != -1:
+                    end = cut + len(boundary)
+                    break
+        result.append((start, text[start:end]))
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return result
+
+
+__all__ = ["NerType", "chunks", "load_ner_types"]
