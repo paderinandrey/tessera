@@ -4,7 +4,7 @@ Types are data: entity type, the label handed to the model, its threshold, tier 
 specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -14,6 +14,15 @@ import yaml
 from .spans import Span
 
 _DEFAULT_CONFIG = resources.files("tessera_detector") / "catalog" / "ner.yaml"
+
+
+@dataclass(frozen=True, slots=True)
+class InferencePass:
+    """One call to the model: the labels of a tier and that tier's floor."""
+
+    tier: int
+    labels: tuple[str, ...]
+    threshold: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,41 +186,70 @@ class GlinerRecognizer:
         by_tier: dict[int, list[NerType]] = {}
         for ner_type in self.types:
             by_tier.setdefault(ner_type.tier, []).append(ner_type)
-        self._passes = [
-            ([t.label for t in group], min(t.threshold for t in group))
-            for _, group in sorted(by_tier.items())
-        ]
+        self.passes = tuple(
+            InferencePass(
+                tier=tier,
+                labels=tuple(t.label for t in group),
+                threshold=min(t.threshold for t in group),
+            )
+            for tier, group in sorted(by_tier.items())
+        )
 
     def _windows(self, chunk: str) -> list[tuple[int, int]]:
         encoded = self._tokenizer(chunk, return_offsets_mapping=True, add_special_tokens=False)
         offsets = [(int(s), int(e)) for s, e in encoded["offset_mapping"] if e > s]
         return token_windows(offsets, budget=self._token_budget, overlap=TOKEN_OVERLAP)
 
+    def windows(self, text: str) -> Iterator[tuple[int, str]]:
+        """Every piece handed to the model, with its absolute offset in `text`.
+
+        A generator, not a list: the pieces are a second copy of the document
+        plus its window overlap, and the CLI accepts files of any size. Callers
+        that genuinely need them all — a benchmark timing one pass over fixed
+        input — can materialize them and pay for it deliberately.
+        """
+        for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+            for start, end in self._windows(chunk):
+                yield offset + start, chunk[start:end]
+
+    def _spans_from(self, base: int, piece: str, inference: InferencePass) -> Iterator[Span]:
+        for entity in self._model.predict_entities(
+            piece, list(inference.labels), threshold=inference.threshold
+        ):
+            ner_type = self._by_label.get(entity["label"])
+            score = float(entity["score"])
+            if ner_type is None or score < ner_type.threshold:
+                continue
+            yield Span(
+                entity_type=ner_type.entity_type,
+                start=base + int(entity["start"]),
+                end=base + int(entity["end"]),
+                confidence=min(score, 0.99),
+                recognizer="ner:gliner",
+                tier=ner_type.tier,
+            )
+
+    def run_pass(
+        self, pieces: Iterable[tuple[int, str]], inference: InferencePass
+    ) -> list[Span]:
+        """Spans from one inference pass over already-prepared pieces."""
+        return [span for base, piece in pieces for span in self._spans_from(base, piece, inference)]
+
     def detect(self, text: str) -> list[Span]:
         if not text:
             return []
         spans: list[Span] = []
-        for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-            for window_start, window_end in self._windows(chunk):
-                piece = chunk[window_start:window_end]
-                base = offset + window_start
-                for labels, floor in self._passes:
-                    for entity in self._model.predict_entities(piece, labels, threshold=floor):
-                        ner_type = self._by_label.get(entity["label"])
-                        score = float(entity["score"])
-                        if ner_type is None or score < ner_type.threshold:
-                            continue
-                        spans.append(
-                            Span(
-                                entity_type=ner_type.entity_type,
-                                start=base + int(entity["start"]),
-                                end=base + int(entity["end"]),
-                                confidence=min(score, 0.99),
-                                recognizer="ner:gliner",
-                                tier=ner_type.tier,
-                            )
-                        )
+        for base, piece in self.windows(text):
+            for inference in self.passes:
+                spans.extend(self._spans_from(base, piece, inference))
         return spans
 
 
-__all__ = ["GlinerRecognizer", "NerType", "chunks", "load_ner_types", "token_windows"]
+__all__ = [
+    "GlinerRecognizer",
+    "InferencePass",
+    "NerType",
+    "chunks",
+    "load_ner_types",
+    "token_windows",
+]
