@@ -12,14 +12,17 @@ entities:
 """
 
 
-def test_default_config_declares_the_three_types() -> None:
-    types = load_ner_types()
-    assert [t.entity_type for t in types] == ["PERSON", "LOCATION", "ORG"]
-    assert [t.label for t in types] == ["person", "location", "organization"]
-    assert all(0.0 < t.threshold <= 1.0 for t in types)
+def test_default_config_declares_the_quasi_identifiers() -> None:
+    quasi = [t for t in load_ner_types() if t.tier == 2]
+    assert [t.entity_type for t in quasi] == ["PERSON", "LOCATION", "ORG"]
+    assert [t.label for t in quasi] == ["person", "location", "organization"]
+    assert all(0.0 < t.threshold <= 1.0 for t in quasi)
     # Below every catalog identifier (40-90), so an identifier wins a partial overlap.
-    assert all(t.specificity < 40 for t in types)
-    assert all(t.tier == 2 for t in types)
+    assert all(t.specificity < 40 for t in quasi)
+
+
+def test_every_configured_type_stays_below_the_identifier_catalog() -> None:
+    assert all(t.specificity < 40 for t in load_ner_types())
 
 
 def test_threshold_is_required() -> None:
@@ -96,3 +99,45 @@ entities:
 """
     with pytest.raises(ValueError, match="person"):
         load_ner_types(config)
+
+
+ARTICLE_9_TYPES = {
+    "HEALTH": "medical condition",
+    "BIOMETRIC": "biometric data",
+    "GENETIC": "genetic data",
+    "ETHNICITY": "ethnic origin",
+    "POLITICAL_OPINION": "political affiliation",
+    "RELIGION": "religion",
+    "TRADE_UNION": "trade union membership",
+    "SEXUAL_ORIENTATION": "sexual orientation",
+}
+
+
+def test_article_9_categories_are_configured() -> None:
+    by_type = {t.entity_type: t for t in load_ner_types()}
+    for entity_type, label in ARTICLE_9_TYPES.items():
+        assert entity_type in by_type, f"{entity_type} missing from ner.yaml"
+        assert by_type[entity_type].label == label
+
+
+def test_article_9_uses_the_aggressive_threshold() -> None:
+    # REQ-3's acceptance criterion: misses are not tolerable here, so the
+    # threshold is far below the quasi-identifiers'.
+    by_type = {t.entity_type: t for t in load_ner_types()}
+    for entity_type in ARTICLE_9_TYPES:
+        assert by_type[entity_type].threshold == 0.30
+
+
+def test_article_9_sits_in_its_own_tier() -> None:
+    by_type = {t.entity_type: t for t in load_ner_types()}
+    assert {by_type[t].tier for t in ARTICLE_9_TYPES} == {3}
+    assert by_type["PERSON"].tier == 2
+
+
+def test_article_9_outranks_quasi_identifiers_but_not_identifiers() -> None:
+    by_type = {t.entity_type: t for t in load_ner_types()}
+    article_9 = {by_type[t].specificity for t in ARTICLE_9_TYPES}
+    assert article_9 == {35}
+    assert max(by_type[t].specificity for t in ("PERSON", "LOCATION", "ORG")) < 35
+    # 40 is the lowest specificity in the identifier catalog.
+    assert 35 < 40
