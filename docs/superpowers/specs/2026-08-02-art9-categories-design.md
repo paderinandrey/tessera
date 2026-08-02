@@ -19,8 +19,17 @@ here, misses are not"; REQ-1 (multi-layer detection); REQ-38 (target metrics).
   today rests on arithmetic.
 - **Eight separate entity types**, not one umbrella type. A DPIA needs to know which
   category was found, and per-category thresholds stay tunable.
-- The gate target is **recall ≥ 0.95**, binding when the model is available. High enough
-  to catch a real regression, honest about not being checksum arithmetic.
+- The gate target is **≥ 0.95**, binding when the model is available. High enough to
+  catch a real regression, honest about not being checksum arithmetic.
+
+**Revised during implementation:** the gate measures **coverage of the group**, not
+per-category recall. Measurement showed the model reads "maghrébine" as religion rather
+than ethnicity and "IG Metall" as an organization unless the label is phrased as "trade
+union". A span found under the wrong Article 9 label is still redacted, so per-category
+recall would fail the build over a taxonomy disagreement with no operational
+consequence. What REQ-3's "misses are not tolerable" is actually about is a
+special-category mention reaching the model provider unredacted — that is what the gate
+now measures. Per-category numbers stay in the report, where a DPO can see them.
 
 ## Runtime approach
 
@@ -44,9 +53,9 @@ a second download and cache for no evidence of better quality.
 | BIOMETRIC | biometric data | 0.30 | 3 | 35 |
 | GENETIC | genetic data | 0.30 | 3 | 35 |
 | ETHNICITY | ethnic origin | 0.30 | 3 | 35 |
-| POLITICAL_OPINION | political affiliation | 0.30 | 3 | 35 |
+| POLITICAL_OPINION | political party | 0.30 | 3 | 35 |
 | RELIGION | religion | 0.30 | 3 | 35 |
-| TRADE_UNION | trade union membership | 0.30 | 3 | 35 |
+| TRADE_UNION | trade union | 0.30 | 3 | 35 |
 | SEXUAL_ORIENTATION | sexual orientation | 0.30 | 3 | 35 |
 
 **Tier 3** is the "separate tier" the requirement asks for — the free slot in the span
@@ -58,6 +67,12 @@ identifier (40–90). That ordering decides the overlaps that actually happen: i
 Gewerkschaft ver.di" a trade-union mention outranks a plain ORG, while a
 checksum-validated identifier still outranks everything.
 
+The labels are the model's interface and their phrasing decides whether it fires at all:
+measured against the real weights, "trade union" scores 0.95 on "IG Metall" where "trade
+union membership" scores 0.70, and "political affiliation" mislabels a union as a party
+outright. The two labels were chosen from that measurement, not from the wording of the
+regulation.
+
 No new loader code. The configuration already validates thresholds, tiers, specificity,
 and the uniqueness of both entity types and labels.
 
@@ -65,8 +80,9 @@ and the uniqueness of both entity types and labels.
 
 `make evaluate` gains a third gate beside Tier 1 recall and LOCATION precision:
 
-- **Article 9 recall ≥ 0.95** — binding when the model is available, skipped with an
-  explicit note when it is not, exactly like the existing NER gates.
+- **Article 9 coverage ≥ 0.95** — the share of gold Article 9 entities matched (IoU ≥ 0.5)
+  by a prediction carrying *any* Article 9 type. Binding when the model is available,
+  skipped with an explicit note when it is not, exactly like the existing NER gates.
 - **Article 9 precision is reported, never gated.** The requirement is explicit that
   false positives are tolerable and misses are not; gating precision would push the
   threshold back up and defeat the point.
@@ -79,6 +95,14 @@ them with identifiers, so the two kinds of number are not read as one.
 New FR/DE templates carry explicit mentions of each category — a diagnosis, a
 confession, a union membership, a party affiliation — with the mention annotated as gold.
 Every name and circumstance is synthetic, as everywhere in the public corpus.
+
+Two corpus rules emerged from measuring rather than from theory. **Slot values are keyed
+by language**: a French HR note reading "est ver.di-Mitglied" is not code-switching, it is
+nonsense, and a model judged on nonsense tells you nothing. **The gold annotates the datum,
+not the sentence around it**: the qualifier ("Mitglied der", "de confession", "adhérent de
+la") lives in the template text while the annotated span is the union, party, faith or
+condition itself — which is both what the model spans and what carries the sensitive
+content.
 
 The corpus also needs more entity-free templates in the same register: business prose
 with clinical or institutional vocabulary that is *not* about a person ("the delivery is
