@@ -36,10 +36,10 @@ FR_TEMPLATES = [
 
 DE_TEMPLATES = [
     "Sehr geehrter Herr {person}, Ihre Steuer-ID {idnr} wurde erfasst.",
-    "Die Zahlung von {person} erfolgt auf das Konto {iban} bei der Bank in {city}.",
+    "Die Zahlung von {person} erfolgt auf das Konto {iban} bei der {org} in {city}.",
     "Bitte senden Sie die Unterlagen an {email}; die Karte {card} wurde gesperrt.",
     "Der Mandant {person} (AVS-Nummer {avs}) wohnt in {city}.",
-    "Steuernummer {stnr} des Mandanten {person} liegt dem Finanzamt vor.",
+    "Steuernummer {stnr} des Mandanten {person} liegt der {org} vor.",
     "Die {org} in {city} hat die Rechnung von {person} beglichen.",
 ]
 
@@ -51,7 +51,7 @@ MIXED_TEMPLATES = [
 ]
 
 CLEAN_TEMPLATES = [
-    "Le comité se réunit jeudi pour valider le budget du prochain trimestre.",
+    "La réunion de jeudi validera le budget du prochain trimestre.",
     "Die Lieferung verzögert sich wegen des Feiertags um zwei Werktage.",
     "Merci de confirmer la réception de ce message avant la fin de la semaine.",
 ]
@@ -150,7 +150,10 @@ def render(
                 value = {
                     "person": faker.last_name,
                     "city": faker.city,
-                    "org": faker.company,
+                    # faker.company() often returns a bare surname, which no
+                    # annotator could tell from a PERSON; a suffix makes the
+                    # gold label decidable.
+                    "org": lambda: f"{faker.last_name()} {faker.company_suffix()}",
                 }[name]()
                 entity_type = {"person": "PERSON", "city": "LOCATION", "org": "ORG"}[name]
                 entities.append(

@@ -90,6 +90,27 @@ def test_zero_division_yields_zero() -> None:
     assert m.f1 == 0.0
 
 
+def test_precision_gate_passes_when_above_target() -> None:
+    from tessera_detector.evaluation import precision_gate_failures
+
+    per_type = {"ORG": Metrics(tp=9, fp=1), "LOCATION": Metrics(tp=8, fp=2)}
+    assert precision_gate_failures(per_type, types={"ORG", "LOCATION"}, target=0.8) == []
+
+
+def test_precision_gate_reports_each_type_below_target() -> None:
+    from tessera_detector.evaluation import precision_gate_failures
+
+    per_type = {"ORG": Metrics(tp=5, fp=5), "LOCATION": Metrics(tp=9, fp=1)}
+    failures = precision_gate_failures(per_type, types={"ORG", "LOCATION"}, target=0.8)
+    assert [name for name, _ in failures] == ["ORG"]
+
+
+def test_precision_gate_ignores_types_absent_from_the_run() -> None:
+    from tessera_detector.evaluation import precision_gate_failures
+
+    assert precision_gate_failures({"IBAN": Metrics(tp=3)}, types={"ORG"}, target=0.8) == []
+
+
 def test_summarize_aggregates_and_reports_tier1() -> None:
     per_doc = [
         {"IBAN": Metrics(tp=1)},

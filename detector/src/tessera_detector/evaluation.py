@@ -114,4 +114,22 @@ def summarize(per_document: list[dict[str, Metrics]], *, tier1_types: set[str]) 
     return Summary(per_type=dict(per_type), tier1_recall=tier1.recall)
 
 
-__all__ = ["EvalEntity", "Metrics", "Summary", "evaluate_document", "summarize"]
+def precision_gate_failures(
+    per_type: dict[str, Metrics], *, types: set[str], target: float
+) -> list[tuple[str, float]]:
+    """Types present in the run whose precision falls below target (REQ-38)."""
+    return [
+        (entity_type, per_type[entity_type].precision)
+        for entity_type in sorted(types)
+        if entity_type in per_type and per_type[entity_type].precision < target
+    ]
+
+
+__all__ = [
+    "EvalEntity",
+    "Metrics",
+    "Summary",
+    "evaluate_document",
+    "precision_gate_failures",
+    "summarize",
+]

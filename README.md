@@ -57,6 +57,11 @@ uv run --project detector tessera scan path/to/texts --json     # machine-readab
 Found values are masked by default (`FR76…89`) so a saved report is not itself
 a PII leak; `--show-values` prints them verbatim.
 
+The NER layer (PERSON, LOCATION, ORG) runs automatically when its weights are present
+(`make model`, several hundred megabytes, cached under `~/.cache/tessera/models`).
+Without them the scan runs the deterministic layer alone and says so; `--ner` makes their
+absence an error, `--no-ner` skips the layer even when they are installed.
+
 ## Evaluation
 
 The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic
@@ -67,7 +72,7 @@ make corpus     # regenerates evaluation/corpus/public.jsonl byte-identically
 make evaluate   # per-type precision/recall/F1 + the Tier 1 recall gate (>= 0.99)
 ```
 
-Current results on the public corpus (deterministic layer only):
+Current results on the public corpus, with the NER weights installed:
 
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
@@ -79,12 +84,25 @@ Current results on the public corpus (deterministic layer only):
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
+| LOCATION | 0.870 | 1.000 | 0.930 |
+| ORG | 0.950 | 0.760 | 0.844 |
+| PERSON | 0.644 | 0.543 | 0.589 |
 
-> Perfect scores here mean the deterministic layer covers its own catalog, nothing
-> more: the corpus currently contains only catalog-backed types with clean formatting.
-> The numbers become meaningful as the corpus grows adversarial cases (noisy
-> formatting, near-misses, uncovered types) and the NER layer lands. A second,
-> manually annotated corpus on real texts stays private and is reported separately.
+> Perfect scores on the catalog types mean the deterministic layer covers its own
+> catalog, nothing more: those corpus entries are checksum-valid identifiers with clean
+> formatting. The numbers become meaningful as the corpus grows adversarial cases —
+> noisy formatting, near-misses, uncovered types.
+>
+> The NER rows are flattered in one direction and penalised in another. Names, cities
+> and companies sit in fixed template slots rather than in the shapes real text
+> produces, which makes them easier to find than they would be in a real document; at
+> the same time a model that correctly spots an entity the synthetic gold does not
+> enumerate is scored as wrong. So `make evaluate` enforces the Tier 1 recall gate
+> (≥ 0.99) and the LOCATION precision gate (≥ 0.8), while ORG precision is reported
+> and warned about rather than enforced — a number that good on this corpus is not
+> evidence about real prose. PERSON precision is the honest weak spot and is not yet
+> gated. The privately annotated corpus on real texts is the measure that counts, and
+> it is reported separately.
 
 ## Status
 

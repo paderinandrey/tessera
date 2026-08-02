@@ -9,15 +9,28 @@ import json
 import sys
 from pathlib import Path
 
-from tessera_detector.evaluation import EvalEntity, evaluate_document, summarize
-from tessera_detector.pipeline import Detector
+from tessera_detector.evaluation import (
+    EvalEntity,
+    evaluate_document,
+    precision_gate_failures,
+    summarize,
+)
+from tessera_detector.pipeline import build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TIER1_TARGET = 0.99
+PRECISION_TARGET = 0.8
+# Both are REQ-38 targets, but only LOCATION is enforceable on the synthetic
+# corpus: an ORG here is a Faker company name in a fixed slot, while the model
+# also finds the institutions real prose is full of, which the gold cannot
+# enumerate. ORG is reported and warned about until the private corpus can
+# judge it.
+BINDING_PRECISION_TYPES = {"LOCATION"}
+ADVISORY_PRECISION_TYPES = {"ORG"}
 
 
 def main() -> int:
-    detector = Detector()
+    detector = build_detector()
     tier1_types = {rule.entity_type for rule in detector.deterministic.rules if rule.tier == 1}
     per_document = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
@@ -39,7 +52,26 @@ def main() -> int:
     if summary.tier1_recall < TIER1_TARGET:
         print("FAIL: Tier 1 recall below target", file=sys.stderr)
         return 1
-    return 0
+    if not detector.ner_available:
+        print("NER layer off (no weights): the ORG/LOCATION precision gate is skipped.")
+        return 0
+    advisory = precision_gate_failures(
+        summary.per_type, types=ADVISORY_PRECISION_TYPES, target=PRECISION_TARGET
+    )
+    for entity_type, precision in advisory:
+        print(
+            f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
+            "(advisory on the synthetic corpus)"
+        )
+    failures = precision_gate_failures(
+        summary.per_type, types=BINDING_PRECISION_TYPES, target=PRECISION_TARGET
+    )
+    for entity_type, precision in failures:
+        print(
+            f"FAIL: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET}",
+            file=sys.stderr,
+        )
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
