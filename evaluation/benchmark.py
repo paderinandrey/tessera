@@ -165,7 +165,9 @@ def main(argv: list[str] | None = None) -> int:
                     measure(recognizer.windows, text, runs=args.runs, warmup=args.warmup),
                 )
             )
-            pieces = recognizer.windows(text)
+            # Materialized on purpose: timing a pass needs fixed input, and
+            # the benchmark's sizes are bounded where a scanned file is not.
+            pieces = list(recognizer.windows(text))
             for inference in recognizer.passes:
                 timings.append(
                     Timing(

@@ -4,7 +4,7 @@ Types are data: entity type, the label handed to the model, its threshold, tier 
 specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -200,49 +200,48 @@ class GlinerRecognizer:
         offsets = [(int(s), int(e)) for s, e in encoded["offset_mapping"] if e > s]
         return token_windows(offsets, budget=self._token_budget, overlap=TOKEN_OVERLAP)
 
-    def windows(self, text: str) -> list[tuple[int, str]]:
+    def windows(self, text: str) -> Iterator[tuple[int, str]]:
         """Every piece handed to the model, with its absolute offset in `text`.
 
-        Chunking and tokenization are shared across the inference passes and
-        happen once per document; splitting them out keeps that plain, and lets
-        a benchmark attribute cost to preprocessing or to a specific pass.
+        A generator, not a list: the pieces are a second copy of the document
+        plus its window overlap, and the CLI accepts files of any size. Callers
+        that genuinely need them all — a benchmark timing one pass over fixed
+        input — can materialize them and pay for it deliberately.
         """
-        pieces: list[tuple[int, str]] = []
         for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
             for start, end in self._windows(chunk):
-                pieces.append((offset + start, chunk[start:end]))
-        return pieces
+                yield offset + start, chunk[start:end]
 
-    def run_pass(self, pieces: list[tuple[int, str]], inference: InferencePass) -> list[Span]:
+    def _spans_from(self, base: int, piece: str, inference: InferencePass) -> Iterator[Span]:
+        for entity in self._model.predict_entities(
+            piece, list(inference.labels), threshold=inference.threshold
+        ):
+            ner_type = self._by_label.get(entity["label"])
+            score = float(entity["score"])
+            if ner_type is None or score < ner_type.threshold:
+                continue
+            yield Span(
+                entity_type=ner_type.entity_type,
+                start=base + int(entity["start"]),
+                end=base + int(entity["end"]),
+                confidence=min(score, 0.99),
+                recognizer="ner:gliner",
+                tier=ner_type.tier,
+            )
+
+    def run_pass(
+        self, pieces: Iterable[tuple[int, str]], inference: InferencePass
+    ) -> list[Span]:
         """Spans from one inference pass over already-prepared pieces."""
-        spans: list[Span] = []
-        for base, piece in pieces:
-            for entity in self._model.predict_entities(
-                piece, list(inference.labels), threshold=inference.threshold
-            ):
-                ner_type = self._by_label.get(entity["label"])
-                score = float(entity["score"])
-                if ner_type is None or score < ner_type.threshold:
-                    continue
-                spans.append(
-                    Span(
-                        entity_type=ner_type.entity_type,
-                        start=base + int(entity["start"]),
-                        end=base + int(entity["end"]),
-                        confidence=min(score, 0.99),
-                        recognizer="ner:gliner",
-                        tier=ner_type.tier,
-                    )
-                )
-        return spans
+        return [span for base, piece in pieces for span in self._spans_from(base, piece, inference)]
 
     def detect(self, text: str) -> list[Span]:
         if not text:
             return []
-        pieces = self.windows(text)
         spans: list[Span] = []
-        for inference in self.passes:
-            spans.extend(self.run_pass(pieces, inference))
+        for base, piece in self.windows(text):
+            for inference in self.passes:
+                spans.extend(self._spans_from(base, piece, inference))
         return spans
 
 
