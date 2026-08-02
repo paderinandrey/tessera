@@ -99,9 +99,15 @@ message content are masked too — OpenAI's `user` and per-message `name`, Anthr
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.
 
-**Every failure refuses the request.** A detector that errors or exceeds its timeout, a
-body whose shape the gateway does not recognize, a span the detector reports that cannot be
-applied, and a placeholder in the response that no mapping knows all end the request. Nothing unmasked is forwarded, and no placeholder is
+Provider credentials pass through — `Authorization`, `x-api-key`, `anthropic-version` and
+the providers' own routing headers — on an allowlist rather than a blanket forward, because
+a client's cookies are not the model provider's business.
+
+**Every failure refuses the request.** A detector that errors or exceeds its timeout, a body
+whose shape the gateway does not recognize — including a content part it has no rule for,
+such as a tool block, whose masking is a later slice — a span the detector reports that
+cannot be applied, and a placeholder in the response that no mapping knows all end the
+request. Nothing unmasked is forwarded, and no placeholder is
 ever handed to the client in place of a value. No error body or log line carries the
 submitted text.
 

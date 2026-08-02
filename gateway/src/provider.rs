@@ -22,18 +22,38 @@ pub trait Provider: Send + Sync {
 pub struct OpenAi;
 pub struct Anthropic;
 
-fn content_pointers(prefix: &str, content: &Value, out: &mut Vec<String>) {
+/// Content parts we deliberately do not scan. Anything else without a `text`
+/// string is refused rather than forwarded: a shape we do not understand may
+/// carry personal data we would pass through untouched. Tool blocks are on this
+/// list by absence — masking their arguments is a later slice, and until then
+/// a request carrying them is refused rather than silently leaked.
+const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "audio"];
+
+fn content_pointers(
+    prefix: &str,
+    content: &Value,
+    provider: &'static str,
+    out: &mut Vec<String>,
+) -> Result<(), ShapeError> {
     match content {
         Value::String(_) => out.push(prefix.to_owned()),
         Value::Array(parts) => {
             for (index, part) in parts.iter().enumerate() {
                 if part.get("text").and_then(Value::as_str).is_some() {
                     out.push(format!("{prefix}/{index}/text"));
+                    continue;
+                }
+                let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+                if !UNSCANNED_PART_TYPES.contains(&kind) {
+                    return Err(ShapeError::Request(provider));
                 }
             }
         }
-        _ => {}
+        // Neither a string nor a list of parts: we cannot say where the text
+        // is, so the request does not go anywhere.
+        _ => return Err(ShapeError::Request(provider)),
     }
+    Ok(())
 }
 
 impl Provider for OpenAi {
@@ -66,8 +86,9 @@ impl Provider for OpenAi {
                 content_pointers(
                     &format!("/messages/{index}/content"),
                     content,
+                    "openai",
                     &mut pointers,
-                );
+                )?;
             }
         }
         Ok(pointers)
@@ -84,8 +105,9 @@ impl Provider for OpenAi {
                 content_pointers(
                     &format!("/choices/{index}/message/content"),
                     content,
+                    "openai",
                     &mut pointers,
-                );
+                )?;
             }
         }
         Ok(pointers)
@@ -116,15 +138,16 @@ impl Provider for Anthropic {
             pointers.push("/metadata/user_id".to_owned());
         }
         if let Some(system) = body.get("system") {
-            content_pointers("/system", system, &mut pointers);
+            content_pointers("/system", system, "anthropic", &mut pointers)?;
         }
         for (index, message) in messages.iter().enumerate() {
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
                     content,
+                    "anthropic",
                     &mut pointers,
-                );
+                )?;
             }
         }
         Ok(pointers)
@@ -247,6 +270,33 @@ mod tests {
         assert!(Anthropic
             .request_pointers(&json!({"model": "claude"}))
             .is_err());
+    }
+
+    #[test]
+    fn an_unrecognized_content_shape_is_refused() {
+        // Silently finding no pointers would forward the body untouched.
+        let body = json!({"messages": [{"role": "user", "content": {"text": "Weber"}}]});
+        assert!(OpenAi.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn an_unrecognized_content_part_is_refused() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "content": "Weber"}
+        ]}]});
+        assert!(OpenAi.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn media_parts_are_allowed_through_unscanned() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Weber"},
+            {"type": "image_url", "image_url": {"url": "http://x"}}
+        ]}]});
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec!["/messages/0/content/0/text"]
+        );
     }
 
     #[test]

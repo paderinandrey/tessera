@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -38,6 +38,20 @@ impl IntoResponse for ProxyError {
     }
 }
 
+/// Headers the upstream needs to authenticate and route the call. An allowlist
+/// rather than a passthrough: `host`, `content-length` and friends belong to
+/// the hop we are making, not the one we received, and forwarding a client's
+/// cookies to a model provider is nobody's intent.
+const FORWARDED_HEADERS: [&str; 7] = [
+    "authorization",
+    "x-api-key",
+    "anthropic-version",
+    "anthropic-beta",
+    "openai-organization",
+    "openai-project",
+    "openai-beta",
+];
+
 pub struct AppState {
     pub detector: DetectorClient,
     pub upstream: reqwest::Client,
@@ -69,6 +83,7 @@ impl AppState {
 async fn handle(
     state: Arc<AppState>,
     provider: &dyn Provider,
+    headers: HeaderMap,
     body: Value,
 ) -> Result<Response, ProxyError> {
     // Where is the text? A shape we do not recognize is refused, not forwarded.
@@ -84,13 +99,18 @@ async fn handle(
     }
 
     // Only what is masked leaves the process.
-    let response = state
-        .upstream
-        .post(format!(
-            "{}{}",
-            state.base_for(provider),
-            provider.upstream_path()
-        ))
+    let mut request = state.upstream.post(format!(
+        "{}{}",
+        state.base_for(provider),
+        provider.upstream_path()
+    ));
+    for name in FORWARDED_HEADERS {
+        let header = HeaderName::from_static(name);
+        if let Some(value) = headers.get(&header) {
+            request = request.header(header, value);
+        }
+    }
+    let response = request
         .json(&masked)
         .send()
         .await
@@ -141,15 +161,23 @@ fn restore_everywhere(value: &Value, mapping: &Mapping) -> Result<Value, Mapping
     })
 }
 
-async fn openai(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    match handle(state, &OpenAi, body).await {
+async fn openai(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match handle(state, &OpenAi, headers, body).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
-async fn anthropic(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    match handle(state, &Anthropic, body).await {
+async fn anthropic(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match handle(state, &Anthropic, headers, body).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -221,15 +249,24 @@ mod tests {
     }
 
     async fn call(state: Arc<AppState>, route: &str, body: Value) -> (StatusCode, String) {
+        call_with_headers(state, route, body, &[]).await
+    }
+
+    async fn call_with_headers(
+        state: Arc<AppState>,
+        route: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(route)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
         let response = router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(route)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -461,6 +498,88 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_credentials_reach_the_upstream() {
+        // Without these the proxy is not a drop-in: every authenticated request
+        // fails before it reaches a model.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+
+        let (status, _) = call_with_headers(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Hallo"}]}),
+            &[
+                ("authorization", "Bearer sk-test"),
+                ("openai-organization", "org-1"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(received.headers["authorization"], "Bearer sk-test");
+        assert_eq!(received.headers["openai-organization"], "org-1");
+    }
+
+    #[tokio::test]
+    async fn anthropic_credentials_and_version_reach_the_upstream() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "text", "text": "ok"}]}),
+        )
+        .await;
+
+        let (status, _) = call_with_headers(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Hallo"}]}),
+            &[
+                ("x-api-key", "sk-ant-test"),
+                ("anthropic-version", "2023-06-01"),
+            ],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(received.headers["x-api-key"], "sk-ant-test");
+        assert_eq!(received.headers["anthropic-version"], "2023-06-01");
+    }
+
+    #[tokio::test]
+    async fn headers_outside_the_allowlist_are_not_forwarded() {
+        // A client's cookies are not the model provider's business.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+
+        call_with_headers(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Hallo"}]}),
+            &[
+                ("cookie", "session=secret"),
+                ("authorization", "Bearer sk-test"),
+            ],
+        )
+        .await;
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert!(
+            received.headers.get("cookie").is_none(),
+            "a cookie was forwarded"
+        );
     }
 
     #[tokio::test]
