@@ -98,7 +98,8 @@ def test_render_text_masks_values_and_summarizes() -> None:
         "\n"
         "Total: 2 files, 2 findings\n"
         "  FR_NIR       1\n"
-        "  IBAN         1"
+        "  IBAN         1\n"
+        "NER layer: off (no weights; run `make model`)"
     )
 
 
@@ -122,11 +123,14 @@ def test_render_text_sorts_summary_by_count_then_name() -> None:
     )
     text = render_text(report)
     assert text.index("IBAN         2") < text.index("EMAIL        1")
-    assert text.endswith("Skipped: 1 (not valid UTF-8)")
+    assert "Skipped: 1 (not valid UTF-8)" in text
+    assert text.endswith("NER layer: off (no weights; run `make model`)")
 
 
 def test_render_text_empty_report() -> None:
-    assert render_text(ScanReport(files=[], skipped=[])) == "Total: 0 files, 0 findings"
+    assert render_text(ScanReport(files=[], skipped=[])) == (
+        "Total: 0 files, 0 findings\nNER layer: off (no weights; run `make model`)"
+    )
 
 
 def test_render_json_shape_and_masking() -> None:
@@ -135,6 +139,7 @@ def test_render_json_shape_and_masking() -> None:
         "files_scanned": 2,
         "files_skipped": 0,
         "files_unreadable": 0,
+        "ner": False,
         "total_findings": 2,
         "by_type": {"FR_NIR": 1, "IBAN": 1},
     }
@@ -240,7 +245,7 @@ def test_nested_unreadable_subdirectory_is_reported(
 
 def test_render_text_reports_unreadable_entries() -> None:
     report = ScanReport(files=[], skipped=[], unreadable=["dir/locked"])
-    assert render_text(report).endswith("Unreadable: 1")
+    assert "Unreadable: 1" in render_text(report)
 
 
 def test_render_json_counts_unreadable_entries() -> None:
@@ -301,6 +306,47 @@ def test_surrogate_filenames_do_not_break_output(
     assert "�" in out
 
 
+def test_report_notes_when_ner_did_not_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path)]) == 0
+    assert "NER layer: off" in capsys.readouterr().out
+
+
+def test_json_reports_ner_availability(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["ner"] is False
+
+
+def test_no_ner_flag_skips_the_layer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TESSERA_NER_MODEL", "/definitely/not/here")
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--no-ner"]) == 0
+    assert "EMAIL" in capsys.readouterr().out
+
+
+def test_ner_flag_without_weights_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--ner"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no NER weights" in captured.err
+
+
 def test_scan_offsets_stay_in_original_crlf_coordinates(tmp_path: Path) -> None:
     # Newline translation would silently shift every offset left of the raw file.
     (tmp_path / "a.txt").write_bytes(b"line1\r\nmail: anna.keller@example.ch\r\n")
@@ -310,7 +356,13 @@ def test_scan_offsets_stay_in_original_crlf_coordinates(tmp_path: Path) -> None:
     assert finding.value == "anna.keller@example.ch"
 
 
-def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_full_report_over_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Isolate from any NER weights actually cached on the machine running this
+    # test: the exact-match assertion below must hold regardless of local state.
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
     fr = "Contact: anna.keller@example.ch pour le dossier."
     de = "Bitte an max.weber@example.de schreiben."
     (tmp_path / "a.txt").write_text(fr, encoding="utf-8")
@@ -328,4 +380,5 @@ def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixtur
         "Total: 2 files, 2 findings\n"
         "  EMAIL        2\n"
         "Skipped: 1 (not valid UTF-8)\n"
+        "NER layer: off (no weights; run `make model`)\n"
     )
