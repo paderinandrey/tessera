@@ -153,3 +153,32 @@ def test_schema_describes_the_span_shape() -> None:
         "tier",
         "boosted",
     }
+
+
+@pytest.mark.ner
+def test_the_real_detector_serves_detection() -> None:
+    pytest.importorskip("gliner")
+    from tessera_detector.models import find_model
+    from tessera_detector.pipeline import build_detector
+
+    if find_model() is None:
+        pytest.skip("no NER weights: run `make model`")
+    test_client = TestClient(create_app(build_detector()))
+    body = test_client.post(
+        "/detect", json={"text": "Der Mitarbeiter Weber leidet an Diabetes."}
+    ).json()
+    found = {span["entity_type"] for span in body["spans"]}
+    assert "HEALTH" in found
+    assert body["layers_run"] == ["deterministic", "ner"]
+
+
+@pytest.mark.ner
+def test_health_reports_a_loaded_layer() -> None:
+    pytest.importorskip("gliner")
+    from tessera_detector.models import find_model
+    from tessera_detector.pipeline import build_detector
+
+    if find_model() is None:
+        pytest.skip("no NER weights: run `make model`")
+    body = TestClient(create_app(build_detector())).get("/health").json()
+    assert body == {"status": "ok", "ner": True, "ner_off_reason": None}

@@ -45,7 +45,7 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           working-directory: detector
-      - run: uv sync --locked --group ner
+      - run: uv sync --locked --group ner --group serve
       - name: Cache NER weights
         uses: actions/cache@v4
         with:
@@ -57,7 +57,7 @@ jobs:
       # --require-ner is what keeps this job honest: the marked tests skip when
       # the runtime is broken, so without it the job would pass green with the
       # NER layer entirely unusable.
-      - run: uv run --group ner pytest -m ner
+      - run: uv run --group ner --group serve pytest -m ner
       - run: uv run --group ner python ../evaluation/evaluate.py --require-ner
       # Smoke only: the harness must run, but timings on a shared runner are
       # noise and are never asserted. Real numbers come from a known machine
