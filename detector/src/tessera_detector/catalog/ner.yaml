@@ -52,7 +52,7 @@ entities:
     specificity: 35
 
   - entity_type: POLITICAL_OPINION
-    label: political affiliation
+    label: political party
     threshold: 0.30
     tier: 3
     specificity: 35
@@ -64,7 +64,7 @@ entities:
     specificity: 35
 
   - entity_type: TRADE_UNION
-    label: trade union membership
+    label: trade union
     threshold: 0.30
     tier: 3
     specificity: 35

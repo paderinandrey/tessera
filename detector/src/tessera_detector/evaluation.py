@@ -114,6 +114,29 @@ def summarize(per_document: list[dict[str, Metrics]], *, tier1_types: set[str]) 
     return Summary(per_type=dict(per_type), tier1_recall=tier1.recall)
 
 
+def group_recall(
+    entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
+) -> tuple[int, int]:
+    """Gold entities of a group covered by any prediction from that group, and the total.
+
+    Per-type recall punishes confusion inside a group that has no operational
+    consequence: an ethnicity mention read as religion is still redacted, and
+    REQ-3's "misses are not tolerable" is about the span going unnoticed, not
+    about picking the right member of the group.
+    """
+    gold = [entity for entity in entities if entity.entity_type in types]
+    candidates = [span for span in predictions if span.entity_type in types]
+    covered = sum(
+        1
+        for entity in gold
+        if any(
+            _iou(entity.start, entity.end, span.start, span.end) >= IOU_THRESHOLD
+            for span in candidates
+        )
+    )
+    return covered, len(gold)
+
+
 def precision_gate_failures(
     per_type: dict[str, Metrics], *, types: set[str], target: float
 ) -> list[tuple[str, float]]:
@@ -130,6 +153,7 @@ __all__ = [
     "Metrics",
     "Summary",
     "evaluate_document",
+    "group_recall",
     "precision_gate_failures",
     "summarize",
 ]

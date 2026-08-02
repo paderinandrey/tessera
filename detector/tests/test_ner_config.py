@@ -101,14 +101,17 @@ entities:
         load_ner_types(config)
 
 
+# Labels are the model's interface, and the phrasing decides whether it fires:
+# "trade union" scores 0.95 on "IG Metall" where "trade union membership" scores
+# 0.70, and "political affiliation" mislabels a union as a party.
 ARTICLE_9_TYPES = {
     "HEALTH": "medical condition",
     "BIOMETRIC": "biometric data",
     "GENETIC": "genetic data",
     "ETHNICITY": "ethnic origin",
-    "POLITICAL_OPINION": "political affiliation",
+    "POLITICAL_OPINION": "political party",
     "RELIGION": "religion",
-    "TRADE_UNION": "trade union membership",
+    "TRADE_UNION": "trade union",
     "SEXUAL_ORIENTATION": "sexual orientation",
 }
 
