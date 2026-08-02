@@ -39,8 +39,9 @@ nothing more, nothing less.
 tessera/
   detector/    Python detection service: deterministic recognizers with checksum
                validation, NER (GLiNER/ONNX), context boosting. Stable HTTP contract.
-  gateway/     Rust reverse proxy (planned): HTTP/SSE, placeholder substitution and
-               restoration, session mapping, audit. Wave 1.
+  gateway/     Rust reverse proxy: drop-in base URL for OpenAI- and Anthropic-shaped
+               requests, placeholder substitution and restoration. Non-streaming for
+               now; SSE, sessions and audit are the next slices.
   evaluation/  Public synthetic corpus and metrics harness (planned). The manually
                annotated corpus stays private and never enters this repository.
 ```
@@ -80,6 +81,33 @@ for a layer the server cannot run is a 503 naming the reason rather than a quiet
 downgrade. `GET /health` reports whether the NER layer is loaded and why it is not. The
 committed OpenAPI document at `docs/api/openapi.json` is the schema both implementations
 share (REQ-44); `make openapi` regenerates it and CI fails if it drifts.
+
+## Gateway
+
+Point a client's base URL at the gateway and personal data stops leaving the process:
+
+```
+cd gateway && cargo run -- tessera.example.toml     # 127.0.0.1:8080
+```
+
+It accepts the OpenAI shape at `/v1/chat/completions` and the Anthropic shape at
+`/v1/messages`, including Anthropic's separate `system` field and both providers'
+content-part arrays. Detected spans become typed placeholders — `[PERSON_1]`, `[IBAN_2]` —
+and an identical value always gets the same placeholder within a request, because two
+placeholders for one person would tell the model there were two. The response is restored
+before it reaches the client.
+
+**Every failure refuses the request.** A detector that errors or exceeds its timeout, a
+body whose shape the gateway does not recognize, and a placeholder in the response that no
+mapping knows all end the request. Nothing unmasked is forwarded, and no placeholder is
+ever handed to the client in place of a value. No error body or log line carries the
+submitted text.
+
+The gateway asks the detector for every layer it has, so a request costs what the
+[latency](#latency) section reports; `detector_timeout_secs` defaults to 30 seconds
+because a tight timeout would turn protection into a denial of service. Configuration is
+TOML and rejects unknown keys — a typo in a security control should fail loudly rather
+than leave a default in place.
 
 ## Evaluation
 

@@ -1,4 +1,4 @@
-.PHONY: corpus evaluate bench openapi test lint model
+.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
@@ -11,6 +11,12 @@ bench:
 
 openapi:
 	uv run --project detector --group serve python evaluation/export_openapi.py
+
+gateway-test:
+	cd gateway && cargo test
+
+gateway-lint:
+	cd gateway && cargo fmt --check && cargo clippy -- -D warnings
 
 test:
 	cd detector && uv run --group serve pytest
