@@ -168,3 +168,14 @@ def test_broader_outer_still_wins_over_a_less_specific_inner() -> None:
     (kept,) = resolution.spans
     assert kept.entity_type == "TRADE_UNION"
     assert (kept.start, kept.end) == (22, 28)
+
+
+def test_checksum_outer_keeps_its_identity_over_a_more_specific_inner() -> None:
+    # Rule 1 is unconditional: a checksum span is never silently replaced, and
+    # a custom catalog can put a higher specificity on the inner type.
+    outer = span("IBAN", 0, 27, confidence=1.0, recognizer="catalog:iban")
+    inner = span("TRADE_UNION", 10, 20, confidence=0.6, recognizer="ner:gliner", tier=3)
+    resolution = resolve([outer, inner], specificity={"IBAN": 90, "TRADE_UNION": 95})
+    (kept,) = resolution.spans
+    assert kept.entity_type == "IBAN"
+    assert kept.recognizer == "catalog:iban"

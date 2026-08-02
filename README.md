@@ -133,14 +133,14 @@ and a stated view that names no party needs a label separate from `political par
 > (≥ 0.99) and the LOCATION precision gate (≥ 0.8), while ORG precision is reported
 > and warned about rather than enforced — a number that good on this corpus is not
 > evidence about real prose. PERSON precision is the honest weak spot and is not yet
-> ORG and LOCATION precision are both advisory rather than gated, and the reason is worth
-> stating: every LOCATION false positive here is a French surname that is also a place
-> name — Lenoir, Fontaine, Mercier — where the model marks the very span the gold calls
-> PERSON. That is two quasi-identifiers disagreeing about a label, not the service masking
-> text it should have left alone, and the span is redacted either way. Raising LOCATION's
-> threshold to 0.90 moves precision only to 0.727 with recall still at 1.000, which says
-> the number is bound by the corpus rather than by the detector. REQ-38's 0.8 target is an
-> irritation metric; measuring it needs the privately annotated corpus.
+> REQ-38's 0.8 precision target is an irritation metric — below it, clients say the service
+> ruins their text — so the binding gate measures **over-masking**: predictions that land on
+> no personal data at all. LOCATION scores 1.000 there (14/14 predictions cover a real gold
+> span) while its strict per-type precision reads 0.571, and the gap is entirely French
+> surnames that are also place names — Lenoir, Fontaine, Mercier — where the model marks the
+> very span the gold calls PERSON. That span is redacted either way; only the placeholder's
+> type differs. ORG stays advisory because its over-masking is real rather than a labelling
+> disagreement: "Le laboratoire" and "service juridique" match no gold entity at all.
 >
 > ORG precision fell from 0.950 to 0.167 when this corpus gained entity-free
 > business prose: the model finds organizations in "die Apotheke" and "convention

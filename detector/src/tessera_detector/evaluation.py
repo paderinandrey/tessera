@@ -160,6 +160,30 @@ def group_recall(
     return covered, len(gold)
 
 
+def overmasking_counts(
+    entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
+) -> dict[str, tuple[int, int]]:
+    """Per type: predictions that land on some gold entity, and the total.
+
+    REQ-38's precision target is an irritation metric — below it, clients say
+    the service ruins their text. A prediction that marks a person's name and
+    calls it a location does not ruin anything: the span is redacted either
+    way, and only the placeholder's type differs. What irritates is masking a
+    span that holds no personal data at all, which is what this counts.
+    """
+    counts: dict[str, list[int]] = {}
+    for span in predictions:
+        if span.entity_type not in types:
+            continue
+        bucket = counts.setdefault(span.entity_type, [0, 0])
+        bucket[1] += 1
+        if any(
+            min(span.end, entity.end) - max(span.start, entity.start) > 0 for entity in entities
+        ):
+            bucket[0] += 1
+    return {entity_type: (kept, total) for entity_type, (kept, total) in counts.items()}
+
+
 def precision_gate_failures(
     per_type: dict[str, Metrics], *, types: set[str], target: float
 ) -> list[tuple[str, float]]:
@@ -178,6 +202,7 @@ __all__ = [
     "evaluate_document",
     "group_coverage",
     "group_recall",
+    "overmasking_counts",
     "precision_gate_failures",
     "summarize",
 ]

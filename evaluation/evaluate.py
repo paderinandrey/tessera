@@ -17,6 +17,7 @@ from tessera_detector.evaluation import (
     EvalEntity,
     evaluate_document,
     group_coverage,
+    overmasking_counts,
     precision_gate_failures,
     summarize,
 )
@@ -32,15 +33,15 @@ PRECISION_TARGET = 0.8
 # enumerate. ORG is reported and warned about until the private corpus can
 # judge it.
 # REQ-38 targets 0.8 precision on ORG and LOCATION as an irritation metric —
-# below it, clients complain the service ruins their text. This corpus cannot
-# measure that: every LOCATION false positive is a French surname that is also
-# a place name (Lenoir, Fontaine, Mercier), where the model marks the very span
-# the gold calls PERSON. That is label confusion between two quasi-identifiers,
-# not over-masking, and the text gets redacted either way. Raising LOCATION's
-# threshold to 0.90 only moves precision to 0.727 while recall stays 1.000, so
-# the number is corpus-bound rather than detector-bound. Both stay advisory
-# until the privately annotated corpus can judge them.
-BINDING_PRECISION_TYPES: set[str] = set()
+# below it, clients complain the service ruins their text. The gate measures
+# over-masking rather than strict per-type precision: every LOCATION false
+# positive on this corpus is a French surname that is also a place name
+# (Lenoir, Fontaine, Mercier), marking the very span the gold calls PERSON.
+# That span is redacted either way, so it irritates nobody; what irritates is
+# masking text that holds no personal data. Both strict numbers stay in the
+# table. ORG remains advisory: at 0.208 its over-masking is real, not a
+# labelling disagreement ("Le laboratoire", "service juridique").
+BINDING_OVERMASKING_TYPES = {"LOCATION"}
 ADVISORY_PRECISION_TYPES = {"ORG", "LOCATION"}
 # Article 9 (REQ-3) is gated on coverage, not per-category recall: the model
 # reads "maghrébine" as religion rather than ethnicity, and that span is still
@@ -78,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     # Bucketed by (language, category): a pooled ratio lets a category go dark
     # in one language while the aggregate stays above target.
     article_9_buckets: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    overmasking: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
         document = json.loads(line)
         entities = [EvalEntity(**e) for e in document["entities"]]
@@ -89,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
             bucket = article_9_buckets[(document["lang"], entity_type)]
             bucket[0] += int(covered)
             bucket[1] += 1
+        for entity_type, (kept, total) in overmasking_counts(
+            entities, predictions, types=BINDING_OVERMASKING_TYPES
+        ).items():
+            counts = overmasking[entity_type]
+            counts[0] += kept
+            counts[1] += total
     summary = summarize(per_document, tier1_types=tier1_types)
 
     width = max(len(t) for t in summary.per_type)
@@ -148,6 +156,20 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     article_9_missed = bool(dark) or overall < ARTICLE_9_TARGET
+    overmasking_failures = []
+    for entity_type, (kept, total) in sorted(overmasking.items()):
+        rate = kept / total if total else 1.0
+        print(
+            f"{entity_type} over-masking precision: {rate:.4f} ({kept}/{total} predictions "
+            f"land on real data, target >= {PRECISION_TARGET})"
+        )
+        if total and rate < PRECISION_TARGET:
+            overmasking_failures.append(entity_type)
+            print(
+                f"FAIL: {entity_type} over-masking precision {rate:.4f} below "
+                f"target {PRECISION_TARGET}",
+                file=sys.stderr,
+            )
     advisory = precision_gate_failures(
         summary.per_type, types=ADVISORY_PRECISION_TYPES, target=PRECISION_TARGET
     )
@@ -156,15 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
             "(advisory on the synthetic corpus)"
         )
-    failures = precision_gate_failures(
-        summary.per_type, types=BINDING_PRECISION_TYPES, target=PRECISION_TARGET
-    )
-    for entity_type, precision in failures:
-        print(
-            f"FAIL: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET}",
-            file=sys.stderr,
-        )
-    return 1 if failures or article_9_missed else 0
+    return 1 if overmasking_failures or article_9_missed else 0
 
 
 if __name__ == "__main__":

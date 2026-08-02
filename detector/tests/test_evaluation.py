@@ -174,3 +174,20 @@ def test_group_coverage_ignores_gold_outside_the_group() -> None:
 
     gold = [EvalEntity(entity_type="IBAN", start=0, end=10)]
     assert group_coverage(gold, [], types={"HEALTH"}) == []
+
+
+def test_overmasking_counts_only_predictions_matching_no_gold() -> None:
+    from tessera_detector.evaluation import overmasking_counts
+
+    # A location prediction landing on a person's name is a disagreement about
+    # the label, not the service masking text it should have left alone.
+    gold = [EvalEntity(entity_type="PERSON", start=0, end=8)]
+    pred = [pred_span("LOCATION", 0, 8), pred_span("LOCATION", 40, 50)]
+    assert overmasking_counts(gold, pred, types={"LOCATION"}) == {"LOCATION": (1, 2)}
+
+
+def test_overmasking_counts_ignores_ungated_types() -> None:
+    from tessera_detector.evaluation import overmasking_counts
+
+    gold = [EvalEntity(entity_type="PERSON", start=0, end=8)]
+    assert overmasking_counts(gold, [pred_span("HEALTH", 40, 50)], types={"LOCATION"}) == {}
