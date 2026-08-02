@@ -191,3 +191,13 @@ def test_overmasking_counts_ignores_ungated_types() -> None:
 
     gold = [EvalEntity(entity_type="PERSON", start=0, end=8)]
     assert overmasking_counts(gold, [pred_span("HEALTH", 40, 50)], types={"LOCATION"}) == {}
+
+
+def test_overmasking_ignores_a_grazing_overlap() -> None:
+    from tessera_detector.evaluation import overmasking_counts
+
+    # One shared character out of forty is not "landing on real data".
+    gold = [EvalEntity(entity_type="PERSON", start=0, end=8)]
+    assert overmasking_counts(gold, [pred_span("LOCATION", 7, 47)], types={"LOCATION"}) == {
+        "LOCATION": (0, 1)
+    }

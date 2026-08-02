@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from .spans import Span
 
 IOU_THRESHOLD = 0.5
+# How much of a prediction must cover real data before it stops counting as
+# over-masking. Half: a span that is mostly padding is padding.
+OVERMASKING_SHARE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,9 +180,11 @@ def overmasking_counts(
             continue
         bucket = counts.setdefault(span.entity_type, [0, 0])
         bucket[1] += 1
-        if any(
-            min(span.end, entity.end) - max(span.start, entity.start) > 0 for entity in entities
-        ):
+        covered = sum(
+            max(0, min(span.end, entity.end) - max(span.start, entity.start))
+            for entity in entities
+        )
+        if covered >= OVERMASKING_SHARE * (span.end - span.start):
             bucket[0] += 1
     return {entity_type: (kept, total) for entity_type, (kept, total) in counts.items()}
 

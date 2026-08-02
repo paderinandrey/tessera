@@ -114,6 +114,8 @@ ARTICLE_9_TYPES = {
     "RELIGION": "religion",
     "TRADE_UNION": "trade union",
     "SEXUAL_ORIENTATION": "sexual orientation",
+    "PHILOSOPHICAL_BELIEF": "philosophical belief",
+    "SEX_LIFE": "sex life",
 }
 
 

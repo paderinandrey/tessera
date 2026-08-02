@@ -89,28 +89,32 @@ Current results on the public corpus, with the NER weights installed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| LOCATION | 0.571 | 1.000 | 0.727 |
-| ORG | 0.167 | 0.500 | 0.250 |
-| PERSON | 0.746 | 0.618 | 0.676 |
+| LOCATION | 0.667 | 1.000 | 0.800 |
+| ORG | 0.154 | 0.333 | 0.211 |
+| PERSON | 0.785 | 0.671 | 0.723 |
 
 Article 9 special categories, detected by the same layer at a lower threshold:
 
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
 | BIOMETRIC | 1.000 | 1.000 | 1.000 |
-| ETHNICITY | 1.000 | 0.714 | 0.833 |
+| ETHNICITY | 1.000 | 1.000 | 1.000 |
 | GENETIC | 1.000 | 0.750 | 0.857 |
-| HEALTH | 0.889 | 1.000 | 0.941 |
-| POLITICAL_AFFILIATION | 0.667 | 1.000 | 0.800 |
-| POLITICAL_OPINION | 1.000 | 0.667 | 0.800 |
-| RELIGION | 0.444 | 1.000 | 0.615 |
+| HEALTH | 0.667 | 1.000 | 0.800 |
+| PHILOSOPHICAL_BELIEF | 0.000 | 0.000 | 0.000 |
+| POLITICAL_AFFILIATION | 0.800 | 1.000 | 0.889 |
+| POLITICAL_OPINION | 0.000 | 0.000 | 0.000 |
+| RELIGION | 0.500 | 1.000 | 0.667 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
-| TRADE_UNION | 0.381 | 1.000 | 0.552 |
+| SEX_LIFE | 0.000 | 0.000 | 0.000 |
+| TRADE_UNION | 0.296 | 1.000 | 0.457 |
 
-**Article 9 coverage: 0.978 (45/46)** — nearly every special-category mention in the
+**Article 9 coverage: 0.9783 (45/46)** — nearly every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
-across nine detector types rather than eight: the regulation protects political opinions,
-and a stated view that names no party needs a label separate from `political party`.
+across eleven detector types rather than eight: the regulation protects political opinions,
+a stated view that names no party needs a label separate from `political party`, and the
+regulation names philosophical beliefs beside religious ones and sex life beside sexual
+orientation — each clause gets its own label.
 
 > Perfect scores on the catalog types mean the deterministic layer covers its own
 > catalog, nothing more: those corpus entries are checksum-valid identifiers with clean

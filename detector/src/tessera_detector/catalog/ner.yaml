@@ -82,3 +82,18 @@ entities:
     threshold: 0.30
     tier: 3
     specificity: 35
+
+  # Article 9 names religious *or philosophical* beliefs, and sex life *or*
+  # sexual orientation. Each pair is two clauses in the regulation, so each
+  # gets its own label rather than being folded into its neighbour.
+  - entity_type: PHILOSOPHICAL_BELIEF
+    label: philosophical belief
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: SEX_LIFE
+    label: sex life
+    threshold: 0.30
+    tier: 3
+    specificity: 35

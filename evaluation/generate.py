@@ -98,6 +98,17 @@ ARTICLE_9_SLOTS = {
             "de": ["IG Metall", "ver.di"],
         },
     ),
+    "philosophy": (
+        "PHILOSOPHICAL_BELIEF",
+        {"fr": ["athée", "agnostique"], "de": ["atheistisch", "agnostisch"]},
+    ),
+    "sexlife": (
+        "SEX_LIFE",
+        {
+            "fr": ["un suivi en PMA", "une interruption de grossesse"],
+            "de": ["eine Kinderwunschbehandlung", "ein Schwangerschaftsabbruch"],
+        },
+    ),
     "orientation": (
         "SEXUAL_ORIENTATION",
         {"fr": ["homosexuel", "bisexuelle"], "de": ["homosexuell", "bisexuell"]},
@@ -121,6 +132,8 @@ FR_TEMPLATES = [
     "Le dossier de {person} mentionne une orientation {orientation}.",
     "Le salarié {person} se dit {opinion} lors de la réunion du comité.",
     "Le rapport interne décrit {person} comme {race}.",
+    "Le dossier de {person}, de conviction {philosophy}, a été archivé.",
+    "Le dossier médical de {person} mentionne {sexlife} en 2023.",
 ]
 
 DE_TEMPLATES = [
@@ -139,6 +152,8 @@ DE_TEMPLATES = [
     "Die Personalakte von {person} nennt: Mitglied der {political}.",
     "Der Mitarbeiter {person} bezeichnet sich in der Sitzung als {opinion}.",
     "Der interne Bericht beschreibt {person} als {race}.",
+    "Der Mitarbeiter {person} bezeichnet sich als {philosophy}.",
+    "Die Krankenakte von {person} nennt {sexlife} im Jahr 2023.",
 ]
 
 MIXED_TEMPLATES = [
