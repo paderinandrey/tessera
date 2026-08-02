@@ -1,4 +1,5 @@
-# Tier 2 NER types (REQ-4). Labels are the zero-shot prompts handed to the model;
+# NER types: tier 2 quasi-identifiers (REQ-4) and tier 3 Article 9 special
+# categories (REQ-3). Labels are the zero-shot prompts handed to the model;
 # specificity stays below every catalog identifier (40-90) so a checksum-backed
 # identifier wins a partial overlap with a model guess.
 entities:
@@ -19,3 +20,80 @@ entities:
     threshold: 0.75
     tier: 2
     specificity: 10
+
+  # GDPR Article 9 special categories (REQ-3). These have no format, only
+  # meaning, so the NER layer is the only thing that can find them — and the
+  # sanctions behind them make a miss far worse than a false positive. Hence
+  # tier 3 of their own and a threshold well below the quasi-identifiers'.
+  # Specificity 35 puts them above PERSON/LOCATION/ORG and below every
+  # checksum-backed identifier.
+  - entity_type: HEALTH
+    label: medical condition
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: BIOMETRIC
+    label: biometric data
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: GENETIC
+    label: genetic data
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: ETHNICITY
+    label: ethnic origin
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: POLITICAL_AFFILIATION
+    label: political party
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  # Article 9 protects political opinions, not only party membership: a stated
+  # view that names no party needs a label of its own to have any chance.
+  - entity_type: POLITICAL_OPINION
+    label: political opinion
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: RELIGION
+    label: religion
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: TRADE_UNION
+    label: trade union
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: SEXUAL_ORIENTATION
+    label: sexual orientation
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  # Article 9 names religious *or philosophical* beliefs, and sex life *or*
+  # sexual orientation. Each pair is two clauses in the regulation, so each
+  # gets its own label rather than being folded into its neighbour.
+  - entity_type: PHILOSOPHICAL_BELIEF
+    label: philosophical belief
+    threshold: 0.30
+    tier: 3
+    specificity: 35
+
+  - entity_type: SEX_LIFE
+    label: sex life
+    threshold: 0.30
+    tier: 3
+    specificity: 35

@@ -25,6 +25,96 @@ from stdnum.fr import nir as fr_nir
 SEED = 20260801
 OUTPUT = Path(__file__).parent / "corpus" / "public.jsonl"
 
+# GDPR Article 9 categories (REQ-3). Values are ordinary vocabulary, not real
+# people's data; the corpus never leaves synthetic ground. Values are keyed by
+# language: a French HR note saying "ver.di-Mitglied" is not code-switching,
+# it is nonsense, and a model judged on nonsense tells you nothing.
+ARTICLE_9_SLOTS = {
+    "health": (
+        "HEALTH",
+        {
+            "fr": ["un cancer du sein", "une sclérose en plaques", "un diabète de type 2"],
+            "de": ["Diabetes", "eine Hepatitis-B-Infektion", "Bluthochdruck"],
+        },
+    ),
+    "biometric": (
+        "BIOMETRIC",
+        {
+            "fr": ["empreinte digitale", "reconnaissance faciale"],
+            "de": ["Fingerabdruck", "Gesichtsscan"],
+        },
+    ),
+    "genetic": (
+        "GENETIC",
+        {
+            "fr": ["test génétique", "séquençage ADN"],
+            "de": ["DNA-Analyse", "Erbgutuntersuchung"],
+        },
+    ),
+    "ethnicity": (
+        "ETHNICITY",
+        {
+            "fr": ["maghrébine", "sénégalaise"],
+            "de": ["kurdischer Herkunft", "türkischer Herkunft"],
+        },
+    ),
+    # Article 9 says "racial or ethnic origin". Race statements need their own
+    # phrasing — "d'origine noir de peau" is not French — but they are the same
+    # legal category, so they carry the same entity type. Measured against the
+    # weights, a dedicated "race" label lowers every score and loses cases; the
+    # "ethnic origin" prompt already covers both halves.
+    "race": (
+        "ETHNICITY",
+        {
+            "fr": ["métisse", "noir de peau"],
+            "de": ["schwarz", "asiatischstämmig"],
+        },
+    ),
+    "political": (
+        "POLITICAL_AFFILIATION",
+        {
+            "fr": ["socialiste", "écologiste"],
+            "de": ["Grünen", "CDU"],
+        },
+    ),
+    "opinion": (
+        "POLITICAL_OPINION",
+        {
+            "fr": ["antimilitariste", "eurosceptique", "monarchiste"],
+            "de": ["pazifistisch", "eurokritisch", "monarchistisch"],
+        },
+    ),
+    "religion": (
+        "RELIGION",
+        {
+            "fr": ["musulmane", "protestante"],
+            "de": ["katholisch", "jüdisch"],
+        },
+    ),
+    "union": (
+        "TRADE_UNION",
+        {
+            "fr": ["CGT", "CFDT"],
+            "de": ["IG Metall", "ver.di"],
+        },
+    ),
+    "philosophy": (
+        "PHILOSOPHICAL_BELIEF",
+        {"fr": ["athée", "agnostique"], "de": ["atheistisch", "agnostisch"]},
+    ),
+    "sexlife": (
+        "SEX_LIFE",
+        {
+            "fr": ["un suivi en PMA", "une interruption de grossesse"],
+            "de": ["eine Kinderwunschbehandlung", "ein Schwangerschaftsabbruch"],
+        },
+    ),
+    "orientation": (
+        "SEXUAL_ORIENTATION",
+        {"fr": ["homosexuel", "bisexuelle"], "de": ["homosexuell", "bisexuell"]},
+    ),
+}
+
 FR_TEMPLATES = [
     "Bonjour, le virement pour {person} partira de l'IBAN {iban} avant vendredi.",
     "Le client {person} (NIR {nir}) a demandé la clôture de son dossier.",
@@ -32,6 +122,18 @@ FR_TEMPLATES = [
     "Contact : {email} pour toute question sur le paiement par carte {card}.",
     "Madame {person} habite à {city} ; son numéro AVS est le {avs}.",
     "La société {org} confirme le virement de {person} vers l'IBAN {iban}.",
+    "Le dossier médical de {person} mentionne {health} depuis 2019.",
+    "{person}, de confession {religion}, demande un aménagement d'horaire.",
+    "Le salarié {person} est adhérent de la {union} et conteste la sanction.",
+    "Note RH : {person} est militant {political} et a demandé un congé.",
+    "Le laboratoire a transmis le {genetic} concernant {person}.",
+    "Le dossier de {person}, d'origine {ethnicity}, part au service juridique.",
+    "L'accès au site a été enregistré par {biometric} pour {person}.",
+    "Le dossier de {person} mentionne une orientation {orientation}.",
+    "Le salarié {person} se dit {opinion} lors de la réunion du comité.",
+    "Le rapport interne décrit {person} comme {race}.",
+    "Le dossier de {person}, de conviction {philosophy}, a été archivé.",
+    "Le dossier médical de {person} mentionne {sexlife} en 2023.",
 ]
 
 DE_TEMPLATES = [
@@ -41,6 +143,17 @@ DE_TEMPLATES = [
     "Der Mandant {person} (AVS-Nummer {avs}) wohnt in {city}.",
     "Steuernummer {stnr} des Mandanten {person} liegt der {org} vor.",
     "Die {org} in {city} hat die Rechnung von {person} beglichen.",
+    "Der Mitarbeiter {person} leidet an {health} und ist krankgeschrieben.",
+    "{person} ist Mitglied der {union} und nimmt an der Betriebsversammlung teil.",
+    "Die Personalakte von {person} vermerkt: {religion}, {ethnicity}.",
+    "Für den Zugang wurde ein {biometric} von {person} erfasst.",
+    "Der Antrag von {person} nennt die Angabe {orientation}.",
+    "Das Labor hat die {genetic} von {person} übermittelt.",
+    "Die Personalakte von {person} nennt: Mitglied der {political}.",
+    "Der Mitarbeiter {person} bezeichnet sich in der Sitzung als {opinion}.",
+    "Der interne Bericht beschreibt {person} als {race}.",
+    "Der Mitarbeiter {person} bezeichnet sich als {philosophy}.",
+    "Die Krankenakte von {person} nennt {sexlife} im Jahr 2023.",
 ]
 
 MIXED_TEMPLATES = [
@@ -48,12 +161,20 @@ MIXED_TEMPLATES = [
     "Kunde {person} demande le remboursement — carte {card}, NIR {nir}.",
     "Die Rechnung pour {person} référence la Steuer-ID {idnr} et l'IBAN {iban}.",
     "Der Kunde {person} de la société {org} demande un remboursement — IBAN {iban}.",
+    "Der Mandant {person} ist Mitglied der {union}, le dossier mentionne {health}.",
 ]
 
 CLEAN_TEMPLATES = [
     "La réunion de jeudi validera le budget du prochain trimestre.",
     "Die Lieferung verzögert sich wegen des Feiertags um zwei Werktage.",
     "Merci de confirmer la réception de ce message avant la fin de la semaine.",
+    "Die Lieferung der Medikamente an die Apotheke verzögert sich um zwei Tage.",
+    "Le laboratoire ouvre un nouveau site de production en janvier.",
+    "Die Betriebsversammlung findet am Donnerstag um 14 Uhr statt.",
+    "La convention collective sera renégociée au printemps prochain.",
+    "Das Formular für den Zugang zum Gebäude liegt am Empfang bereit.",
+    "Le service des ressources humaines publiera le calendrier lundi.",
+    "Die Aufzeichnungen der Sitzung werden im Intranet veröffentlicht.",
 ]
 
 
@@ -128,7 +249,8 @@ TYPES = {
 def render(
     template: str, fakers: dict[str, Faker], lang: str, rng: random.Random
 ) -> dict[str, object]:
-    faker = fakers[lang if lang != "mixed" else rng.choice(["fr", "de"])]
+    value_lang = lang if lang != "mixed" else rng.choice(["fr", "de"])
+    faker = fakers[value_lang]
     text, entities = "", []
     for token in _tokenize(template):
         if token.startswith("{"):
@@ -156,6 +278,13 @@ def render(
                     "org": lambda: f"{faker.last_name()} {faker.company_suffix()}",
                 }[name]()
                 entity_type = {"person": "PERSON", "city": "LOCATION", "org": "ORG"}[name]
+                entities.append(
+                    {"entity_type": entity_type, "start": len(text), "end": len(text) + len(value)}
+                )
+                text += value
+            elif name in ARTICLE_9_SLOTS:
+                entity_type, by_language = ARTICLE_9_SLOTS[name]
+                value = rng.choice(by_language[value_lang])
                 entities.append(
                     {"entity_type": entity_type, "start": len(text), "end": len(text) + len(value)}
                 )

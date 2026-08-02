@@ -167,6 +167,20 @@ class GlinerRecognizer:
         )
         self._tokenizer = self._model.data_processor.transformer_tokenizer
         self._token_budget = int(self._model.config.max_len) - PROMPT_TOKEN_RESERVE
+        # One inference pass per tier. GLiNER gives a span a single label, so
+        # tiers competing in one call lose data: "ver.di" is claimed by
+        # `organization` at 0.505 — beating `trade union` at 0.445 — and is then
+        # dropped by ORG's own 0.75 threshold, so an Article 9 mention vanishes
+        # because a quasi-identifier won the argmax and then failed its bar.
+        # Separate passes cost one inference per tier and keep the categories
+        # from bidding against each other.
+        by_tier: dict[int, list[NerType]] = {}
+        for ner_type in self.types:
+            by_tier.setdefault(ner_type.tier, []).append(ner_type)
+        self._passes = [
+            ([t.label for t in group], min(t.threshold for t in group))
+            for _, group in sorted(by_tier.items())
+        ]
 
     def _windows(self, chunk: str) -> list[tuple[int, int]]:
         encoded = self._tokenizer(chunk, return_offsets_mapping=True, add_special_tokens=False)
@@ -176,28 +190,27 @@ class GlinerRecognizer:
     def detect(self, text: str) -> list[Span]:
         if not text:
             return []
-        labels = [t.label for t in self.types]
-        floor = min(t.threshold for t in self.types)
         spans: list[Span] = []
         for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
             for window_start, window_end in self._windows(chunk):
                 piece = chunk[window_start:window_end]
                 base = offset + window_start
-                for entity in self._model.predict_entities(piece, labels, threshold=floor):
-                    ner_type = self._by_label.get(entity["label"])
-                    score = float(entity["score"])
-                    if ner_type is None or score < ner_type.threshold:
-                        continue
-                    spans.append(
-                        Span(
-                            entity_type=ner_type.entity_type,
-                            start=base + int(entity["start"]),
-                            end=base + int(entity["end"]),
-                            confidence=min(score, 0.99),
-                            recognizer="ner:gliner",
-                            tier=ner_type.tier,
+                for labels, floor in self._passes:
+                    for entity in self._model.predict_entities(piece, labels, threshold=floor):
+                        ner_type = self._by_label.get(entity["label"])
+                        score = float(entity["score"])
+                        if ner_type is None or score < ner_type.threshold:
+                            continue
+                        spans.append(
+                            Span(
+                                entity_type=ner_type.entity_type,
+                                start=base + int(entity["start"]),
+                                end=base + int(entity["end"]),
+                                confidence=min(score, 0.99),
+                                recognizer="ner:gliner",
+                                tier=ner_type.tier,
+                            )
                         )
-                    )
         return spans
 
 

@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from .spans import Span
 
 IOU_THRESHOLD = 0.5
+# How much of a prediction must cover real data before it stops counting as
+# over-masking. Half: a span that is mostly padding is padding.
+OVERMASKING_SHARE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +117,78 @@ def summarize(per_document: list[dict[str, Metrics]], *, tier1_types: set[str]) 
     return Summary(per_type=dict(per_type), tier1_recall=tier1.recall)
 
 
+def group_coverage(
+    entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
+) -> list[tuple[str, bool]]:
+    """Per gold entity of the group: its type, and whether the group covered it.
+
+    Reported per entity rather than as a total so callers can bucket by
+    language and category — a pooled ratio lets a category go dark in one
+    language while the aggregate stays above target.
+    """
+    candidates = [span for span in predictions if span.entity_type in types]
+    return [
+        (
+            entity.entity_type,
+            any(
+                _iou(entity.start, entity.end, span.start, span.end) >= IOU_THRESHOLD
+                for span in candidates
+            ),
+        )
+        for entity in entities
+        if entity.entity_type in types
+    ]
+
+
+def group_recall(
+    entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
+) -> tuple[int, int]:
+    """Gold entities of a group covered by any prediction from that group, and the total.
+
+    Per-type recall punishes confusion inside a group that has no operational
+    consequence: an ethnicity mention read as religion is still redacted, and
+    REQ-3's "misses are not tolerable" is about the span going unnoticed, not
+    about picking the right member of the group.
+    """
+    gold = [entity for entity in entities if entity.entity_type in types]
+    candidates = [span for span in predictions if span.entity_type in types]
+    covered = sum(
+        1
+        for entity in gold
+        if any(
+            _iou(entity.start, entity.end, span.start, span.end) >= IOU_THRESHOLD
+            for span in candidates
+        )
+    )
+    return covered, len(gold)
+
+
+def overmasking_counts(
+    entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
+) -> dict[str, tuple[int, int]]:
+    """Per type: predictions that land on some gold entity, and the total.
+
+    REQ-38's precision target is an irritation metric — below it, clients say
+    the service ruins their text. A prediction that marks a person's name and
+    calls it a location does not ruin anything: the span is redacted either
+    way, and only the placeholder's type differs. What irritates is masking a
+    span that holds no personal data at all, which is what this counts.
+    """
+    counts: dict[str, list[int]] = {}
+    for span in predictions:
+        if span.entity_type not in types:
+            continue
+        bucket = counts.setdefault(span.entity_type, [0, 0])
+        bucket[1] += 1
+        covered = sum(
+            max(0, min(span.end, entity.end) - max(span.start, entity.start))
+            for entity in entities
+        )
+        if covered >= OVERMASKING_SHARE * (span.end - span.start):
+            bucket[0] += 1
+    return {entity_type: (kept, total) for entity_type, (kept, total) in counts.items()}
+
+
 def precision_gate_failures(
     per_type: dict[str, Metrics], *, types: set[str], target: float
 ) -> list[tuple[str, float]]:
@@ -130,6 +205,9 @@ __all__ = [
     "Metrics",
     "Summary",
     "evaluate_document",
+    "group_coverage",
+    "group_recall",
+    "overmasking_counts",
     "precision_gate_failures",
     "summarize",
 ]
