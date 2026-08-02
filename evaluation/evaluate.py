@@ -9,16 +9,16 @@ import json
 import sys
 from pathlib import Path
 
-from tessera_detector.deterministic import DeterministicDetector
 from tessera_detector.evaluation import EvalEntity, evaluate_document, summarize
+from tessera_detector.pipeline import Detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TIER1_TARGET = 0.99
 
 
 def main() -> int:
-    detector = DeterministicDetector()
-    tier1_types = {rule.entity_type for rule in detector.rules if rule.tier == 1}
+    detector = Detector()
+    tier1_types = {rule.entity_type for rule in detector.deterministic.rules if rule.tier == 1}
     per_document = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
         document = json.loads(line)

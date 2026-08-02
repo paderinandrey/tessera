@@ -1,9 +1,9 @@
-from tessera_detector.deterministic import DeterministicDetector
+from tessera_detector.pipeline import Detector
 from tessera_detector.spans import Span
 
 
 def detect(text: str) -> list[Span]:
-    return DeterministicDetector().detect(text)
+    return Detector().detect(text)
 
 
 def test_steuernummer_with_trigger_detected_and_boosted() -> None:
@@ -95,7 +95,7 @@ identifiers:
       triggers: ["marker"]
     pattern: 'xx+'
 """
-    (span,) = DeterministicDetector(catalog).detect("marker xx")
+    (span,) = Detector(catalog).detect("marker xx")
     assert span.confidence == 0.8
 
 
@@ -122,7 +122,7 @@ identifiers:
       triggers: ["marker"]
     pattern: 'xx+'
 """
-    (span,) = DeterministicDetector(catalog).detect("marker xx")
+    (span,) = Detector(catalog).detect("marker xx")
     assert span.confidence == 0.995
 
 

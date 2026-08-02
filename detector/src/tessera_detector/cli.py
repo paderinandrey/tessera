@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .deterministic import DeterministicDetector
+from .pipeline import Detector
 from .resolution import resolve
 
 MASK_MIN_LENGTH = 8
@@ -54,7 +54,7 @@ def _display_path(path: Path) -> str:
     return str(path).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
-def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
+def scan(path: Path, detector: Detector) -> ScanReport:
     report = ScanReport(files=[], skipped=[])
     if path.is_file():
         # PATH itself must be readable: let the OSError reach main() -> exit 2.
@@ -180,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tessera: {args.path}: no such file or directory", file=sys.stderr)
         return 2
     try:
-        report = scan(args.path, DeterministicDetector())
+        report = scan(args.path, Detector())
     except OSError as error:
         print(f"tessera: {args.path}: {error.strerror or error}", file=sys.stderr)
         return 2
