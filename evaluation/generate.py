@@ -98,6 +98,8 @@ FR_TEMPLATES = [
     "Note RH : {person} est militant {political} et a demandé un congé.",
     "Le laboratoire a transmis le {genetic} concernant {person}.",
     "Le dossier de {person}, d'origine {ethnicity}, part au service juridique.",
+    "L'accès au site a été enregistré par {biometric} pour {person}.",
+    "Le dossier de {person} mentionne une orientation {orientation}.",
 ]
 
 DE_TEMPLATES = [
@@ -112,6 +114,8 @@ DE_TEMPLATES = [
     "Die Personalakte von {person} vermerkt: {religion}, {ethnicity}.",
     "Für den Zugang wurde ein {biometric} von {person} erfasst.",
     "Der Antrag von {person} nennt die Angabe {orientation}.",
+    "Das Labor hat die {genetic} von {person} übermittelt.",
+    "Die Personalakte von {person} nennt: Mitglied der {political}.",
 ]
 
 MIXED_TEMPLATES = [

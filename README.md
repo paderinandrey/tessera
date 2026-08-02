@@ -89,25 +89,25 @@ Current results on the public corpus, with the NER weights installed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| LOCATION | 0.857 | 1.000 | 0.923 |
-| ORG | 0.444 | 0.750 | 0.558 |
-| PERSON | 0.741 | 0.581 | 0.652 |
+| LOCATION | 0.833 | 1.000 | 0.909 |
+| ORG | 0.346 | 0.692 | 0.462 |
+| PERSON | 0.770 | 0.627 | 0.691 |
 
 Article 9 special categories, detected by the same layer at a lower threshold:
 
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
 | BIOMETRIC | 1.000 | 1.000 | 1.000 |
-| ETHNICITY | 1.000 | 0.250 | 0.400 |
+| ETHNICITY | 1.000 | 0.500 | 0.667 |
 | GENETIC | 1.000 | 1.000 | 1.000 |
-| HEALTH | 0.750 | 1.000 | 0.857 |
-| POLITICAL_OPINION | 0.667 | 1.000 | 0.800 |
-| RELIGION | 0.571 | 1.000 | 0.727 |
+| HEALTH | 0.800 | 1.000 | 0.889 |
+| POLITICAL_OPINION | 1.000 | 1.000 | 1.000 |
+| RELIGION | 0.667 | 1.000 | 0.800 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
-| TRADE_UNION | 0.600 | 1.000 | 0.750 |
+| TRADE_UNION | 0.571 | 1.000 | 0.727 |
 
-**Article 9 coverage: 1.000** — every special-category mention in the corpus is caught by
-at least one of the eight labels.
+**Article 9 coverage: 1.000 (40/40)** — every special-category mention in the corpus is
+caught by at least one of the eight labels, in both languages.
 
 > Perfect scores on the catalog types mean the deterministic layer covers its own
 > catalog, nothing more: those corpus entries are checksum-valid identifiers with clean
@@ -130,7 +130,7 @@ at least one of the eight labels.
 > (≥ 0.99) and the LOCATION precision gate (≥ 0.8), while ORG precision is reported
 > and warned about rather than enforced — a number that good on this corpus is not
 > evidence about real prose. PERSON precision is the honest weak spot and is not yet
-> gated. ORG precision fell from 0.950 to 0.444 when this corpus gained entity-free
+> gated. ORG precision fell from 0.950 to 0.346 when this corpus gained entity-free
 > business prose: the model finds organizations in "die Apotheke" and "convention
 > collective" that the gold does not enumerate. That is the negative examples doing their
 > job — the earlier number was measured on a corpus with almost nothing to get wrong.

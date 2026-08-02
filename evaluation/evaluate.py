@@ -87,17 +87,21 @@ def main(argv: list[str] | None = None) -> int:
 
     _rows(sorted(t for t in summary.per_type if t not in ARTICLE_9_TYPES))
     article_9_present = sorted(t for t in summary.per_type if t in ARTICLE_9_TYPES)
-    if article_9_present:
+    if article_9_present and detector.ner_available:
         print("\nArticle 9 special categories")
         _rows(article_9_present)
+    elif article_9_present:
+        # Without the model these rows are all-zero gold false negatives, which
+        # reads as "evaluated and found nothing" rather than "never ran".
+        print("\nArticle 9 special categories: not evaluated (NER layer off)")
     print(f"\nTier 1 recall: {summary.tier1_recall:.4f} (target >= {TIER1_TARGET})")
     if summary.tier1_recall < TIER1_TARGET:
         print("FAIL: Tier 1 recall below target", file=sys.stderr)
         return 1
     if not detector.ner_available:
         print(
-            f"NER layer off ({detector.ner_off_reason}): "
-            "the LOCATION precision gate is skipped."
+            f"NER layer off ({detector.ner_off_reason}): the LOCATION precision "
+            "and Article 9 coverage gates are skipped."
         )
         return 0
     article_9_recall = article_9_covered / article_9_total if article_9_total else 0.0

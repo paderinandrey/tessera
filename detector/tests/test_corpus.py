@@ -2,6 +2,8 @@ import json
 from itertools import pairwise
 from pathlib import Path
 
+import pytest
+
 CORPUS = Path(__file__).resolve().parents[2] / "evaluation" / "corpus" / "public.jsonl"
 
 
@@ -46,6 +48,20 @@ def test_corpus_covers_every_article_9_category() -> None:
     found = {e["entity_type"] for doc in _documents() for e in doc["entities"]}
     missing = ARTICLE_9 - found
     assert not missing, f"no gold annotation for {sorted(missing)}"
+
+
+@pytest.mark.parametrize("language", ["fr", "de"])
+def test_corpus_covers_every_article_9_category_in_each_language(language: str) -> None:
+    # A category present in only one language hides a language-specific
+    # regression from the coverage gate, which sums across the whole corpus.
+    found = {
+        e["entity_type"]
+        for doc in _documents()
+        if doc["lang"] == language
+        for e in doc["entities"]
+    }
+    missing = ARTICLE_9 - found
+    assert not missing, f"{language} corpus has no gold for {sorted(missing)}"
 
 
 def test_corpus_keeps_entity_free_documents() -> None:
