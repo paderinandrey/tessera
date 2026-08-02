@@ -140,6 +140,7 @@ def test_render_json_shape_and_masking() -> None:
         "files_skipped": 0,
         "files_unreadable": 0,
         "ner": False,
+        "ner_off_reason": "no weights",
         "total_findings": 2,
         "by_type": {"FR_NIR": 1, "IBAN": 1},
     }
@@ -388,3 +389,41 @@ def test_full_report_over_directory(
         "Skipped: 1 (not valid UTF-8)\n"
         "NER layer: off (no weights; run `make model`)\n"
     )
+
+
+def test_report_distinguishes_disabled_from_missing_weights(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --no-ner is a choice, not a missing install: telling the user to download
+    # weights they may already have makes the report's provenance misleading.
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--no-ner"]) == 0
+    out = capsys.readouterr().out
+    assert "NER layer: off (disabled with --no-ner)" in out
+    assert "make model" not in out
+
+
+def test_json_reports_why_the_layer_is_off(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--no-ner", "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["ner"] is False
+    assert summary["ner_off_reason"] == "disabled"
+
+
+def test_json_reports_missing_weights_as_the_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["ner"] is False
+    assert summary["ner_off_reason"] == "no weights"

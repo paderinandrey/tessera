@@ -47,6 +47,10 @@ class ScanReport:
     skipped: list[str]
     unreadable: list[str] = field(default_factory=list)
     ner_available: bool = False
+    # Why the layer did not run. "disabled" is a choice the caller made;
+    # "no weights" is an install the caller can fix. Telling someone to
+    # download weights they already have misreads the scan's provenance.
+    ner_off_reason: str = "no weights"
 
 
 def _display_path(path: Path) -> str:
@@ -55,8 +59,13 @@ def _display_path(path: Path) -> str:
     return str(path).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
-def scan(path: Path, detector: Detector) -> ScanReport:
-    report = ScanReport(files=[], skipped=[], ner_available=detector.ner_available)
+def scan(path: Path, detector: Detector, *, ner_off_reason: str = "no weights") -> ScanReport:
+    report = ScanReport(
+        files=[],
+        skipped=[],
+        ner_available=detector.ner_available,
+        ner_off_reason=ner_off_reason,
+    )
     if path.is_file():
         # PATH itself must be readable: let the OSError reach main() -> exit 2.
         path.open("rb").close()
@@ -136,7 +145,12 @@ def render_text(report: ScanReport, *, show_values: bool = False) -> str:
     if report.unreadable:
         lines.append(f"Unreadable: {len(report.unreadable)}")
     if not report.ner_available:
-        lines.append("NER layer: off (no weights; run `make model`)")
+        detail = (
+            "disabled with --no-ner"
+            if report.ner_off_reason == "disabled"
+            else "no weights; run `make model`"
+        )
+        lines.append(f"NER layer: off ({detail})")
     return "\n".join(lines)
 
 
@@ -165,6 +179,7 @@ def render_json(report: ScanReport, *, show_values: bool = False) -> str:
             "files_skipped": len(report.skipped),
             "files_unreadable": len(report.unreadable),
             "ner": report.ner_available,
+            "ner_off_reason": None if report.ner_available else report.ner_off_reason,
             "total_findings": sum(len(file.findings) for file in report.files),
             "by_type": dict(_type_counts(report)),
         },
@@ -197,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tessera: {error}", file=sys.stderr)
         return 2
     try:
-        report = scan(args.path, detector)
+        report = scan(
+            args.path, detector, ner_off_reason="disabled" if args.no_ner else "no weights"
+        )
     except OSError as error:
         print(f"tessera: {args.path}: {error.strerror or error}", file=sys.stderr)
         return 2
