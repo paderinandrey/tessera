@@ -41,6 +41,8 @@ class DetectRequest(BaseModel):
             return self
         if not self.layers:
             raise ValueError("layers must not be empty; omit the field to run every layer")
+        if len(set(self.layers)) != len(self.layers):
+            raise ValueError("layers must not contain duplicates")
         if "deterministic" not in self.layers:
             raise ValueError(
                 "layers must include 'deterministic': the pipeline resolves NER spans "
@@ -85,6 +87,13 @@ def create_app(detector: Detector | None = None) -> FastAPI:
         version="0.1.0",
         summary="PII detection over text, in original coordinates",
         lifespan=lifespan,
+        # Two endpoints and a committed schema file are the whole contract.
+        # The interactive docs and the served schema are surface nobody asked
+        # for on a service that sees personal data; `make openapi` is how the
+        # document is published.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     @app.exception_handler(RequestValidationError)

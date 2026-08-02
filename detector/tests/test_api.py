@@ -224,3 +224,18 @@ def test_the_schema_describes_the_unavailable_layer_response() -> None:
     ]
     assert "503" in responses
     assert "application/json" in responses["503"]["content"]
+
+
+def test_duplicate_layers_are_rejected() -> None:
+    response = client(FakeDetector()).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic", "deterministic"]}
+    )
+    assert response.status_code == 422
+    assert "duplicate" in response.text.lower()
+
+
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+def test_no_undeclared_routes_are_served(path: str) -> None:
+    # The contract is two endpoints and a committed schema file. A docs UI on a
+    # service that sees personal data is surface nobody asked for.
+    assert client(FakeDetector()).get(path).status_code == 404
