@@ -31,6 +31,7 @@ FR_TEMPLATES = [
     "Numéro fiscal {nif} — merci de vérifier l'avis d'imposition de {person}.",
     "Contact : {email} pour toute question sur le paiement par carte {card}.",
     "Madame {person} habite à {city} ; son numéro AVS est le {avs}.",
+    "La société {org} confirme le virement de {person} vers l'IBAN {iban}.",
 ]
 
 DE_TEMPLATES = [
@@ -39,12 +40,14 @@ DE_TEMPLATES = [
     "Bitte senden Sie die Unterlagen an {email}; die Karte {card} wurde gesperrt.",
     "Der Mandant {person} (AVS-Nummer {avs}) wohnt in {city}.",
     "Steuernummer {stnr} des Mandanten {person} liegt dem Finanzamt vor.",
+    "Die {org} in {city} hat die Rechnung von {person} beglichen.",
 ]
 
 MIXED_TEMPLATES = [
     "Le paiement erfolgt bis Freitag: IBAN {iban}, Ansprechpartner {person} ({email}).",
     "Kunde {person} demande le remboursement — carte {card}, NIR {nir}.",
     "Die Rechnung pour {person} référence la Steuer-ID {idnr} et l'IBAN {iban}.",
+    "Der Kunde {person} de la société {org} demande un remboursement — IBAN {iban}.",
 ]
 
 CLEAN_TEMPLATES = [
@@ -143,10 +146,17 @@ def render(
                     {"entity_type": "EMAIL", "start": len(text), "end": len(text) + len(value)}
                 )
                 text += value
-            elif name == "person":
-                text += faker.last_name()
-            else:
-                text += faker.city()
+            elif name in ("person", "city", "org"):
+                value = {
+                    "person": faker.last_name,
+                    "city": faker.city,
+                    "org": faker.company,
+                }[name]()
+                entity_type = {"person": "PERSON", "city": "LOCATION", "org": "ORG"}[name]
+                entities.append(
+                    {"entity_type": entity_type, "start": len(text), "end": len(text) + len(value)}
+                )
+                text += value
         else:
             text += token
     return {"lang": lang, "text": text, "entities": entities}
