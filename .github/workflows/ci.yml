@@ -63,3 +63,17 @@ jobs:
       # noise and are never asserted. Real numbers come from a known machine
       # and are recorded in the README with its hardware.
       - run: uv run --group ner python ../evaluation/benchmark.py --runs 3 --warmup 1
+
+  gateway:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test

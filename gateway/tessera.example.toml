@@ -1,0 +1,13 @@
+# Tessera gateway configuration. Unknown keys are rejected: a typo in a
+# security control must fail loudly rather than leave a default in place.
+
+bind = "127.0.0.1:8080"
+detector_url = "http://127.0.0.1:8000"
+
+# Generous on purpose. Full detection costs about a second per 1 200 characters
+# and a conversation history is longer than that; exceeding this refuses the
+# request rather than forwarding unmasked text.
+detector_timeout_secs = 30
+
+openai_base = "https://api.openai.com"
+anthropic_base = "https://api.anthropic.com"
