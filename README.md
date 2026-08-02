@@ -94,12 +94,14 @@ It accepts the OpenAI shape at `/v1/chat/completions` and the Anthropic shape at
 `/v1/messages`, including Anthropic's separate `system` field and both providers'
 content-part arrays. Detected spans become typed placeholders — `[PERSON_1]`, `[IBAN_2]` —
 and an identical value always gets the same placeholder within a request, because two
-placeholders for one person would tell the model there were two. The response is restored
-before it reaches the client.
+placeholders for one person would tell the model there were two. Identifiers outside the
+message content are masked too — OpenAI's `user` and per-message `name`, Anthropic's
+`metadata.user_id`. The response is restored before it reaches the client, and an upstream
+error keeps its own status and body so a rate limit still reads as a rate limit.
 
 **Every failure refuses the request.** A detector that errors or exceeds its timeout, a
-body whose shape the gateway does not recognize, and a placeholder in the response that no
-mapping knows all end the request. Nothing unmasked is forwarded, and no placeholder is
+body whose shape the gateway does not recognize, a span the detector reports that cannot be
+applied, and a placeholder in the response that no mapping knows all end the request. Nothing unmasked is forwarded, and no placeholder is
 ever handed to the client in place of a value. No error body or log line carries the
 submitted text.
 

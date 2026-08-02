@@ -80,11 +80,11 @@ async fn handle(
     for pointer in &pointers {
         let text = read_pointer(&body, pointer)?;
         let spans = state.detector.detect(&text).await?;
-        write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans))?;
+        write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
     }
 
     // Only what is masked leaves the process.
-    let upstream: Value = state
+    let response = state
         .upstream
         .post(format!(
             "{}{}",
@@ -94,10 +94,22 @@ async fn handle(
         .json(&masked)
         .send()
         .await
-        .map_err(|error| ProxyError::Upstream(error.to_string()))?
+        .map_err(|error| ProxyError::Upstream(error.to_string()))?;
+
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .map_err(|error| ProxyError::Upstream(error.to_string()))?;
+    let upstream: Value = response
         .json()
         .await
         .map_err(|error| ProxyError::Upstream(error.to_string()))?;
+
+    if !status.is_success() {
+        // The provider's status and error envelope carry retry semantics the
+        // client needs; turning a 429 into a generic 502 loses them. The body
+        // may still echo what we sent, so it is restored before it goes back.
+        let restored = restore_everywhere(&upstream, &mapping)?;
+        return Ok((status, Json(restored)).into_response());
+    }
 
     // Restore, and refuse rather than hand a placeholder to the client.
     let mut restored = upstream.clone();
@@ -106,6 +118,27 @@ async fn handle(
         write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
     }
     Ok(Json(restored).into_response())
+}
+
+/// Restore every string in a value. Used for upstream error envelopes, whose
+/// shape is the provider's business but which may quote the masked text back.
+fn restore_everywhere(value: &Value, mapping: &Mapping) -> Result<Value, MappingError> {
+    Ok(match value {
+        Value::String(text) => Value::String(mapping.restore(text)?),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| restore_everywhere(item, mapping))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, item)| Ok((key.clone(), restore_everywhere(item, mapping)?)))
+                .collect::<Result<serde_json::Map<_, _>, MappingError>>()?,
+        ),
+        other => other.clone(),
+    })
 }
 
 async fn openai(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
@@ -331,6 +364,103 @@ mod tests {
             "the error body echoed the text: {body}"
         );
         assert!(!body.contains("CH9300762011623852957"));
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_keeps_its_status_and_body() {
+        // A 429 turned into a generic 502 loses the retry semantics the client
+        // needs to behave well.
+        let detector = detector_returning(json!([])).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(
+                json!({"error": {"type": "rate_limit_error", "message": "slow down"}}),
+            ))
+            .mount(&upstream)
+            .await;
+
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body.contains("rate_limit_error"),
+            "the envelope was lost: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_still_gets_its_placeholders_restored() {
+        // Providers quote the offending request back; that quote is masked.
+        let detector = detector_returning(person_span()).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"error": {"message": "bad request near [PERSON_1]"}})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("near Weber"), "not restored: {body}");
+    }
+
+    #[tokio::test]
+    async fn identifier_fields_outside_content_are_masked() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "user": "Weber",
+                   "messages": [{"role": "user", "name": "Weber", "content": "Weber fragt"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(!sent.contains(SECRET), "an identifier field leaked: {sent}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_span_refuses_the_request() {
+        // A detector contract bug must not become raw egress.
+        let detector = detector_returning(
+            json!([{"entity_type": "PERSON", "start": 0, "end": 999, "confidence": 1.0,
+                    "recognizer": "ner:fake", "tier": 2, "boosted": false}]),
+        )
+        .await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

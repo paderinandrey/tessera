@@ -51,7 +51,17 @@ impl Provider for OpenAi {
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
         let mut pointers = Vec::new();
+        // Personal data does not only live in `content`. OpenAI's optional
+        // per-message `name` and top-level `user` are identifiers, and
+        // forwarding them verbatim would leak exactly what the proxy exists to
+        // stop.
+        if body.get("user").and_then(Value::as_str).is_some() {
+            pointers.push("/user".to_owned());
+        }
         for (index, message) in messages.iter().enumerate() {
+            if message.get("name").and_then(Value::as_str).is_some() {
+                pointers.push(format!("/messages/{index}/name"));
+            }
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
@@ -97,6 +107,14 @@ impl Provider for Anthropic {
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
         let mut pointers = Vec::new();
+        // Anthropic carries a caller-supplied identifier here.
+        if body
+            .pointer("/metadata/user_id")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            pointers.push("/metadata/user_id".to_owned());
+        }
         if let Some(system) = body.get("system") {
             content_pointers("/system", system, &mut pointers);
         }
@@ -165,6 +183,30 @@ mod tests {
         assert_eq!(
             OpenAi.request_pointers(&body).unwrap(),
             vec!["/messages/0/content/0/text"]
+        );
+    }
+
+    #[test]
+    fn openai_masks_identifier_fields_outside_content() {
+        let body = json!({
+            "user": "weber@example.ch",
+            "messages": [{"role": "user", "name": "Weber", "content": "Hallo"}]
+        });
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec!["/user", "/messages/0/name", "/messages/0/content"]
+        );
+    }
+
+    #[test]
+    fn anthropic_masks_the_metadata_user_id() {
+        let body = json!({
+            "metadata": {"user_id": "weber-1"},
+            "messages": [{"role": "user", "content": "Hallo"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec!["/metadata/user_id", "/messages/0/content"]
         );
     }
 

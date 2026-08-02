@@ -14,6 +14,11 @@ pub struct Span {
 pub enum MappingError {
     #[error("no mapping for placeholder {0}; the request is refused rather than served with it")]
     Unknown(String),
+    #[error(
+        "detector reported an unusable span ({0}); the request is refused rather than \
+             forwarded with the value still in it"
+    )]
+    BadSpan(&'static str),
 }
 
 #[derive(Debug, Default)]
@@ -28,7 +33,7 @@ impl Mapping {
         Self::default()
     }
 
-    pub fn mask(&mut self, text: &str, spans: &[Span]) -> String {
+    pub fn mask(&mut self, text: &str, spans: &[Span]) -> Result<String, MappingError> {
         // Character indices, because that is what the detector reports.
         let chars: Vec<char> = text.chars().collect();
         let mut ordered: Vec<&Span> = spans.iter().collect();
@@ -37,10 +42,17 @@ impl Mapping {
         let mut result = String::with_capacity(text.len());
         let mut cursor = 0usize;
         for span in ordered {
-            if span.start < cursor || span.end > chars.len() || span.start >= span.end {
-                // Overlapping or out-of-range spans are the detector's job to
-                // resolve; skipping is safer than producing torn text.
-                continue;
+            // A span we cannot apply means the value stays in the text, and the
+            // text is about to leave the process. Refuse instead: skipping here
+            // would turn a detector contract bug into raw egress.
+            if span.start >= span.end {
+                return Err(MappingError::BadSpan("empty or inverted"));
+            }
+            if span.end > chars.len() {
+                return Err(MappingError::BadSpan("past the end of the text"));
+            }
+            if span.start < cursor {
+                return Err(MappingError::BadSpan("overlapping"));
             }
             result.extend(&chars[cursor..span.start]);
             let value: String = chars[span.start..span.end].iter().collect();
@@ -48,7 +60,7 @@ impl Mapping {
             cursor = span.end;
         }
         result.extend(&chars[cursor..]);
-        result
+        Ok(result)
     }
 
     fn placeholder_for(&mut self, entity_type: &str, value: String) -> String {
@@ -79,10 +91,14 @@ impl Mapping {
                     .get(candidate)
                     .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
                 result.push_str(value);
+                rest = &from_open[close + 1..];
             } else {
-                result.push_str(candidate);
+                // Not a placeholder: consume only this bracket and keep looking.
+                // Swallowing the whole candidate would step over a real
+                // placeholder nested inside it, as in "[see [PERSON_1]]".
+                result.push('[');
+                rest = &from_open[1..];
             }
-            rest = &from_open[close + 1..];
         }
         result.push_str(rest);
         Ok(result)
@@ -118,7 +134,9 @@ mod tests {
     #[test]
     fn masking_replaces_a_span_with_a_typed_placeholder() {
         let mut mapping = Mapping::new();
-        let masked = mapping.mask("Herr Weber schreibt", &[span("PERSON", 5, 10)]);
+        let masked = mapping
+            .mask("Herr Weber schreibt", &[span("PERSON", 5, 10)])
+            .unwrap();
         assert_eq!(masked, "Herr [PERSON_1] schreibt");
     }
 
@@ -126,10 +144,12 @@ mod tests {
     fn later_spans_do_not_shift_earlier_ones() {
         // Replacing left to right would invalidate every offset after the first.
         let mut mapping = Mapping::new();
-        let masked = mapping.mask(
-            "Weber und Schmidt",
-            &[span("PERSON", 0, 5), span("PERSON", 10, 17)],
-        );
+        let masked = mapping
+            .mask(
+                "Weber und Schmidt",
+                &[span("PERSON", 0, 5), span("PERSON", 10, 17)],
+            )
+            .unwrap();
         assert_eq!(masked, "[PERSON_1] und [PERSON_2]");
     }
 
@@ -137,10 +157,12 @@ mod tests {
     fn the_same_value_keeps_the_same_placeholder() {
         // Two placeholders for one person would tell the model there are two.
         let mut mapping = Mapping::new();
-        let masked = mapping.mask(
-            "Weber schrieb an Weber",
-            &[span("PERSON", 0, 5), span("PERSON", 17, 22)],
-        );
+        let masked = mapping
+            .mask(
+                "Weber schrieb an Weber",
+                &[span("PERSON", 0, 5), span("PERSON", 17, 22)],
+            )
+            .unwrap();
         assert_eq!(masked, "[PERSON_1] schrieb an [PERSON_1]");
     }
 
@@ -148,15 +170,15 @@ mod tests {
     fn numbering_continues_across_calls() {
         // One request carries several texts; they share a mapping.
         let mut mapping = Mapping::new();
-        mapping.mask("Weber", &[span("PERSON", 0, 5)]);
-        let second = mapping.mask("Schmidt", &[span("PERSON", 0, 7)]);
+        mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        let second = mapping.mask("Schmidt", &[span("PERSON", 0, 7)]).unwrap();
         assert_eq!(second, "[PERSON_2]");
     }
 
     #[test]
     fn restoring_puts_the_values_back() {
         let mut mapping = Mapping::new();
-        mapping.mask("Weber", &[span("PERSON", 0, 5)]);
+        mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
         assert_eq!(
             mapping.restore("Hallo [PERSON_1]!").unwrap(),
             "Hallo Weber!"
@@ -189,10 +211,41 @@ mod tests {
     }
 
     #[test]
+    fn a_span_past_the_end_refuses_rather_than_leaking() {
+        // A detector contract bug must not become raw egress.
+        let mut mapping = Mapping::new();
+        assert!(mapping.mask("Weber", &[span("PERSON", 0, 99)]).is_err());
+    }
+
+    #[test]
+    fn an_overlapping_span_refuses() {
+        let mut mapping = Mapping::new();
+        let spans = [span("PERSON", 0, 5), span("IBAN", 3, 8)];
+        assert!(mapping.mask("Weber schreibt", &spans).is_err());
+    }
+
+    #[test]
+    fn an_inverted_span_refuses() {
+        let mut mapping = Mapping::new();
+        assert!(mapping.mask("Weber", &[span("PERSON", 4, 2)]).is_err());
+    }
+
+    #[test]
+    fn a_placeholder_nested_after_another_bracket_is_restored() {
+        // "[see [PERSON_1]]": pairing every '[' with the next ']' would step
+        // straight over the real placeholder.
+        let mut mapping = Mapping::new();
+        mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        assert_eq!(mapping.restore("[see [PERSON_1]]").unwrap(), "[see Weber]");
+    }
+
+    #[test]
     fn masking_is_offset_correct_on_multibyte_text() {
         // The detector counts characters; Rust slices bytes.
         let mut mapping = Mapping::new();
-        let masked = mapping.mask("Grüße an Weber", &[span("PERSON", 9, 14)]);
+        let masked = mapping
+            .mask("Grüße an Weber", &[span("PERSON", 9, 14)])
+            .unwrap();
         assert_eq!(masked, "Grüße an [PERSON_1]");
     }
 }
