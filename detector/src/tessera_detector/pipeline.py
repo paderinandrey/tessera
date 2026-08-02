@@ -56,9 +56,9 @@ def build_detector(
                 f"(looked in {model_cache_dir()})"
             )
         return Detector(catalog_text=catalog_text)
-    # GlinerRecognizer lands in Task 5; this path only runs once weights exist,
-    # which none of this task's tests arrange.
-    from .ner import GlinerRecognizer  # type: ignore[attr-defined]
+    # Imported lazily: this path only runs once weights exist, and the ner
+    # dependency group (gliner) need not be installed until it does.
+    from .ner import GlinerRecognizer
 
     return Detector(catalog_text=catalog_text, recognizer=GlinerRecognizer(path))
 

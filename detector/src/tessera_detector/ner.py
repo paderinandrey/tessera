@@ -4,10 +4,14 @@ Types are data: entity type, the label handed to the model, its threshold, tier 
 specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import resources
+from pathlib import Path
 
 import yaml
+
+from .spans import Span
 
 _DEFAULT_CONFIG = resources.files("tessera_detector") / "catalog" / "ner.yaml"
 
@@ -102,4 +106,53 @@ def chunks(text: str, *, size: int, overlap: int) -> list[tuple[int, str]]:
     return result
 
 
-__all__ = ["NerType", "chunks", "load_ner_types"]
+# The model's token window is far shorter than a real document; these are
+# character budgets, chosen well inside it, with an overlap wide enough that a
+# name split by one cut survives in the neighbouring chunk.
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+
+
+class GlinerRecognizer:
+    def __init__(self, model_path: Path, types: tuple[NerType, ...] | None = None) -> None:
+        # Imported lazily: the base install does not carry the ner group, and
+        # `import tessera_detector.ner` must keep working without it.
+        from gliner import GLiNER
+
+        self.model_path = model_path
+        self.types = types or load_ner_types()
+        self.specificity: Mapping[str, int] = {t.entity_type: t.specificity for t in self.types}
+        self._by_label = {t.label: t for t in self.types}
+        # `urchade/gliner_multi-v2.1` ships only PyTorch weights (no model.onnx),
+        # and converting one would need the separate `onnx` package on top of the
+        # declared ner group (gliner, onnxruntime, huggingface-hub) — so this loads
+        # the standard PyTorch backend rather than `load_onnx_model=True`. See the
+        # task report for the inspected API and the reasoning.
+        self._model = GLiNER.from_pretrained(str(model_path))
+
+    def detect(self, text: str) -> list[Span]:
+        if not text:
+            return []
+        labels = [t.label for t in self.types]
+        floor = min(t.threshold for t in self.types)
+        spans: list[Span] = []
+        for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+            for entity in self._model.predict_entities(chunk, labels, threshold=floor):
+                ner_type = self._by_label.get(entity["label"])
+                score = float(entity["score"])
+                if ner_type is None or score < ner_type.threshold:
+                    continue
+                spans.append(
+                    Span(
+                        entity_type=ner_type.entity_type,
+                        start=offset + int(entity["start"]),
+                        end=offset + int(entity["end"]),
+                        confidence=min(score, 0.99),
+                        recognizer="ner:gliner",
+                        tier=ner_type.tier,
+                    )
+                )
+        return spans
+
+
+__all__ = ["GlinerRecognizer", "NerType", "chunks", "load_ner_types"]
