@@ -9,6 +9,7 @@ Run from the repository root:  uv run --project detector python evaluation/bench
 
 import argparse
 import json
+import math
 import statistics
 import time
 from collections.abc import Callable
@@ -25,10 +26,16 @@ SIZE_CLASSES = {"sentence": 80, "paragraph": 1200, "document": 6000}
 
 
 def percentile(values: list[float], share: float) -> float:
+    """Nearest-rank percentile: the smallest value at or above the given share.
+
+    `int(n * share)` would land one observation late whenever `n * share` is a
+    whole number — p95 of 1..100 would report 96 — which overstates latency and
+    can flip a verdict against the target.
+    """
     if not values:
         raise ValueError("no samples to take a percentile of")
     ordered = sorted(values)
-    index = min(int(len(ordered) * share), len(ordered) - 1)
+    index = max(0, math.ceil(len(ordered) * share) - 1)
     return ordered[index]
 
 

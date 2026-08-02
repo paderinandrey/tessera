@@ -2,11 +2,13 @@ import pytest
 from benchmark import SIZE_CLASSES, Timing, build_sizes, measure, percentile, render
 
 
-def test_percentile_picks_the_ranked_value() -> None:
+def test_percentile_picks_the_nearest_rank() -> None:
+    # Nearest rank: p95 of 1..100 is the 95th observation, not the 96th.
     values = [float(i) for i in range(1, 101)]
-    assert percentile(values, 0.5) == 51.0
-    assert percentile(values, 0.95) == 96.0
-    assert percentile(values, 0.99) == 100.0
+    assert percentile(values, 0.5) == 50.0
+    assert percentile(values, 0.95) == 95.0
+    assert percentile(values, 0.99) == 99.0
+    assert percentile(values, 1.0) == 100.0
 
 
 def test_percentile_handles_a_single_sample() -> None:
@@ -57,8 +59,8 @@ def test_measure_discards_the_warm_up_runs() -> None:
 def test_timing_exposes_the_percentiles() -> None:
     timing = Timing(name="total", size="sentence", samples=[float(i) for i in range(1, 101)])
     assert timing.median == 50.5
-    assert timing.p95 == 96.0
-    assert timing.p99 == 100.0
+    assert timing.p95 == 95.0
+    assert timing.p99 == 99.0
 
 
 def test_render_groups_by_size_and_names_the_target() -> None:
