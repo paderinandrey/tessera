@@ -1,0 +1,21 @@
+# Tier 2 NER types (REQ-4). Labels are the zero-shot prompts handed to the model;
+# specificity stays below every catalog identifier (40-90) so a checksum-backed
+# identifier wins a partial overlap with a model guess.
+entities:
+  - entity_type: PERSON
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: 30
+
+  - entity_type: LOCATION
+    label: location
+    threshold: 0.7
+    tier: 2
+    specificity: 20
+
+  - entity_type: ORG
+    label: organization
+    threshold: 0.75
+    tier: 2
+    specificity: 10
