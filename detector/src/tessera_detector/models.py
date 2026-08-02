@@ -9,6 +9,10 @@ import os
 from pathlib import Path
 
 MODEL_NAME = "gliner_multi-v2.1"
+# The upstream `urchade/gliner_multi-v2.1` repo publishes PyTorch weights only.
+# This mirror re-exports the same model with ONNX graphs (`onnx/model.onnx` and
+# quantized variants), which is what `GlinerRecognizer` loads via onnxruntime.
+HF_REPO_ID = f"onnx-community/{MODEL_NAME}"
 
 
 class ModelUnavailable(Exception):
@@ -30,4 +34,4 @@ def find_model() -> Path | None:
     return cached if cached.exists() else None
 
 
-__all__ = ["MODEL_NAME", "ModelUnavailable", "find_model", "model_cache_dir"]
+__all__ = ["HF_REPO_ID", "MODEL_NAME", "ModelUnavailable", "find_model", "model_cache_dir"]

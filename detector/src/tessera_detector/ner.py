@@ -123,12 +123,13 @@ class GlinerRecognizer:
         self.types = types or load_ner_types()
         self.specificity: Mapping[str, int] = {t.entity_type: t.specificity for t in self.types}
         self._by_label = {t.label: t for t in self.types}
-        # `urchade/gliner_multi-v2.1` ships only PyTorch weights (no model.onnx),
-        # and converting one would need the separate `onnx` package on top of the
-        # declared ner group (gliner, onnxruntime, huggingface-hub) — so this loads
-        # the standard PyTorch backend rather than `load_onnx_model=True`. See the
-        # task report for the inspected API and the reasoning.
-        self._model = GLiNER.from_pretrained(str(model_path))
+        # The weights come from the onnx-community mirror (see models.HF_REPO_ID):
+        # the upstream urchade repo ships PyTorch weights only. The mirror's ONNX
+        # graph lives under onnx/model.onnx rather than at the repo root, so the
+        # default onnx_model_file="model.onnx" must be overridden to match.
+        self._model = GLiNER.from_pretrained(
+            str(model_path), load_onnx_model=True, onnx_model_file="onnx/model.onnx"
+        )
 
     def detect(self, text: str) -> list[Span]:
         if not text:
