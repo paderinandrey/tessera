@@ -55,3 +55,7 @@ jobs:
       # NER layer entirely unusable.
       - run: uv run --group ner pytest -m ner
       - run: uv run --group ner python ../evaluation/evaluate.py --require-ner
+      # Smoke only: the harness must run, but timings on a shared runner are
+      # noise and are never asserted. Real numbers come from a known machine
+      # and are recorded in the README with its hardware.
+      - run: uv run --group ner python ../evaluation/benchmark.py --runs 3 --warmup 1

@@ -1,10 +1,13 @@
-.PHONY: corpus evaluate test lint model
+.PHONY: corpus evaluate bench test lint model
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
 
 evaluate:
 	uv run --project detector python evaluation/evaluate.py
+
+bench:
+	uv run --project detector --group ner python evaluation/benchmark.py
 
 test:
 	cd detector && uv run pytest

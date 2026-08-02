@@ -7,11 +7,15 @@ implied.
 Run from the repository root:  uv run --project detector python evaluation/benchmark.py
 """
 
+import argparse
+import json
 import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from tessera_detector.pipeline import Detector, build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TARGET_P95_MS = 80.0
@@ -101,12 +105,87 @@ def render(timings: list[Timing]) -> str:
     return "\n".join(lines)
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Detector latency benchmark (REQ-38)")
+    parser.add_argument("--runs", type=int, default=30, help="timed runs per measurement")
+    parser.add_argument("--warmup", type=int, default=5, help="discarded runs per measurement")
+    parser.add_argument("--json", action="store_true", dest="as_json", help="machine-readable")
+    args = parser.parse_args(argv)
+
+    documents = [
+        json.loads(line)["text"] for line in CORPUS.read_text(encoding="utf-8").splitlines()
+    ]
+    sizes = build_sizes(documents)
+    deterministic = Detector()
+    full = build_detector()
+
+    timings: list[Timing] = []
+    for size, text in sizes.items():
+        timings.append(
+            Timing(
+                "deterministic",
+                size,
+                measure(
+                    deterministic.deterministic.detect,
+                    text,
+                    runs=args.runs,
+                    warmup=args.warmup,
+                ),
+            )
+        )
+        recognizer = full.recognizer
+        if recognizer is not None:
+            timings.append(
+                Timing(
+                    "ner",
+                    size,
+                    measure(recognizer.detect, text, runs=args.runs, warmup=args.warmup),
+                )
+            )
+        timings.append(
+            Timing("total", size, measure(full.detect, text, runs=args.runs, warmup=args.warmup))
+        )
+
+    if args.as_json:
+        print(
+            json.dumps(
+                {
+                    "ner": full.ner_available,
+                    "target_p95_ms": TARGET_P95_MS,
+                    "timings": [
+                        {
+                            "size": t.size,
+                            "layer": t.name,
+                            "median_ms": round(t.median, 2),
+                            "p95_ms": round(t.p95, 2),
+                            "p99_ms": round(t.p99, 2),
+                            "runs": len(t.samples),
+                        }
+                        for t in timings
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if not full.ner_available:
+        print(f"NER layer off ({full.ner_off_reason}): only the deterministic layer is timed.")
+    print(render(timings))
+    return 0
+
+
 __all__ = [
     "SIZE_CLASSES",
     "TARGET_P95_MS",
     "Timing",
     "build_sizes",
+    "main",
     "measure",
     "percentile",
     "render",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
