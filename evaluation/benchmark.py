@@ -36,7 +36,10 @@ def build_sizes(documents: list[str]) -> dict[str, str]:
     """One text per size class, concatenated from the corpus in order.
 
     Deterministic on purpose: a benchmark whose input drifts between runs
-    reports noise as change.
+    reports noise as change. Each class is truncated to exactly its budget:
+    overshooting by even one character pushes the paragraph class past
+    CHUNK_SIZE into a second chunk, doubling the work and inflating the number
+    the class exists to report.
     """
     sizes: dict[str, str] = {}
     for name, budget in SIZE_CLASSES.items():
@@ -50,7 +53,7 @@ def build_sizes(documents: list[str]) -> dict[str, str]:
             length += len(document) + (1 if parts else 0)
             parts.append(document)
             index += 1
-        sizes[name] = " ".join(parts)
+        sizes[name] = " ".join(parts)[:budget]
     return sizes
 
 

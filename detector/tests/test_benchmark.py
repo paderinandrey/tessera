@@ -18,13 +18,21 @@ def test_percentile_rejects_an_empty_series() -> None:
         percentile([], 0.95)
 
 
-def test_size_classes_hit_their_budgets() -> None:
+def test_size_classes_are_exactly_their_budgets() -> None:
+    # Exact, not "at least": one character past CHUNK_SIZE turns the paragraph
+    # class into two chunks and doubles the work it is meant to measure.
     documents = [f"Dokument {i} mit etwas Text darin." for i in range(400)]
     sizes = build_sizes(documents)
     assert set(sizes) == set(SIZE_CLASSES)
-    longest = max(len(d) for d in documents)
     for name, budget in SIZE_CLASSES.items():
-        assert budget <= len(sizes[name]) < budget + longest + 1
+        assert len(sizes[name]) == budget
+
+
+def test_paragraph_class_stays_within_one_chunk() -> None:
+    from tessera_detector.ner import CHUNK_SIZE
+
+    documents = [f"Dokument {i} mit etwas Text darin." for i in range(400)]
+    assert len(build_sizes(documents)["paragraph"]) <= CHUNK_SIZE
 
 
 def test_size_classes_are_deterministic() -> None:
@@ -35,7 +43,7 @@ def test_size_classes_are_deterministic() -> None:
 def test_size_classes_reuse_documents_when_the_corpus_is_short() -> None:
     # The corpus is finite; a long class must still reach its budget.
     sizes = build_sizes(["Kurz."])
-    assert len(sizes["document"]) >= SIZE_CLASSES["document"]
+    assert len(sizes["document"]) == SIZE_CLASSES["document"]
 
 
 def test_measure_discards_the_warm_up_runs() -> None:
