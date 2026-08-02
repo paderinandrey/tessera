@@ -80,3 +80,23 @@ def test_render_says_when_the_target_is_missed() -> None:
     under = render([Timing(name="total", size="paragraph", samples=[10.0, 11.0, 13.0])])
     assert "over target" in over
     assert "over target" not in under
+
+
+def test_prepare_consumes_the_generator() -> None:
+    # `windows()` is a generator, so timing the bare call would measure iterator
+    # construction and report preprocessing as free whatever it costs.
+    from benchmark import _prepare
+
+    class FakeRecognizer:
+        def __init__(self) -> None:
+            self.consumed = 0
+
+        def windows(self, text: str):
+            for index, char in enumerate(text):
+                self.consumed += 1
+                yield index, char
+
+    recognizer = FakeRecognizer()
+    result = _prepare(recognizer, "abcd")
+    assert recognizer.consumed == 4
+    assert result == [(0, "a"), (1, "b"), (2, "c"), (3, "d")]

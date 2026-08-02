@@ -117,6 +117,12 @@ def render(timings: list[Timing]) -> str:
     return "\n".join(lines)
 
 
+def _prepare(recognizer: GlinerRecognizer, text: str) -> object:
+    # windows() is a generator: calling it does no work, so the timing has to
+    # consume it or it measures the cost of creating an iterator.
+    return list(recognizer.windows(text))
+
+
 def _run_pass(
     recognizer: GlinerRecognizer, pieces: list[tuple[int, str]], inference: InferencePass, _: str
 ) -> object:
@@ -162,7 +168,9 @@ def main(argv: list[str] | None = None) -> int:
                 Timing(
                     "chunk+tokenize",
                     size,
-                    measure(recognizer.windows, text, runs=args.runs, warmup=args.warmup),
+                    measure(
+                        partial(_prepare, recognizer), text, runs=args.runs, warmup=args.warmup
+                    ),
                 )
             )
             # Materialized on purpose: timing a pass needs fixed input, and
