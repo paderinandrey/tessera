@@ -147,3 +147,24 @@ def test_same_type_merge_prefers_untouchable_metadata() -> None:
     (kept,) = result.spans
     assert (kept.start, kept.end) == (0, 30)
     assert kept.recognizer == "catalog:iban"
+
+
+def test_more_specific_inner_survives_a_broader_outer() -> None:
+    # ORG spans "la CGT" while TRADE_UNION spans "CGT": nesting alone would
+    # erase the Article 9 classification, which is the one that decides
+    # whether the span is treated as special-category data.
+    outer = span("ORG", 22, 28, confidence=0.9)
+    inner = span("TRADE_UNION", 25, 28, confidence=0.5)
+    resolution = resolve([outer, inner], specificity={"ORG": 10, "TRADE_UNION": 35})
+    (kept,) = resolution.spans
+    assert kept.entity_type == "TRADE_UNION"
+    assert (kept.start, kept.end) == (22, 28)
+
+
+def test_broader_outer_still_wins_over_a_less_specific_inner() -> None:
+    outer = span("TRADE_UNION", 22, 28, confidence=0.9)
+    inner = span("ORG", 25, 28, confidence=0.5)
+    resolution = resolve([outer, inner], specificity={"ORG": 10, "TRADE_UNION": 35})
+    (kept,) = resolution.spans
+    assert kept.entity_type == "TRADE_UNION"
+    assert (kept.start, kept.end) == (22, 28)

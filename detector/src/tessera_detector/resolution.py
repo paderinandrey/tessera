@@ -5,9 +5,12 @@ Rules, in precedence order:
 1. Checksum spans are untouchable: never silently dropped in favour of a
    non-checksum span.
 2. Same type overlapping or nested: union bounds, max confidence.
-3. Different types, strict containment: outer wins. Exception per rule 1 — an
-   untouchable inner nested in a non-untouchable outer merges to the union bounds
+3. Different types, strict containment: outer wins, with two exceptions. Per rule 1,
+   an untouchable inner nested in a non-untouchable outer merges to the union bounds
    and keeps the more sensitive type, so the identifier keeps its identity in audit.
+   And a strictly more specific inner type does the same: an ORG reading of "la CGT"
+   must not erase the trade-union reading of "CGT", because the narrower type is what
+   marks the span sensitive.
 4. Different types, partial overlap or equal range: higher specificity wins, then
    higher confidence; on a full tie the spans merge with the more sensitive type
    (lower tier).
@@ -99,6 +102,11 @@ def _resolve_pair(
                 return _union(outer, inner, _more_sensitive(inner, outer)), (
                     "untouchable-inner-merge"
                 )
+            # A more specific inner type keeps its identity: "la CGT" read as
+            # an organization must not erase the trade-union reading of "CGT",
+            # because that classification is what marks the span sensitive.
+            if specificity.get(inner.entity_type, 0) > specificity.get(outer.entity_type, 0):
+                return _union(outer, inner, take_type_from=inner), "specific-inner-merge"
             return outer, "nesting-outer-wins"
 
     # Rule 1 precedes rule 4: a lone checksum span never loses to a non-checksum one.
