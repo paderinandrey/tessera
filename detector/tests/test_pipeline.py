@@ -1,6 +1,10 @@
 from collections.abc import Mapping
+from pathlib import Path
 
-from tessera_detector.pipeline import Detector
+import pytest
+
+from tessera_detector.models import ModelUnavailable
+from tessera_detector.pipeline import Detector, build_detector
 from tessera_detector.spans import Span
 
 
@@ -53,3 +57,28 @@ def test_deterministic_layer_no_longer_resolves_on_its_own() -> None:
     raw = DeterministicDetector().detect("mail: anna.keller@example.ch")
     assert [s.entity_type for s in raw] == ["EMAIL"]
     assert DeterministicDetector().specificity["EMAIL"] == 70
+
+
+def test_build_detector_off_never_loads_a_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TESSERA_NER_MODEL", "/definitely/not/here")
+    detector = build_detector(ner=False)
+    assert detector.ner_available is False
+
+
+def test_build_detector_auto_falls_back_without_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    detector = build_detector()
+    assert detector.ner_available is False
+    assert [s.entity_type for s in detector.detect("mail: anna.keller@example.ch")] == ["EMAIL"]
+
+
+def test_build_detector_required_raises_without_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with pytest.raises(ModelUnavailable):
+        build_detector(ner=True)

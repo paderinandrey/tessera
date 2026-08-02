@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Protocol
 
 from .deterministic import DeterministicDetector
+from .models import ModelUnavailable, find_model, model_cache_dir
 from .resolution import resolve
 from .spans import Span
 
@@ -41,4 +42,25 @@ class Detector:
         return resolve(spans, specificity=specificity).spans
 
 
-__all__ = ["Detector", "NerRecognizer"]
+def build_detector(
+    *, ner: bool | None = None, catalog_text: str | None = None
+) -> Detector:
+    """ner=None auto-enables when weights exist, True requires them, False disables."""
+    if ner is False:
+        return Detector(catalog_text=catalog_text)
+    path = find_model()
+    if path is None:
+        if ner is True:
+            raise ModelUnavailable(
+                f"no NER weights found; run `make model` or set TESSERA_NER_MODEL "
+                f"(looked in {model_cache_dir()})"
+            )
+        return Detector(catalog_text=catalog_text)
+    # GlinerRecognizer lands in Task 5; this path only runs once weights exist,
+    # which none of this task's tests arrange.
+    from .ner import GlinerRecognizer  # type: ignore[attr-defined]
+
+    return Detector(catalog_text=catalog_text, recognizer=GlinerRecognizer(path))
+
+
+__all__ = ["Detector", "NerRecognizer", "build_detector"]
