@@ -452,3 +452,28 @@ def test_json_names_the_missing_runtime(
     (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
     assert main(["scan", str(tmp_path), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["summary"]["ner_off_reason"] == "no runtime"
+
+
+def test_serve_subcommand_takes_host_and_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("uvicorn")
+    started: dict[str, object] = {}
+
+    def fake_run(app: object, *, host: str, port: int) -> None:
+        started["host"] = host
+        started["port"] = port
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    assert main(["serve", "--host", "127.0.0.1", "--port", "9001"]) == 0
+    assert started == {"host": "127.0.0.1", "port": 9001}
+
+
+def test_serve_defaults_to_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Binding every interface by default would expose a service that sees
+    # personal data to whatever network the machine is on.
+    pytest.importorskip("uvicorn")
+    started: dict[str, object] = {}
+    monkeypatch.setattr(
+        "uvicorn.run", lambda app, *, host, port: started.update(host=host, port=port)
+    )
+    assert main(["serve"]) == 0
+    assert started["host"] == "127.0.0.1"

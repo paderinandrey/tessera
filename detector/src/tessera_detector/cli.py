@@ -197,7 +197,19 @@ def main(argv: list[str] | None = None) -> int:
     ner_group = scan_parser.add_mutually_exclusive_group()
     ner_group.add_argument("--ner", action="store_true", help="require the NER layer")
     ner_group.add_argument("--no-ner", action="store_true", help="skip the NER layer")
+    serve_parser = subparsers.add_parser("serve", help="run the detection HTTP service")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="interface to bind")
+    serve_parser.add_argument("--port", type=int, default=8000, help="port to bind")
     args = parser.parse_args(argv)
+    if args.command == "serve":
+        # Imported here: the serve group is optional, and `tessera scan` must
+        # keep working without it.
+        import uvicorn
+
+        from .api import create_app
+
+        uvicorn.run(create_app(), host=args.host, port=args.port)
+        return 0
     if not args.path.exists():
         print(f"tessera: {args.path}: no such file or directory", file=sys.stderr)
         return 2

@@ -67,6 +67,20 @@ opinion, religion, trade union membership, sexual orientation) are detected by t
 layer at a deliberately low threshold, so expect visible false positives —
 over-redaction is the safe failure for this category.
 
+The same binary serves the detection HTTP contract the gateway will call:
+
+```
+uv run --project detector --group serve tessera serve      # 127.0.0.1:8000
+```
+
+`POST /detect` takes `{"text": "...", "layers": ["deterministic", "ner"]}` — `layers` is
+optional and may only narrow what the server runs — and every response reports
+`layers_run`, so a deterministic-only result is never mistakable for a full scan. Asking
+for a layer the server cannot run is a 503 naming the reason rather than a quiet
+downgrade. `GET /health` reports whether the NER layer is loaded and why it is not. The
+committed OpenAPI document at `docs/api/openapi.json` is the schema both implementations
+share (REQ-44); `make openapi` regenerates it and CI fails if it drifts.
+
 ## Evaluation
 
 The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic

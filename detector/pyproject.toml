@@ -58,4 +58,6 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["ner: needs GLiNER weights (skipped when absent)"]
+markers = [
+    "ner: needs GLiNER weights (skipped when absent)",
+]
