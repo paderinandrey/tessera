@@ -25,6 +25,11 @@ dev = [
 eval = [
     "faker>=40",
 ]
+serve = [
+    "fastapi>=0.120",
+    "uvicorn>=0.40",
+    "httpx>=0.28",
+]
 ner = [
     "gliner>=0.2.22",
     "onnxruntime>=1.20",
@@ -53,4 +58,6 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["ner: needs GLiNER weights (skipped when absent)"]
+markers = [
+    "ner: needs GLiNER weights (skipped when absent)",
+]

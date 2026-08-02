@@ -19,7 +19,7 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           working-directory: detector
-      - run: uv sync --locked
+      - run: uv sync --locked --group serve
       - run: uv run pytest
       - run: uv run ruff check . ../evaluation
       - run: uv run mypy src
@@ -27,6 +27,10 @@ jobs:
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
       - run: git diff --exit-code ../evaluation/corpus
+      # The committed OpenAPI document is the schema the gateway will read
+      # (REQ-44); it must not drift from the application.
+      - run: uv run --group serve python ../evaluation/export_openapi.py
+      - run: git diff --exit-code ../docs/api
       # Tier 1 recall gate (REQ-38): exits non-zero below target. Runs without
       # NER weights, so it also exercises the deterministic-only fallback.
       - run: uv run python ../evaluation/evaluate.py
@@ -41,7 +45,7 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           working-directory: detector
-      - run: uv sync --locked --group ner
+      - run: uv sync --locked --group ner --group serve
       - name: Cache NER weights
         uses: actions/cache@v4
         with:
@@ -53,7 +57,7 @@ jobs:
       # --require-ner is what keeps this job honest: the marked tests skip when
       # the runtime is broken, so without it the job would pass green with the
       # NER layer entirely unusable.
-      - run: uv run --group ner pytest -m ner
+      - run: uv run --group ner --group serve pytest -m ner
       - run: uv run --group ner python ../evaluation/evaluate.py --require-ner
       # Smoke only: the harness must run, but timings on a shared runner are
       # noise and are never asserted. Real numbers come from a known machine

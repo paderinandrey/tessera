@@ -1,4 +1,4 @@
-.PHONY: corpus evaluate bench test lint model
+.PHONY: corpus evaluate bench openapi test lint model
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
@@ -9,8 +9,11 @@ evaluate:
 bench:
 	uv run --project detector --group ner python evaluation/benchmark.py
 
+openapi:
+	uv run --project detector --group serve python evaluation/export_openapi.py
+
 test:
-	cd detector && uv run pytest
+	cd detector && uv run --group serve pytest
 
 lint:
 	cd detector && uv run ruff check . ../evaluation && uv run mypy src
