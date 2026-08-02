@@ -106,11 +106,40 @@ def chunks(text: str, *, size: int, overlap: int) -> list[tuple[int, str]]:
     return result
 
 
-# The model's token window is far shorter than a real document; these are
-# character budgets, chosen well inside it, with an overlap wide enough that a
-# name split by one cut survives in the neighbouring chunk.
+# Character budgets for the first pass, with an overlap wide enough that a name
+# split by one cut survives in the neighbouring chunk. Characters are only a
+# proxy for tokens, so a second, token-exact pass bounds every chunk below.
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
+# Tokens the label prompt and the special tokens consume before any text does;
+# subtracted from the model's window so a dense chunk cannot silently truncate.
+PROMPT_TOKEN_RESERVE = 64
+TOKEN_OVERLAP = 32
+
+
+def token_windows(
+    offsets: list[tuple[int, int]], *, budget: int, overlap: int
+) -> list[tuple[int, int]]:
+    """Group token offsets into (char_start, char_end) windows of at most budget tokens.
+
+    Character counts only approximate token counts: dense text can exceed the
+    model's window inside one chunk, and inference then truncates the tail
+    silently — the characters between the truncation point and the next chunk's
+    start would never be looked at.
+    """
+    if budget <= 0 or overlap < 0 or overlap >= budget:
+        raise ValueError(f"invalid token window: budget={budget!r}, overlap={overlap!r}")
+    if not offsets:
+        return []
+    windows: list[tuple[int, int]] = []
+    start = 0
+    while start < len(offsets):
+        end = min(start + budget, len(offsets))
+        windows.append((offsets[start][0], offsets[end - 1][1]))
+        if end >= len(offsets):
+            break
+        start = max(end - overlap, start + 1)
+    return windows
 
 
 class GlinerRecognizer:
@@ -130,6 +159,13 @@ class GlinerRecognizer:
         self._model = GLiNER.from_pretrained(
             str(model_path), load_onnx_model=True, onnx_model_file="onnx/model.onnx"
         )
+        self._tokenizer = self._model.data_processor.transformer_tokenizer
+        self._token_budget = int(self._model.config.max_len) - PROMPT_TOKEN_RESERVE
+
+    def _windows(self, chunk: str) -> list[tuple[int, int]]:
+        encoded = self._tokenizer(chunk, return_offsets_mapping=True, add_special_tokens=False)
+        offsets = [(int(s), int(e)) for s, e in encoded["offset_mapping"] if e > s]
+        return token_windows(offsets, budget=self._token_budget, overlap=TOKEN_OVERLAP)
 
     def detect(self, text: str) -> list[Span]:
         if not text:
@@ -138,22 +174,25 @@ class GlinerRecognizer:
         floor = min(t.threshold for t in self.types)
         spans: list[Span] = []
         for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-            for entity in self._model.predict_entities(chunk, labels, threshold=floor):
-                ner_type = self._by_label.get(entity["label"])
-                score = float(entity["score"])
-                if ner_type is None or score < ner_type.threshold:
-                    continue
-                spans.append(
-                    Span(
-                        entity_type=ner_type.entity_type,
-                        start=offset + int(entity["start"]),
-                        end=offset + int(entity["end"]),
-                        confidence=min(score, 0.99),
-                        recognizer="ner:gliner",
-                        tier=ner_type.tier,
+            for window_start, window_end in self._windows(chunk):
+                piece = chunk[window_start:window_end]
+                base = offset + window_start
+                for entity in self._model.predict_entities(piece, labels, threshold=floor):
+                    ner_type = self._by_label.get(entity["label"])
+                    score = float(entity["score"])
+                    if ner_type is None or score < ner_type.threshold:
+                        continue
+                    spans.append(
+                        Span(
+                            entity_type=ner_type.entity_type,
+                            start=base + int(entity["start"]),
+                            end=base + int(entity["end"]),
+                            confidence=min(score, 0.99),
+                            recognizer="ner:gliner",
+                            tier=ner_type.tier,
+                        )
                     )
-                )
         return spans
 
 
-__all__ = ["GlinerRecognizer", "NerType", "chunks", "load_ner_types"]
+__all__ = ["GlinerRecognizer", "NerType", "chunks", "load_ner_types", "token_windows"]

@@ -2,7 +2,7 @@ from itertools import pairwise
 
 import pytest
 
-from tessera_detector.ner import chunks
+from tessera_detector.ner import chunks, token_windows
 
 
 def test_short_text_is_one_chunk() -> None:
@@ -48,3 +48,37 @@ def test_paragraph_boundary_is_preferred_over_a_hard_cut() -> None:
 def test_invalid_windows_are_rejected(size: int, overlap: int) -> None:
     with pytest.raises(ValueError):
         chunks("some text", size=size, overlap=overlap)
+
+
+def test_token_windows_keeps_short_input_whole() -> None:
+    offsets = [(0, 3), (4, 8), (9, 12)]
+    assert token_windows(offsets, budget=10, overlap=2) == [(0, 12)]
+
+
+def test_token_windows_splits_when_over_budget() -> None:
+    offsets = [(i * 2, i * 2 + 1) for i in range(10)]
+    windows = token_windows(offsets, budget=4, overlap=1)
+    assert len(windows) > 1
+    assert windows[0] == (0, 7)
+    assert all(start < end for start, end in windows)
+
+
+def test_token_windows_cover_every_token() -> None:
+    offsets = [(i * 3, i * 3 + 2) for i in range(25)]
+    windows = token_windows(offsets, budget=6, overlap=2)
+    for start, end in offsets:
+        assert any(w_start <= start and end <= w_end for w_start, w_end in windows), (
+            f"token ({start}, {end}) fell outside every window"
+        )
+
+
+def test_token_windows_overlap_at_the_seams() -> None:
+    # Without overlap an entity split by a window edge is lost twice over.
+    offsets = [(i * 2, i * 2 + 1) for i in range(20)]
+    windows = token_windows(offsets, budget=5, overlap=2)
+    for (start_a, end_a), (start_b, _) in pairwise(windows):
+        assert start_b < end_a, f"windows {(start_a, end_a)} and {start_b} do not overlap"
+
+
+def test_token_windows_handles_no_tokens() -> None:
+    assert token_windows([], budget=4, overlap=1) == []
