@@ -57,10 +57,21 @@ def build_detector(
             )
         return Detector(catalog_text=catalog_text)
     # Imported lazily: this path only runs once weights exist, and the ner
-    # dependency group (gliner) need not be installed until it does.
-    from .ner import GlinerRecognizer
+    # dependency group (gliner) need not be installed until it does. Weights
+    # outlive virtualenvs — a base-synced environment with a populated cache
+    # must degrade like a missing install, not crash on the import.
+    try:
+        from .ner import GlinerRecognizer
 
-    return Detector(catalog_text=catalog_text, recognizer=GlinerRecognizer(path))
+        recognizer = GlinerRecognizer(path)
+    except ImportError as error:
+        if ner is True:
+            raise ModelUnavailable(
+                f"NER weights are installed but the ner dependency group is not "
+                f"(`uv sync --group ner`): {error}"
+            ) from error
+        return Detector(catalog_text=catalog_text)
+    return Detector(catalog_text=catalog_text, recognizer=recognizer)
 
 
 __all__ = ["Detector", "NerRecognizer", "build_detector"]

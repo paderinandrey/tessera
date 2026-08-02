@@ -46,6 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/tessera/models
+          # models.py carries the pinned HF revision, so its hash is the weight identity.
           key: ner-weights-${{ hashFiles('detector/src/tessera_detector/models.py') }}
       - run: make -C .. model
       # Model-backed tests plus the LOCATION precision gate (REQ-38).

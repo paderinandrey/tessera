@@ -13,6 +13,9 @@ MODEL_NAME = "gliner_multi-v2.1"
 # This mirror re-exports the same model with ONNX graphs (`onnx/model.onnx` and
 # quantized variants), which is what `GlinerRecognizer` loads via onnxruntime.
 HF_REPO_ID = f"onnx-community/{MODEL_NAME}"
+# Pinned: the published metrics are only reproducible if the same Tessera commit
+# always runs the same weights. Bump deliberately, and re-measure when you do.
+HF_REVISION = "6ddaeb9413b0e71ad8457da1aab378a165b24058"
 # What GlinerRecognizer needs to load. snapshot_download creates the directory
 # before it finishes, so directory existence alone would let an interrupted
 # download masquerade as installed weights and crash the loader instead of
@@ -50,4 +53,12 @@ def find_model() -> Path | None:
     return cached
 
 
-__all__ = ["HF_REPO_ID", "MODEL_NAME", "ModelUnavailable", "find_model", "model_cache_dir"]
+__all__ = [
+    "HF_REPO_ID",
+    "HF_REVISION",
+    "MODEL_NAME",
+    "REQUIRED_ARTIFACTS",
+    "ModelUnavailable",
+    "find_model",
+    "model_cache_dir",
+]

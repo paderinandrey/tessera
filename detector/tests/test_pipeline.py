@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -81,4 +82,29 @@ def test_build_detector_required_raises_without_weights(
     monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     with pytest.raises(ModelUnavailable):
+        build_detector(ner=True)
+
+
+def test_auto_mode_falls_back_when_the_ner_runtime_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Weights survive in the user-wide cache across virtualenv rebuilds; a base
+    # install must degrade to deterministic-only, not crash importing gliner.
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(tmp_path))
+    monkeypatch.setattr(
+        "tessera_detector.pipeline.find_model", lambda: tmp_path
+    )
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    detector = build_detector()
+    assert detector.ner_available is False
+
+
+def test_required_mode_reports_a_missing_ner_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "tessera_detector.pipeline.find_model", lambda: tmp_path
+    )
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    with pytest.raises(ModelUnavailable, match="ner"):
         build_detector(ner=True)

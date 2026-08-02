@@ -35,9 +35,14 @@ def test_finds_a_french_person_with_exact_offsets(recognizer: GlinerRecognizer) 
 
 
 def test_finds_a_german_organization(recognizer: GlinerRecognizer) -> None:
+    # ORG precision is advisory in the metrics gate, so this is the only place
+    # a total ORG regression would be caught: assert the type, not "something".
     text = "Die Rechnung wurde von der Siemens AG in München bezahlt."
-    found = {s.entity_type for s in recognizer.detect(text)}
-    assert "ORG" in found or "LOCATION" in found
+    spans = recognizer.detect(text)
+    orgs = [s for s in spans if s.entity_type == "ORG"]
+    assert orgs, f"expected an ORG span, got {[(s.entity_type, s.start, s.end) for s in spans]}"
+    assert "Siemens" in text[orgs[0].start : orgs[0].end]
+    assert "LOCATION" in {s.entity_type for s in spans}
 
 
 def test_long_text_keeps_absolute_offsets(recognizer: GlinerRecognizer) -> None:
