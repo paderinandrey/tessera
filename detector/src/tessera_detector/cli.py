@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import ModelUnavailable
-from .pipeline import Detector, build_detector
+from .pipeline import DISABLED, NO_RUNTIME, NO_WEIGHTS, Detector, build_detector
 
 MASK_MIN_LENGTH = 8
 
@@ -59,12 +59,12 @@ def _display_path(path: Path) -> str:
     return str(path).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
-def scan(path: Path, detector: Detector, *, ner_off_reason: str = "no weights") -> ScanReport:
+def scan(path: Path, detector: Detector) -> ScanReport:
     report = ScanReport(
         files=[],
         skipped=[],
         ner_available=detector.ner_available,
-        ner_off_reason=ner_off_reason,
+        ner_off_reason=detector.ner_off_reason or NO_WEIGHTS,
     )
     if path.is_file():
         # PATH itself must be readable: let the OSError reach main() -> exit 2.
@@ -145,11 +145,11 @@ def render_text(report: ScanReport, *, show_values: bool = False) -> str:
     if report.unreadable:
         lines.append(f"Unreadable: {len(report.unreadable)}")
     if not report.ner_available:
-        detail = (
-            "disabled with --no-ner"
-            if report.ner_off_reason == "disabled"
-            else "no weights; run `make model`"
-        )
+        detail = {
+            DISABLED: "disabled with --no-ner",
+            NO_RUNTIME: "weights present but the ner dependency group is not installed",
+            NO_WEIGHTS: "no weights; run `make model`",
+        }[report.ner_off_reason]
         lines.append(f"NER layer: off ({detail})")
     return "\n".join(lines)
 
@@ -212,9 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tessera: {error}", file=sys.stderr)
         return 2
     try:
-        report = scan(
-            args.path, detector, ner_off_reason="disabled" if args.no_ner else "no weights"
-        )
+        report = scan(args.path, detector)
     except OSError as error:
         print(f"tessera: {args.path}: {error.strerror or error}", file=sys.stderr)
         return 2

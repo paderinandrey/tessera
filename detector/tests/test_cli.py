@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -427,3 +428,27 @@ def test_json_reports_missing_weights_as_the_reason(
     summary = json.loads(capsys.readouterr().out)["summary"]
     assert summary["ner"] is False
     assert summary["ner_off_reason"] == "no weights"
+
+
+def test_report_names_a_missing_runtime_rather_than_missing_weights(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Weights are installed; the ner group is not. Telling the user to download
+    # the model would send them after something they already have.
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "ner dependency group is not installed" in out
+    assert "make model" not in out
+
+
+def test_json_names_the_missing_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["ner_off_reason"] == "no runtime"

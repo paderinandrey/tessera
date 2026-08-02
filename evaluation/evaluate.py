@@ -53,7 +53,10 @@ def main() -> int:
         print("FAIL: Tier 1 recall below target", file=sys.stderr)
         return 1
     if not detector.ner_available:
-        print("NER layer off (no weights): the ORG/LOCATION precision gate is skipped.")
+        print(
+            f"NER layer off ({detector.ner_off_reason}): "
+            "the LOCATION precision gate is skipped."
+        )
         return 0
     advisory = precision_gate_failures(
         summary.per_type, types=ADVISORY_PRECISION_TYPES, target=PRECISION_TARGET
