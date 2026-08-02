@@ -42,6 +42,16 @@ const TOOL_FIELDS: [&str; 5] = [
     "tool_calls",
 ];
 
+/// Every message must be an object carrying `content`. A bare string entry, or
+/// an object without content, produced no pointer and was forwarded untouched —
+/// the same silence-is-a-leak shape as the others.
+fn require_scannable_message(message: &Value, provider: &'static str) -> Result<(), ShapeError> {
+    if !message.is_object() || message.get("content").is_none() {
+        return Err(ShapeError::Request(provider));
+    }
+    Ok(())
+}
+
 fn reject_tool_fields(body: &Value, provider: &'static str) -> Result<(), ShapeError> {
     for field in TOOL_FIELDS {
         if body.get(field).is_some_and(|value| !value.is_null()) {
@@ -119,6 +129,7 @@ impl Provider for OpenAi {
         // stop.
         identifier_pointer(body, "/user", "/user".to_owned(), "openai", &mut pointers)?;
         for (index, message) in messages.iter().enumerate() {
+            require_scannable_message(message, "openai")?;
             reject_tool_fields(message, "openai")?;
             if message.get("tool_call_id").is_some() {
                 return Err(ShapeError::Unsupported("openai", "tool_call_id"));
@@ -190,6 +201,8 @@ impl Provider for Anthropic {
             content_pointers("/system", system, "anthropic", &mut pointers)?;
         }
         for (index, message) in messages.iter().enumerate() {
+            require_scannable_message(message, "anthropic")?;
+            reject_tool_fields(message, "anthropic")?;
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
@@ -366,6 +379,21 @@ mod tests {
             {"role": "assistant", "tool_calls": [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}
         ]});
         assert!(OpenAi.request_pointers(&with_calls).is_err());
+    }
+
+    #[test]
+    fn a_message_that_cannot_be_scanned_is_refused() {
+        // A bare string entry, or an object with no content, used to produce no
+        // pointer and travel upstream untouched.
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": ["Weber"]}))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [{"role": "assistant"}]}))
+            .is_err());
+        assert!(Anthropic
+            .request_pointers(&json!({"messages": ["Weber"]}))
+            .is_err());
     }
 
     #[test]

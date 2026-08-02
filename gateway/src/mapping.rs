@@ -19,6 +19,11 @@ pub enum MappingError {
              forwarded with the value still in it"
     )]
     BadSpan(&'static str),
+    #[error(
+        "entity type {0:?} cannot be written as a restorable placeholder; the request is \
+             refused rather than masked with a token restoration would not recognize"
+    )]
+    BadEntityType(String),
 }
 
 #[derive(Debug, Default)]
@@ -39,6 +44,11 @@ impl Mapping {
         let mut ordered: Vec<&Span> = spans.iter().collect();
         ordered.sort_by_key(|span| span.start);
 
+        // A placeholder-shaped token already in the caller's text would be
+        // indistinguishable from one we issue. Mapping it to itself reserves
+        // the number and makes an echo restore to exactly what was sent.
+        self.reserve_literals(text);
+
         let mut result = String::with_capacity(text.len());
         let mut cursor = 0usize;
         for span in ordered {
@@ -56,22 +66,64 @@ impl Mapping {
             }
             result.extend(&chars[cursor..span.start]);
             let value: String = chars[span.start..span.end].iter().collect();
-            result.push_str(&self.placeholder_for(&span.entity_type, value));
+            result.push_str(&self.placeholder_for(&span.entity_type, value)?);
             cursor = span.end;
         }
         result.extend(&chars[cursor..]);
         Ok(result)
     }
 
-    fn placeholder_for(&mut self, entity_type: &str, value: String) -> String {
-        if let Some(existing) = self.by_value.get(&value) {
-            return existing.clone();
+    /// Map every placeholder-shaped token already present to itself, so it is
+    /// never issued for a detected value and an echo restores unchanged.
+    fn reserve_literals(&mut self, text: &str) {
+        let mut rest = text;
+        while let Some(open) = rest.find('[') {
+            let from_open = &rest[open..];
+            let Some(close) = from_open.find(']') else {
+                return;
+            };
+            let candidate = &from_open[..=close];
+            if is_placeholder(candidate) {
+                self.by_placeholder
+                    .entry(candidate.to_owned())
+                    .or_insert_with(|| candidate.to_owned());
+                rest = &from_open[close + 1..];
+            } else {
+                rest = &from_open[1..];
+            }
         }
-        self.next += 1;
-        let placeholder = format!("[{entity_type}_{}]", self.next);
+    }
+
+    fn placeholder_for(
+        &mut self,
+        entity_type: &str,
+        value: String,
+    ) -> Result<String, MappingError> {
+        if let Some(existing) = self.by_value.get(&value) {
+            return Ok(existing.clone());
+        }
+        // The detector's entity_type is an unrestricted string, but only types
+        // matching the restoration grammar produce a token restoration will
+        // recognize. Anything else would sail through masked and come back
+        // unrestored, so it refuses instead.
+        if entity_type.is_empty()
+            || !entity_type
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_')
+        {
+            return Err(MappingError::BadEntityType(entity_type.to_owned()));
+        }
+        // Skip numbers already taken by a literal in the caller's own text.
+        let placeholder = loop {
+            self.next += 1;
+            let candidate = format!("[{entity_type}_{}]", self.next);
+            if !self.by_placeholder.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         self.by_value.insert(value.clone(), placeholder.clone());
         self.by_placeholder.insert(placeholder.clone(), value);
-        placeholder
+        Ok(placeholder)
     }
 
     pub fn restore(&self, text: &str) -> Result<String, MappingError> {
@@ -237,6 +289,35 @@ mod tests {
         let mut mapping = Mapping::new();
         mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
         assert_eq!(mapping.restore("[see [PERSON_1]]").unwrap(), "[see Weber]");
+    }
+
+    #[test]
+    fn a_literal_placeholder_in_the_request_is_reserved_and_survives() {
+        // The caller's own "[PERSON_1]" must not become the value we masked,
+        // and it must come back as it was sent.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask("[PERSON_1] fragt nach Weber", &[span("PERSON", 22, 27)])
+            .unwrap();
+        assert!(masked.starts_with("[PERSON_1] fragt nach ["));
+        assert!(
+            !masked.ends_with("[PERSON_1]"),
+            "the number was reused: {masked}"
+        );
+        assert_eq!(
+            mapping.restore(&masked).unwrap(),
+            "[PERSON_1] fragt nach Weber"
+        );
+    }
+
+    #[test]
+    fn an_entity_type_outside_the_grammar_is_refused() {
+        // "[person_1]" or "[PERSON-ROLE_1]" would not be recognized on the way
+        // back, so it would reach the client unrestored.
+        let mut mapping = Mapping::new();
+        assert!(mapping.mask("Weber", &[span("person", 0, 5)]).is_err());
+        assert!(mapping.mask("Weber", &[span("PERSON-ROLE", 0, 5)]).is_err());
+        assert!(mapping.mask("Weber", &[span("", 0, 5)]).is_err());
     }
 
     #[test]

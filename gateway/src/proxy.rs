@@ -186,7 +186,9 @@ async fn handle(
         let text = read_pointer(&upstream, &pointer)?;
         write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
     }
-    Ok(Json(restored).into_response())
+    // The same quota headers matter on a 200: a client that only learns its
+    // remaining budget from errors learns it too late.
+    Ok((returned, Json(restored)).into_response())
 }
 
 /// Restore every string in a value. Used for upstream error envelopes, whose
