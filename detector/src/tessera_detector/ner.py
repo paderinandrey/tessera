@@ -50,13 +50,21 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
         label = entry["label"]
         if not isinstance(label, str) or not label.strip():
             raise ValueError(f"ner type {entity_type!r} declares an empty label")
+        if "specificity" not in entry:
+            raise ValueError(f"ner type {entity_type!r} declares no specificity")
+        specificity = entry["specificity"]
+        if isinstance(specificity, bool) or not isinstance(specificity, int) or specificity < 0:
+            raise ValueError(
+                f"ner type {entity_type!r} declares specificity {specificity!r} "
+                "outside the non-negative integer range"
+            )
         types.append(
             NerType(
                 entity_type=entity_type,
                 label=label,
                 threshold=float(threshold),
                 tier=tier,
-                specificity=entry["specificity"],
+                specificity=specificity,
             )
         )
     return tuple(types)

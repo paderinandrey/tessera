@@ -43,6 +43,29 @@ def test_tier_must_be_between_one_and_three(bad: str) -> None:
         load_ner_types(TEMPLATE.format(threshold=0.7, tier=bad))
 
 
+def test_specificity_is_required() -> None:
+    config = (
+        "entities:\n  - entity_type: PERSON\n    label: person\n"
+        "    threshold: 0.7\n    tier: 2\n"
+    )
+    with pytest.raises(ValueError, match="specificity"):
+        load_ner_types(config)
+
+
+@pytest.mark.parametrize("bad", ["-1", "true", "'high'", "1.5"])
+def test_specificity_must_be_a_non_negative_integer(bad: str) -> None:
+    config = f"""
+entities:
+  - entity_type: PERSON
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: {bad}
+"""
+    with pytest.raises(ValueError, match="specificity"):
+        load_ner_types(config)
+
+
 def test_duplicate_entity_types_are_rejected() -> None:
     config = TEMPLATE.format(threshold=0.7, tier=2) * 1 + """
   - entity_type: PERSON
