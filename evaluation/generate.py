@@ -58,6 +58,18 @@ ARTICLE_9_SLOTS = {
             "de": ["kurdischer Herkunft", "türkischer Herkunft"],
         },
     ),
+    # Article 9 says "racial or ethnic origin". Race statements need their own
+    # phrasing — "d'origine noir de peau" is not French — but they are the same
+    # legal category, so they carry the same entity type. Measured against the
+    # weights, a dedicated "race" label lowers every score and loses cases; the
+    # "ethnic origin" prompt already covers both halves.
+    "race": (
+        "ETHNICITY",
+        {
+            "fr": ["métisse", "noir de peau"],
+            "de": ["schwarz", "asiatischstämmig"],
+        },
+    ),
     "political": (
         "POLITICAL_AFFILIATION",
         {
@@ -108,6 +120,7 @@ FR_TEMPLATES = [
     "L'accès au site a été enregistré par {biometric} pour {person}.",
     "Le dossier de {person} mentionne une orientation {orientation}.",
     "Le salarié {person} se dit {opinion} lors de la réunion du comité.",
+    "Le rapport interne décrit {person} comme {race}.",
 ]
 
 DE_TEMPLATES = [
@@ -125,6 +138,7 @@ DE_TEMPLATES = [
     "Das Labor hat die {genetic} von {person} übermittelt.",
     "Die Personalakte von {person} nennt: Mitglied der {political}.",
     "Der Mitarbeiter {person} bezeichnet sich in der Sitzung als {opinion}.",
+    "Der interne Bericht beschreibt {person} als {race}.",
 ]
 
 MIXED_TEMPLATES = [

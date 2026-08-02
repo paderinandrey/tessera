@@ -98,16 +98,16 @@ Article 9 special categories, detected by the same layer at a lower threshold:
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
 | BIOMETRIC | 1.000 | 1.000 | 1.000 |
-| ETHNICITY | 1.000 | 0.500 | 0.667 |
+| ETHNICITY | 1.000 | 0.714 | 0.833 |
 | GENETIC | 1.000 | 1.000 | 1.000 |
 | HEALTH | 0.800 | 1.000 | 0.889 |
 | POLITICAL_AFFILIATION | 0.800 | 1.000 | 0.889 |
 | POLITICAL_OPINION | 1.000 | 1.000 | 1.000 |
-| RELIGION | 0.571 | 1.000 | 0.727 |
+| RELIGION | 0.667 | 1.000 | 0.800 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
-| TRADE_UNION | 0.583 | 0.875 | 0.700 |
+| TRADE_UNION | 0.545 | 0.750 | 0.632 |
 
-**Article 9 coverage: 0.977 (43/44)** — nearly every special-category mention in the
+**Article 9 coverage: 0.957 (44/46)** — nearly every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
 across nine detector types rather than eight: the regulation protects political opinions,
 and a stated view that names no party needs a label separate from `political party`.
