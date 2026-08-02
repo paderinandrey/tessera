@@ -19,7 +19,7 @@
                 "type": "null"
               }
             ],
-            "description": "Layers to run. May only narrow what the server runs; omit for all.",
+            "description": "Layers to run, omit for all. May only narrow what the server runs, and must always include 'deterministic': the catalog layer costs microseconds and its checksum spans are what keep a model guess from displacing an identifier.",
             "title": "Layers"
           },
           "text": {
@@ -62,6 +62,20 @@
           "layers_run"
         ],
         "title": "DetectResponse",
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "description": "Body of a fail-closed response: a reason, never the submitted text.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ErrorDetail",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -241,6 +255,16 @@
               }
             },
             "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            },
+            "description": "A requested layer cannot run; the reason is named."
           }
         },
         "summary": "Detect"

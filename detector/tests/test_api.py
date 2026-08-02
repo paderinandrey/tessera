@@ -2,6 +2,11 @@ import json
 from pathlib import Path
 
 import pytest
+
+# The serve group is optional, so a bare `uv run pytest` must skip this file
+# rather than fail collection. `make test` installs the group so it runs.
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 from tessera_detector.api import create_app
@@ -95,14 +100,27 @@ def test_empty_text_is_rejected() -> None:
     assert client(FakeDetector()).post("/detect", json={"text": ""}).status_code == 422
 
 
-def test_errors_never_echo_the_submitted_text() -> None:
+SECRET = "Mandant Weber, IBAN CH9300762011623852957"
+
+
+def test_the_fail_closed_body_never_echoes_the_submitted_text() -> None:
     # Originals are forbidden in logs and bodies at every level, and error
     # paths are where that is easiest to forget.
-    secret = "Mandant Weber, IBAN CH9300762011623852957"
     detector = FakeDetector(ner_available=False, ner_off_reason="no weights")
-    response = client(detector).post("/detect", json={"text": secret, "layers": ["ner"]})
+    response = client(detector).post(
+        "/detect", json={"text": SECRET, "layers": ["deterministic", "ner"]}
+    )
     assert response.status_code == 503
-    assert secret not in response.text
+    assert SECRET not in response.text
+    assert "Weber" not in response.text
+
+
+def test_the_validation_body_never_echoes_the_submitted_text() -> None:
+    # Pydantic's default error body reports the offending input, which on this
+    # endpoint would be personal data.
+    response = client(FakeDetector()).post("/detect", json={"text": SECRET, "layers": ["ner"]})
+    assert response.status_code == 422
+    assert SECRET not in response.text
     assert "Weber" not in response.text
 
 
@@ -182,3 +200,27 @@ def test_health_reports_a_loaded_layer() -> None:
         pytest.skip("no NER weights: run `make model`")
     body = TestClient(create_app(build_detector())).get("/health").json()
     assert body == {"status": "ok", "ner": True, "ner_off_reason": None}
+
+
+def test_ner_without_the_deterministic_layer_is_rejected() -> None:
+    # The catalog layer costs 0.1 ms and its checksum spans are what keep a
+    # model guess from displacing an identifier; running NER alone would report
+    # a provenance the pipeline cannot deliver.
+    response = client(FakeDetector()).post("/detect", json={"text": TEXT, "layers": ["ner"]})
+    assert response.status_code == 422
+    assert "deterministic" in response.text
+
+
+def test_an_empty_layer_list_is_rejected() -> None:
+    response = client(FakeDetector()).post("/detect", json={"text": TEXT, "layers": []})
+    assert response.status_code == 422
+
+
+def test_the_schema_describes_the_unavailable_layer_response() -> None:
+    # The gateway generates its client from this file; the fail-closed outcome
+    # has to be in it or the client cannot model the case.
+    responses = json.loads(OPENAPI.read_text(encoding="utf-8"))["paths"]["/detect"]["post"][
+        "responses"
+    ]
+    assert "503" in responses
+    assert "application/json" in responses["503"]["content"]

@@ -13,7 +13,7 @@ openapi:
 	uv run --project detector --group serve python evaluation/export_openapi.py
 
 test:
-	cd detector && uv run pytest
+	cd detector && uv run --group serve pytest
 
 lint:
 	cd detector && uv run ruff check . ../evaluation && uv run mypy src
