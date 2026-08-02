@@ -99,14 +99,19 @@ message content are masked too — OpenAI's `user` and per-message `name`, Anthr
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.
 
-Provider credentials pass through — `Authorization`, `x-api-key`, `anthropic-version` and
-the providers' own routing headers — on an allowlist rather than a blanket forward, because
-a client's cookies are not the model provider's business.
+Provider credentials pass through on a per-provider allowlist: `Authorization` and OpenAI's
+routing headers go to OpenAI, `x-api-key` and `anthropic-version` go to Anthropic, and
+nothing else goes anywhere. A caller holding both sets of credentials does not have one
+provider's key posted to the other, and a client's cookies are nobody's business but the
+client's. Coming back, the provider's status and its rate-limit headers are preserved, so a
+429 still reads as a 429 with its `Retry-After`.
 
-**Every failure refuses the request.** A detector that errors or exceeds its timeout, a body
-whose shape the gateway does not recognize — including a content part it has no rule for,
-such as a tool block, whose masking is a later slice — a span the detector reports that
-cannot be applied, and a placeholder in the response that no mapping knows all end the
+**Every failure refuses the request**, and refuses it *before* the upstream call wherever
+the problem is visible there. A detector that errors or exceeds its timeout; a body whose
+shape the gateway has no rule for, including tool definitions and tool traffic, whose
+masking is a later slice; an identifier field present in a form that cannot be masked; a
+streaming request, which this slice cannot restore; a span the detector reports that cannot
+be applied; and a placeholder in the response that no mapping knows — each of these ends the
 request. Nothing unmasked is forwarded, and no placeholder is
 ever handed to the client in place of a value. No error body or log line carries the
 submitted text.

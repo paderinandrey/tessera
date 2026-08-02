@@ -8,6 +8,8 @@ pub enum ShapeError {
     Response(&'static str),
     #[error("no value at {0}")]
     Pointer(String),
+    #[error("{0} request uses {1}, which this gateway does not mask yet; it is refused rather than forwarded")]
+    Unsupported(&'static str, &'static str),
 }
 
 /// Where the text lives. Providers describe locations; masking and restoration
@@ -28,6 +30,45 @@ pub struct Anthropic;
 /// list by absence — masking their arguments is a later slice, and until then
 /// a request carrying them is refused rather than silently leaked.
 const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "audio"];
+
+/// Fields carrying tool definitions or tool traffic. Masking their arguments is
+/// a later slice, so a request that uses them is refused: forwarding it would
+/// send arbitrary strings past the masker.
+const TOOL_FIELDS: [&str; 5] = [
+    "tools",
+    "tool_choice",
+    "functions",
+    "function_call",
+    "tool_calls",
+];
+
+fn reject_tool_fields(body: &Value, provider: &'static str) -> Result<(), ShapeError> {
+    for field in TOOL_FIELDS {
+        if body.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(ShapeError::Unsupported(provider, field));
+        }
+    }
+    Ok(())
+}
+
+/// A field that should hold a maskable string. Absent is fine; present but not
+/// a string cannot be masked, so it is refused rather than forwarded as it is.
+fn identifier_pointer(
+    body: &Value,
+    lookup: &str,
+    output: String,
+    provider: &'static str,
+    out: &mut Vec<String>,
+) -> Result<(), ShapeError> {
+    match body.pointer(lookup) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(_)) => {
+            out.push(output);
+            Ok(())
+        }
+        Some(_) => Err(ShapeError::Request(provider)),
+    }
+}
 
 fn content_pointers(
     prefix: &str,
@@ -70,18 +111,25 @@ impl Provider for OpenAi {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
+        reject_tool_fields(body, "openai")?;
         let mut pointers = Vec::new();
         // Personal data does not only live in `content`. OpenAI's optional
         // per-message `name` and top-level `user` are identifiers, and
         // forwarding them verbatim would leak exactly what the proxy exists to
         // stop.
-        if body.get("user").and_then(Value::as_str).is_some() {
-            pointers.push("/user".to_owned());
-        }
+        identifier_pointer(body, "/user", "/user".to_owned(), "openai", &mut pointers)?;
         for (index, message) in messages.iter().enumerate() {
-            if message.get("name").and_then(Value::as_str).is_some() {
-                pointers.push(format!("/messages/{index}/name"));
+            reject_tool_fields(message, "openai")?;
+            if message.get("tool_call_id").is_some() {
+                return Err(ShapeError::Unsupported("openai", "tool_call_id"));
             }
+            identifier_pointer(
+                message,
+                "/name",
+                format!("/messages/{index}/name"),
+                "openai",
+                &mut pointers,
+            )?;
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
@@ -128,15 +176,16 @@ impl Provider for Anthropic {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
+        reject_tool_fields(body, "anthropic")?;
         let mut pointers = Vec::new();
         // Anthropic carries a caller-supplied identifier here.
-        if body
-            .pointer("/metadata/user_id")
-            .and_then(Value::as_str)
-            .is_some()
-        {
-            pointers.push("/metadata/user_id".to_owned());
-        }
+        identifier_pointer(
+            body,
+            "/metadata/user_id",
+            "/metadata/user_id".to_owned(),
+            "anthropic",
+            &mut pointers,
+        )?;
         if let Some(system) = body.get("system") {
             content_pointers("/system", system, "anthropic", &mut pointers)?;
         }
@@ -162,7 +211,12 @@ impl Provider for Anthropic {
         for (index, block) in blocks.iter().enumerate() {
             if block.get("text").and_then(Value::as_str).is_some() {
                 pointers.push(format!("/content/{index}/text"));
+                continue;
             }
+            // A tool_use block's arguments can carry placeholders we issued.
+            // Handing them to the client unrestored is the failure restoration
+            // exists to prevent, so an unreadable block refuses the response.
+            return Err(ShapeError::Response("anthropic"));
         }
         Ok(pointers)
     }
@@ -297,6 +351,44 @@ mod tests {
             OpenAi.request_pointers(&body).unwrap(),
             vec!["/messages/0/content/0/text"]
         );
+    }
+
+    #[test]
+    fn tool_bearing_requests_are_refused() {
+        // Masking tool arguments is a later slice; until then a request that
+        // uses them is refused rather than forwarded past the masker.
+        let with_tools = json!({"messages": [{"role": "user", "content": "Hi"}],
+                                "tools": [{"type": "function"}]});
+        assert!(OpenAi.request_pointers(&with_tools).is_err());
+        assert!(Anthropic.request_pointers(&with_tools).is_err());
+
+        let with_calls = json!({"messages": [
+            {"role": "assistant", "tool_calls": [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}
+        ]});
+        assert!(OpenAi.request_pointers(&with_calls).is_err());
+    }
+
+    #[test]
+    fn an_identifier_that_is_not_a_string_is_refused() {
+        // as_str() returning None used to mean "nothing to mask", which left
+        // the value in the body on its way upstream.
+        assert!(OpenAi
+            .request_pointers(&json!({"user": 42, "messages": []}))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [{"name": ["Weber"], "content": "Hi"}]}))
+            .is_err());
+        assert!(Anthropic
+            .request_pointers(&json!({"metadata": {"user_id": 7}, "messages": []}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_unreadable_anthropic_response_block_is_refused() {
+        // A tool_use block can carry placeholders we issued; handing them to
+        // the client unrestored is the failure restoration exists to prevent.
+        let body = json!({"content": [{"type": "tool_use", "input": {"n": "[PERSON_1]"}}]});
+        assert!(Anthropic.response_pointers(&body).is_err());
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub enum ProxyError {
     Mapping(#[from] MappingError),
     #[error("upstream request failed: {0}")]
     Upstream(String),
+    #[error("streaming is not supported by this gateway yet; the request is refused rather than forwarded unrestorable")]
+    Streaming,
 }
 
 impl IntoResponse for ProxyError {
@@ -30,7 +32,9 @@ impl IntoResponse for ProxyError {
         let status = match self {
             // A body we cannot read is the client's to fix, and it is refused
             // rather than forwarded unmasked.
-            ProxyError::Shape(ShapeError::Request(_)) => StatusCode::BAD_REQUEST,
+            ProxyError::Shape(ShapeError::Request(_))
+            | ProxyError::Shape(ShapeError::Unsupported(_, _))
+            | ProxyError::Streaming => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
         };
         // The reason names the failure. It never carries the submitted text.
@@ -42,14 +46,26 @@ impl IntoResponse for ProxyError {
 /// rather than a passthrough: `host`, `content-length` and friends belong to
 /// the hop we are making, not the one we received, and forwarding a client's
 /// cookies to a model provider is nobody's intent.
-const FORWARDED_HEADERS: [&str; 7] = [
+/// Per provider, so a caller holding credentials for both does not send the
+/// Anthropic key to OpenAI. A secret crossing a provider boundary is a leak of
+/// a different kind than the one this proxy was built for, but a leak.
+const OPENAI_HEADERS: [&str; 4] = [
     "authorization",
-    "x-api-key",
-    "anthropic-version",
-    "anthropic-beta",
     "openai-organization",
     "openai-project",
     "openai-beta",
+];
+const ANTHROPIC_HEADERS: [&str; 3] = ["x-api-key", "anthropic-version", "anthropic-beta"];
+
+/// Response headers a client needs to behave well against a provider that is
+/// pushing back.
+const RETURNED_HEADERS: [&str; 6] = [
+    "retry-after",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-requests-reset",
 ];
 
 pub struct AppState {
@@ -86,6 +102,12 @@ async fn handle(
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, ProxyError> {
+    // This slice does not restore a stream, so a streaming request is refused
+    // before it costs the caller an upstream call and the tokens with it.
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(ProxyError::Streaming);
+    }
+
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let pointers = provider.request_pointers(&body)?;
 
@@ -104,7 +126,11 @@ async fn handle(
         state.base_for(provider),
         provider.upstream_path()
     ));
-    for name in FORWARDED_HEADERS {
+    let allowed: &[&str] = match provider.name() {
+        "anthropic" => &ANTHROPIC_HEADERS,
+        _ => &OPENAI_HEADERS,
+    };
+    for name in allowed {
         let header = HeaderName::from_static(name);
         if let Some(value) = headers.get(&header) {
             request = request.header(header, value);
@@ -118,18 +144,41 @@ async fn handle(
 
     let status = StatusCode::from_u16(response.status().as_u16())
         .map_err(|error| ProxyError::Upstream(error.to_string()))?;
-    let upstream: Value = response
-        .json()
+    // The rate-limit headers are what let a client back off as the provider
+    // asked; rebuilding the response without them silently drops that.
+    let mut returned = HeaderMap::new();
+    for name in RETURNED_HEADERS {
+        let header = HeaderName::from_static(name);
+        if let Some(value) = response.headers().get(&header) {
+            returned.insert(header, value.clone());
+        }
+    }
+    let raw = response
+        .bytes()
         .await
         .map_err(|error| ProxyError::Upstream(error.to_string()))?;
 
     if !status.is_success() {
         // The provider's status and error envelope carry retry semantics the
         // client needs; turning a 429 into a generic 502 loses them. The body
-        // may still echo what we sent, so it is restored before it goes back.
-        let restored = restore_everywhere(&upstream, &mapping)?;
-        return Ok((status, Json(restored)).into_response());
+        // may still echo what we sent, so it is restored before it goes back —
+        // and an error body is not always JSON, so text is handled too.
+        return Ok(match serde_json::from_slice::<Value>(&raw) {
+            Ok(parsed) => (
+                status,
+                returned,
+                Json(restore_everywhere(&parsed, &mapping)?),
+            )
+                .into_response(),
+            Err(_) => {
+                let text = String::from_utf8_lossy(&raw);
+                (status, returned, mapping.restore(&text)?).into_response()
+            }
+        });
     }
+
+    let upstream: Value =
+        serde_json::from_slice(&raw).map_err(|error| ProxyError::Upstream(error.to_string()))?;
 
     // Restore, and refuse rather than hand a placeholder to the client.
     let mut restored = upstream.clone();
@@ -580,6 +629,128 @@ mod tests {
             received.headers.get("cookie").is_none(),
             "a cookie was forwarded"
         );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_request_is_refused_before_the_upstream_is_called() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "a refusal after the call still costs the caller tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_json_upstream_error_keeps_its_status_and_body() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("<html>bad gateway</html>"))
+            .mount(&upstream)
+            .await;
+
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("bad gateway"), "the body was lost: {body}");
+    }
+
+    #[tokio::test]
+    async fn retry_after_survives_an_upstream_rate_limit() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(json!({"error": {"message": "slow down"}})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let response = router(state(&detector, &upstream))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "gpt",
+                               "messages": [{"role": "user", "content": "Hallo"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "30");
+    }
+
+    #[tokio::test]
+    async fn one_providers_key_never_reaches_the_other() {
+        // A caller holding both sets of credentials must not have the Anthropic
+        // key posted to OpenAI.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+
+        call_with_headers(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Hallo"}]}),
+            &[
+                ("authorization", "Bearer sk-openai"),
+                ("x-api-key", "sk-ant-secret"),
+            ],
+        )
+        .await;
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        assert_eq!(received.headers["authorization"], "Bearer sk-openai");
+        assert!(
+            received.headers.get("x-api-key").is_none(),
+            "the Anthropic key crossed to OpenAI"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_bearing_request_is_refused() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "tools": [{"type": "function"}],
+                   "messages": [{"role": "user", "content": "Weber"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
