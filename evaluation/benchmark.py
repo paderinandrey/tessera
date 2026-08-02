@@ -14,10 +14,10 @@ import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
-from tessera_detector.models import find_model
-from tessera_detector.ner import load_ner_types
+from tessera_detector.ner import GlinerRecognizer, InferencePass
 from tessera_detector.pipeline import Detector, build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
@@ -117,6 +117,12 @@ def render(timings: list[Timing]) -> str:
     return "\n".join(lines)
 
 
+def _run_pass(
+    recognizer: GlinerRecognizer, pieces: list[tuple[int, str]], inference: InferencePass, _: str
+) -> object:
+    return recognizer.run_pass(pieces, inference)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Detector latency benchmark (REQ-38)")
     parser.add_argument("--runs", type=int, default=30, help="timed runs per measurement")
@@ -130,9 +136,6 @@ def main(argv: list[str] | None = None) -> int:
     sizes = build_sizes(documents)
     deterministic = Detector()
     full = build_detector()
-    model_path = find_model() if full.ner_available else None
-    if model_path is not None:
-        from tessera_detector.ner import GlinerRecognizer
 
     timings: list[Timing] = []
     for size, text in sizes.items():
@@ -148,22 +151,34 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         )
-        if full.ner_available:
-            # One recognizer per tier, built from the public `types=` parameter
-            # and released before the next: the passes are what a regression
-            # lands in, and holding three ONNX sessions at once is needless.
-            for tier in sorted({t.tier for t in load_ner_types()}):
-                per_tier = GlinerRecognizer(
-                    model_path, types=tuple(t for t in load_ner_types() if t.tier == tier)
+        recognizer = full.recognizer
+        if recognizer is not None:
+            # Preprocessing is shared across the passes and happens once per
+            # document, so it is timed once and the passes are timed over its
+            # output. Timing whole per-tier detections instead would charge
+            # every tier for the same chunking, and the parts would sum past
+            # the total they are meant to explain.
+            timings.append(
+                Timing(
+                    "chunk+tokenize",
+                    size,
+                    measure(recognizer.windows, text, runs=args.runs, warmup=args.warmup),
                 )
+            )
+            pieces = recognizer.windows(text)
+            for inference in recognizer.passes:
                 timings.append(
                     Timing(
-                        f"ner tier {tier}",
+                        f"ner tier {inference.tier}",
                         size,
-                        measure(per_tier.detect, text, runs=args.runs, warmup=args.warmup),
+                        measure(
+                            partial(_run_pass, recognizer, pieces, inference),
+                            text,
+                            runs=args.runs,
+                            warmup=args.warmup,
+                        ),
                     )
                 )
-                del per_tier
         timings.append(
             Timing("total", size, measure(full.detect, text, runs=args.runs, warmup=args.warmup))
         )

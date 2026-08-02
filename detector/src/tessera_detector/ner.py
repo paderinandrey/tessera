@@ -17,6 +17,15 @@ _DEFAULT_CONFIG = resources.files("tessera_detector") / "catalog" / "ner.yaml"
 
 
 @dataclass(frozen=True, slots=True)
+class InferencePass:
+    """One call to the model: the labels of a tier and that tier's floor."""
+
+    tier: int
+    labels: tuple[str, ...]
+    threshold: float
+
+
+@dataclass(frozen=True, slots=True)
 class NerType:
     entity_type: str
     label: str
@@ -177,41 +186,71 @@ class GlinerRecognizer:
         by_tier: dict[int, list[NerType]] = {}
         for ner_type in self.types:
             by_tier.setdefault(ner_type.tier, []).append(ner_type)
-        self._passes = [
-            ([t.label for t in group], min(t.threshold for t in group))
-            for _, group in sorted(by_tier.items())
-        ]
+        self.passes = tuple(
+            InferencePass(
+                tier=tier,
+                labels=tuple(t.label for t in group),
+                threshold=min(t.threshold for t in group),
+            )
+            for tier, group in sorted(by_tier.items())
+        )
 
     def _windows(self, chunk: str) -> list[tuple[int, int]]:
         encoded = self._tokenizer(chunk, return_offsets_mapping=True, add_special_tokens=False)
         offsets = [(int(s), int(e)) for s, e in encoded["offset_mapping"] if e > s]
         return token_windows(offsets, budget=self._token_budget, overlap=TOKEN_OVERLAP)
 
+    def windows(self, text: str) -> list[tuple[int, str]]:
+        """Every piece handed to the model, with its absolute offset in `text`.
+
+        Chunking and tokenization are shared across the inference passes and
+        happen once per document; splitting them out keeps that plain, and lets
+        a benchmark attribute cost to preprocessing or to a specific pass.
+        """
+        pieces: list[tuple[int, str]] = []
+        for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+            for start, end in self._windows(chunk):
+                pieces.append((offset + start, chunk[start:end]))
+        return pieces
+
+    def run_pass(self, pieces: list[tuple[int, str]], inference: InferencePass) -> list[Span]:
+        """Spans from one inference pass over already-prepared pieces."""
+        spans: list[Span] = []
+        for base, piece in pieces:
+            for entity in self._model.predict_entities(
+                piece, list(inference.labels), threshold=inference.threshold
+            ):
+                ner_type = self._by_label.get(entity["label"])
+                score = float(entity["score"])
+                if ner_type is None or score < ner_type.threshold:
+                    continue
+                spans.append(
+                    Span(
+                        entity_type=ner_type.entity_type,
+                        start=base + int(entity["start"]),
+                        end=base + int(entity["end"]),
+                        confidence=min(score, 0.99),
+                        recognizer="ner:gliner",
+                        tier=ner_type.tier,
+                    )
+                )
+        return spans
+
     def detect(self, text: str) -> list[Span]:
         if not text:
             return []
+        pieces = self.windows(text)
         spans: list[Span] = []
-        for offset, chunk in chunks(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-            for window_start, window_end in self._windows(chunk):
-                piece = chunk[window_start:window_end]
-                base = offset + window_start
-                for labels, floor in self._passes:
-                    for entity in self._model.predict_entities(piece, labels, threshold=floor):
-                        ner_type = self._by_label.get(entity["label"])
-                        score = float(entity["score"])
-                        if ner_type is None or score < ner_type.threshold:
-                            continue
-                        spans.append(
-                            Span(
-                                entity_type=ner_type.entity_type,
-                                start=base + int(entity["start"]),
-                                end=base + int(entity["end"]),
-                                confidence=min(score, 0.99),
-                                recognizer="ner:gliner",
-                                tier=ner_type.tier,
-                            )
-                        )
+        for inference in self.passes:
+            spans.extend(self.run_pass(pieces, inference))
         return spans
 
 
-__all__ = ["GlinerRecognizer", "NerType", "chunks", "load_ner_types", "token_windows"]
+__all__ = [
+    "GlinerRecognizer",
+    "InferencePass",
+    "NerType",
+    "chunks",
+    "load_ner_types",
+    "token_windows",
+]
