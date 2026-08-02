@@ -28,7 +28,10 @@ class ModelUnavailable(Exception):
 
 
 def model_cache_dir() -> Path:
-    return Path.home() / ".cache" / "tessera" / "models" / MODEL_NAME
+    # The revision is part of the directory name, not just of the download call:
+    # a cache filled before a revision bump would otherwise keep serving stale
+    # weights to every automatic scan until someone re-ran `make model`.
+    return Path.home() / ".cache" / "tessera" / "models" / f"{MODEL_NAME}@{HF_REVISION[:12]}"
 
 
 def _missing_artifacts(path: Path) -> list[str]:

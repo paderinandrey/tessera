@@ -3,8 +3,11 @@
 Exits non-zero when Tier 1 recall drops below the target so CI can gate on it.
 
 Run from the repository root:  uv run --project detector python evaluation/evaluate.py
+Pass --require-ner where the NER layer is provisioned: without it a broken
+runtime would skip the NER gates and still report success.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -15,6 +18,7 @@ from tessera_detector.evaluation import (
     precision_gate_failures,
     summarize,
 )
+from tessera_detector.models import ModelUnavailable
 from tessera_detector.pipeline import build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
@@ -29,8 +33,19 @@ BINDING_PRECISION_TYPES = {"LOCATION"}
 ADVISORY_PRECISION_TYPES = {"ORG"}
 
 
-def main() -> int:
-    detector = build_detector()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--require-ner",
+        action="store_true",
+        help="fail instead of skipping the NER gates when the layer cannot run",
+    )
+    args = parser.parse_args(argv)
+    try:
+        detector = build_detector(ner=True if args.require_ner else None)
+    except (ModelUnavailable, ValueError) as error:
+        print(f"FAIL: --require-ner but the layer cannot run: {error}", file=sys.stderr)
+        return 1
     tier1_types = {rule.entity_type for rule in detector.deterministic.rules if rule.tier == 1}
     per_document = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():

@@ -50,5 +50,8 @@ jobs:
           key: ner-weights-${{ hashFiles('detector/src/tessera_detector/models.py') }}
       - run: make -C .. model
       # Model-backed tests plus the LOCATION precision gate (REQ-38).
+      # --require-ner is what keeps this job honest: the marked tests skip when
+      # the runtime is broken, so without it the job would pass green with the
+      # NER layer entirely unusable.
       - run: uv run --group ner pytest -m ner
-      - run: uv run --group ner python ../evaluation/evaluate.py
+      - run: uv run --group ner python ../evaluation/evaluate.py --require-ner
