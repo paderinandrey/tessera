@@ -114,6 +114,29 @@ def summarize(per_document: list[dict[str, Metrics]], *, tier1_types: set[str]) 
     return Summary(per_type=dict(per_type), tier1_recall=tier1.recall)
 
 
+def group_coverage(
+    entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
+) -> list[tuple[str, bool]]:
+    """Per gold entity of the group: its type, and whether the group covered it.
+
+    Reported per entity rather than as a total so callers can bucket by
+    language and category — a pooled ratio lets a category go dark in one
+    language while the aggregate stays above target.
+    """
+    candidates = [span for span in predictions if span.entity_type in types]
+    return [
+        (
+            entity.entity_type,
+            any(
+                _iou(entity.start, entity.end, span.start, span.end) >= IOU_THRESHOLD
+                for span in candidates
+            ),
+        )
+        for entity in entities
+        if entity.entity_type in types
+    ]
+
+
 def group_recall(
     entities: list[EvalEntity], predictions: list[Span], *, types: set[str]
 ) -> tuple[int, int]:
@@ -153,6 +176,7 @@ __all__ = [
     "Metrics",
     "Summary",
     "evaluate_document",
+    "group_coverage",
     "group_recall",
     "precision_gate_failures",
     "summarize",

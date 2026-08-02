@@ -153,3 +153,24 @@ def test_group_recall_with_no_gold_of_the_group() -> None:
     from tessera_detector.evaluation import group_recall
 
     assert group_recall([], [], types={"HEALTH"}) == (0, 0)
+
+
+def test_group_coverage_reports_each_gold_entity() -> None:
+    from tessera_detector.evaluation import group_coverage
+
+    gold = [
+        EvalEntity(entity_type="HEALTH", start=0, end=10),
+        EvalEntity(entity_type="RELIGION", start=20, end=30),
+    ]
+    pred = [pred_span("ETHNICITY", 0, 10)]
+    assert group_coverage(gold, pred, types={"HEALTH", "RELIGION", "ETHNICITY"}) == [
+        ("HEALTH", True),
+        ("RELIGION", False),
+    ]
+
+
+def test_group_coverage_ignores_gold_outside_the_group() -> None:
+    from tessera_detector.evaluation import group_coverage
+
+    gold = [EvalEntity(entity_type="IBAN", start=0, end=10)]
+    assert group_coverage(gold, [], types={"HEALTH"}) == []

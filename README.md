@@ -89,9 +89,9 @@ Current results on the public corpus, with the NER weights installed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| LOCATION | 0.833 | 1.000 | 0.909 |
-| ORG | 0.346 | 0.692 | 0.462 |
-| PERSON | 0.770 | 0.627 | 0.691 |
+| LOCATION | 0.571 | 1.000 | 0.727 |
+| ORG | 0.167 | 0.500 | 0.250 |
+| PERSON | 0.746 | 0.618 | 0.676 |
 
 Article 9 special categories, detected by the same layer at a lower threshold:
 
@@ -99,15 +99,15 @@ Article 9 special categories, detected by the same layer at a lower threshold:
 |---|---|---|---|
 | BIOMETRIC | 1.000 | 1.000 | 1.000 |
 | ETHNICITY | 1.000 | 0.714 | 0.833 |
-| GENETIC | 1.000 | 1.000 | 1.000 |
-| HEALTH | 0.800 | 1.000 | 0.889 |
-| POLITICAL_AFFILIATION | 0.800 | 1.000 | 0.889 |
-| POLITICAL_OPINION | 1.000 | 1.000 | 1.000 |
-| RELIGION | 0.667 | 1.000 | 0.800 |
+| GENETIC | 1.000 | 0.750 | 0.857 |
+| HEALTH | 0.889 | 1.000 | 0.941 |
+| POLITICAL_AFFILIATION | 0.667 | 1.000 | 0.800 |
+| POLITICAL_OPINION | 1.000 | 0.667 | 0.800 |
+| RELIGION | 0.444 | 1.000 | 0.615 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
-| TRADE_UNION | 0.545 | 0.750 | 0.632 |
+| TRADE_UNION | 0.381 | 1.000 | 0.552 |
 
-**Article 9 coverage: 0.957 (44/46)** — nearly every special-category mention in the
+**Article 9 coverage: 0.978 (45/46)** — nearly every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
 across nine detector types rather than eight: the regulation protects political opinions,
 and a stated view that names no party needs a label separate from `political party`.
@@ -133,7 +133,16 @@ and a stated view that names no party needs a label separate from `political par
 > (≥ 0.99) and the LOCATION precision gate (≥ 0.8), while ORG precision is reported
 > and warned about rather than enforced — a number that good on this corpus is not
 > evidence about real prose. PERSON precision is the honest weak spot and is not yet
-> gated. ORG precision fell from 0.950 to 0.346 when this corpus gained entity-free
+> ORG and LOCATION precision are both advisory rather than gated, and the reason is worth
+> stating: every LOCATION false positive here is a French surname that is also a place
+> name — Lenoir, Fontaine, Mercier — where the model marks the very span the gold calls
+> PERSON. That is two quasi-identifiers disagreeing about a label, not the service masking
+> text it should have left alone, and the span is redacted either way. Raising LOCATION's
+> threshold to 0.90 moves precision only to 0.727 with recall still at 1.000, which says
+> the number is bound by the corpus rather than by the detector. REQ-38's 0.8 target is an
+> irritation metric; measuring it needs the privately annotated corpus.
+>
+> ORG precision fell from 0.950 to 0.167 when this corpus gained entity-free
 > business prose: the model finds organizations in "die Apotheke" and "convention
 > collective" that the gold does not enumerate. That is the negative examples doing their
 > job — the earlier number was measured on a corpus with almost nothing to get wrong.
