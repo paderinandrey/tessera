@@ -347,6 +347,12 @@ def test_ner_flag_without_weights_exits_2(
     assert "no NER weights" in captured.err
 
 
+def test_contradictory_ner_flags_are_rejected(tmp_path: Path) -> None:
+    # Silently letting one win would hide a mistake in the caller's invocation.
+    with pytest.raises(SystemExit):
+        main(["scan", str(tmp_path), "--ner", "--no-ner"])
+
+
 def test_scan_offsets_stay_in_original_crlf_coordinates(tmp_path: Path) -> None:
     # Newline translation would silently shift every offset left of the raw file.
     (tmp_path / "a.txt").write_bytes(b"line1\r\nmail: anna.keller@example.ch\r\n")

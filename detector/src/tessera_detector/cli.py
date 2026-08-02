@@ -179,8 +179,9 @@ def main(argv: list[str] | None = None) -> int:
     scan_parser.add_argument("path", type=Path, help="file or directory to scan")
     scan_parser.add_argument("--json", action="store_true", dest="as_json", help="JSON output")
     scan_parser.add_argument("--show-values", action="store_true", help="print values verbatim")
-    scan_parser.add_argument("--ner", action="store_true", help="require the NER layer")
-    scan_parser.add_argument("--no-ner", action="store_true", help="skip the NER layer")
+    ner_group = scan_parser.add_mutually_exclusive_group()
+    ner_group.add_argument("--ner", action="store_true", help="require the NER layer")
+    ner_group.add_argument("--no-ner", action="store_true", help="skip the NER layer")
     args = parser.parse_args(argv)
     if not args.path.exists():
         print(f"tessera: {args.path}: no such file or directory", file=sys.stderr)
