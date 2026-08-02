@@ -151,3 +151,9 @@ def test_checksum_identifier_still_outranks_an_article_9_span() -> None:
     )
     spans = Detector(recognizer=recognizer).detect(text)
     assert [(s.entity_type, s.start, s.end) for s in spans] == [("EMAIL", 6, 28)]
+
+
+def test_deterministic_only_still_resolves_conflicts() -> None:
+    detector = Detector(recognizer=FakeRecognizer([person(0, 5)]))
+    spans = detector.deterministic_only("Keller a écrit à anna.keller@example.ch")
+    assert [s.entity_type for s in spans] == ["EMAIL"], "the NER span must not appear"

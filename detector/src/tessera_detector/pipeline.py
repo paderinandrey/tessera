@@ -43,6 +43,15 @@ class Detector:
     def ner_available(self) -> bool:
         return self.recognizer is not None
 
+    def deterministic_only(self, text: str) -> list[Span]:
+        """Resolved spans from the catalog layer alone.
+
+        Narrowing to one layer must not also drop conflict resolution: the
+        caller asked for fewer detectors, not for raw overlapping spans.
+        """
+        spans = self.deterministic.detect(text)
+        return resolve(spans, specificity=self.deterministic.specificity).spans
+
     def detect(self, text: str) -> list[Span]:
         spans = self.deterministic.detect(text)
         specificity = dict(self.deterministic.specificity)

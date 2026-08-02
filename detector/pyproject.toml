@@ -25,6 +25,11 @@ dev = [
 eval = [
     "faker>=40",
 ]
+serve = [
+    "fastapi>=0.120",
+    "uvicorn>=0.40",
+    "httpx>=0.28",
+]
 ner = [
     "gliner>=0.2.22",
     "onnxruntime>=1.20",
