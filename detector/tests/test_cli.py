@@ -14,7 +14,7 @@ from tessera_detector.cli import (
     render_text,
     scan,
 )
-from tessera_detector.deterministic import DeterministicDetector
+from tessera_detector.pipeline import Detector
 
 
 def test_mask_keeps_first_four_and_last_two() -> None:
@@ -37,7 +37,7 @@ def test_mask_counts_characters_not_bytes() -> None:
 def test_scan_reports_findings_with_values_from_text(tmp_path: Path) -> None:
     text = "Contact: anna.keller@example.ch pour le dossier."
     (tmp_path / "a.txt").write_text(text, encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     assert [f.path for f in report.files] == [str(tmp_path / "a.txt")]
     finding = report.files[0].findings[0]
     assert finding.entity_type == "EMAIL"
@@ -51,7 +51,7 @@ def test_scan_walks_directories_recursively_in_sorted_order(tmp_path: Path) -> N
     text = "Bitte an max.weber@example.de schreiben."
     (tmp_path / "sub" / "b.txt").write_text(text, encoding="utf-8")
     (tmp_path / "a.txt").write_text("nothing personal here", encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     expected = [str(tmp_path / "a.txt"), str(tmp_path / "sub" / "b.txt")]
     assert [f.path for f in report.files] == expected
     assert report.files[0].findings == []
@@ -61,7 +61,7 @@ def test_scan_walks_directories_recursively_in_sorted_order(tmp_path: Path) -> N
 def test_scan_skips_non_utf8_files_without_aborting(tmp_path: Path) -> None:
     (tmp_path / "c.bin").write_bytes(b"\xff\xfe\x00\x01")
     (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     assert report.skipped == [str(tmp_path / "c.bin")]
     assert len(report.files) == 1
 
@@ -69,7 +69,7 @@ def test_scan_skips_non_utf8_files_without_aborting(tmp_path: Path) -> None:
 def test_scan_accepts_a_single_file(tmp_path: Path) -> None:
     target = tmp_path / "one.txt"
     target.write_text("mail: anna.keller@example.ch", encoding="utf-8")
-    report = scan(target, DeterministicDetector())
+    report = scan(target, Detector())
     assert [f.path for f in report.files] == [str(target)]
     assert report.files[0].findings[0].entity_type == "EMAIL"
 
@@ -256,7 +256,7 @@ def test_scan_does_not_follow_file_symlinks(tmp_path: Path) -> None:
     root.mkdir()
     (root / "link.txt").symlink_to(outside / "secret.txt")
     (root / "real.txt").write_text("mail: max.weber@example.de", encoding="utf-8")
-    report = scan(root, DeterministicDetector())
+    report = scan(root, Detector())
     assert [f.path for f in report.files] == [str(root / "real.txt")]
 
 
@@ -264,7 +264,7 @@ def test_scan_ignores_special_files(tmp_path: Path) -> None:
     # A FIFO must never be opened: read blocks forever waiting for a writer.
     os.mkfifo(tmp_path / "pipe.fifo")
     (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     assert [f.path for f in report.files] == [str(tmp_path / "a.txt")]
     assert report.skipped == []
     assert report.unreadable == []
@@ -278,7 +278,7 @@ def test_unsearchable_directory_entries_are_reported(tmp_path: Path) -> None:
     (sub / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
     sub.chmod(0o444)
     try:
-        report = scan(tmp_path, DeterministicDetector())
+        report = scan(tmp_path, Detector())
     finally:
         sub.chmod(0o755)
     assert report.unreadable == [str(sub / "a.txt")]
@@ -304,7 +304,7 @@ def test_surrogate_filenames_do_not_break_output(
 def test_scan_offsets_stay_in_original_crlf_coordinates(tmp_path: Path) -> None:
     # Newline translation would silently shift every offset left of the raw file.
     (tmp_path / "a.txt").write_bytes(b"line1\r\nmail: anna.keller@example.ch\r\n")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     finding = report.files[0].findings[0]
     assert (finding.start, finding.end) == (13, 35)
     assert finding.value == "anna.keller@example.ch"

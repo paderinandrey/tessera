@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .pipeline import Detector
-from .resolution import resolve
 
 MASK_MIN_LENGTH = 8
 
@@ -104,7 +103,7 @@ def scan(path: Path, detector: Detector) -> ScanReport:
                 recognizer=span.recognizer,
                 value=text[span.start : span.end],
             )
-            for span in resolve(detector.detect(text)).spans
+            for span in detector.detect(text)
         ]
         report.files.append(FileReport(path=_display_path(file), findings=findings))
     return report
