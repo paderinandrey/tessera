@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from tessera_detector.cli import (
     render_text,
     scan,
 )
-from tessera_detector.deterministic import DeterministicDetector
+from tessera_detector.pipeline import Detector
 
 
 def test_mask_keeps_first_four_and_last_two() -> None:
@@ -37,7 +38,7 @@ def test_mask_counts_characters_not_bytes() -> None:
 def test_scan_reports_findings_with_values_from_text(tmp_path: Path) -> None:
     text = "Contact: anna.keller@example.ch pour le dossier."
     (tmp_path / "a.txt").write_text(text, encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     assert [f.path for f in report.files] == [str(tmp_path / "a.txt")]
     finding = report.files[0].findings[0]
     assert finding.entity_type == "EMAIL"
@@ -51,7 +52,7 @@ def test_scan_walks_directories_recursively_in_sorted_order(tmp_path: Path) -> N
     text = "Bitte an max.weber@example.de schreiben."
     (tmp_path / "sub" / "b.txt").write_text(text, encoding="utf-8")
     (tmp_path / "a.txt").write_text("nothing personal here", encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     expected = [str(tmp_path / "a.txt"), str(tmp_path / "sub" / "b.txt")]
     assert [f.path for f in report.files] == expected
     assert report.files[0].findings == []
@@ -61,7 +62,7 @@ def test_scan_walks_directories_recursively_in_sorted_order(tmp_path: Path) -> N
 def test_scan_skips_non_utf8_files_without_aborting(tmp_path: Path) -> None:
     (tmp_path / "c.bin").write_bytes(b"\xff\xfe\x00\x01")
     (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     assert report.skipped == [str(tmp_path / "c.bin")]
     assert len(report.files) == 1
 
@@ -69,7 +70,7 @@ def test_scan_skips_non_utf8_files_without_aborting(tmp_path: Path) -> None:
 def test_scan_accepts_a_single_file(tmp_path: Path) -> None:
     target = tmp_path / "one.txt"
     target.write_text("mail: anna.keller@example.ch", encoding="utf-8")
-    report = scan(target, DeterministicDetector())
+    report = scan(target, Detector())
     assert [f.path for f in report.files] == [str(target)]
     assert report.files[0].findings[0].entity_type == "EMAIL"
 
@@ -98,7 +99,8 @@ def test_render_text_masks_values_and_summarizes() -> None:
         "\n"
         "Total: 2 files, 2 findings\n"
         "  FR_NIR       1\n"
-        "  IBAN         1"
+        "  IBAN         1\n"
+        "NER layer: off (no weights; run `make model`)"
     )
 
 
@@ -122,11 +124,14 @@ def test_render_text_sorts_summary_by_count_then_name() -> None:
     )
     text = render_text(report)
     assert text.index("IBAN         2") < text.index("EMAIL        1")
-    assert text.endswith("Skipped: 1 (not valid UTF-8)")
+    assert "Skipped: 1 (not valid UTF-8)" in text
+    assert text.endswith("NER layer: off (no weights; run `make model`)")
 
 
 def test_render_text_empty_report() -> None:
-    assert render_text(ScanReport(files=[], skipped=[])) == "Total: 0 files, 0 findings"
+    assert render_text(ScanReport(files=[], skipped=[])) == (
+        "Total: 0 files, 0 findings\nNER layer: off (no weights; run `make model`)"
+    )
 
 
 def test_render_json_shape_and_masking() -> None:
@@ -135,6 +140,8 @@ def test_render_json_shape_and_masking() -> None:
         "files_scanned": 2,
         "files_skipped": 0,
         "files_unreadable": 0,
+        "ner": False,
+        "ner_off_reason": "no weights",
         "total_findings": 2,
         "by_type": {"FR_NIR": 1, "IBAN": 1},
     }
@@ -240,7 +247,7 @@ def test_nested_unreadable_subdirectory_is_reported(
 
 def test_render_text_reports_unreadable_entries() -> None:
     report = ScanReport(files=[], skipped=[], unreadable=["dir/locked"])
-    assert render_text(report).endswith("Unreadable: 1")
+    assert "Unreadable: 1" in render_text(report)
 
 
 def test_render_json_counts_unreadable_entries() -> None:
@@ -256,7 +263,7 @@ def test_scan_does_not_follow_file_symlinks(tmp_path: Path) -> None:
     root.mkdir()
     (root / "link.txt").symlink_to(outside / "secret.txt")
     (root / "real.txt").write_text("mail: max.weber@example.de", encoding="utf-8")
-    report = scan(root, DeterministicDetector())
+    report = scan(root, Detector())
     assert [f.path for f in report.files] == [str(root / "real.txt")]
 
 
@@ -264,7 +271,7 @@ def test_scan_ignores_special_files(tmp_path: Path) -> None:
     # A FIFO must never be opened: read blocks forever waiting for a writer.
     os.mkfifo(tmp_path / "pipe.fifo")
     (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     assert [f.path for f in report.files] == [str(tmp_path / "a.txt")]
     assert report.skipped == []
     assert report.unreadable == []
@@ -278,7 +285,7 @@ def test_unsearchable_directory_entries_are_reported(tmp_path: Path) -> None:
     (sub / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
     sub.chmod(0o444)
     try:
-        report = scan(tmp_path, DeterministicDetector())
+        report = scan(tmp_path, Detector())
     finally:
         sub.chmod(0o755)
     assert report.unreadable == [str(sub / "a.txt")]
@@ -301,16 +308,69 @@ def test_surrogate_filenames_do_not_break_output(
     assert "�" in out
 
 
+def test_report_notes_when_ner_did_not_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path)]) == 0
+    assert "NER layer: off" in capsys.readouterr().out
+
+
+def test_json_reports_ner_availability(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["ner"] is False
+
+
+def test_no_ner_flag_skips_the_layer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TESSERA_NER_MODEL", "/definitely/not/here")
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--no-ner"]) == 0
+    assert "EMAIL" in capsys.readouterr().out
+
+
+def test_ner_flag_without_weights_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--ner"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no NER weights" in captured.err
+
+
+def test_contradictory_ner_flags_are_rejected(tmp_path: Path) -> None:
+    # Silently letting one win would hide a mistake in the caller's invocation.
+    with pytest.raises(SystemExit):
+        main(["scan", str(tmp_path), "--ner", "--no-ner"])
+
+
 def test_scan_offsets_stay_in_original_crlf_coordinates(tmp_path: Path) -> None:
     # Newline translation would silently shift every offset left of the raw file.
     (tmp_path / "a.txt").write_bytes(b"line1\r\nmail: anna.keller@example.ch\r\n")
-    report = scan(tmp_path, DeterministicDetector())
+    report = scan(tmp_path, Detector())
     finding = report.files[0].findings[0]
     assert (finding.start, finding.end) == (13, 35)
     assert finding.value == "anna.keller@example.ch"
 
 
-def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_full_report_over_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Isolate from any NER weights actually cached on the machine running this
+    # test: the exact-match assertion below must hold regardless of local state.
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
     fr = "Contact: anna.keller@example.ch pour le dossier."
     de = "Bitte an max.weber@example.de schreiben."
     (tmp_path / "a.txt").write_text(fr, encoding="utf-8")
@@ -328,4 +388,67 @@ def test_full_report_over_directory(tmp_path: Path, capsys: pytest.CaptureFixtur
         "Total: 2 files, 2 findings\n"
         "  EMAIL        2\n"
         "Skipped: 1 (not valid UTF-8)\n"
+        "NER layer: off (no weights; run `make model`)\n"
     )
+
+
+def test_report_distinguishes_disabled_from_missing_weights(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --no-ner is a choice, not a missing install: telling the user to download
+    # weights they may already have makes the report's provenance misleading.
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--no-ner"]) == 0
+    out = capsys.readouterr().out
+    assert "NER layer: off (disabled with --no-ner)" in out
+    assert "make model" not in out
+
+
+def test_json_reports_why_the_layer_is_off(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--no-ner", "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["ner"] is False
+    assert summary["ner_off_reason"] == "disabled"
+
+
+def test_json_reports_missing_weights_as_the_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["ner"] is False
+    assert summary["ner_off_reason"] == "no weights"
+
+
+def test_report_names_a_missing_runtime_rather_than_missing_weights(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Weights are installed; the ner group is not. Telling the user to download
+    # the model would send them after something they already have.
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "ner dependency group is not installed" in out
+    assert "make model" not in out
+
+
+def test_json_names_the_missing_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    (tmp_path / "a.txt").write_text("mail: anna.keller@example.ch", encoding="utf-8")
+    assert main(["scan", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["ner_off_reason"] == "no runtime"

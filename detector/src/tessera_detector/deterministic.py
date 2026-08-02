@@ -2,7 +2,8 @@
 
 The engine knows nothing about concrete identifiers — types, tiers, patterns and
 validator names come from the YAML catalog. Matching runs over normalized text;
-resulting spans are reported in original coordinates (REQ-6).
+resulting spans are reported in original coordinates (REQ-6) and are left
+unresolved for the pipeline to arbitrate.
 """
 
 import re
@@ -12,7 +13,6 @@ from importlib import resources
 import yaml
 
 from .normalize import normalize
-from .resolution import resolve
 from .spans import Span
 from .validators import CHECKSUM_VALIDATORS, VALIDATORS
 
@@ -185,6 +185,10 @@ class DeterministicDetector:
             catalog_text = _DEFAULT_CATALOG.read_text(encoding="utf-8")
         self.rules = _load_rules(catalog_text)
 
+    @property
+    def specificity(self) -> dict[str, int]:
+        return {rule.entity_type: rule.specificity for rule in self.rules}
+
     def detect(self, text: str) -> list[Span]:
         if not text:
             return []
@@ -224,5 +228,4 @@ class DeterministicDetector:
                         boosted=boosted,
                     )
                 )
-        specificity = {rule.entity_type: rule.specificity for rule in self.rules}
-        return resolve(spans, specificity=specificity).spans
+        return spans

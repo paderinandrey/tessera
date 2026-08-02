@@ -25,6 +25,11 @@ dev = [
 eval = [
     "faker>=40",
 ]
+ner = [
+    "gliner>=0.2.22",
+    "onnxruntime>=1.20",
+    "huggingface-hub>=0.28",
+]
 
 [build-system]
 requires = ["uv_build>=0.7.3"]
@@ -42,5 +47,10 @@ allowed-confusables = ["–"]
 [tool.mypy]
 strict = true
 
+[[tool.mypy.overrides]]
+module = ["gliner.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["ner: needs GLiNER weights (skipped when absent)"]

@@ -3,22 +3,50 @@
 Exits non-zero when Tier 1 recall drops below the target so CI can gate on it.
 
 Run from the repository root:  uv run --project detector python evaluation/evaluate.py
+Pass --require-ner where the NER layer is provisioned: without it a broken
+runtime would skip the NER gates and still report success.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
-from tessera_detector.deterministic import DeterministicDetector
-from tessera_detector.evaluation import EvalEntity, evaluate_document, summarize
+from tessera_detector.evaluation import (
+    EvalEntity,
+    evaluate_document,
+    precision_gate_failures,
+    summarize,
+)
+from tessera_detector.models import ModelUnavailable
+from tessera_detector.pipeline import build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TIER1_TARGET = 0.99
+PRECISION_TARGET = 0.8
+# Both are REQ-38 targets, but only LOCATION is enforceable on the synthetic
+# corpus: an ORG here is a Faker company name in a fixed slot, while the model
+# also finds the institutions real prose is full of, which the gold cannot
+# enumerate. ORG is reported and warned about until the private corpus can
+# judge it.
+BINDING_PRECISION_TYPES = {"LOCATION"}
+ADVISORY_PRECISION_TYPES = {"ORG"}
 
 
-def main() -> int:
-    detector = DeterministicDetector()
-    tier1_types = {rule.entity_type for rule in detector.rules if rule.tier == 1}
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--require-ner",
+        action="store_true",
+        help="fail instead of skipping the NER gates when the layer cannot run",
+    )
+    args = parser.parse_args(argv)
+    try:
+        detector = build_detector(ner=True if args.require_ner else None)
+    except (ModelUnavailable, ValueError) as error:
+        print(f"FAIL: --require-ner but the layer cannot run: {error}", file=sys.stderr)
+        return 1
+    tier1_types = {rule.entity_type for rule in detector.deterministic.rules if rule.tier == 1}
     per_document = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
         document = json.loads(line)
@@ -39,7 +67,29 @@ def main() -> int:
     if summary.tier1_recall < TIER1_TARGET:
         print("FAIL: Tier 1 recall below target", file=sys.stderr)
         return 1
-    return 0
+    if not detector.ner_available:
+        print(
+            f"NER layer off ({detector.ner_off_reason}): "
+            "the LOCATION precision gate is skipped."
+        )
+        return 0
+    advisory = precision_gate_failures(
+        summary.per_type, types=ADVISORY_PRECISION_TYPES, target=PRECISION_TARGET
+    )
+    for entity_type, precision in advisory:
+        print(
+            f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
+            "(advisory on the synthetic corpus)"
+        )
+    failures = precision_gate_failures(
+        summary.per_type, types=BINDING_PRECISION_TYPES, target=PRECISION_TARGET
+    )
+    for entity_type, precision in failures:
+        print(
+            f"FAIL: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET}",
+            file=sys.stderr,
+        )
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -27,5 +27,31 @@ jobs:
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
       - run: git diff --exit-code ../evaluation/corpus
-      # Tier 1 recall gate (REQ-38): exits non-zero below target.
+      # Tier 1 recall gate (REQ-38): exits non-zero below target. Runs without
+      # NER weights, so it also exercises the deterministic-only fallback.
       - run: uv run python ../evaluation/evaluate.py
+
+  ner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: detector
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          working-directory: detector
+      - run: uv sync --locked --group ner
+      - name: Cache NER weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/tessera/models
+          # models.py carries the pinned HF revision, so its hash is the weight identity.
+          key: ner-weights-${{ hashFiles('detector/src/tessera_detector/models.py') }}
+      - run: make -C .. model
+      # Model-backed tests plus the LOCATION precision gate (REQ-38).
+      # --require-ner is what keeps this job honest: the marked tests skip when
+      # the runtime is broken, so without it the job would pass green with the
+      # NER layer entirely unusable.
+      - run: uv run --group ner pytest -m ner
+      - run: uv run --group ner python ../evaluation/evaluate.py --require-ner

@@ -13,8 +13,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .deterministic import DeterministicDetector
-from .resolution import resolve
+from .models import ModelUnavailable
+from .pipeline import DISABLED, NO_RUNTIME, NO_WEIGHTS, Detector, build_detector
 
 MASK_MIN_LENGTH = 8
 
@@ -46,6 +46,11 @@ class ScanReport:
     files: list[FileReport]
     skipped: list[str]
     unreadable: list[str] = field(default_factory=list)
+    ner_available: bool = False
+    # Why the layer did not run. "disabled" is a choice the caller made;
+    # "no weights" is an install the caller can fix. Telling someone to
+    # download weights they already have misreads the scan's provenance.
+    ner_off_reason: str = "no weights"
 
 
 def _display_path(path: Path) -> str:
@@ -54,8 +59,13 @@ def _display_path(path: Path) -> str:
     return str(path).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
-def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
-    report = ScanReport(files=[], skipped=[])
+def scan(path: Path, detector: Detector) -> ScanReport:
+    report = ScanReport(
+        files=[],
+        skipped=[],
+        ner_available=detector.ner_available,
+        ner_off_reason=detector.ner_off_reason or NO_WEIGHTS,
+    )
     if path.is_file():
         # PATH itself must be readable: let the OSError reach main() -> exit 2.
         path.open("rb").close()
@@ -104,7 +114,7 @@ def scan(path: Path, detector: DeterministicDetector) -> ScanReport:
                 recognizer=span.recognizer,
                 value=text[span.start : span.end],
             )
-            for span in resolve(detector.detect(text)).spans
+            for span in detector.detect(text)
         ]
         report.files.append(FileReport(path=_display_path(file), findings=findings))
     return report
@@ -134,6 +144,13 @@ def render_text(report: ScanReport, *, show_values: bool = False) -> str:
         lines.append(f"Skipped: {len(report.skipped)} (not valid UTF-8)")
     if report.unreadable:
         lines.append(f"Unreadable: {len(report.unreadable)}")
+    if not report.ner_available:
+        detail = {
+            DISABLED: "disabled with --no-ner",
+            NO_RUNTIME: "weights present but the ner dependency group is not installed",
+            NO_WEIGHTS: "no weights; run `make model`",
+        }[report.ner_off_reason]
+        lines.append(f"NER layer: off ({detail})")
     return "\n".join(lines)
 
 
@@ -161,6 +178,8 @@ def render_json(report: ScanReport, *, show_values: bool = False) -> str:
             "files_scanned": len(report.files),
             "files_skipped": len(report.skipped),
             "files_unreadable": len(report.unreadable),
+            "ner": report.ner_available,
+            "ner_off_reason": None if report.ner_available else report.ner_off_reason,
             "total_findings": sum(len(file.findings) for file in report.files),
             "by_type": dict(_type_counts(report)),
         },
@@ -175,12 +194,25 @@ def main(argv: list[str] | None = None) -> int:
     scan_parser.add_argument("path", type=Path, help="file or directory to scan")
     scan_parser.add_argument("--json", action="store_true", dest="as_json", help="JSON output")
     scan_parser.add_argument("--show-values", action="store_true", help="print values verbatim")
+    ner_group = scan_parser.add_mutually_exclusive_group()
+    ner_group.add_argument("--ner", action="store_true", help="require the NER layer")
+    ner_group.add_argument("--no-ner", action="store_true", help="skip the NER layer")
     args = parser.parse_args(argv)
     if not args.path.exists():
         print(f"tessera: {args.path}: no such file or directory", file=sys.stderr)
         return 2
+    ner: bool | None = None
+    if args.ner:
+        ner = True
+    elif args.no_ner:
+        ner = False
     try:
-        report = scan(args.path, DeterministicDetector())
+        detector = build_detector(ner=ner)
+    except (ModelUnavailable, ValueError) as error:
+        print(f"tessera: {error}", file=sys.stderr)
+        return 2
+    try:
+        report = scan(args.path, detector)
     except OSError as error:
         print(f"tessera: {args.path}: {error.strerror or error}", file=sys.stderr)
         return 2

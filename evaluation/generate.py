@@ -31,24 +31,27 @@ FR_TEMPLATES = [
     "Numéro fiscal {nif} — merci de vérifier l'avis d'imposition de {person}.",
     "Contact : {email} pour toute question sur le paiement par carte {card}.",
     "Madame {person} habite à {city} ; son numéro AVS est le {avs}.",
+    "La société {org} confirme le virement de {person} vers l'IBAN {iban}.",
 ]
 
 DE_TEMPLATES = [
     "Sehr geehrter Herr {person}, Ihre Steuer-ID {idnr} wurde erfasst.",
-    "Die Zahlung von {person} erfolgt auf das Konto {iban} bei der Bank in {city}.",
+    "Die Zahlung von {person} erfolgt auf das Konto {iban} bei der {org} in {city}.",
     "Bitte senden Sie die Unterlagen an {email}; die Karte {card} wurde gesperrt.",
     "Der Mandant {person} (AVS-Nummer {avs}) wohnt in {city}.",
-    "Steuernummer {stnr} des Mandanten {person} liegt dem Finanzamt vor.",
+    "Steuernummer {stnr} des Mandanten {person} liegt der {org} vor.",
+    "Die {org} in {city} hat die Rechnung von {person} beglichen.",
 ]
 
 MIXED_TEMPLATES = [
     "Le paiement erfolgt bis Freitag: IBAN {iban}, Ansprechpartner {person} ({email}).",
     "Kunde {person} demande le remboursement — carte {card}, NIR {nir}.",
     "Die Rechnung pour {person} référence la Steuer-ID {idnr} et l'IBAN {iban}.",
+    "Der Kunde {person} de la société {org} demande un remboursement — IBAN {iban}.",
 ]
 
 CLEAN_TEMPLATES = [
-    "Le comité se réunit jeudi pour valider le budget du prochain trimestre.",
+    "La réunion de jeudi validera le budget du prochain trimestre.",
     "Die Lieferung verzögert sich wegen des Feiertags um zwei Werktage.",
     "Merci de confirmer la réception de ce message avant la fin de la semaine.",
 ]
@@ -143,10 +146,20 @@ def render(
                     {"entity_type": "EMAIL", "start": len(text), "end": len(text) + len(value)}
                 )
                 text += value
-            elif name == "person":
-                text += faker.last_name()
-            else:
-                text += faker.city()
+            elif name in ("person", "city", "org"):
+                value = {
+                    "person": faker.last_name,
+                    "city": faker.city,
+                    # faker.company() often returns a bare surname, which no
+                    # annotator could tell from a PERSON; a suffix makes the
+                    # gold label decidable.
+                    "org": lambda: f"{faker.last_name()} {faker.company_suffix()}",
+                }[name]()
+                entity_type = {"person": "PERSON", "city": "LOCATION", "org": "ORG"}[name]
+                entities.append(
+                    {"entity_type": entity_type, "start": len(text), "end": len(text) + len(value)}
+                )
+                text += value
         else:
             text += token
     return {"lang": lang, "text": text, "entities": entities}
