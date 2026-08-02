@@ -82,3 +82,35 @@ def test_windows_stay_inside_the_model_token_budget(recognizer: GlinerRecognizer
     for start, end in recognizer._windows(dense):
         count = len(tokenizer(dense[start:end], add_special_tokens=False)["input_ids"])
         assert count + prompt <= limit, f"window {start}-{end} holds {count} tokens"
+
+
+def test_finds_a_german_health_mention(recognizer: GlinerRecognizer) -> None:
+    text = "Der Mitarbeiter Weber leidet an Diabetes und ist krankgeschrieben."
+    spans = [s for s in recognizer.detect(text) if s.entity_type == "HEALTH"]
+    assert spans, "expected a HEALTH span"
+    assert "Diabetes" in text[spans[0].start : spans[0].end]
+    assert spans[0].tier == 3
+
+
+def test_finds_a_french_union_mention(recognizer: GlinerRecognizer) -> None:
+    text = "Le salarié Dupont est adhérent de la CGT depuis trois ans."
+    found = {s.entity_type for s in recognizer.detect(text)}
+    assert "TRADE_UNION" in found, f"expected TRADE_UNION, got {sorted(found)}"
+
+
+def test_an_article_9_mention_is_never_missed_by_the_whole_group(
+    recognizer: GlinerRecognizer,
+) -> None:
+    # Which of the eight labels wins is second-order; that some label fires is
+    # what keeps the span from reaching the model provider unredacted.
+    article_9 = {
+        "HEALTH", "BIOMETRIC", "GENETIC", "ETHNICITY",
+        "POLITICAL_OPINION", "RELIGION", "TRADE_UNION", "SEXUAL_ORIENTATION",
+    }
+    for text in (
+        "Der Mandant Weber ist jüdisch und bittet um Rücksicht.",
+        "Le dossier de Dupont, d'origine maghrébine, part au service juridique.",
+        "Die Personalakte von Weber vermerkt: Mitglied der Grünen.",
+    ):
+        found = {s.entity_type for s in recognizer.detect(text)} & article_9
+        assert found, f"no Article 9 span at all in: {text}"

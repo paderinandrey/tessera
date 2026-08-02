@@ -62,6 +62,11 @@ The NER layer (PERSON, LOCATION, ORG) runs automatically when its weights are pr
 Without them the scan runs the deterministic layer alone and says so; `--ner` makes their
 absence an error, `--no-ner` skips the layer even when they are installed.
 
+Article 9 special categories (health, biometrics, genetics, ethnic origin, political
+opinion, religion, trade union membership, sexual orientation) are detected by the same
+layer at a deliberately low threshold, so expect visible false positives —
+over-redaction is the safe failure for this category.
+
 ## Evaluation
 
 The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic
@@ -84,14 +89,38 @@ Current results on the public corpus, with the NER weights installed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| LOCATION | 0.870 | 1.000 | 0.930 |
-| ORG | 0.950 | 0.760 | 0.844 |
-| PERSON | 0.644 | 0.543 | 0.589 |
+| LOCATION | 0.857 | 1.000 | 0.923 |
+| ORG | 0.444 | 0.750 | 0.558 |
+| PERSON | 0.741 | 0.581 | 0.652 |
+
+Article 9 special categories, detected by the same layer at a lower threshold:
+
+| Type | Precision | Recall | F1 |
+|---|---|---|---|
+| BIOMETRIC | 1.000 | 1.000 | 1.000 |
+| ETHNICITY | 1.000 | 0.250 | 0.400 |
+| GENETIC | 1.000 | 1.000 | 1.000 |
+| HEALTH | 0.750 | 1.000 | 0.857 |
+| POLITICAL_OPINION | 0.667 | 1.000 | 0.800 |
+| RELIGION | 0.571 | 1.000 | 0.727 |
+| SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
+| TRADE_UNION | 0.600 | 1.000 | 0.750 |
+
+**Article 9 coverage: 1.000** — every special-category mention in the corpus is caught by
+at least one of the eight labels.
 
 > Perfect scores on the catalog types mean the deterministic layer covers its own
 > catalog, nothing more: those corpus entries are checksum-valid identifiers with clean
 > formatting. The numbers become meaningful as the corpus grows adversarial cases —
 > noisy formatting, near-misses, uncovered types.
+>
+> Article 9 is gated on **coverage**, not on per-category recall, and the ETHNICITY row
+> shows why: the model reads "maghrébine" as religion rather than ethnicity. That span is
+> still redacted, which is what REQ-3's "misses are not tolerable" is actually about — a
+> special-category mention reaching the model provider unredacted. Which of the eight
+> labels wins is second-order, so the report shows it and the gate does not. Their
+> precision is left ungated on purpose: at threshold 0.30 the layer over-reports by
+> design, because over-redaction is the safe failure for this category.
 >
 > The NER rows are flattered in one direction and penalised in another. Names, cities
 > and companies sit in fixed template slots rather than in the shapes real text
@@ -101,8 +130,12 @@ Current results on the public corpus, with the NER weights installed:
 > (≥ 0.99) and the LOCATION precision gate (≥ 0.8), while ORG precision is reported
 > and warned about rather than enforced — a number that good on this corpus is not
 > evidence about real prose. PERSON precision is the honest weak spot and is not yet
-> gated. The privately annotated corpus on real texts is the measure that counts, and
-> it is reported separately.
+> gated. ORG precision fell from 0.950 to 0.444 when this corpus gained entity-free
+> business prose: the model finds organizations in "die Apotheke" and "convention
+> collective" that the gold does not enumerate. That is the negative examples doing their
+> job — the earlier number was measured on a corpus with almost nothing to get wrong.
+> The privately annotated corpus on real texts is the measure that counts, and it is
+> reported separately.
 
 ## Status
 
