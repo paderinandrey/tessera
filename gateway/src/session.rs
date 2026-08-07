@@ -5,9 +5,14 @@
 //! the way back. So a client-chosen id never selects a session on its own — it
 //! is namespaced by a fingerprint of the caller's own credential.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
 
+use crate::mapping::Mapping;
 use crate::provider::Provider;
 
 /// The header a client uses to say two requests belong to one conversation.
@@ -139,11 +144,118 @@ pub fn key_from(
     Ok(Some(SessionKey::new(credential, id)))
 }
 
+/// The three bounds on how much personal data outlives a request.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// How long a session survives without a request. Zero disables sessions.
+    pub idle: Duration,
+    pub max_sessions: usize,
+    pub max_values: usize,
+}
+
+/// One conversation's table.
+#[allow(dead_code)]
+pub struct Session {
+    /// A tokio mutex because it is held across the detector calls that mask a
+    /// request. It is released before the upstream call: a stream may run for
+    /// minutes, and a lock that outlived one would block its session for as
+    /// long as the stream did — forever, if the stream hung.
+    pub mapping: tokio::sync::Mutex<Mapping>,
+}
+
+struct Entry {
+    session: Arc<Session>,
+    last_seen: Instant,
+}
+
+#[allow(dead_code)]
+pub struct SessionStore {
+    /// A std mutex, held only for map operations and never across an `await`.
+    inner: Mutex<HashMap<SessionKey, Entry>>,
+    limits: Limits,
+}
+
+#[allow(dead_code)]
+impl SessionStore {
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            limits,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.limits.idle.is_zero()
+    }
+
+    pub fn max_values(&self) -> usize {
+        self.limits.max_values
+    }
+
+    pub fn acquire(&self, key: &SessionKey) -> Arc<Session> {
+        self.acquire_at(key, Instant::now())
+    }
+
+    /// Time is a parameter so eviction is tested without sleeping.
+    fn acquire_at(&self, key: &SessionKey, now: Instant) -> Arc<Session> {
+        // Poisoning is recovered rather than propagated. Nothing in this
+        // critical section can panic today, but if something ever does, one
+        // failure must not turn every later request into a 500.
+        let mut map = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+
+        // Sweeping here rather than in a background task: at a thousand
+        // sessions this costs less than a syscall, and there is no separate
+        // task whose health is a new thing to reason about.
+        map.retain(|_, entry| now.duration_since(entry.last_seen) < self.limits.idle);
+
+        if let Some(entry) = map.get_mut(key) {
+            entry.last_seen = now;
+            return Arc::clone(&entry.session);
+        }
+
+        if map.len() >= self.limits.max_sessions {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                map.remove(&oldest);
+            }
+        }
+
+        // A whole session is evicted; values within one never are. A value
+        // dropped from a live session can come back from the model on the next
+        // turn, and that is not a lost coreference but a request that dies with
+        // nothing to restore to.
+        let session = Arc::new(Session {
+            mapping: tokio::sync::Mutex::new(Mapping::new()),
+        });
+        map.insert(
+            key.clone(),
+            Entry {
+                session: Arc::clone(&session),
+                last_seen: now,
+            },
+        );
+        session
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::OpenAi;
     use axum::http::HeaderMap;
+    use std::time::{Duration, Instant};
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -298,5 +410,89 @@ mod tests {
         let formatted = format!("{key:?}");
         assert!(!formatted.contains("Weber"));
         assert!(!formatted.contains("sekrit"));
+    }
+
+    fn limits(max_sessions: usize) -> Limits {
+        Limits {
+            idle: Duration::from_secs(60),
+            max_sessions,
+            max_values: 100,
+        }
+    }
+
+    fn key(id: &str, credential: &str) -> SessionKey {
+        key_from(
+            &headers(&[("authorization", credential), (SESSION_HEADER, id)]),
+            &OpenAi,
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn the_same_key_returns_the_same_session() {
+        let store = SessionStore::new(limits(4));
+        let now = Instant::now();
+        let one = store.acquire_at(&key("conv1", "Bearer k"), now);
+        let two = store.acquire_at(&key("conv1", "Bearer k"), now);
+        assert!(Arc::ptr_eq(&one, &two));
+    }
+
+    #[test]
+    fn a_different_credential_is_a_different_session() {
+        let store = SessionStore::new(limits(4));
+        let now = Instant::now();
+        let one = store.acquire_at(&key("shared", "Bearer k1"), now);
+        let two = store.acquire_at(&key("shared", "Bearer k2"), now);
+        assert!(!Arc::ptr_eq(&one, &two));
+        assert_eq!(store.live(), 2);
+    }
+
+    #[test]
+    fn a_session_idle_past_the_ttl_is_swept() {
+        let store = SessionStore::new(limits(4));
+        let start = Instant::now();
+        let one = store.acquire_at(&key("conv1", "Bearer k"), start);
+        let two = store.acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61));
+        assert!(!Arc::ptr_eq(&one, &two), "a stale table was handed back");
+        assert_eq!(store.live(), 1, "the swept entry was left behind");
+    }
+
+    #[test]
+    fn a_full_store_evicts_the_least_recently_used() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+        let a = store.acquire_at(&key("a", "Bearer k"), start);
+        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        // Touching "a" makes "b" the oldest.
+        store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(2));
+        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(3));
+
+        assert_eq!(store.live(), 2);
+        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(4));
+        assert!(Arc::ptr_eq(&a, &a_again), "the touched session was evicted");
+    }
+
+    #[tokio::test]
+    async fn an_evicted_session_does_not_interrupt_a_request_holding_it() {
+        let store = SessionStore::new(limits(1));
+        let start = Instant::now();
+        let held = store.acquire_at(&key("a", "Bearer k"), start);
+        // Another conversation pushes "a" out of a store that holds one.
+        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        // The request already holding the Arc finishes normally; its commit is
+        // simply lost to a table nobody will look up again.
+        held.mapping.lock().await.absorb(&Mapping::new(), 10);
+    }
+
+    #[test]
+    fn a_zero_idle_reports_sessions_disabled() {
+        let store = SessionStore::new(Limits {
+            idle: Duration::ZERO,
+            max_sessions: 0,
+            max_values: 0,
+        });
+        assert!(!store.enabled());
     }
 }
