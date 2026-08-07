@@ -35,16 +35,32 @@ pub enum MappingError {
 /// `stream::MAX_HELD`.
 pub const MAX_ENTITY_TYPE: usize = 40;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Mapping {
     by_value: HashMap<String, String>,
     by_placeholder: HashMap<String, String>,
+    /// Placeholders in the order they were issued. A session commits in this
+    /// order, so a cap keeps the earliest values rather than an arbitrary set.
+    /// Literals reserved from the caller's own text are deliberately absent:
+    /// they map to themselves and name nobody.
+    order: Vec<String>,
     next: usize,
 }
 
 impl Mapping {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many values this mapping has issued placeholders for.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
     }
 
     pub fn mask(&mut self, text: &str, spans: &[Span]) -> Result<String, MappingError> {
@@ -80,6 +96,33 @@ impl Mapping {
         }
         result.extend(&chars[cursor..]);
         Ok(result)
+    }
+
+    /// Commit `other`'s new pairs, in the order they were issued, until `cap`
+    /// is reached. `other` is the copy a request masked with; `self` is the
+    /// session's table.
+    ///
+    /// The counter moves past pairs that were declined. A number that already
+    /// named somebody in a request that reached the provider must never be
+    /// issued to a second value, or a later response restores the wrong name.
+    #[allow(dead_code)]
+    pub fn absorb(&mut self, other: &Mapping, cap: usize) {
+        for placeholder in &other.order {
+            if self.by_placeholder.contains_key(placeholder) {
+                continue;
+            }
+            if self.order.len() >= cap {
+                break;
+            }
+            let Some(value) = other.by_placeholder.get(placeholder) else {
+                continue;
+            };
+            self.by_value.insert(value.clone(), placeholder.clone());
+            self.by_placeholder
+                .insert(placeholder.clone(), value.clone());
+            self.order.push(placeholder.clone());
+        }
+        self.next = self.next.max(other.next);
     }
 
     /// Map every placeholder-shaped token already present to itself, so it is
@@ -133,6 +176,7 @@ impl Mapping {
         };
         self.by_value.insert(value.clone(), placeholder.clone());
         self.by_placeholder.insert(placeholder.clone(), value);
+        self.order.push(placeholder.clone());
         Ok(placeholder)
     }
 
@@ -371,5 +415,78 @@ mod tests {
             .mask("Grüße an Weber", &[span("PERSON", 9, 14)])
             .unwrap();
         assert_eq!(masked, "Grüße an [PERSON_1]");
+    }
+
+    #[test]
+    fn absorb_commits_new_pairs_in_the_order_they_were_issued() {
+        let mut session = Mapping::new();
+        let mut work = session.clone();
+        work.mask(
+            "Weber und Meier",
+            &[span("PERSON", 0, 5), span("PERSON", 10, 15)],
+        )
+        .unwrap();
+        session.absorb(&work, 10);
+        assert_eq!(
+            session.restore("[PERSON_1] und [PERSON_2]").unwrap(),
+            "Weber und Meier"
+        );
+    }
+
+    #[test]
+    fn absorb_stops_at_the_cap_and_keeps_the_earliest() {
+        let mut session = Mapping::new();
+        let mut work = session.clone();
+        work.mask(
+            "Weber und Meier",
+            &[span("PERSON", 0, 5), span("PERSON", 10, 15)],
+        )
+        .unwrap();
+        session.absorb(&work, 1);
+        assert_eq!(session.len(), 1);
+        assert_eq!(session.restore("[PERSON_1]").unwrap(), "Weber");
+        assert!(session.restore("[PERSON_2]").is_err());
+    }
+
+    #[test]
+    fn absorb_carries_the_counter_past_what_it_declined() {
+        let mut session = Mapping::new();
+        let mut work = session.clone();
+        work.mask(
+            "Weber und Meier",
+            &[span("PERSON", 0, 5), span("PERSON", 10, 15)],
+        )
+        .unwrap();
+        // [PERSON_2] went to Meier and was declined by the cap. It must not be
+        // reissued: the number already named somebody in a request that shipped.
+        session.absorb(&work, 1);
+        let mut next = session.clone();
+        next.mask("Schmidt", &[span("PERSON", 0, 7)]).unwrap();
+        assert_eq!(next.restore("[PERSON_3]").unwrap(), "Schmidt");
+    }
+
+    #[test]
+    fn a_clone_does_not_write_back_to_its_source() {
+        let session = Mapping::new();
+        let mut work = session.clone();
+        work.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        // The request failed before absorb; the session never heard of Weber.
+        assert!(session.restore("[PERSON_1]").is_err());
+    }
+
+    #[test]
+    fn absorb_ignores_placeholders_reserved_from_the_callers_own_text() {
+        let mut session = Mapping::new();
+        let mut work = session.clone();
+        // "[PERSON_9]" is 10 characters, so "Weber" starts at 16.
+        work.mask("[PERSON_9] traf Weber", &[span("PERSON", 16, 21)])
+            .unwrap();
+        session.absorb(&work, 10);
+        assert_eq!(session.len(), 1);
+        assert_eq!(session.restore("[PERSON_1]").unwrap(), "Weber");
+        // The literal was reserved so an echo survives, not committed: it names
+        // nobody, and a session that remembered it would restore it to itself
+        // for every later caller of this conversation.
+        assert!(session.restore("[PERSON_9]").is_err());
     }
 }
