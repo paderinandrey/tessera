@@ -181,6 +181,27 @@ Also:
   through the router and asserts the client sees restored values;
 - the pre-flight refusal is gone: `stream: true` reaches the upstream.
 
+## Revisions after review
+
+Review found four holes in the design as written; the code carries the fixes:
+
+- **Buffers keyed by JSON pointer were wrong.** OpenAI streams one choice per
+  chunk at array position 0 whatever its logical `index`, so `n > 1` gave two
+  completions the same buffer and spliced their fragments. `stream_pointers`
+  became `stream_slots`, returning a pointer *and* a key: the pointer addresses
+  this event, the key identifies the run. A remainder is placed only into an
+  event carrying the same key, so a shared pointer can no longer misdirect it.
+- **A malformed `data:` payload was forwarded unchanged.** A truncated event
+  still holding `[PERSON_1]` would have reached the client. Only `[DONE]` and an
+  empty payload pass without parsing; anything else must be JSON or the stream
+  ends.
+- **Provider error events were forwarded verbatim.** An upstream error quotes
+  what we sent it. Events with no text of their own now go through
+  `Mapping::restore_value`, as the buffered path's error body already did.
+- **The size cap was checked after the event was assembled.** An oversized event
+  arriving complete in one chunk slipped past it. The cap is now enforced while
+  framing, before the block is copied.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

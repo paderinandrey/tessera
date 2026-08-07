@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// A span as the detector reports it: offsets are in characters, not bytes.
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +134,27 @@ impl Mapping {
         self.by_value.insert(value.clone(), placeholder.clone());
         self.by_placeholder.insert(placeholder.clone(), value);
         Ok(placeholder)
+    }
+
+    /// Restore every string in a value. Used for upstream envelopes, whose shape
+    /// is the provider's business but which may quote the masked text back.
+    pub fn restore_value(&self, value: &Value) -> Result<Value, MappingError> {
+        Ok(match value {
+            Value::String(text) => Value::String(self.restore(text)?),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.restore_value(item))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, item)| Ok((key.clone(), self.restore_value(item)?)))
+                    .collect::<Result<serde_json::Map<_, _>, MappingError>>()?,
+            ),
+            other => other.clone(),
+        })
     }
 
     pub fn restore(&self, text: &str) -> Result<String, MappingError> {

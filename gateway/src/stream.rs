@@ -32,6 +32,11 @@ pub enum StreamError {
     Unplaceable(String),
     #[error("upstream sent an event larger than this gateway will buffer; the stream ends")]
     Oversized,
+    #[error(
+        "upstream sent an event this gateway cannot parse; the stream ends rather \
+         than forwarding text it could not restore"
+    )]
+    Malformed,
 }
 
 /// How much of an unfinished event to hold. A response that never sends a blank
@@ -163,6 +168,10 @@ impl SseEvent {
 #[derive(Default)]
 pub struct SseFramer {
     buffer: Vec<u8>,
+    /// How far the delimiter scan has already looked. Without it every push
+    /// rescans the whole retained buffer, which the size cap makes affordable
+    /// but not free.
+    scanned: usize,
 }
 
 impl SseFramer {
@@ -170,27 +179,43 @@ impl SseFramer {
         Self::default()
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, StreamError> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some((end, width)) = find_blank_line(&self.buffer) {
-            let block = self.buffer[..end].to_vec();
-            self.buffer.drain(..end + width);
-            if let Some(event) = parse_event(&block) {
-                events.push(event);
+        loop {
+            // A delimiter can straddle the point the last scan reached.
+            let from = self.scanned.saturating_sub(3);
+            match find_blank_line(&self.buffer, from) {
+                Some((end, width)) => {
+                    // Checked before the block is copied and parsed: an oversized
+                    // event that arrives complete in one chunk must be refused,
+                    // not buffered, cloned and handed on.
+                    if end > MAX_EVENT_BYTES {
+                        return Err(StreamError::Oversized);
+                    }
+                    let block = self.buffer[..end].to_vec();
+                    self.buffer.drain(..end + width);
+                    self.scanned = 0;
+                    if let Some(event) = parse_event(&block) {
+                        events.push(event);
+                    }
+                }
+                None => {
+                    if self.buffer.len() > MAX_EVENT_BYTES {
+                        return Err(StreamError::Oversized);
+                    }
+                    self.scanned = self.buffer.len();
+                    break;
+                }
             }
         }
-        events
-    }
-
-    /// Bytes accumulated toward an event that has not ended yet.
-    pub fn pending_len(&self) -> usize {
-        self.buffer.len()
+        Ok(events)
     }
 
     /// Bytes left over when the body ended. A stream that stops without its
     /// final blank line must not swallow the text it already sent.
     pub fn finish(&mut self) -> Option<SseEvent> {
+        self.scanned = 0;
         let block = std::mem::take(&mut self.buffer);
         parse_event(&block)
     }
@@ -200,8 +225,8 @@ impl SseFramer {
 /// Scanning forward matters: a `\r\n\r\n` delimiter contains no `\n\n`, so
 /// searching for `\n\n` across the whole buffer first would run past it and
 /// merge two events into one.
-fn find_blank_line(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len() {
+fn find_blank_line(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
+    for index in from..buffer.len() {
         let rest = &buffer[index..];
         if rest.starts_with(b"\r\n\r\n") {
             return Some((index, 4));
@@ -253,10 +278,25 @@ pub struct StreamRestorer<'a> {
     provider: &'a dyn Provider,
     mapping: &'a Mapping,
     framer: SseFramer,
-    /// One buffer per JSON pointer, so several choices on OpenAI and several
-    /// content blocks on Anthropic do not share hold-back state.
-    buffers: BTreeMap<String, RestoreBuffer<'a>>,
-    pending: Option<SseEvent>,
+    /// One buffer per run of text, keyed by the provider's logical identity —
+    /// not by the pointer, which repeats across interleaved choices.
+    buffers: BTreeMap<String, Held<'a>>,
+    pending: Option<Pending>,
+}
+
+/// A run of text in progress, and where its event wrote it last.
+struct Held<'a> {
+    buffer: RestoreBuffer<'a>,
+    pointer: String,
+}
+
+/// The text-bearing event waiting one behind, and which runs it carries. A
+/// remainder can only be appended to an event that holds the same run: with
+/// interleaved choices two different completions share a pointer, and writing
+/// into the wrong one would hand a client another client's text.
+struct Pending {
+    event: SseEvent,
+    slots: BTreeMap<String, String>,
 }
 
 impl<'a> StreamRestorer<'a> {
@@ -272,13 +312,8 @@ impl<'a> StreamRestorer<'a> {
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<String, StreamError> {
         let mut out = String::new();
-        for event in self.framer.push(chunk) {
+        for event in self.framer.push(chunk)? {
             out.push_str(&self.handle(event)?);
-        }
-        // An upstream that never ends an event would have us buffer its whole
-        // response in memory. Past this size it is not sending events.
-        if self.framer.pending_len() > MAX_EVENT_BYTES {
-            return Err(StreamError::Oversized);
         }
         Ok(out)
     }
@@ -293,66 +328,95 @@ impl<'a> StreamRestorer<'a> {
     }
 
     fn handle(&mut self, event: SseEvent) -> Result<String, StreamError> {
-        // `[DONE]` and anything else that is not JSON carries no text.
-        let Ok(parsed) = serde_json::from_str::<Value>(event.data.as_deref().unwrap_or("")) else {
+        let data = event.data.as_deref().unwrap_or("");
+        // Protocol sentinels are not JSON and carry no text.
+        if data.is_empty() || data == "[DONE]" {
             let mut out = self.flush()?;
             out.push_str(&event.render());
             return Ok(out);
-        };
-        let pointers = self.provider.stream_pointers(&parsed)?;
-        if pointers.is_empty() {
+        }
+        // Anything else claiming to be data must parse. A truncated event that
+        // still contains `[PERSON_1]` would otherwise be rendered unchanged and
+        // hand the token to the client.
+        let parsed: Value = serde_json::from_str(data).map_err(|_| StreamError::Malformed)?;
+
+        let slots = self.provider.stream_slots(&parsed)?;
+        if slots.is_empty() {
+            // No text of its own — but a provider's error envelope quotes what we
+            // sent, so every string in it is restored, exactly as the buffered
+            // path does with an error body.
             let mut out = self.flush()?;
+            let mut event = event;
+            event.data = Some(self.mapping.restore_value(&parsed)?.to_string());
             out.push_str(&event.render());
             return Ok(out);
         }
 
         let mapping = self.mapping;
         let mut rewritten = parsed.clone();
-        for pointer in &pointers {
-            let text = read_pointer(&parsed, pointer)?;
-            let safe = self
+        let mut carried = BTreeMap::new();
+        for slot in &slots {
+            let text = read_pointer(&parsed, &slot.pointer)?;
+            let held = self
                 .buffers
-                .entry(pointer.clone())
-                .or_insert_with(|| RestoreBuffer::new(mapping))
-                .push(&text)?;
-            write_pointer(&mut rewritten, pointer, &safe)?;
+                .entry(slot.key.clone())
+                .or_insert_with(|| Held {
+                    buffer: RestoreBuffer::new(mapping),
+                    pointer: slot.pointer.clone(),
+                });
+            held.pointer = slot.pointer.clone();
+            let safe = held.buffer.push(&text)?;
+            write_pointer(&mut rewritten, &slot.pointer, &safe)?;
+            carried.insert(slot.key.clone(), slot.pointer.clone());
         }
         let mut event = event;
         event.data = Some(rewritten.to_string());
-        let previous = self.pending.replace(event);
-        Ok(previous.map(|event| event.render()).unwrap_or_default())
+        let previous = self.pending.replace(Pending {
+            event,
+            slots: carried,
+        });
+        Ok(previous
+            .map(|pending| pending.event.render())
+            .unwrap_or_default())
     }
 
     /// The text run has ended: drain every buffer into the waiting event.
     fn flush(&mut self) -> Result<String, StreamError> {
         let mut remainders: Vec<(String, String)> = Vec::new();
-        for (pointer, buffer) in self.buffers.iter_mut() {
-            let rest = buffer.finish()?;
+        for (key, held) in self.buffers.iter_mut() {
+            let rest = held.buffer.finish()?;
             if !rest.is_empty() {
-                remainders.push((pointer.clone(), rest));
+                remainders.push((key.clone(), rest));
             }
         }
         self.buffers.clear();
 
-        let Some(mut event) = self.pending.take() else {
+        let Some(mut pending) = self.pending.take() else {
             // Restored text with nowhere to go is not dropped quietly.
-            if let Some((pointer, _)) = remainders.first() {
-                return Err(StreamError::Unplaceable(pointer.clone()));
+            if let Some((key, _)) = remainders.first() {
+                return Err(StreamError::Unplaceable(key.clone()));
             }
             return Ok(String::new());
         };
         if remainders.is_empty() {
-            return Ok(event.render());
+            return Ok(pending.event.render());
         }
-        let mut parsed: Value = serde_json::from_str(event.data.as_deref().unwrap_or(""))
-            .map_err(|_| StreamError::Unplaceable("the waiting event".to_owned()))?;
-        for (pointer, rest) in remainders {
-            let existing = read_pointer(&parsed, &pointer)
-                .map_err(|_| StreamError::Unplaceable(pointer.clone()))?;
-            write_pointer(&mut parsed, &pointer, &format!("{existing}{rest}"))?;
+        let mut parsed: Value =
+            serde_json::from_str(pending.event.data.as_deref().unwrap_or(""))
+                .map_err(|_| StreamError::Unplaceable("the waiting event".to_owned()))?;
+        for (key, rest) in remainders {
+            // Only into the event that carries this same run. A pointer that
+            // happens to match is not the same completion.
+            let pointer = pending
+                .slots
+                .get(&key)
+                .ok_or_else(|| StreamError::Unplaceable(key.clone()))?;
+            let existing = read_pointer(&parsed, pointer)
+                .map_err(|_| StreamError::Unplaceable(key.clone()))?;
+            write_pointer(&mut parsed, pointer, &format!("{existing}{rest}"))?;
         }
-        event.data = Some(parsed.to_string());
-        Ok(event.render())
+        pending.event.data = Some(parsed.to_string());
+        Ok(pending.event.render())
     }
 }
 
@@ -527,6 +591,113 @@ mod restorer_tests {
         assert!(!rendered.contains("PERSON"));
     }
 
+    /// Every delta the client would have seen for one choice, in order.
+    fn text_for_choice(rendered: &str, index: u64) -> String {
+        let mut out = String::new();
+        for line in rendered.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+                continue;
+            };
+            for choice in choices {
+                if choice.get("index").and_then(Value::as_u64) != Some(index) {
+                    continue;
+                }
+                if let Some(text) = choice.pointer("/delta/content").and_then(Value::as_str) {
+                    out.push_str(text);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn interleaved_choices_do_not_share_a_hold_back_buffer() {
+        // With `n > 1` each chunk carries one choice at array position 0. Keying
+        // the buffer on the pointer would splice two completions together and
+        // emit corrupted text instead of failing safely.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A [PER\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"B [PER\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1] one\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"SON_1] two\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        assert_eq!(text_for_choice(&rendered, 0), "A Weber one");
+        assert_eq!(text_for_choice(&rendered, 1), "B Weber two");
+    }
+
+    #[test]
+    fn a_remainder_is_never_written_into_another_choices_event() {
+        // Choice 0 ends mid-token while choice 1 is the event waiting behind.
+        // The two share a pointer but not a completion, so the stream ends
+        // rather than hand one client the other's text.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        restorer
+            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A [PER\"}}]}\n\n")
+            .unwrap();
+        restorer
+            .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"B\"}}]}\n\n")
+            .unwrap();
+        let error = restorer.push(b"data: [DONE]\n\n").unwrap_err();
+        assert!(matches!(error, StreamError::Unplaceable(_)), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_data_event_ends_the_stream() {
+        // A truncated event still carrying a placeholder must not be rendered
+        // back unchanged.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let error = restorer
+            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hallo [PERSON_1]\n\n")
+            .unwrap_err();
+        assert!(matches!(error, StreamError::Malformed), "{error}");
+    }
+
+    #[test]
+    fn a_provider_error_event_is_restored_before_it_is_forwarded() {
+        // An upstream error quotes what we sent it. The buffered path restores
+        // every string in the envelope; a stream must not be the exception.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let rendered = restorer
+            .push(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":\
+{\"type\":\"invalid_request_error\",\"message\":\"bad input [PERSON_1]\"}}\n\n",
+            )
+            .unwrap();
+        assert!(rendered.contains("bad input Weber"), "{rendered}");
+        assert!(!rendered.contains("PERSON_1"), "{rendered}");
+    }
+
+    #[test]
+    fn an_oversized_event_that_arrives_complete_is_refused() {
+        // The cap must bound a whole event, not only an unfinished one: a
+        // delimiter in the same chunk would otherwise let it through.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let mut body = b"data: ".to_vec();
+        body.extend(std::iter::repeat_n(b'x', MAX_EVENT_BYTES + 1));
+        body.extend_from_slice(b"\n\n");
+        assert!(matches!(
+            restorer.push(&body).unwrap_err(),
+            StreamError::Oversized
+        ));
+    }
+
     #[test]
     fn an_event_that_never_ends_stops_the_stream() {
         // Buffering the whole response is the cost streaming exists to avoid.
@@ -574,12 +745,16 @@ mod restorer_tests {
 mod framer_tests {
     use super::*;
 
+    fn unwrap_push(framer: &mut SseFramer, chunk: &[u8]) -> Vec<SseEvent> {
+        framer.push(chunk).unwrap()
+    }
+
     const BODY: &str = "event: content_block_delta\ndata: {\"a\":1}\n\ndata: [DONE]\n\n";
 
     #[test]
     fn complete_events_are_yielded_with_name_and_data() {
         let mut framer = SseFramer::new();
-        let events = framer.push(BODY.as_bytes());
+        let events = unwrap_push(&mut framer, BODY.as_bytes());
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name.as_deref(), Some("content_block_delta"));
         assert_eq!(events[0].data.as_deref(), Some("{\"a\":1}"));
@@ -590,9 +765,9 @@ mod framer_tests {
     #[test]
     fn a_partial_event_is_held_until_it_completes() {
         let mut framer = SseFramer::new();
-        assert!(framer.push(b"data: {\"a\"").is_empty());
-        assert!(framer.push(b":1}").is_empty());
-        assert_eq!(framer.push(b"\n\n").len(), 1);
+        assert!(unwrap_push(&mut framer, b"data: {\"a\"").is_empty());
+        assert!(unwrap_push(&mut framer, b":1}").is_empty());
+        assert_eq!(unwrap_push(&mut framer, b"\n\n").len(), 1);
     }
 
     #[test]
@@ -602,7 +777,7 @@ mod framer_tests {
         let mut framer = SseFramer::new();
         let mut events = Vec::new();
         for byte in body.as_bytes() {
-            events.extend(framer.push(&[*byte]));
+            events.extend(unwrap_push(&mut framer, &[*byte]));
         }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data.as_deref(), Some("{\"t\":\"Grüße\"}"));
@@ -612,7 +787,7 @@ mod framer_tests {
     fn crlf_delimited_events_are_framed_separately() {
         // Searching the whole buffer for "\n\n" first would merge these two.
         let mut framer = SseFramer::new();
-        let events = framer.push(b"data: one\r\n\r\ndata: two\n\n");
+        let events = unwrap_push(&mut framer, b"data: one\r\n\r\ndata: two\n\n");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data.as_deref(), Some("one"));
         assert_eq!(events[1].data.as_deref(), Some("two"));
@@ -621,7 +796,7 @@ mod framer_tests {
     #[test]
     fn multi_line_data_is_joined_with_newlines() {
         let mut framer = SseFramer::new();
-        let events = framer.push(b"data: one\ndata: two\n\n");
+        let events = unwrap_push(&mut framer, b"data: one\ndata: two\n\n");
         assert_eq!(events[0].data.as_deref(), Some("one\ntwo"));
     }
 
@@ -629,7 +804,7 @@ mod framer_tests {
     fn trailing_bytes_without_a_blank_line_are_still_delivered() {
         // A body that ends without the final blank line must not swallow text.
         let mut framer = SseFramer::new();
-        assert!(framer.push(b"data: tail").is_empty());
+        assert!(unwrap_push(&mut framer, b"data: tail").is_empty());
         assert_eq!(framer.finish().unwrap().data.as_deref(), Some("tail"));
     }
 
@@ -637,14 +812,14 @@ mod framer_tests {
     fn other_fields_survive_the_round_trip() {
         // Dropping `id:` would break a client's resume.
         let mut framer = SseFramer::new();
-        let events = framer.push(b"id: 7\nevent: ping\ndata: {}\n\n");
+        let events = unwrap_push(&mut framer, b"id: 7\nevent: ping\ndata: {}\n\n");
         assert_eq!(events[0].render(), "event: ping\nid: 7\ndata: {}\n\n");
     }
 
     #[test]
     fn an_event_without_data_renders_no_data_line() {
         let mut framer = SseFramer::new();
-        let events = framer.push(b"event: ping\n\n");
+        let events = unwrap_push(&mut framer, b"event: ping\n\n");
         assert_eq!(events[0].render(), "event: ping\n\n");
     }
 }

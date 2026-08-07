@@ -169,12 +169,7 @@ async fn handle(
         // may still echo what we sent, so it is restored before it goes back —
         // and an error body is not always JSON, so text is handled too.
         return Ok(match serde_json::from_slice::<Value>(&raw) {
-            Ok(parsed) => (
-                status,
-                returned,
-                Json(restore_everywhere(&parsed, &mapping)?),
-            )
-                .into_response(),
+            Ok(parsed) => (status, returned, Json(mapping.restore_value(&parsed)?)).into_response(),
             Err(_) => {
                 let text = String::from_utf8_lossy(&raw);
                 (status, returned, mapping.restore(&text)?).into_response()
@@ -194,27 +189,6 @@ async fn handle(
     // The same quota headers matter on a 200: a client that only learns its
     // remaining budget from errors learns it too late.
     Ok((returned, Json(restored)).into_response())
-}
-
-/// Restore every string in a value. Used for upstream error envelopes, whose
-/// shape is the provider's business but which may quote the masked text back.
-fn restore_everywhere(value: &Value, mapping: &Mapping) -> Result<Value, MappingError> {
-    Ok(match value {
-        Value::String(text) => Value::String(mapping.restore(text)?),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| restore_everywhere(item, mapping))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(key, item)| Ok((key.clone(), restore_everywhere(item, mapping)?)))
-                .collect::<Result<serde_json::Map<_, _>, MappingError>>()?,
-        ),
-        other => other.clone(),
-    })
 }
 
 async fn openai(

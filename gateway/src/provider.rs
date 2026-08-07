@@ -20,9 +20,22 @@ pub trait Provider: Send + Sync {
     fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
     fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
     /// Where the text lives inside one streamed event. An event type we do not
-    /// know carries no pointers and is forwarded as it came: both protocols add
+    /// know carries no slots and is forwarded as it came: both protocols add
     /// event types over time, and `ping` must not break a stream.
-    fn stream_pointers(&self, event: &Value) -> Result<Vec<String>, ShapeError>;
+    fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError>;
+}
+
+/// Where text sits in one streamed event, and which run of text it belongs to.
+///
+/// The two differ, and the difference is load-bearing. OpenAI streams one choice
+/// per chunk at array position 0 whatever its logical `index`, so the pointer
+/// alone would give two completions the same hold-back buffer and splice their
+/// fragments together. The pointer addresses this event; the key identifies the
+/// run across events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSlot {
+    pub pointer: String,
+    pub key: String,
 }
 
 pub struct OpenAi;
@@ -176,12 +189,12 @@ impl Provider for OpenAi {
         Ok(pointers)
     }
 
-    fn stream_pointers(&self, event: &Value) -> Result<Vec<String>, ShapeError> {
+    fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError> {
         let Some(choices) = event.get("choices").and_then(Value::as_array) else {
             return Ok(Vec::new());
         };
-        let mut pointers = Vec::new();
-        for (index, choice) in choices.iter().enumerate() {
+        let mut slots = Vec::new();
+        for (position, choice) in choices.iter().enumerate() {
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
@@ -192,21 +205,29 @@ impl Provider for OpenAi {
                     return Err(ShapeError::Unsupported("openai", "tool_calls"));
                 }
             }
+            // `index` says which completion this chunk belongs to; the array
+            // position only says where it sits in this chunk. With `n > 1` they
+            // are not the same number.
+            let index = choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(position as u64);
             // `refusal` is model text like `content` and streams beside it. Left
             // out, it would pass through unrestored — a placeholder handed to
             // the client in the one case where nobody is looking.
             for field in ["content", "refusal"] {
                 match delta.get(field) {
                     None | Some(Value::Null) => {}
-                    Some(Value::String(_)) => {
-                        pointers.push(format!("/choices/{index}/delta/{field}"));
-                    }
+                    Some(Value::String(_)) => slots.push(TextSlot {
+                        pointer: format!("/choices/{position}/delta/{field}"),
+                        key: format!("choice/{index}/{field}"),
+                    }),
                     // Recognized, unreadable: refused rather than forwarded.
                     Some(_) => return Err(ShapeError::Response("openai")),
                 }
             }
         }
-        Ok(pointers)
+        Ok(slots)
     }
 }
 
@@ -271,13 +292,22 @@ impl Provider for Anthropic {
         Ok(pointers)
     }
 
-    fn stream_pointers(&self, event: &Value) -> Result<Vec<String>, ShapeError> {
+    fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError> {
+        // One content block is one run of text: its opening event and every
+        // delta after it share a key, so a token split between them joins.
+        let key = format!(
+            "block/{}",
+            event.get("index").and_then(Value::as_u64).unwrap_or(0)
+        );
         match event.get("type").and_then(Value::as_str) {
             Some("content_block_delta") => {
                 let delta = event.get("delta").unwrap_or(&Value::Null);
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => match delta.get("text") {
-                        Some(Value::String(_)) => Ok(vec!["/delta/text".to_owned()]),
+                        Some(Value::String(_)) => Ok(vec![TextSlot {
+                            pointer: "/delta/text".to_owned(),
+                            key,
+                        }]),
                         _ => Err(ShapeError::Response("anthropic")),
                     },
                     // `input_json_delta` streams tool arguments, which this
@@ -292,7 +322,10 @@ impl Provider for Anthropic {
                 let block = event.get("content_block").unwrap_or(&Value::Null);
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => match block.get("text") {
-                        Some(Value::String(_)) => Ok(vec!["/content_block/text".to_owned()]),
+                        Some(Value::String(_)) => Ok(vec![TextSlot {
+                            pointer: "/content_block/text".to_owned(),
+                            key,
+                        }]),
                         _ => Err(ShapeError::Response("anthropic")),
                     },
                     Some("tool_use") => Err(ShapeError::Unsupported("anthropic", "tool_use")),
@@ -323,6 +356,60 @@ pub fn write_pointer(body: &mut Value, pointer: &str, text: &str) -> Result<(), 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn pointers(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
+        slots
+            .unwrap()
+            .into_iter()
+            .map(|slot| slot.pointer)
+            .collect()
+    }
+
+    fn keys(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
+        slots.unwrap().into_iter().map(|slot| slot.key).collect()
+    }
+
+    #[test]
+    fn interleaved_choices_get_distinct_keys_at_the_same_position() {
+        // With `n > 1` each chunk carries one choice at array position 0, and
+        // only `index` says which completion it is. Keying on the pointer would
+        // splice two completions into one hold-back buffer.
+        let first = json!({"choices": [{"index": 0, "delta": {"content": "a"}}]});
+        let second = json!({"choices": [{"index": 1, "delta": {"content": "b"}}]});
+        assert_eq!(
+            pointers(OpenAi.stream_slots(&first)),
+            pointers(OpenAi.stream_slots(&second))
+        );
+        assert_ne!(
+            keys(OpenAi.stream_slots(&first)),
+            keys(OpenAi.stream_slots(&second))
+        );
+    }
+
+    #[test]
+    fn an_anthropic_block_keeps_one_key_from_start_to_delta() {
+        // A token split between the opening event and the first delta must join.
+        let start = json!({"type": "content_block_start", "index": 2,
+                           "content_block": {"type": "text", "text": ""}});
+        let delta = json!({"type": "content_block_delta", "index": 2,
+                           "delta": {"type": "text_delta", "text": "x"}});
+        assert_eq!(
+            keys(Anthropic.stream_slots(&start)),
+            keys(Anthropic.stream_slots(&delta))
+        );
+    }
+
+    #[test]
+    fn separate_anthropic_blocks_get_separate_keys() {
+        let zero = json!({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "text_delta", "text": "x"}});
+        let one = json!({"type": "content_block_delta", "index": 1,
+                         "delta": {"type": "text_delta", "text": "y"}});
+        assert_ne!(
+            keys(Anthropic.stream_slots(&zero)),
+            keys(Anthropic.stream_slots(&one))
+        );
+    }
 
     #[test]
     fn openai_finds_string_content() {
@@ -500,7 +587,7 @@ mod tests {
     fn openai_finds_the_delta_content() {
         let event = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]});
         assert_eq!(
-            OpenAi.stream_pointers(&event).unwrap(),
+            pointers(OpenAi.stream_slots(&event)),
             ["/choices/0/delta/content"]
         );
     }
@@ -512,7 +599,7 @@ mod tests {
             {"delta": {"content": "b"}}
         ]});
         assert_eq!(
-            OpenAi.stream_pointers(&event).unwrap(),
+            pointers(OpenAi.stream_slots(&event)),
             ["/choices/0/delta/content", "/choices/1/delta/content"]
         );
     }
@@ -523,7 +610,7 @@ mod tests {
         // a placeholder to the client.
         let event = json!({"choices": [{"delta": {"refusal": "I cannot help [PERSON_1]"}}]});
         assert_eq!(
-            OpenAi.stream_pointers(&event).unwrap(),
+            pointers(OpenAi.stream_slots(&event)),
             ["/choices/0/delta/refusal"]
         );
     }
@@ -531,20 +618,20 @@ mod tests {
     #[test]
     fn openai_yields_nothing_for_a_finish_chunk() {
         let event = json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
-        assert!(OpenAi.stream_pointers(&event).unwrap().is_empty());
+        assert!(OpenAi.stream_slots(&event).unwrap().is_empty());
     }
 
     #[test]
     fn openai_refuses_a_non_string_delta_content() {
         // A shape we recognize but cannot read is refused, never forwarded.
         let event = json!({"choices": [{"delta": {"content": {"parts": []}}}]});
-        assert!(OpenAi.stream_pointers(&event).is_err());
+        assert!(OpenAi.stream_slots(&event).is_err());
     }
 
     #[test]
     fn openai_refuses_a_streamed_tool_call() {
         let event = json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]});
-        assert!(OpenAi.stream_pointers(&event).is_err());
+        assert!(OpenAi.stream_slots(&event).is_err());
     }
 
     #[test]
@@ -554,7 +641,7 @@ mod tests {
             "index": 0,
             "delta": {"type": "text_delta", "text": "hi"}
         });
-        assert_eq!(Anthropic.stream_pointers(&event).unwrap(), ["/delta/text"]);
+        assert_eq!(pointers(Anthropic.stream_slots(&event)), ["/delta/text"]);
     }
 
     #[test]
@@ -565,7 +652,7 @@ mod tests {
             "content_block": {"type": "text", "text": ""}
         });
         assert_eq!(
-            Anthropic.stream_pointers(&event).unwrap(),
+            pointers(Anthropic.stream_slots(&event)),
             ["/content_block/text"]
         );
     }
@@ -577,7 +664,7 @@ mod tests {
             "index": 0,
             "content_block": {"type": "tool_use", "input": {}}
         });
-        assert!(Anthropic.stream_pointers(&event).is_err());
+        assert!(Anthropic.stream_slots(&event).is_err());
     }
 
     #[test]
@@ -587,18 +674,18 @@ mod tests {
             "index": 0,
             "delta": {"type": "input_json_delta", "partial_json": "{"}
         });
-        assert!(Anthropic.stream_pointers(&event).is_err());
+        assert!(Anthropic.stream_slots(&event).is_err());
     }
 
     #[test]
     fn unknown_event_types_carry_no_text() {
         // `ping` and event types added later must not break a stream.
         assert!(Anthropic
-            .stream_pointers(&json!({"type": "ping"}))
+            .stream_slots(&json!({"type": "ping"}))
             .unwrap()
             .is_empty());
         assert!(OpenAi
-            .stream_pointers(&json!({"object": "x"}))
+            .stream_slots(&json!({"object": "x"}))
             .unwrap()
             .is_empty());
     }
