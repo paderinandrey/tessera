@@ -80,6 +80,206 @@ impl<'a> RestoreBuffer<'a> {
     }
 }
 
+/// One SSE event: the `event:` name if the stream sent one, the `data:` lines
+/// joined as the specification requires, and every other line kept verbatim so
+/// `id:`, `retry:` and comments reach the client as the provider sent them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SseEvent {
+    pub name: Option<String>,
+    pub data: Option<String>,
+    other: Vec<String>,
+}
+
+impl SseEvent {
+    pub fn new(name: Option<String>, data: Option<String>) -> Self {
+        Self {
+            name,
+            data,
+            other: Vec::new(),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        if let Some(name) = &self.name {
+            out.push_str("event: ");
+            out.push_str(name);
+            out.push('\n');
+        }
+        for line in &self.other {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if let Some(data) = &self.data {
+            for line in data.split('\n') {
+                out.push_str("data: ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+        out
+    }
+}
+
+/// Frames a byte stream into events. HTTP chunks break anywhere, including the
+/// middle of a UTF-8 character, so framing happens on bytes and decoding only
+/// once an event is whole.
+#[derive(Default)]
+pub struct SseFramer {
+    buffer: Vec<u8>,
+}
+
+impl SseFramer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some((end, width)) = find_blank_line(&self.buffer) {
+            let block = self.buffer[..end].to_vec();
+            self.buffer.drain(..end + width);
+            if let Some(event) = parse_event(&block) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Bytes left over when the body ended. A stream that stops without its
+    /// final blank line must not swallow the text it already sent.
+    pub fn finish(&mut self) -> Option<SseEvent> {
+        let block = std::mem::take(&mut self.buffer);
+        parse_event(&block)
+    }
+}
+
+/// Offset and width of the first blank line, in either line-ending convention.
+/// Scanning forward matters: a `\r\n\r\n` delimiter contains no `\n\n`, so
+/// searching for `\n\n` across the whole buffer first would run past it and
+/// merge two events into one.
+fn find_blank_line(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        let rest = &buffer[index..];
+        if rest.starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if rest.starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+    }
+    None
+}
+
+fn parse_event(block: &[u8]) -> Option<SseEvent> {
+    let text = String::from_utf8_lossy(block);
+    let mut event = SseEvent::new(None, None);
+    let mut data: Vec<&str> = Vec::new();
+    let mut seen = false;
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        seen = true;
+        if let Some(value) = line.strip_prefix("event:") {
+            event.name = Some(value.trim_start().to_owned());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        } else {
+            event.other.push(line.to_owned());
+        }
+    }
+    if !seen {
+        return None;
+    }
+    if !data.is_empty() {
+        event.data = Some(data.join("\n"));
+    }
+    Some(event)
+}
+
+#[cfg(test)]
+mod framer_tests {
+    use super::*;
+
+    const BODY: &str = "event: content_block_delta\ndata: {\"a\":1}\n\ndata: [DONE]\n\n";
+
+    #[test]
+    fn complete_events_are_yielded_with_name_and_data() {
+        let mut framer = SseFramer::new();
+        let events = framer.push(BODY.as_bytes());
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].name.as_deref(), Some("content_block_delta"));
+        assert_eq!(events[0].data.as_deref(), Some("{\"a\":1}"));
+        assert_eq!(events[1].name, None);
+        assert_eq!(events[1].data.as_deref(), Some("[DONE]"));
+    }
+
+    #[test]
+    fn a_partial_event_is_held_until_it_completes() {
+        let mut framer = SseFramer::new();
+        assert!(framer.push(b"data: {\"a\"").is_empty());
+        assert!(framer.push(b":1}").is_empty());
+        assert_eq!(framer.push(b"\n\n").len(), 1);
+    }
+
+    #[test]
+    fn a_byte_at_a_time_yields_the_same_events() {
+        // A chunk boundary inside a multi-byte character must not corrupt it.
+        let body = "data: {\"t\":\"Grüße\"}\n\n";
+        let mut framer = SseFramer::new();
+        let mut events = Vec::new();
+        for byte in body.as_bytes() {
+            events.extend(framer.push(&[*byte]));
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data.as_deref(), Some("{\"t\":\"Grüße\"}"));
+    }
+
+    #[test]
+    fn crlf_delimited_events_are_framed_separately() {
+        // Searching the whole buffer for "\n\n" first would merge these two.
+        let mut framer = SseFramer::new();
+        let events = framer.push(b"data: one\r\n\r\ndata: two\n\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data.as_deref(), Some("one"));
+        assert_eq!(events[1].data.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn multi_line_data_is_joined_with_newlines() {
+        let mut framer = SseFramer::new();
+        let events = framer.push(b"data: one\ndata: two\n\n");
+        assert_eq!(events[0].data.as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn trailing_bytes_without_a_blank_line_are_still_delivered() {
+        // A body that ends without the final blank line must not swallow text.
+        let mut framer = SseFramer::new();
+        assert!(framer.push(b"data: tail").is_empty());
+        assert_eq!(framer.finish().unwrap().data.as_deref(), Some("tail"));
+    }
+
+    #[test]
+    fn other_fields_survive_the_round_trip() {
+        // Dropping `id:` would break a client's resume.
+        let mut framer = SseFramer::new();
+        let events = framer.push(b"id: 7\nevent: ping\ndata: {}\n\n");
+        assert_eq!(events[0].render(), "event: ping\nid: 7\ndata: {}\n\n");
+    }
+
+    #[test]
+    fn an_event_without_data_renders_no_data_line() {
+        let mut framer = SseFramer::new();
+        let events = framer.push(b"event: ping\n\n");
+        assert_eq!(events[0].render(), "event: ping\n\n");
+    }
+}
+
 #[cfg(test)]
 mod buffer_tests {
     use super::*;

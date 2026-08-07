@@ -19,6 +19,10 @@ pub trait Provider: Send + Sync {
     fn upstream_path(&self) -> &'static str;
     fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
     fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
+    /// Where the text lives inside one streamed event. An event type we do not
+    /// know carries no pointers and is forwarded as it came: both protocols add
+    /// event types over time, and `ping` must not break a stream.
+    fn stream_pointers(&self, event: &Value) -> Result<Vec<String>, ShapeError>;
 }
 
 pub struct OpenAi;
@@ -171,6 +175,34 @@ impl Provider for OpenAi {
         }
         Ok(pointers)
     }
+
+    fn stream_pointers(&self, event: &Value) -> Result<Vec<String>, ShapeError> {
+        let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+            return Ok(Vec::new());
+        };
+        let mut pointers = Vec::new();
+        for (index, choice) in choices.iter().enumerate() {
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            // Tool arguments stream as their own field, past the masker.
+            // Masking them is a later slice; until then they are refused.
+            for field in ["tool_calls", "function_call"] {
+                if delta.get(field).is_some_and(|value| !value.is_null()) {
+                    return Err(ShapeError::Unsupported("openai", "tool_calls"));
+                }
+            }
+            match delta.get("content") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(_)) => {
+                    pointers.push(format!("/choices/{index}/delta/content"));
+                }
+                // Recognized, unreadable: refused rather than forwarded.
+                Some(_) => return Err(ShapeError::Response("openai")),
+            }
+        }
+        Ok(pointers)
+    }
 }
 
 impl Provider for Anthropic {
@@ -232,6 +264,38 @@ impl Provider for Anthropic {
             return Err(ShapeError::Response("anthropic"));
         }
         Ok(pointers)
+    }
+
+    fn stream_pointers(&self, event: &Value) -> Result<Vec<String>, ShapeError> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_delta") => {
+                let delta = event.get("delta").unwrap_or(&Value::Null);
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => match delta.get("text") {
+                        Some(Value::String(_)) => Ok(vec!["/delta/text".to_owned()]),
+                        _ => Err(ShapeError::Response("anthropic")),
+                    },
+                    // `input_json_delta` streams tool arguments, which this
+                    // gateway does not mask yet.
+                    Some("input_json_delta") => {
+                        Err(ShapeError::Unsupported("anthropic", "tool_use"))
+                    }
+                    _ => Err(ShapeError::Response("anthropic")),
+                }
+            }
+            Some("content_block_start") => {
+                let block = event.get("content_block").unwrap_or(&Value::Null);
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => match block.get("text") {
+                        Some(Value::String(_)) => Ok(vec!["/content_block/text".to_owned()]),
+                        _ => Err(ShapeError::Response("anthropic")),
+                    },
+                    Some("tool_use") => Err(ShapeError::Unsupported("anthropic", "tool_use")),
+                    _ => Err(ShapeError::Response("anthropic")),
+                }
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 }
 
@@ -425,5 +489,101 @@ mod tests {
         assert_eq!(read_pointer(&body, "/messages/0/content").unwrap(), "Weber");
         write_pointer(&mut body, "/messages/0/content", "[PERSON_1]").unwrap();
         assert_eq!(body["messages"][0]["content"], "[PERSON_1]");
+    }
+
+    #[test]
+    fn openai_finds_the_delta_content() {
+        let event = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]});
+        assert_eq!(
+            OpenAi.stream_pointers(&event).unwrap(),
+            ["/choices/0/delta/content"]
+        );
+    }
+
+    #[test]
+    fn openai_finds_every_choice_in_a_chunk() {
+        let event = json!({"choices": [
+            {"delta": {"content": "a"}},
+            {"delta": {"content": "b"}}
+        ]});
+        assert_eq!(
+            OpenAi.stream_pointers(&event).unwrap(),
+            ["/choices/0/delta/content", "/choices/1/delta/content"]
+        );
+    }
+
+    #[test]
+    fn openai_yields_nothing_for_a_finish_chunk() {
+        let event = json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        assert!(OpenAi.stream_pointers(&event).unwrap().is_empty());
+    }
+
+    #[test]
+    fn openai_refuses_a_non_string_delta_content() {
+        // A shape we recognize but cannot read is refused, never forwarded.
+        let event = json!({"choices": [{"delta": {"content": {"parts": []}}}]});
+        assert!(OpenAi.stream_pointers(&event).is_err());
+    }
+
+    #[test]
+    fn openai_refuses_a_streamed_tool_call() {
+        let event = json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]});
+        assert!(OpenAi.stream_pointers(&event).is_err());
+    }
+
+    #[test]
+    fn anthropic_finds_the_text_delta() {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"}
+        });
+        assert_eq!(Anthropic.stream_pointers(&event).unwrap(), ["/delta/text"]);
+    }
+
+    #[test]
+    fn anthropic_finds_the_text_of_an_opening_block() {
+        let event = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        assert_eq!(
+            Anthropic.stream_pointers(&event).unwrap(),
+            ["/content_block/text"]
+        );
+    }
+
+    #[test]
+    fn anthropic_refuses_a_streamed_tool_block() {
+        let event = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "input": {}}
+        });
+        assert!(Anthropic.stream_pointers(&event).is_err());
+    }
+
+    #[test]
+    fn anthropic_refuses_an_input_json_delta() {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{"}
+        });
+        assert!(Anthropic.stream_pointers(&event).is_err());
+    }
+
+    #[test]
+    fn unknown_event_types_carry_no_text() {
+        // `ping` and event types added later must not break a stream.
+        assert!(Anthropic
+            .stream_pointers(&json!({"type": "ping"}))
+            .unwrap()
+            .is_empty());
+        assert!(OpenAi
+            .stream_pointers(&json!({"object": "x"}))
+            .unwrap()
+            .is_empty());
     }
 }
