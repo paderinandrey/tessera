@@ -293,6 +293,16 @@ Review found four holes in the design as written; the code carries the fixes:
   token-level fragments, and restoring them would leave the probabilities
   describing text that is no longer there.
 
+- **Whole-envelope restoration is event-local, and a field that streams in
+  fragments needs a run.** OpenAI's audio output puts a transcript under
+  `delta.audio.transcript`, arriving in pieces beside audio bytes nothing can
+  mask. The envelope pass would meet `[PER` and `SON_1]` in separate events and
+  pass each untouched. Restoring the transcript would leave it saying a name the
+  recording does not say; leaving it alone hands over the placeholder a fragment
+  at a time. Audio output is refused before the call. The rule this leaves
+  behind: any field whose text arrives incrementally must be declared as a slot,
+  because the envelope pass cannot join across events by construction.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

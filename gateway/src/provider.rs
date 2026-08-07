@@ -185,6 +185,25 @@ impl Provider for OpenAi {
             None | Some(Value::Null) | Some(Value::Bool(false)) => {}
             _ => return Err(ShapeError::Unsupported("openai", "logprobs")),
         }
+        // Audio output streams a transcript in fragments beside audio bytes we
+        // cannot mask at all. Restoring the transcript would leave it saying a
+        // name the recording does not say; leaving it alone would hand the
+        // placeholder to the client a fragment at a time. Neither is a service,
+        // so the request is refused before the call.
+        if body.get("audio").is_some_and(|value| !value.is_null()) {
+            return Err(ShapeError::Unsupported("openai", "audio"));
+        }
+        if body
+            .get("modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| modality.as_str() == Some("audio"))
+            })
+        {
+            return Err(ShapeError::Unsupported("openai", "audio"));
+        }
         match body.get("top_logprobs") {
             None | Some(Value::Null) => {}
             Some(Value::Number(count)) if count.as_u64() == Some(0) => {}
@@ -258,6 +277,14 @@ impl Provider for OpenAi {
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
+            // A field whose text arrives in fragments must be a declared run:
+            // restoring the envelope is event-local, so `[PER` and `SON_1]` in
+            // successive events would each pass it untouched and join at the
+            // client. Audio transcripts are such a field, and they are refused
+            // rather than restored, for the reason given on the request side.
+            if delta.get("audio").is_some_and(|value| !value.is_null()) {
+                return Err(ShapeError::Unsupported("openai", "audio"));
+            }
             // Tool arguments stream as their own field, past the masker.
             // Masking them is a later slice; until then they are refused.
             for field in ["tool_calls", "function_call"] {
@@ -893,6 +920,30 @@ mod tests {
                 "{empty} refused"
             );
         }
+    }
+
+    #[test]
+    fn an_audio_output_request_is_refused_before_the_call() {
+        // The transcript streams in fragments beside audio nothing can mask.
+        assert!(OpenAi
+            .request_pointers(&with_option(
+                "audio",
+                json!({"voice": "alloy", "format": "pcm16"})
+            ))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&with_option("modalities", json!(["text", "audio"])))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&with_option("modalities", json!(["text"])))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_streamed_audio_transcript_is_refused() {
+        let event = json!({"choices": [{"index": 0,
+                                        "delta": {"audio": {"transcript": "[PER"}}}]});
+        assert!(OpenAi.stream_slots(&event).is_err());
     }
 
     #[test]
