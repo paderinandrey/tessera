@@ -6,7 +6,25 @@
 //! offsets, including the middle of a UTF-8 character. Restoring per chunk
 //! would emit `[PER` to the client and never recognize the token.
 
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
 use crate::mapping::{Mapping, MappingError};
+use crate::provider::{read_pointer, write_pointer, Provider, ShapeError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StreamError {
+    #[error("{0}")]
+    Mapping(#[from] MappingError),
+    #[error("{0}")]
+    Shape(#[from] ShapeError),
+    #[error(
+        "restored text had no place in the stream at {0}; the stream ends rather \
+         than continuing without it"
+    )]
+    Unplaceable(String),
+}
 
 /// A `[` that never closes would suspend the stream. Past this many bytes the
 /// bracket cannot begin a placeholder, so it is emitted as ordinary text.
@@ -199,6 +217,255 @@ fn parse_event(block: &[u8]) -> Option<SseEvent> {
         event.data = Some(data.join("\n"));
     }
     Some(event)
+}
+
+/// Restores an SSE response as it arrives.
+///
+/// Restored text does not have the length of the masked text, so a delta is
+/// rewritten whole rather than patched. That leaves one problem: text still
+/// held when the last text-bearing event goes out has nowhere to live. So
+/// text-bearing events are emitted one behind, and the first event that carries
+/// no text — `finish_reason`, `content_block_stop`, `[DONE]` — ends the run and
+/// releases what is held into the event waiting behind it.
+pub struct StreamRestorer<'a> {
+    provider: &'a dyn Provider,
+    mapping: &'a Mapping,
+    framer: SseFramer,
+    /// One buffer per JSON pointer, so several choices on OpenAI and several
+    /// content blocks on Anthropic do not share hold-back state.
+    buffers: BTreeMap<String, RestoreBuffer<'a>>,
+    pending: Option<SseEvent>,
+}
+
+impl<'a> StreamRestorer<'a> {
+    pub fn new(provider: &'a dyn Provider, mapping: &'a Mapping) -> Self {
+        Self {
+            provider,
+            mapping,
+            framer: SseFramer::new(),
+            buffers: BTreeMap::new(),
+            pending: None,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<String, StreamError> {
+        let mut out = String::new();
+        for event in self.framer.push(chunk) {
+            out.push_str(&self.handle(event)?);
+        }
+        Ok(out)
+    }
+
+    pub fn finish(&mut self) -> Result<String, StreamError> {
+        let mut out = String::new();
+        if let Some(event) = self.framer.finish() {
+            out.push_str(&self.handle(event)?);
+        }
+        out.push_str(&self.flush()?);
+        Ok(out)
+    }
+
+    fn handle(&mut self, event: SseEvent) -> Result<String, StreamError> {
+        // `[DONE]` and anything else that is not JSON carries no text.
+        let Ok(parsed) = serde_json::from_str::<Value>(event.data.as_deref().unwrap_or("")) else {
+            let mut out = self.flush()?;
+            out.push_str(&event.render());
+            return Ok(out);
+        };
+        let pointers = self.provider.stream_pointers(&parsed)?;
+        if pointers.is_empty() {
+            let mut out = self.flush()?;
+            out.push_str(&event.render());
+            return Ok(out);
+        }
+
+        let mapping = self.mapping;
+        let mut rewritten = parsed.clone();
+        for pointer in &pointers {
+            let text = read_pointer(&parsed, pointer)?;
+            let safe = self
+                .buffers
+                .entry(pointer.clone())
+                .or_insert_with(|| RestoreBuffer::new(mapping))
+                .push(&text)?;
+            write_pointer(&mut rewritten, pointer, &safe)?;
+        }
+        let mut event = event;
+        event.data = Some(rewritten.to_string());
+        let previous = self.pending.replace(event);
+        Ok(previous.map(|event| event.render()).unwrap_or_default())
+    }
+
+    /// The text run has ended: drain every buffer into the waiting event.
+    fn flush(&mut self) -> Result<String, StreamError> {
+        let mut remainders: Vec<(String, String)> = Vec::new();
+        for (pointer, buffer) in self.buffers.iter_mut() {
+            let rest = buffer.finish()?;
+            if !rest.is_empty() {
+                remainders.push((pointer.clone(), rest));
+            }
+        }
+        self.buffers.clear();
+
+        let Some(mut event) = self.pending.take() else {
+            // Restored text with nowhere to go is not dropped quietly.
+            if let Some((pointer, _)) = remainders.first() {
+                return Err(StreamError::Unplaceable(pointer.clone()));
+            }
+            return Ok(String::new());
+        };
+        if remainders.is_empty() {
+            return Ok(event.render());
+        }
+        let mut parsed: Value = serde_json::from_str(event.data.as_deref().unwrap_or(""))
+            .map_err(|_| StreamError::Unplaceable("the waiting event".to_owned()))?;
+        for (pointer, rest) in remainders {
+            let existing = read_pointer(&parsed, &pointer)
+                .map_err(|_| StreamError::Unplaceable(pointer.clone()))?;
+            write_pointer(&mut parsed, &pointer, &format!("{existing}{rest}"))?;
+        }
+        event.data = Some(parsed.to_string());
+        Ok(event.render())
+    }
+}
+
+#[cfg(test)]
+mod restorer_tests {
+    use super::*;
+    use crate::mapping::Span;
+    use crate::provider::OpenAi;
+
+    fn mapped() -> Mapping {
+        let mut mapping = Mapping::new();
+        mapping
+            .mask(
+                "Weber",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 5,
+                }],
+            )
+            .unwrap();
+        mapping
+    }
+
+    /// Concatenate every delta the client would have seen.
+    fn text_of(rendered: &str) -> String {
+        let mut out = String::new();
+        for line in rendered.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(text) = value
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    const BODY: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PER\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1], bis \"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"bald [PERSON_1]\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    fn run(chunk_size: usize) -> String {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let mut rendered = String::new();
+        for chunk in BODY.as_bytes().chunks(chunk_size) {
+            rendered.push_str(&restorer.push(chunk).unwrap());
+        }
+        rendered.push_str(&restorer.finish().unwrap());
+        rendered
+    }
+
+    #[test]
+    fn every_slicing_granularity_produces_the_same_text() {
+        // The mandatory test: a restoration that works on natural chunk
+        // boundaries and fails on a one-byte split is the bug this slice exists
+        // to remove.
+        for chunk_size in 1..=BODY.len() {
+            assert_eq!(
+                text_of(&run(chunk_size)),
+                "Hallo Weber, bis bald Weber",
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_placeholder_ever_reaches_the_client() {
+        for chunk_size in 1..=BODY.len() {
+            assert!(
+                !run(chunk_size).contains("PERSON_1"),
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_terminal_events_survive() {
+        let rendered = run(BODY.len());
+        assert!(rendered.contains("finish_reason"));
+        assert!(rendered.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn an_unknown_placeholder_ends_the_stream_before_it_is_served() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let rendered = restorer
+            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hallo [PERSON\"}}]}\n\n")
+            .unwrap();
+        let error = restorer
+            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"_9]\"}}]}\n\n")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StreamError::Mapping(MappingError::Unknown(_))
+        ));
+        assert!(!rendered.contains("PERSON"));
+    }
+
+    #[test]
+    fn an_unknown_event_type_passes_through() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let rendered = restorer.push(b"event: ping\ndata: {}\n\n").unwrap();
+        assert!(rendered.contains("event: ping"));
+    }
+
+    #[test]
+    fn a_streamed_tool_call_ends_the_stream() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let error = restorer
+            .push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n")
+            .unwrap_err();
+        assert!(matches!(error, StreamError::Shape(_)));
+    }
+
+    #[test]
+    fn a_body_that_stops_mid_placeholder_still_serves_what_it_held() {
+        // An upstream that dies mid-token must not swallow the text before it.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        restorer
+            .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hallo [no\"}}]}\n\n")
+            .unwrap();
+        let tail = restorer.finish().unwrap();
+        assert!(tail.contains("Hallo [no"), "text was swallowed: {tail}");
+    }
 }
 
 #[cfg(test)]
