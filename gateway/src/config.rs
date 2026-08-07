@@ -6,6 +6,10 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("detector_timeout_secs must be greater than zero")]
     ZeroTimeout,
+    #[error("max_sessions must be greater than zero unless session_idle_secs is zero")]
+    ZeroSessionLimit,
+    #[error("max_session_values must be greater than zero unless session_idle_secs is zero")]
+    ZeroSessionValues,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +28,19 @@ pub struct Config {
     pub openai_base: String,
     #[serde(default = "default_anthropic_base")]
     pub anthropic_base: String,
+    /// How long a session survives without a request. Zero disables sessions
+    /// entirely: personal data then never outlives the request that carried it,
+    /// which is the right setting for a deployment that wants that guarantee.
+    #[serde(default = "default_session_idle_secs")]
+    pub session_idle_secs: u64,
+    /// How many conversations may hold a table at once. The oldest is dropped
+    /// when a new one arrives at the limit.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+    /// How many values one conversation may remember. Past it, values are still
+    /// masked and still restored — they are simply not remembered.
+    #[serde(default = "default_max_session_values")]
+    pub max_session_values: usize,
 }
 
 fn default_bind() -> String {
@@ -41,12 +58,29 @@ fn default_openai_base() -> String {
 fn default_anthropic_base() -> String {
     "https://api.anthropic.com".to_owned()
 }
+fn default_session_idle_secs() -> u64 {
+    1800
+}
+fn default_max_sessions() -> usize {
+    1000
+}
+fn default_max_session_values() -> usize {
+    1000
+}
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let config: Config = toml::from_str(text)?;
         if config.detector_timeout_secs == 0 {
             return Err(ConfigError::ZeroTimeout);
+        }
+        if config.session_idle_secs > 0 {
+            if config.max_sessions == 0 {
+                return Err(ConfigError::ZeroSessionLimit);
+            }
+            if config.max_session_values == 0 {
+                return Err(ConfigError::ZeroSessionValues);
+            }
         }
         Ok(config)
     }
@@ -90,5 +124,48 @@ mod tests {
     #[test]
     fn a_zero_timeout_is_rejected() {
         assert!(Config::from_toml("detector_timeout_secs = 0").is_err());
+    }
+
+    #[test]
+    fn session_defaults_are_bounded() {
+        let config = Config::from_toml("").expect("empty config is valid");
+        assert_eq!(config.session_idle_secs, 1800);
+        assert_eq!(config.max_sessions, 1000);
+        assert_eq!(config.max_session_values, 1000);
+    }
+
+    #[test]
+    fn session_values_override_the_defaults() {
+        let config = Config::from_toml(
+            r#"
+            session_idle_secs = 60
+            max_sessions = 4
+            max_session_values = 8
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(config.session_idle_secs, 60);
+        assert_eq!(config.max_sessions, 4);
+        assert_eq!(config.max_session_values, 8);
+    }
+
+    #[test]
+    fn zero_idle_disables_sessions_and_permits_zero_limits() {
+        let config = Config::from_toml(
+            r#"
+            session_idle_secs = 0
+            max_sessions = 0
+            max_session_values = 0
+            "#,
+        )
+        .expect("a deployment that wants no personal data in memory between requests");
+        assert_eq!(config.session_idle_secs, 0);
+    }
+
+    #[test]
+    fn a_zero_limit_with_sessions_enabled_is_rejected() {
+        // Enabled and unable to hold anything is not a configuration, it is a typo.
+        assert!(Config::from_toml("max_sessions = 0").is_err());
+        assert!(Config::from_toml("max_session_values = 0").is_err());
     }
 }
