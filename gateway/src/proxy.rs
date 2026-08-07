@@ -23,8 +23,6 @@ pub enum ProxyError {
     Mapping(#[from] MappingError),
     #[error("upstream request failed: {0}")]
     Upstream(String),
-    #[error("streaming is not supported by this gateway yet; the request is refused rather than forwarded unrestorable")]
-    Streaming,
 }
 
 impl IntoResponse for ProxyError {
@@ -33,8 +31,7 @@ impl IntoResponse for ProxyError {
             // A body we cannot read is the client's to fix, and it is refused
             // rather than forwarded unmasked.
             ProxyError::Shape(ShapeError::Request(_))
-            | ProxyError::Shape(ShapeError::Unsupported(_, _))
-            | ProxyError::Streaming => StatusCode::BAD_REQUEST,
+            | ProxyError::Shape(ShapeError::Unsupported(_, _)) => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
         };
         // The reason names the failure. It never carries the submitted text.
@@ -98,16 +95,10 @@ impl AppState {
 
 async fn handle(
     state: Arc<AppState>,
-    provider: &dyn Provider,
+    provider: &'static dyn Provider,
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response, ProxyError> {
-    // This slice does not restore a stream, so a streaming request is refused
-    // before it costs the caller an upstream call and the tokens with it.
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(ProxyError::Streaming);
-    }
-
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let pointers = provider.request_pointers(&body)?;
 
@@ -153,6 +144,20 @@ async fn handle(
             returned.insert(header, value.clone());
         }
     }
+    // A stream is restored as it arrives. A non-success status is not a stream,
+    // whatever its content type, and keeps the buffered path below.
+    if status.is_success()
+        && response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        return Ok(crate::stream::restore_stream(
+            response, provider, mapping, returned,
+        ));
+    }
+
     let raw = response
         .bytes()
         .await
@@ -633,12 +638,145 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_streaming_request_is_refused_before_the_upstream_is_called() {
-        let detector = detector_returning(json!([])).await;
-        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+    async fn upstream_streaming(body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(body.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
 
-        let (status, _) = call(
+    const STREAM_BODY: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PER\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1]!\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[tokio::test]
+    async fn a_streaming_response_reaches_the_client_restored() {
+        // The placeholder is split across two events; the client must see the
+        // value once, whole, and never the token.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_streaming(STREAM_BODY).await;
+
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(served.contains(SECRET), "not restored: {served}");
+        assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
+        assert!(served.ends_with("data: [DONE]\n\n"), "truncated: {served}");
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_stream_shape_is_restored_too() {
+        // Anthropic carries text under a different pointer and separates blocks
+        // with events that carry none.
+        let detector = detector_returning(person_span()).await;
+        let upstream = MockServer::start().await;
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\
+             \"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hallo [PER\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"SON_1]\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(body.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "stream": true,
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(served.contains(SECRET), "not restored: {served}");
+        assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
+        assert!(
+            served.contains("event: message_stop"),
+            "truncated: {served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_response_is_served_as_a_stream() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_streaming("data: [DONE]\n\n").await;
+        let response = router(state(&detector, &upstream))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "gpt", "stream": true,
+                               "messages": [{"role": "user", "content": "Hallo"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_upstream_is_still_told_to_stream() {
+        // Dropping the flag would make the provider answer with a whole body the
+        // client is not waiting for.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_streaming("data: [DONE]\n\n").await;
+        call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let sent: Value = serde_json::from_slice(&received.body).unwrap();
+        assert_eq!(sent["stream"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_stream_carrying_an_unknown_placeholder_ends_with_an_error() {
+        // Bytes have already gone out, so the request cannot be refused. It ends
+        // instead — the client never receives a token in place of a name.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_streaming(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hallo [PERSON_9]\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+
+        let (status, served) = call(
             state(&detector, &upstream),
             "/v1/chat/completions",
             json!({"model": "gpt", "stream": true,
@@ -646,11 +784,40 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::OK);
+        assert!(served.contains("tessera_restoration_failed"), "{served}");
         assert!(
-            upstream.received_requests().await.unwrap().is_empty(),
-            "a refusal after the call still costs the caller tokens"
+            !served.contains("data: [DONE]"),
+            "served as complete: {served}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_error_response_keeps_the_buffered_path() {
+        // A 429 is not a stream, whatever it says it is.
+        let detector = detector_returning(json!([])).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("retry-after", "3")
+                    .set_body_json(json!({"error": {"message": "slow down"}})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(served.contains("slow down"), "{served}");
     }
 
     #[tokio::test]

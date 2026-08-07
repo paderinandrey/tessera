@@ -7,7 +7,13 @@
 //! would emit `[PER` to the client and never recognize the token.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 
+use axum::body::{Body, Bytes};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderValue};
+use axum::response::Response;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::mapping::{Mapping, MappingError};
@@ -327,6 +333,69 @@ impl<'a> StreamRestorer<'a> {
         event.data = Some(parsed.to_string());
         Ok(event.render())
     }
+}
+
+/// Serve an upstream SSE response, restored as it arrives.
+///
+/// The mapping moves into the stream: it must outlive the response, and it must
+/// not outlive it by a moment longer — it holds the values this request masked.
+pub fn restore_stream(
+    response: reqwest::Response,
+    provider: &'static dyn Provider,
+    mapping: Mapping,
+    headers: HeaderMap,
+) -> Response {
+    let body = async_stream::stream! {
+        let mut upstream = response.bytes_stream();
+        let mut restorer = StreamRestorer::new(provider, &mapping);
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                // The upstream broke off. Say so rather than let the client read
+                // a truncated answer as a complete one.
+                Err(error) => {
+                    yield Ok(Bytes::from(error_event(&error.to_string())));
+                    return;
+                }
+            };
+            match restorer.push(&chunk) {
+                Ok(out) if out.is_empty() => {}
+                Ok(out) => yield Ok(Bytes::from(out)),
+                Err(error) => {
+                    yield Ok(Bytes::from(error_event(&error.to_string())));
+                    return;
+                }
+            }
+        }
+        match restorer.finish() {
+            Ok(out) if out.is_empty() => {}
+            Ok(out) => yield Ok::<_, Infallible>(Bytes::from(out)),
+            Err(error) => yield Ok(Bytes::from(error_event(&error.to_string()))),
+        }
+    };
+
+    let mut response = Response::new(Body::from_stream(body));
+    *response.headers_mut() = headers;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
+/// What the client sees when restoration fails after bytes have already gone
+/// out. The message names the failure and, at most, a placeholder — never a
+/// value: `MappingError::Unknown` carries the token, not what it stood for.
+fn error_event(message: &str) -> String {
+    SseEvent::new(
+        Some("error".to_owned()),
+        Some(
+            serde_json::json!({
+                "error": {"type": "tessera_restoration_failed", "message": message}
+            })
+            .to_string(),
+        ),
+    )
+    .render()
 }
 
 #[cfg(test)]
