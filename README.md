@@ -126,7 +126,9 @@ request gets its own table, which is the behaviour without the header.
 The id does not select a session on its own. A session table is a restoration oracle: put
 `[PERSON_1]` in a prompt, get it echoed by the model, and the gateway would restore it to
 a real name on the way back. So the store keys on a salted fingerprint of the caller's own
-credential as well as the id, and a guessed id lands in an empty namespace. The raw id
+credential as well as the id, and a guessed id lands in an empty namespace. The boundary
+is the credential, not the id: callers who share one API key share one namespace, and
+within it any id is reachable by anyone holding that key. The raw id
 never reaches a log either — a client may well name its session after the person in it.
 
 The table holds real values in memory between requests, which nothing else in the gateway
@@ -142,7 +144,7 @@ Detection still runs over every text in every request. The session stabilises a
 placeholder that detection produced; it is never asked to find personal data on its own,
 because personal data does not arrive in the same form twice.
 
-A request refused for any reason leaves its session exactly as it was. Asking for a
+A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or
 `session_idle_secs = 0` — is refused before the detector runs rather than served without
 the coreference it asked for.

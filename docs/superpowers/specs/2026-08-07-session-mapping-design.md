@@ -46,7 +46,11 @@ So the id alone does not select anything. The store key is a pair: a SHA-256 fin
 of the value of whichever header authenticates this provider (`authorization` for OpenAI,
 `x-api-key` for Anthropic), salted with a per-process random value, together with the
 client's id. A different credential is a different namespace, and a guessed id lands in
-an empty one. A credential header that is present but empty counts as absent — an empty
+an empty one. The converse follows from the same construction: the same credential is
+the same namespace, so callers who share one API key share one namespace, and a caller
+who knows nothing but that shared key can still guess another user's id and read their
+mapping out one placeholder at a time — the credential is the boundary this defends, not
+the id. A credential header that is present but empty counts as absent — an empty
 string is not a namespace, it is every caller who sent nothing.
 
 The salt is per process because the store must not hold anything from which a credential
