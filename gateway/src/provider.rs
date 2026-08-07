@@ -27,6 +27,12 @@ pub trait Provider: Send + Sync {
     /// buffer on one would release half a placeholder as ordinary text, and the
     /// client would reassemble the token we were hiding.
     fn stream_terminates(&self, event: &Value) -> Terminates;
+    /// The header this provider authenticates with. A session is namespaced by
+    /// its value: the mapping table is a restoration oracle, and an id alone
+    /// would let a guessed id read another caller's values out of it one
+    /// placeholder at a time.
+    #[allow(dead_code)]
+    fn credential_header(&self) -> &'static str;
 }
 
 /// Where text sits in one streamed event, and which run of text it belongs to.
@@ -341,6 +347,10 @@ impl Provider for OpenAi {
             Terminates::Runs(keys)
         }
     }
+
+    fn credential_header(&self) -> &'static str {
+        "authorization"
+    }
 }
 
 impl Provider for Anthropic {
@@ -474,6 +484,10 @@ impl Provider for Anthropic {
             // grow later.
             _ => Terminates::Nothing,
         }
+    }
+
+    fn credential_header(&self) -> &'static str {
+        "x-api-key"
     }
 }
 
