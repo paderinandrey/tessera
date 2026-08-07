@@ -11,3 +11,14 @@ detector_timeout_secs = 30
 
 openai_base = "https://api.openai.com"
 anthropic_base = "https://api.anthropic.com"
+
+# A conversation keeps one value on one placeholder when the client sends
+# X-Tessera-Session. The table holds real values in memory between requests, so
+# it is bounded three ways: how long a conversation survives without a request,
+# how many conversations may hold a table, and how many values one may hold.
+# Set session_idle_secs = 0 to disable sessions outright — personal data then
+# never outlives the request that carried it, and a request that asks for a
+# session is refused rather than quietly served without one.
+session_idle_secs = 1800
+max_sessions = 1000
+max_session_values = 1000

@@ -834,6 +834,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stream_holds_no_session_lock() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_streaming(STREAM_BODY).await;
+        let state = state(&detector, &upstream);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer k1")
+            .header(SESSION_HEADER, "conv-1")
+            .body(Body::from(
+                json!({"model": "gpt", "stream": true,
+                       "messages": [{"role": "user", "content": "Weber schreibt"}]})
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router(Arc::clone(&state)).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The stream has not been read yet. If the masking guard were still
+        // held, this would fail — and a stream that hung would block its
+        // conversation for as long as it hung.
+        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        assert!(
+            session.mapping.try_lock().is_ok(),
+            "the stream is holding its session lock"
+        );
+
+        // Draining afterwards proves the stream still restores from the
+        // snapshot it was handed.
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let served = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            served.contains(SECRET),
+            "the stream did not restore: {served}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_anthropic_stream_shape_is_restored_too() {
         // Anthropic carries text under a different pointer and separates blocks
         // with events that carry none.
