@@ -323,8 +323,14 @@ impl Provider for Anthropic {
         // verification on the caller's next turn. Refused here rather than at
         // the first streamed block, so the refusal does not cost the caller an
         // upstream call and the tokens with it.
-        if body.get("thinking").is_some_and(|value| !value.is_null()) {
-            return Err(ShapeError::Unsupported("anthropic", "thinking"));
+        match body.get("thinking") {
+            None | Some(Value::Null) => {}
+            // Explicitly disabled generates no thinking blocks and asks for
+            // nothing, exactly as `logprobs: false` does.
+            Some(config) => match config.get("type").and_then(Value::as_str) {
+                Some("disabled") => {}
+                _ => return Err(ShapeError::Unsupported("anthropic", "thinking")),
+            },
         }
         let mut pointers = Vec::new();
         // Anthropic carries a caller-supplied identifier here.
@@ -783,14 +789,28 @@ mod tests {
             .is_empty());
     }
 
+    fn thinking_request(config: Value) -> Value {
+        json!({
+            "model": "claude",
+            "thinking": config,
+            "messages": [{"role": "user", "content": "Hallo"}]
+        })
+    }
+
     #[test]
     fn an_extended_thinking_request_is_refused_before_the_call() {
-        let body = json!({
-            "model": "claude",
-            "thinking": {"type": "enabled", "budget_tokens": 1024},
-            "messages": [{"role": "user", "content": "Hallo"}]
-        });
+        let body = thinking_request(json!({"type": "enabled", "budget_tokens": 1024}));
         assert!(Anthropic.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn explicitly_disabled_thinking_is_allowed() {
+        assert!(Anthropic
+            .request_pointers(&thinking_request(json!({"type": "disabled"})))
+            .is_ok());
+        assert!(Anthropic
+            .request_pointers(&thinking_request(json!(null)))
+            .is_ok());
     }
 
     #[test]

@@ -264,6 +264,17 @@ Review found four holes in the design as written; the code carries the fixes:
   same media type; missing it buffered a live response and failed to parse the
   transcript as JSON. Compared without case, and without any parameters.
 
+- **`thinking: {"type":"disabled"}` was refused.** The same compatibility case
+  as `logprobs: false`: explicitly off asks for nothing. Only a mode that
+  actually enables thinking is turned away.
+- **The framer knew two line-ending conventions, not three.** SSE allows CR, LF
+  and CRLF, and a blank line is any two terminators in a row. A CR-only upstream
+  produced no events at all while the connection was live. Framing and field
+  splitting now use the same rule. Where a trailing `\r` could still become
+  `\r\n`, the framer takes the shorter reading rather than waiting: the block
+  ends at the same offset either way, and the leftover byte reads as an empty
+  line, which is skipped. Waiting would delay every event on a CR-only stream.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

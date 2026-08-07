@@ -242,21 +242,58 @@ impl SseFramer {
     }
 }
 
-/// Offset and width of the first blank line, in either line-ending convention.
-/// Scanning forward matters: a `\r\n\r\n` delimiter contains no `\n\n`, so
-/// searching for `\n\n` across the whole buffer first would run past it and
-/// merge two events into one.
+/// Length of the line terminator starting at `index`, if one does. SSE allows
+/// CR, LF and CRLF, and `\r\n` is one terminator rather than two.
+fn terminator_len(buffer: &[u8], index: usize) -> Option<usize> {
+    match buffer.get(index)? {
+        b'\r' if buffer.get(index + 1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// Offset and width of the first blank line — a terminator immediately followed
+/// by another. Scanning forward matters: a `\r\n\r\n` delimiter contains no
+/// `\n\n`, so searching for one convention across the whole buffer first would
+/// run past a delimiter written in another and merge two events into one.
 fn find_blank_line(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
     for index in from..buffer.len() {
-        let rest = &buffer[index..];
-        if rest.starts_with(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-        if rest.starts_with(b"\n\n") {
-            return Some((index, 2));
-        }
+        let Some(first) = terminator_len(buffer, index) else {
+            continue;
+        };
+        let next = index + first;
+        let Some(second) = terminator_len(buffer, next) else {
+            continue;
+        };
+        // A trailing lone `\r` may still turn out to be `\r\n`, which changes
+        // the width by one but not where the block ends. Waiting for the byte
+        // that decides it would delay every event on a CR-only stream; taking
+        // the shorter reading leaves at worst a stray `\n` at the head of the
+        // next block, which reads as an empty line and is skipped.
+        return Some((index, first + second));
     }
     None
+}
+
+/// Split a block into lines on any of the three terminators.
+fn lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let (mut start, mut index) = (0, 0);
+    while index < bytes.len() {
+        match terminator_len(bytes, index) {
+            Some(width) => {
+                out.push(&text[start..index]);
+                index += width;
+                start = index;
+            }
+            None => index += 1,
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
 }
 
 fn parse_event(block: &[u8]) -> Option<SseEvent> {
@@ -268,8 +305,7 @@ fn parse_event(block: &[u8]) -> Option<SseEvent> {
     let mut event = SseEvent::new(None, None);
     let mut data: Vec<&str> = Vec::new();
     let mut seen = false;
-    for line in text.split('\n') {
-        let line = line.trim_end_matches('\r');
+    for line in lines(text) {
         if line.is_empty() {
             continue;
         }
@@ -1218,6 +1254,56 @@ mod framer_tests {
         }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data.as_deref(), Some("{\"t\":\"Grüße\"}"));
+    }
+
+    #[test]
+    fn every_line_ending_convention_frames_the_same_events() {
+        // SSE allows CR, LF and CRLF, and a blank line is any two in a row.
+        for (label, body) in [
+            ("lf", "data: one\n\ndata: two\n\n".to_owned()),
+            ("cr", "data: one\r\rdata: two\r\r".to_owned()),
+            ("crlf", "data: one\r\n\r\ndata: two\r\n\r\n".to_owned()),
+            ("mixed", "data: one\n\r\ndata: two\r\n\n".to_owned()),
+        ] {
+            let mut framer = SseFramer::new();
+            let events = unwrap_push(&mut framer, body.as_bytes());
+            assert_eq!(events.len(), 2, "{label}");
+            assert_eq!(events[0].data.as_deref(), Some("one"), "{label}");
+            assert_eq!(events[1].data.as_deref(), Some("two"), "{label}");
+        }
+    }
+
+    #[test]
+    fn cr_separated_fields_inside_one_event_are_read() {
+        let mut framer = SseFramer::new();
+        let events = unwrap_push(&mut framer, b"event: ping\rdata: {}\r\r");
+        assert_eq!(events[0].name.as_deref(), Some("ping"));
+        assert_eq!(events[0].data.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn a_delimiter_split_across_chunks_leaves_no_stray_bytes() {
+        // `\r\r\n` arriving a piece at a time: whichever reading the framer
+        // takes, no byte of the delimiter may end up inside an event.
+        let mut framer = SseFramer::new();
+        let mut events = unwrap_push(&mut framer, b"data: one\r");
+        events.extend(unwrap_push(&mut framer, b"\r"));
+        events.extend(unwrap_push(&mut framer, b"\ndata: two\n\n"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data.as_deref(), Some("one"));
+        assert_eq!(events[1].data.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn a_cr_stream_a_byte_at_a_time_frames_the_same() {
+        let body = "data: one\r\rdata: two\r\r";
+        let mut framer = SseFramer::new();
+        let mut events = Vec::new();
+        for byte in body.as_bytes() {
+            events.extend(unwrap_push(&mut framer, &[*byte]));
+        }
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].data.as_deref(), Some("two"));
     }
 
     #[test]
