@@ -30,7 +30,14 @@ pub enum StreamError {
          than continuing without it"
     )]
     Unplaceable(String),
+    #[error("upstream sent an event larger than this gateway will buffer; the stream ends")]
+    Oversized,
 }
+
+/// How much of an unfinished event to hold. A response that never sends a blank
+/// line would otherwise be buffered whole, which is the memory cost streaming
+/// exists to avoid. Provider events are a few hundred bytes.
+pub const MAX_EVENT_BYTES: usize = 1 << 20;
 
 /// A `[` that never closes would suspend the stream. Past this many bytes the
 /// bracket cannot begin a placeholder, so it is emitted as ordinary text.
@@ -172,6 +179,11 @@ impl SseFramer {
         events
     }
 
+    /// Bytes accumulated toward an event that has not ended yet.
+    pub fn pending_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Bytes left over when the body ended. A stream that stops without its
     /// final blank line must not swallow the text it already sent.
     pub fn finish(&mut self) -> Option<SseEvent> {
@@ -258,6 +270,11 @@ impl<'a> StreamRestorer<'a> {
         let mut out = String::new();
         for event in self.framer.push(chunk) {
             out.push_str(&self.handle(event)?);
+        }
+        // An upstream that never ends an event would have us buffer its whole
+        // response in memory. Past this size it is not sending events.
+        if self.framer.pending_len() > MAX_EVENT_BYTES {
+            return Err(StreamError::Oversized);
         }
         Ok(out)
     }
@@ -504,6 +521,18 @@ mod restorer_tests {
             StreamError::Mapping(MappingError::Unknown(_))
         ));
         assert!(!rendered.contains("PERSON"));
+    }
+
+    #[test]
+    fn an_event_that_never_ends_stops_the_stream() {
+        // Buffering the whole response is the cost streaming exists to avoid.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let flood = vec![b'x'; MAX_EVENT_BYTES + 1];
+        assert!(matches!(
+            restorer.push(&flood).unwrap_err(),
+            StreamError::Oversized
+        ));
     }
 
     #[test]
