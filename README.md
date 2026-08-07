@@ -108,8 +108,8 @@ client's. Coming back, the provider's status and its rate-limit headers are pres
 
 **Every failure refuses the request**, and refuses it *before* the upstream call wherever
 the problem is visible there. A detector that errors or exceeds its timeout; a body whose
-shape the gateway has no rule for, including tool definitions and tool traffic, whose
-masking is a later slice; an identifier field present in a form that cannot be masked; a
+shape the gateway has no rule for, including tool definitions, tool traffic and Anthropic's
+extended thinking, whose masking is a later slice; an identifier field present in a form that cannot be masked; a
 span the detector reports that cannot be applied; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing
@@ -135,7 +135,11 @@ If a token turns out to have no mapping, bytes have already gone out and the req
 be refused. The stream ends instead, with an `error` event naming the failure — the client
 gets a truncated answer, never a placeholder in place of a name. Streamed tool calls
 (`tool_calls`, `input_json_delta`) end the stream for the same reason they are refused on
-the buffered path: their arguments are not masked yet.
+the buffered path: their arguments are not masked yet. Extended thinking is refused before
+the upstream call rather than at its first streamed block, so the refusal costs no tokens.
+
+If the connection breaks mid-stream, whatever was already restored is served before the
+error event. It was safe to send a moment earlier, and the break does not change that.
 
 The gateway asks the detector for every layer it has, so a request costs what the
 [latency](#latency) section reports; `detector_timeout_secs` defaults to 30 seconds

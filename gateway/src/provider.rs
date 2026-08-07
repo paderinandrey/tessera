@@ -284,6 +284,15 @@ impl Provider for Anthropic {
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
         reject_tool_fields(body, "anthropic")?;
+        // Extended thinking opens the stream with a `thinking` block whose text
+        // this gateway neither masks nor restores, and whose signature is
+        // computed over the text the provider saw — restoring it would break
+        // verification on the caller's next turn. Refused here rather than at
+        // the first streamed block, so the refusal does not cost the caller an
+        // upstream call and the tokens with it.
+        if body.get("thinking").is_some_and(|value| !value.is_null()) {
+            return Err(ShapeError::Unsupported("anthropic", "thinking"));
+        }
         let mut pointers = Vec::new();
         // Anthropic carries a caller-supplied identifier here.
         identifier_pointer(
@@ -739,5 +748,27 @@ mod tests {
             .stream_slots(&json!({"object": "x"}))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn an_extended_thinking_request_is_refused_before_the_call() {
+        let body = json!({
+            "model": "claude",
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "Hallo"}]
+        });
+        assert!(Anthropic.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn a_streamed_thinking_block_is_refused_too() {
+        // Defence in depth: a provider that streams one anyway does not get to
+        // pass its text through unrestored.
+        let start = json!({"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "thinking", "thinking": ""}});
+        assert!(Anthropic.stream_slots(&start).is_err());
+        let delta = json!({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": "hm"}});
+        assert!(Anthropic.stream_slots(&delta).is_err());
     }
 }

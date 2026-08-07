@@ -632,6 +632,84 @@ mod tests {
         "data: [DONE]\n\n",
     );
 
+    /// An upstream that promises more body than it sends and then drops the
+    /// connection. wiremock cannot sever a stream mid-body, and the claim under
+    /// test is exactly what happens when one is severed.
+    async fn truncating_upstream(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = vec![0u8; 8192];
+            let _ = socket.read(&mut scratch).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        content-length: 100000\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            // Dropped here, far short of the promised length.
+        });
+        base
+    }
+
+    fn state_for(detector: &MockServer, upstream_base: String) -> Arc<AppState> {
+        Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream_base.clone(),
+            anthropic_base: upstream_base,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_severed_stream_still_serves_what_was_already_restored() {
+        // The waiting event is restored and safe; the connection dying does not
+        // make it unsafe, and dropping it would lose text the client paid for.
+        let detector = detector_returning(person_span()).await;
+        let base = truncating_upstream(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PERSON_1]\"}}]}\n\n",
+        )
+        .await;
+
+        let (status, served) = call(
+            state_for(&detector, base),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            served.contains(SECRET),
+            "restored text was dropped: {served}"
+        );
+        assert!(
+            served.contains("tessera_restoration_failed"),
+            "the break was not reported: {served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extended_thinking_request_never_reaches_the_upstream() {
+        // Refusing at the first streamed block would already have cost the
+        // caller the call and its tokens.
+        let detector = detector_returning(json!([])).await;
+        let upstream = MockServer::start().await;
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "stream": true,
+                   "thinking": {"type": "enabled", "budget_tokens": 1024},
+                   "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_streaming_response_reaches_the_client_restored() {
         // The placeholder is split across two events; the client must see the

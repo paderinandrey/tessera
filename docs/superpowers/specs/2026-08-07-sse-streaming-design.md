@@ -210,6 +210,20 @@ Review found four holes in the design as written; the code carries the fixes:
   arriving complete in one chunk slipped past it. The cap is now enforced while
   framing, before the block is copied.
 
+- **Extended thinking was refused too late.** Anthropic opens a thinking stream
+  with a `content_block_start` whose block is `thinking`, which the streaming
+  fallback rejected — after the upstream call had already cost the caller its
+  tokens. A request carrying `thinking` is now refused before the call, beside
+  the tool fields. Restoring the text instead is not a fix: the block's
+  signature is computed over the text the provider saw, so restoring it would
+  fail verification on the caller's next turn. Masking it is its own slice.
+- **A severed connection discarded restored output.** The one-event delay leaves
+  the newest rewritten event waiting; the transport-error path emitted only the
+  error and returned, losing text that was already safe to serve. It flushes
+  first now. Tested against a raw socket that promises more body than it sends
+  and then drops — wiremock cannot sever a stream mid-body, and that is the
+  whole claim.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

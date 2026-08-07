@@ -485,8 +485,15 @@ pub fn restore_stream(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 // The upstream broke off. Say so rather than let the client read
-                // a truncated answer as a complete one.
+                // a truncated answer as a complete one — but text already
+                // restored and waiting behind the one-event delay is safe to
+                // serve, and a failed connection does not make it unsafe.
                 Err(error) => {
+                    if let Ok(tail) = restorer.finish() {
+                        if !tail.is_empty() {
+                            yield Ok(Bytes::from(tail));
+                        }
+                    }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
                     return;
                 }
