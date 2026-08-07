@@ -41,6 +41,10 @@ pub const MAX_EVENT_BYTES: usize = 1 << 20;
 
 /// A `[` that never closes would suspend the stream. Past this many bytes the
 /// bracket cannot begin a placeholder, so it is emitted as ordinary text.
+///
+/// This is a bound on what the masker can issue, not a guess:
+/// `mapping::MAX_ENTITY_TYPE` keeps every placeholder under it, so releasing a
+/// bracket here can never orphan a real token.
 pub const MAX_HELD: usize = 64;
 
 /// Restores placeholders in text arriving piece by piece. A placeholder
@@ -733,6 +737,33 @@ mod buffer_tests {
         }
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, mapping.restore(source).unwrap());
+    }
+
+    #[test]
+    fn the_longest_placeholder_the_masker_can_issue_still_fits_the_cap() {
+        // The cap must bound what masking issues, or a legitimate token would be
+        // released as text and reach the client unrestored.
+        let entity_type = "A".repeat(crate::mapping::MAX_ENTITY_TYPE);
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask(
+                "Weber",
+                &[Span {
+                    entity_type: entity_type.clone(),
+                    start: 0,
+                    end: 5,
+                }],
+            )
+            .unwrap();
+        assert!(masked.len() <= MAX_HELD, "{} bytes", masked.len());
+
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = String::new();
+        for character in masked.chars() {
+            out.push_str(&buffer.push(&character.to_string()).unwrap());
+        }
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "Weber");
     }
 
     #[test]

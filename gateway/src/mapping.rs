@@ -26,6 +26,14 @@ pub enum MappingError {
     BadEntityType(String),
 }
 
+/// The longest entity type that can be written as a placeholder. Restoration in
+/// a stream holds back a bounded number of bytes while a token completes, so a
+/// placeholder longer than that bound would be released as ordinary text and
+/// reach the client unrestored. Bounding it here makes that impossible rather
+/// than unlikely: `[` + 40 + `_` + at most 20 digits + `]` is 63 bytes, inside
+/// `stream::MAX_HELD`.
+pub const MAX_ENTITY_TYPE: usize = 40;
+
 #[derive(Debug, Default)]
 pub struct Mapping {
     by_value: HashMap<String, String>,
@@ -107,6 +115,7 @@ impl Mapping {
         // recognize. Anything else would sail through masked and come back
         // unrestored, so it refuses instead.
         if entity_type.is_empty()
+            || entity_type.len() > MAX_ENTITY_TYPE
             || !entity_type
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c == '_')
@@ -318,6 +327,18 @@ mod tests {
         assert!(mapping.mask("Weber", &[span("person", 0, 5)]).is_err());
         assert!(mapping.mask("Weber", &[span("PERSON-ROLE", 0, 5)]).is_err());
         assert!(mapping.mask("Weber", &[span("", 0, 5)]).is_err());
+    }
+
+    #[test]
+    fn an_entity_type_too_long_to_survive_a_stream_is_refused() {
+        // Restoration in a stream holds back a bounded number of bytes. A
+        // placeholder longer than that bound would be released as text and
+        // handed to the client unrestored, so it is never issued.
+        let mut mapping = Mapping::new();
+        let long = "A".repeat(MAX_ENTITY_TYPE + 1);
+        assert!(mapping.mask("Weber", &[span(&long, 0, 5)]).is_err());
+        let longest = "A".repeat(MAX_ENTITY_TYPE);
+        assert!(mapping.mask("Weber", &[span(&longest, 0, 5)]).is_ok());
     }
 
     #[test]
