@@ -192,13 +192,18 @@ impl Provider for OpenAi {
                     return Err(ShapeError::Unsupported("openai", "tool_calls"));
                 }
             }
-            match delta.get("content") {
-                None | Some(Value::Null) => {}
-                Some(Value::String(_)) => {
-                    pointers.push(format!("/choices/{index}/delta/content"));
+            // `refusal` is model text like `content` and streams beside it. Left
+            // out, it would pass through unrestored — a placeholder handed to
+            // the client in the one case where nobody is looking.
+            for field in ["content", "refusal"] {
+                match delta.get(field) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(_)) => {
+                        pointers.push(format!("/choices/{index}/delta/{field}"));
+                    }
+                    // Recognized, unreadable: refused rather than forwarded.
+                    Some(_) => return Err(ShapeError::Response("openai")),
                 }
-                // Recognized, unreadable: refused rather than forwarded.
-                Some(_) => return Err(ShapeError::Response("openai")),
             }
         }
         Ok(pointers)
@@ -509,6 +514,17 @@ mod tests {
         assert_eq!(
             OpenAi.stream_pointers(&event).unwrap(),
             ["/choices/0/delta/content", "/choices/1/delta/content"]
+        );
+    }
+
+    #[test]
+    fn openai_finds_a_streamed_refusal() {
+        // Refusal text is model output like content; unrestored it would carry
+        // a placeholder to the client.
+        let event = json!({"choices": [{"delta": {"refusal": "I cannot help [PERSON_1]"}}]});
+        assert_eq!(
+            OpenAi.stream_pointers(&event).unwrap(),
+            ["/choices/0/delta/refusal"]
         );
     }
 
