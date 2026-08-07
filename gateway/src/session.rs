@@ -16,15 +16,12 @@ use crate::mapping::Mapping;
 use crate::provider::Provider;
 
 /// The header a client uses to say two requests belong to one conversation.
-#[allow(dead_code)]
 pub const SESSION_HEADER: &str = "x-tessera-session";
 
 /// A client-chosen id becomes part of a map key and, hashed, part of a log
 /// line. Bounding it keeps both from having to cope with arbitrary input.
-#[allow(dead_code)]
 const MAX_SESSION_ID: usize = 128;
 
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(
@@ -47,7 +44,6 @@ pub enum SessionError {
 /// Random per process: the store must hold nothing from which a credential can
 /// be recovered. Sessions do not survive a restart in any case — the store is
 /// in memory — so a salt that does not either costs nothing.
-#[allow(dead_code)]
 fn salt() -> &'static [u8; 32] {
     static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     SALT.get_or_init(|| {
@@ -59,7 +55,6 @@ fn salt() -> &'static [u8; 32] {
 
 /// What the store keys on: a salted fingerprint of the caller's credential,
 /// and the id the caller chose.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
     credential: [u8; 32],
@@ -78,7 +73,6 @@ impl std::fmt::Debug for SessionKey {
 }
 
 impl SessionKey {
-    #[allow(dead_code)]
     fn new(credential: &[u8], id: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(salt());
@@ -92,7 +86,6 @@ impl SessionKey {
     /// The only form of a key that may reach a log. The raw id is chosen by the
     /// client, so it may itself be personal data: `patient-Weber-2026` is a
     /// plausible id and an unacceptable log line.
-    #[allow(dead_code)]
     pub fn digest(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.credential);
@@ -105,7 +98,6 @@ impl SessionKey {
     }
 }
 
-#[allow(dead_code)]
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_SESSION_ID
@@ -119,7 +111,6 @@ fn valid_id(id: &str) -> bool {
 ///
 /// Every refusal here happens before detection, so a malformed header costs
 /// nothing rather than a second per 1 200 characters.
-#[allow(dead_code)]
 pub fn key_from(
     headers: &HeaderMap,
     provider: &dyn Provider,
@@ -145,7 +136,6 @@ pub fn key_from(
 }
 
 /// The three bounds on how much personal data outlives a request.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// How long a session survives without a request. Zero disables sessions.
@@ -155,7 +145,6 @@ pub struct Limits {
 }
 
 /// One conversation's table.
-#[allow(dead_code)]
 pub struct Session {
     /// A tokio mutex because it is held across the detector calls that mask a
     /// request. It is released before the upstream call: a stream may run for
@@ -169,14 +158,12 @@ struct Entry {
     last_seen: Instant,
 }
 
-#[allow(dead_code)]
 pub struct SessionStore {
     /// A std mutex, held only for map operations and never across an `await`.
     inner: Mutex<HashMap<SessionKey, Entry>>,
     limits: Limits,
 }
 
-#[allow(dead_code)]
 impl SessionStore {
     pub fn new(limits: Limits) -> Self {
         Self {

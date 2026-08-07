@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping::{Mapping, MappingError};
 use crate::provider::{read_pointer, write_pointer, Anthropic, OpenAi, Provider, ShapeError};
+use crate::session::{key_from, Limits, SessionStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -23,15 +24,19 @@ pub enum ProxyError {
     Mapping(#[from] MappingError),
     #[error("upstream request failed: {0}")]
     Upstream(String),
+    #[error("{0}")]
+    Session(#[from] crate::session::SessionError),
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = match self {
             // A body we cannot read is the client's to fix, and it is refused
-            // rather than forwarded unmasked.
+            // rather than forwarded unmasked. So is a session the gateway
+            // cannot honour as asked.
             ProxyError::Shape(ShapeError::Request(_))
-            | ProxyError::Shape(ShapeError::Unsupported(_, _)) => StatusCode::BAD_REQUEST,
+            | ProxyError::Shape(ShapeError::Unsupported(_, _))
+            | ProxyError::Session(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
         };
         // The reason names the failure. It never carries the submitted text.
@@ -70,6 +75,7 @@ pub struct AppState {
     pub upstream: reqwest::Client,
     pub openai_base: String,
     pub anthropic_base: String,
+    pub sessions: SessionStore,
 }
 
 impl AppState {
@@ -82,6 +88,11 @@ impl AppState {
             upstream: reqwest::Client::new(),
             openai_base: config.openai_base.clone(),
             anthropic_base: config.anthropic_base.clone(),
+            sessions: SessionStore::new(Limits {
+                idle: Duration::from_secs(config.session_idle_secs),
+                max_sessions: config.max_sessions,
+                max_values: config.max_session_values,
+            }),
         }
     }
 
@@ -93,6 +104,23 @@ impl AppState {
     }
 }
 
+/// Detect and mask every text the provider pointed at. Shared by both branches
+/// of `handle`: inline it would exist twice and diverge at the first edit.
+async fn mask_all(
+    detector: &DetectorClient,
+    body: &Value,
+    pointers: &[String],
+    mapping: &mut Mapping,
+) -> Result<Value, ProxyError> {
+    let mut masked = body.clone();
+    for pointer in pointers {
+        let text = read_pointer(body, pointer)?;
+        let spans = detector.detect(&text).await?;
+        write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
+    }
+    Ok(masked)
+}
+
 async fn handle(
     state: Arc<AppState>,
     provider: &'static dyn Provider,
@@ -102,14 +130,33 @@ async fn handle(
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let pointers = provider.request_pointers(&body)?;
 
-    // Detect and mask, one mapping for the whole request so a value keeps one name.
-    let mut mapping = Mapping::new();
-    let mut masked = body.clone();
-    for pointer in &pointers {
-        let text = read_pointer(&body, pointer)?;
-        let spans = state.detector.detect(&text).await?;
-        write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
-    }
+    // Resolved before detection: a malformed header must cost nothing, not a
+    // second per 1 200 characters.
+    let key = key_from(&headers, provider, state.sessions.enabled())?;
+
+    // One mapping for the whole request so a value keeps one name; seeded from
+    // the conversation's table so it keeps that name across turns too.
+    let (masked, mapping) = match key {
+        Some(key) => {
+            let session = state.sessions.acquire(&key);
+            let mut guard = session.mapping.lock().await;
+            let mut work = guard.clone();
+            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            // After the last `?`, and on a copy until here: a refused request
+            // leaves the session exactly as it was, so a client whose detector
+            // blinked does not carry a hole in its numbering for the rest of
+            // the conversation.
+            guard.absorb(&work, state.sessions.max_values());
+            (masked, work)
+            // `guard` is dropped here — before the upstream call, so a stream
+            // that runs for minutes holds no lock on its session.
+        }
+        None => {
+            let mut work = Mapping::new();
+            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            (masked, work)
+        }
+    };
 
     // Only what is masked leaves the process.
     let mut request = state.upstream.post(format!(
@@ -231,6 +278,8 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use crate::session::{SessionKey, SESSION_HEADER};
+
     const SECRET: &str = "Weber";
 
     fn person_span() -> Value {
@@ -271,13 +320,63 @@ mod tests {
         server
     }
 
-    fn state(detector: &MockServer, upstream: &MockServer) -> Arc<AppState> {
+    fn test_limits() -> Limits {
+        Limits {
+            idle: Duration::from_secs(1800),
+            max_sessions: 8,
+            max_values: 8,
+        }
+    }
+
+    fn state_with(detector: &MockServer, upstream: &MockServer, limits: Limits) -> Arc<AppState> {
         Arc::new(AppState {
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(limits),
         })
+    }
+
+    fn session_headers<'a>(credential: &'a str, id: &'a str) -> [(&'a str, &'a str); 2] {
+        [("authorization", credential), (SESSION_HEADER, id)]
+    }
+
+    fn test_key(id: &str, credential: &str) -> SessionKey {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", credential.parse().unwrap());
+        headers.insert(HeaderName::from_static(SESSION_HEADER), id.parse().unwrap());
+        key_from(&headers, &OpenAi, true).unwrap().unwrap()
+    }
+
+    /// A detector that finds "Weber" and nothing else. wiremock takes the
+    /// first mount that matches, so the specific rule is mounted first.
+    async fn detector_finding_weber() -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(body_string_contains(SECRET))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"spans": person_span(), "layers_run": ["deterministic"]}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn state(detector: &MockServer, upstream: &MockServer) -> Arc<AppState> {
+        state_with(detector, upstream, test_limits())
     }
 
     async fn call(state: Arc<AppState>, route: &str, body: Value) -> (StatusCode, String) {
@@ -662,6 +761,7 @@ mod tests {
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
             anthropic_base: upstream_base,
+            sessions: SessionStore::new(test_limits()),
         })
     }
 
@@ -1060,5 +1160,251 @@ mod tests {
             String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
         assert!(!sent.contains(SECRET), "the system field leaked: {sent}");
         assert!(body.contains("Hallo Weber"));
+    }
+
+    #[tokio::test]
+    async fn one_session_keeps_one_value_on_one_placeholder() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        for _ in 0..2 {
+            call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+                &headers,
+            )
+            .await;
+        }
+
+        let received = upstream.received_requests().await.unwrap();
+        let first = String::from_utf8(received[0].body.clone()).unwrap();
+        let second = String::from_utf8(received[1].body.clone()).unwrap();
+        assert!(first.contains("[PERSON_1]"));
+        assert!(
+            second.contains("[PERSON_1]"),
+            "the second turn renamed the same person: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guessed_session_id_returns_no_other_callers_value() {
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+
+        // The first caller puts Weber into the session called "shared".
+        call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "shared"),
+        )
+        .await;
+
+        // A second caller guesses the id but holds a different key, and asks
+        // the model to echo the placeholder back.
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "[PERSON_1] wer?"}]}),
+            &session_headers("Bearer k2", "shared"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains(SECRET),
+            "another caller's value came back: {body}"
+        );
+        assert!(body.contains("[PERSON_1]"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_leaves_the_session_untouched() {
+        // The first message masks; the second has no "Weber" and the detector
+        // refuses it, so the request dies after masking has already happened.
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains(SECRET))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"spans": person_span(), "layers_run": ["deterministic"]}),
+                ),
+            )
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "Weber schreibt"},
+                {"role": "user", "content": "und dann?"}
+            ]}),
+            &session_headers("Bearer k1", "conv-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        assert!(
+            session.mapping.lock().await.is_empty(),
+            "a refused request left values in the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_past_the_cap_is_still_masked_and_still_restored() {
+        let two_spans = json!([
+            {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "PERSON", "start": 10, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false}
+        ]);
+        let detector = detector_returning(two_spans).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant",
+                   "content": "[PERSON_1] und [PERSON_2]"}}]}),
+        )
+        .await;
+        let state = state_with(
+            &detector,
+            &upstream,
+            Limits {
+                idle: Duration::from_secs(1800),
+                max_sessions: 8,
+                max_values: 1,
+            },
+        );
+
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber und Meier"}]}),
+            &session_headers("Bearer k1", "conv-1"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(!sent.contains(SECRET), "the value past the cap went up raw");
+        assert!(
+            !sent.contains("Meier"),
+            "the value past the cap went up raw"
+        );
+        assert!(body.contains(SECRET) && body.contains("Meier"));
+
+        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        assert_eq!(session.mapping.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_header_creates_no_session() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+
+        let (status, _) = call(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            state.sessions.live(),
+            0,
+            "a request that asked for no session got one anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_header_against_a_disabled_gateway_is_refused() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state_with(
+            &detector,
+            &upstream,
+            Limits {
+                idle: Duration::ZERO,
+                max_sessions: 0,
+                max_values: 0,
+            },
+        );
+
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "conv-1"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("disabled"), "{body}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            0,
+            "a refused request still reached the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_session_id_is_refused() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+
+        let (status, _) = call_with_headers(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "conv 1"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            detector.received_requests().await.unwrap().len(),
+            0,
+            "a malformed header cost a detection pass"
+        );
     }
 }

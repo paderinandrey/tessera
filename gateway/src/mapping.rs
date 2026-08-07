@@ -105,7 +105,6 @@ impl Mapping {
     /// The counter moves past pairs that were declined. A number that already
     /// named somebody in a request that reached the provider must never be
     /// issued to a second value, or a later response restores the wrong name.
-    #[allow(dead_code)]
     pub fn absorb(&mut self, other: &Mapping, cap: usize) {
         for placeholder in &other.order {
             if self.by_placeholder.contains_key(placeholder) {
