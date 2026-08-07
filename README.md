@@ -40,8 +40,8 @@ tessera/
   detector/    Python detection service: deterministic recognizers with checksum
                validation, NER (GLiNER/ONNX), context boosting. Stable HTTP contract.
   gateway/     Rust reverse proxy: drop-in base URL for OpenAI- and Anthropic-shaped
-               requests, placeholder substitution and restoration. Non-streaming for
-               now; SSE, sessions and audit are the next slices.
+               requests, placeholder substitution and restoration, buffered and
+               streamed. Sessions and audit are the next slices.
   evaluation/  Public synthetic corpus and metrics harness (planned). The manually
                annotated corpus stays private and never enters this repository.
 ```
@@ -108,13 +108,41 @@ client's. Coming back, the provider's status and its rate-limit headers are pres
 
 **Every failure refuses the request**, and refuses it *before* the upstream call wherever
 the problem is visible there. A detector that errors or exceeds its timeout; a body whose
-shape the gateway has no rule for, including tool definitions and tool traffic, whose
-masking is a later slice; an identifier field present in a form that cannot be masked; a
-streaming request, which this slice cannot restore; a span the detector reports that cannot
-be applied; and a placeholder in the response that no mapping knows — each of these ends the
-request. Nothing unmasked is forwarded, and no placeholder is
-ever handed to the client in place of a value. No error body or log line carries the
-submitted text.
+shape the gateway has no rule for, including tool definitions, tool traffic, Anthropic's
+extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
+OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
+span the detector reports that cannot be applied; and a placeholder in the response that no
+mapping knows — each of these ends the request. Once a stream has begun there is nothing
+left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing
+unmasked is forwarded, and no placeholder is ever handed to the client in place of a value.
+No error body or log line carries the submitted text.
+
+### Streaming
+
+`stream: true` is served for both providers. A placeholder does not respect event
+boundaries — `[PERSON_1]` arrives as `[PER` in one event and `SON_1]` in the next, over HTTP
+chunks that break anywhere, including the middle of a UTF-8 character — so the gateway holds
+back the text from the last unclosed `[` and emits it once the token is whole or has grown
+too long to be one. Everything before that point flows on immediately. Matching is exact:
+tolerating altered spacing, casing or markdown around a token would also be a way to put a
+real name where the model wrote something else.
+
+Restored text is not the length of the masked text, so a delta is rewritten whole, and
+text-bearing events are emitted one behind — the event that carries no text ends the run and
+releases what is held into the event waiting behind it. The terminal events, the quota
+headers and fields like `id:` reach the client as the provider sent them.
+
+If a token turns out to have no mapping, bytes have already gone out and the request cannot
+be refused. The stream ends instead, with an `error` event naming the failure — the client
+gets a truncated answer, never a placeholder in place of a name. Streamed tool calls
+(`tool_calls`, `input_json_delta`) end the stream for the same reason they are refused on
+the buffered path: their arguments are not masked yet. Extended thinking is refused before
+the upstream call rather than at its first streamed block, so the refusal costs no tokens.
+
+Whatever was already restored is served before the error event, whether the stream ends
+because the connection broke or because a token could not be restored. It was safe to send a
+moment earlier, and the failure does not change that; what stays behind is the hold-back
+buffer, which may hold the token that failed.
 
 The gateway asks the detector for every layer it has, so a request costs what the
 [latency](#latency) section reports; `detector_timeout_secs` defaults to 30 seconds

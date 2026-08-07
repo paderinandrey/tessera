@@ -19,6 +19,36 @@ pub trait Provider: Send + Sync {
     fn upstream_path(&self) -> &'static str;
     fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
     fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
+    /// Where the text lives inside one streamed event. An event type we do not
+    /// know carries no slots and is forwarded as it came: both protocols add
+    /// event types over time, and `ping` must not break a stream.
+    fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError>;
+    /// Which runs of text this event ends. A keepalive ends none: draining a
+    /// buffer on one would release half a placeholder as ordinary text, and the
+    /// client would reassemble the token we were hiding.
+    fn stream_terminates(&self, event: &Value) -> Terminates;
+}
+
+/// Where text sits in one streamed event, and which run of text it belongs to.
+///
+/// The two differ, and the difference is load-bearing. OpenAI streams one choice
+/// per chunk at array position 0 whatever its logical `index`, so the pointer
+/// alone would give two completions the same hold-back buffer and splice their
+/// fragments together. The pointer addresses this event; the key identifies the
+/// run across events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSlot {
+    pub pointer: String,
+    pub key: String,
+}
+
+/// What an event without text of its own does to the runs in progress.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Terminates {
+    /// A keepalive, a comment, an event type added after this was written.
+    Nothing,
+    Runs(Vec<String>),
+    All,
 }
 
 pub struct OpenAi;
@@ -80,6 +110,27 @@ fn identifier_pointer(
     }
 }
 
+/// Whether a streamed `logprobs` field is one that can be forwarded untouched.
+///
+/// Only shapes that demonstrably carry no text qualify: null, or an object whose
+/// token lists are absent, null or empty. Everything else is refused — not only
+/// a populated list. A field the slot path does not rewrite is forwarded exactly
+/// as it came, so `"logprobs": "[PERSON_1]"` or a key we have never seen would
+/// carry the placeholder straight to the client.
+fn logprobs_carry_nothing(logprobs: &Value) -> bool {
+    let Some(fields) = logprobs.as_object() else {
+        return logprobs.is_null();
+    };
+    fields.iter().all(|(key, value)| match key.as_str() {
+        "content" | "refusal" => match value {
+            Value::Null => true,
+            Value::Array(items) => items.is_empty(),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 fn content_pointers(
     prefix: &str,
     content: &Value,
@@ -122,6 +173,42 @@ impl Provider for OpenAi {
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
         reject_tool_fields(body, "openai")?;
+        // With logprobs on, every choice carries the model's output again as
+        // token strings under `logprobs`. Those are the masked tokens: joined
+        // back together they spell the placeholder, and their probabilities
+        // describe text the client will never see. Restoring them is not
+        // meaningful — token boundaries do not follow placeholder boundaries —
+        // so the request is refused before the call.
+        // Explicitly disabled is not asking for them: an SDK that serializes
+        // its default must not be turned away.
+        match body.get("logprobs") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+            _ => return Err(ShapeError::Unsupported("openai", "logprobs")),
+        }
+        // Audio output streams a transcript in fragments beside audio bytes we
+        // cannot mask at all. Restoring the transcript would leave it saying a
+        // name the recording does not say; leaving it alone would hand the
+        // placeholder to the client a fragment at a time. Neither is a service,
+        // so the request is refused before the call.
+        if body.get("audio").is_some_and(|value| !value.is_null()) {
+            return Err(ShapeError::Unsupported("openai", "audio"));
+        }
+        if body
+            .get("modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| modality.as_str() == Some("audio"))
+            })
+        {
+            return Err(ShapeError::Unsupported("openai", "audio"));
+        }
+        match body.get("top_logprobs") {
+            None | Some(Value::Null) => {}
+            Some(Value::Number(count)) if count.as_u64() == Some(0) => {}
+            _ => return Err(ShapeError::Unsupported("openai", "top_logprobs")),
+        }
         let mut pointers = Vec::new();
         // Personal data does not only live in `content`. OpenAI's optional
         // per-message `name` and top-level `user` are identifiers, and
@@ -171,6 +258,89 @@ impl Provider for OpenAi {
         }
         Ok(pointers)
     }
+
+    fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError> {
+        let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+            return Ok(Vec::new());
+        };
+        let mut slots = Vec::new();
+        for (position, choice) in choices.iter().enumerate() {
+            // Checked before anything may skip this choice: `logprobs` sits
+            // beside `delta`, not inside it, so a choice carrying no delta at
+            // all can still carry token strings — and with another choice in the
+            // same event producing a slot, the envelope is not restored whole.
+            match choice.get("logprobs") {
+                None => {}
+                Some(logprobs) if logprobs_carry_nothing(logprobs) => {}
+                Some(_) => return Err(ShapeError::Unsupported("openai", "logprobs")),
+            }
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            // A field whose text arrives in fragments must be a declared run:
+            // restoring the envelope is event-local, so `[PER` and `SON_1]` in
+            // successive events would each pass it untouched and join at the
+            // client. Audio transcripts are such a field, and they are refused
+            // rather than restored, for the reason given on the request side.
+            if delta.get("audio").is_some_and(|value| !value.is_null()) {
+                return Err(ShapeError::Unsupported("openai", "audio"));
+            }
+            // Tool arguments stream as their own field, past the masker.
+            // Masking them is a later slice; until then they are refused.
+            for field in ["tool_calls", "function_call"] {
+                if delta.get(field).is_some_and(|value| !value.is_null()) {
+                    return Err(ShapeError::Unsupported("openai", "tool_calls"));
+                }
+            }
+            // `index` says which completion this chunk belongs to; the array
+            // position only says where it sits in this chunk. With `n > 1` they
+            // are not the same number.
+            let index = choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(position as u64);
+            // `refusal` is model text like `content` and streams beside it. Left
+            // out, it would pass through unrestored — a placeholder handed to
+            // the client in the one case where nobody is looking.
+            for field in ["content", "refusal"] {
+                match delta.get(field) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(_)) => slots.push(TextSlot {
+                        pointer: format!("/choices/{position}/delta/{field}"),
+                        key: format!("choice/{index}/{field}"),
+                    }),
+                    // Recognized, unreadable: refused rather than forwarded.
+                    Some(_) => return Err(ShapeError::Response("openai")),
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    fn stream_terminates(&self, event: &Value) -> Terminates {
+        let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+            return Terminates::Nothing;
+        };
+        let mut keys = Vec::new();
+        for (position, choice) in choices.iter().enumerate() {
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                let index = choice
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(position as u64);
+                keys.push(format!("choice/{index}/content"));
+                keys.push(format!("choice/{index}/refusal"));
+            }
+        }
+        if keys.is_empty() {
+            Terminates::Nothing
+        } else {
+            Terminates::Runs(keys)
+        }
+    }
 }
 
 impl Provider for Anthropic {
@@ -188,6 +358,21 @@ impl Provider for Anthropic {
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
         reject_tool_fields(body, "anthropic")?;
+        // Extended thinking opens the stream with a `thinking` block whose text
+        // this gateway neither masks nor restores, and whose signature is
+        // computed over the text the provider saw — restoring it would break
+        // verification on the caller's next turn. Refused here rather than at
+        // the first streamed block, so the refusal does not cost the caller an
+        // upstream call and the tokens with it.
+        match body.get("thinking") {
+            None | Some(Value::Null) => {}
+            // Explicitly disabled generates no thinking blocks and asks for
+            // nothing, exactly as `logprobs: false` does.
+            Some(config) => match config.get("type").and_then(Value::as_str) {
+                Some("disabled") => {}
+                _ => return Err(ShapeError::Unsupported("anthropic", "thinking")),
+            },
+        }
         let mut pointers = Vec::new();
         // Anthropic carries a caller-supplied identifier here.
         identifier_pointer(
@@ -233,6 +418,63 @@ impl Provider for Anthropic {
         }
         Ok(pointers)
     }
+
+    fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError> {
+        // One content block is one run of text: its opening event and every
+        // delta after it share a key, so a token split between them joins.
+        let key = format!(
+            "block/{}",
+            event.get("index").and_then(Value::as_u64).unwrap_or(0)
+        );
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_delta") => {
+                let delta = event.get("delta").unwrap_or(&Value::Null);
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => match delta.get("text") {
+                        Some(Value::String(_)) => Ok(vec![TextSlot {
+                            pointer: "/delta/text".to_owned(),
+                            key,
+                        }]),
+                        _ => Err(ShapeError::Response("anthropic")),
+                    },
+                    // `input_json_delta` streams tool arguments, which this
+                    // gateway does not mask yet.
+                    Some("input_json_delta") => {
+                        Err(ShapeError::Unsupported("anthropic", "tool_use"))
+                    }
+                    _ => Err(ShapeError::Response("anthropic")),
+                }
+            }
+            Some("content_block_start") => {
+                let block = event.get("content_block").unwrap_or(&Value::Null);
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => match block.get("text") {
+                        Some(Value::String(_)) => Ok(vec![TextSlot {
+                            pointer: "/content_block/text".to_owned(),
+                            key,
+                        }]),
+                        _ => Err(ShapeError::Response("anthropic")),
+                    },
+                    Some("tool_use") => Err(ShapeError::Unsupported("anthropic", "tool_use")),
+                    _ => Err(ShapeError::Response("anthropic")),
+                }
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn stream_terminates(&self, event: &Value) -> Terminates {
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_stop") => Terminates::Runs(vec![format!(
+                "block/{}",
+                event.get("index").and_then(Value::as_u64).unwrap_or(0)
+            )]),
+            Some("message_stop") | Some("error") => Terminates::All,
+            // `ping` lands here, and so does every event type these protocols
+            // grow later.
+            _ => Terminates::Nothing,
+        }
+    }
 }
 
 pub fn read_pointer(body: &Value, pointer: &str) -> Result<String, ShapeError> {
@@ -254,6 +496,60 @@ pub fn write_pointer(body: &mut Value, pointer: &str, text: &str) -> Result<(), 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn pointers(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
+        slots
+            .unwrap()
+            .into_iter()
+            .map(|slot| slot.pointer)
+            .collect()
+    }
+
+    fn keys(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
+        slots.unwrap().into_iter().map(|slot| slot.key).collect()
+    }
+
+    #[test]
+    fn interleaved_choices_get_distinct_keys_at_the_same_position() {
+        // With `n > 1` each chunk carries one choice at array position 0, and
+        // only `index` says which completion it is. Keying on the pointer would
+        // splice two completions into one hold-back buffer.
+        let first = json!({"choices": [{"index": 0, "delta": {"content": "a"}}]});
+        let second = json!({"choices": [{"index": 1, "delta": {"content": "b"}}]});
+        assert_eq!(
+            pointers(OpenAi.stream_slots(&first)),
+            pointers(OpenAi.stream_slots(&second))
+        );
+        assert_ne!(
+            keys(OpenAi.stream_slots(&first)),
+            keys(OpenAi.stream_slots(&second))
+        );
+    }
+
+    #[test]
+    fn an_anthropic_block_keeps_one_key_from_start_to_delta() {
+        // A token split between the opening event and the first delta must join.
+        let start = json!({"type": "content_block_start", "index": 2,
+                           "content_block": {"type": "text", "text": ""}});
+        let delta = json!({"type": "content_block_delta", "index": 2,
+                           "delta": {"type": "text_delta", "text": "x"}});
+        assert_eq!(
+            keys(Anthropic.stream_slots(&start)),
+            keys(Anthropic.stream_slots(&delta))
+        );
+    }
+
+    #[test]
+    fn separate_anthropic_blocks_get_separate_keys() {
+        let zero = json!({"type": "content_block_delta", "index": 0,
+                          "delta": {"type": "text_delta", "text": "x"}});
+        let one = json!({"type": "content_block_delta", "index": 1,
+                         "delta": {"type": "text_delta", "text": "y"}});
+        assert_ne!(
+            keys(Anthropic.stream_slots(&zero)),
+            keys(Anthropic.stream_slots(&one))
+        );
+    }
 
     #[test]
     fn openai_finds_string_content() {
@@ -425,5 +721,267 @@ mod tests {
         assert_eq!(read_pointer(&body, "/messages/0/content").unwrap(), "Weber");
         write_pointer(&mut body, "/messages/0/content", "[PERSON_1]").unwrap();
         assert_eq!(body["messages"][0]["content"], "[PERSON_1]");
+    }
+
+    #[test]
+    fn openai_finds_the_delta_content() {
+        let event = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]});
+        assert_eq!(
+            pointers(OpenAi.stream_slots(&event)),
+            ["/choices/0/delta/content"]
+        );
+    }
+
+    #[test]
+    fn openai_finds_every_choice_in_a_chunk() {
+        let event = json!({"choices": [
+            {"delta": {"content": "a"}},
+            {"delta": {"content": "b"}}
+        ]});
+        assert_eq!(
+            pointers(OpenAi.stream_slots(&event)),
+            ["/choices/0/delta/content", "/choices/1/delta/content"]
+        );
+    }
+
+    #[test]
+    fn openai_finds_a_streamed_refusal() {
+        // Refusal text is model output like content; unrestored it would carry
+        // a placeholder to the client.
+        let event = json!({"choices": [{"delta": {"refusal": "I cannot help [PERSON_1]"}}]});
+        assert_eq!(
+            pointers(OpenAi.stream_slots(&event)),
+            ["/choices/0/delta/refusal"]
+        );
+    }
+
+    #[test]
+    fn openai_yields_nothing_for_a_finish_chunk() {
+        let event = json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        assert!(OpenAi.stream_slots(&event).unwrap().is_empty());
+    }
+
+    #[test]
+    fn openai_refuses_a_non_string_delta_content() {
+        // A shape we recognize but cannot read is refused, never forwarded.
+        let event = json!({"choices": [{"delta": {"content": {"parts": []}}}]});
+        assert!(OpenAi.stream_slots(&event).is_err());
+    }
+
+    #[test]
+    fn openai_refuses_a_streamed_tool_call() {
+        let event = json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]});
+        assert!(OpenAi.stream_slots(&event).is_err());
+    }
+
+    #[test]
+    fn anthropic_finds_the_text_delta() {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"}
+        });
+        assert_eq!(pointers(Anthropic.stream_slots(&event)), ["/delta/text"]);
+    }
+
+    #[test]
+    fn anthropic_finds_the_text_of_an_opening_block() {
+        let event = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        });
+        assert_eq!(
+            pointers(Anthropic.stream_slots(&event)),
+            ["/content_block/text"]
+        );
+    }
+
+    #[test]
+    fn anthropic_refuses_a_streamed_tool_block() {
+        let event = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "input": {}}
+        });
+        assert!(Anthropic.stream_slots(&event).is_err());
+    }
+
+    #[test]
+    fn anthropic_refuses_an_input_json_delta() {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{"}
+        });
+        assert!(Anthropic.stream_slots(&event).is_err());
+    }
+
+    #[test]
+    fn unknown_event_types_carry_no_text() {
+        // `ping` and event types added later must not break a stream.
+        assert!(Anthropic
+            .stream_slots(&json!({"type": "ping"}))
+            .unwrap()
+            .is_empty());
+        assert!(OpenAi
+            .stream_slots(&json!({"object": "x"}))
+            .unwrap()
+            .is_empty());
+    }
+
+    fn thinking_request(config: Value) -> Value {
+        json!({
+            "model": "claude",
+            "thinking": config,
+            "messages": [{"role": "user", "content": "Hallo"}]
+        })
+    }
+
+    #[test]
+    fn an_extended_thinking_request_is_refused_before_the_call() {
+        let body = thinking_request(json!({"type": "enabled", "budget_tokens": 1024}));
+        assert!(Anthropic.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn explicitly_disabled_thinking_is_allowed() {
+        assert!(Anthropic
+            .request_pointers(&thinking_request(json!({"type": "disabled"})))
+            .is_ok());
+        assert!(Anthropic
+            .request_pointers(&thinking_request(json!(null)))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_streamed_thinking_block_is_refused_too() {
+        // Defence in depth: a provider that streams one anyway does not get to
+        // pass its text through unrestored.
+        let start = json!({"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "thinking", "thinking": ""}});
+        assert!(Anthropic.stream_slots(&start).is_err());
+        let delta = json!({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": "hm"}});
+        assert!(Anthropic.stream_slots(&delta).is_err());
+    }
+
+    fn with_option(field: &str, value: Value) -> Value {
+        json!({
+            "model": "gpt-4o",
+            field: value,
+            "messages": [{"role": "user", "content": "Hallo"}]
+        })
+    }
+
+    #[test]
+    fn a_logprobs_request_is_refused_before_the_call() {
+        // The token strings under `logprobs` are the masked output again.
+        assert!(OpenAi
+            .request_pointers(&with_option("logprobs", json!(true)))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&with_option("top_logprobs", json!(5)))
+            .is_err());
+    }
+
+    #[test]
+    fn explicitly_disabled_logprobs_are_allowed() {
+        // An SDK serializing its default asks for nothing and is not turned away.
+        assert!(OpenAi
+            .request_pointers(&with_option("logprobs", json!(false)))
+            .is_ok());
+        assert!(OpenAi
+            .request_pointers(&with_option("logprobs", json!(null)))
+            .is_ok());
+        assert!(OpenAi
+            .request_pointers(&with_option("top_logprobs", json!(0)))
+            .is_ok());
+    }
+
+    fn streamed_logprobs(value: Value) -> Value {
+        json!({"choices": [{"index": 0, "delta": {"content": "a"}, "logprobs": value}]})
+    }
+
+    #[test]
+    fn an_empty_streamed_logprobs_field_is_not_a_refusal() {
+        // Providers send `logprobs: null` on every chunk when none were asked
+        // for; refusing on that would break every stream.
+        for empty in [
+            json!(null),
+            json!({}),
+            json!({"content": []}),
+            json!({"content": null}),
+        ] {
+            assert!(
+                OpenAi
+                    .stream_slots(&streamed_logprobs(empty.clone()))
+                    .is_ok(),
+                "{empty} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_audio_output_request_is_refused_before_the_call() {
+        // The transcript streams in fragments beside audio nothing can mask.
+        assert!(OpenAi
+            .request_pointers(&with_option(
+                "audio",
+                json!({"voice": "alloy", "format": "pcm16"})
+            ))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&with_option("modalities", json!(["text", "audio"])))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&with_option("modalities", json!(["text"])))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_streamed_audio_transcript_is_refused() {
+        let event = json!({"choices": [{"index": 0,
+                                        "delta": {"audio": {"transcript": "[PER"}}}]});
+        assert!(OpenAi.stream_slots(&event).is_err());
+    }
+
+    #[test]
+    fn logprobs_on_a_choice_without_a_delta_are_still_checked() {
+        // The first choice produces a slot, so the event takes the rewriting
+        // path and the second choice is forwarded exactly as it came.
+        let event = json!({"choices": [
+            {"index": 0, "delta": {"content": "a"}},
+            {"index": 1, "logprobs": {"content": [{"token": "[PERSON_1]"}]}}
+        ]});
+        assert!(OpenAi.stream_slots(&event).is_err());
+    }
+
+    #[test]
+    fn a_streamed_logprobs_field_that_is_not_demonstrably_empty_is_refused() {
+        // The slot path rewrites `delta`, not this field: whatever is here is
+        // forwarded exactly as it came.
+        for carrying in [
+            json!("[PERSON_1]"),
+            json!({"content": "[PERSON_1]"}),
+            json!({"content": [{"token": "[PER"}]}),
+            json!({"refusal": [{"token": "[PER"}]}),
+            json!({"tokens": ["[PERSON_1]"]}),
+            json!(7),
+        ] {
+            assert!(
+                OpenAi
+                    .stream_slots(&streamed_logprobs(carrying.clone()))
+                    .is_err(),
+                "{carrying} allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_logprobs_are_refused_too() {
+        let event = json!({"choices": [{"index": 0, "delta": {"content": "a"},
+                                        "logprobs": {"content": [{"token": "[PER"}]}}]});
+        assert!(OpenAi.stream_slots(&event).is_err());
     }
 }
