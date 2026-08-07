@@ -224,6 +224,18 @@ Review found four holes in the design as written; the code carries the fixes:
   and then drops — wiremock cannot sever a stream mid-body, and that is the
   whole claim.
 
+- **A failure discarded output that was already correct.** Events rendered
+  earlier in the same chunk, and the event waiting behind the one-event delay,
+  were dropped along with the failing one. `StreamRestorer::salvage` returns
+  them; only the hold-back buffers are dropped untouched, because they may hold
+  the very token that could not be restored. Ending the stream is a decision
+  about what comes next, not a verdict on what already went out.
+- **The queue behind a held event was unbounded.** A stream that stalls after
+  one delta and then sends keepalives forever grew memory without limit; the
+  per-event cap does not cover it. `MAX_QUEUED_BYTES = 64 KiB`, and the budget
+  resets each time the queue is released, so a long healthy stream never trips
+  it.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

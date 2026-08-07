@@ -33,6 +33,11 @@ pub enum StreamError {
     #[error("upstream sent an event larger than this gateway will buffer; the stream ends")]
     Oversized,
     #[error(
+        "upstream sent more behind an unfinished event than this gateway will hold; \
+         the stream ends"
+    )]
+    Stalled,
+    #[error(
         "upstream sent an event this gateway cannot parse; the stream ends rather \
          than forwarding text it could not restore"
     )]
@@ -43,6 +48,11 @@ pub enum StreamError {
 /// line would otherwise be buffered whole, which is the memory cost streaming
 /// exists to avoid. Provider events are a few hundred bytes.
 pub const MAX_EVENT_BYTES: usize = 1 << 20;
+
+/// How much may wait behind an event that has not been released yet. A stream
+/// that stalls after one delta and then sends keepalives forever would
+/// otherwise grow without bound, which the per-event cap does not cover.
+pub const MAX_QUEUED_BYTES: usize = 64 << 10;
 
 /// A `[` that never closes would suspend the stream. Past this many bytes the
 /// bracket cannot begin a placeholder, so it is emitted as ordinary text.
@@ -286,6 +296,9 @@ pub struct StreamRestorer<'a> {
     /// and event types these protocols grow later. They are held only to keep
     /// the order the provider sent, never to drain a buffer.
     queued: Vec<SseEvent>,
+    queued_bytes: usize,
+    /// Output that was already safe to serve when a failure stopped the stream.
+    salvage: String,
 }
 
 /// A run of text in progress, and where its event wrote it last.
@@ -312,15 +325,39 @@ impl<'a> StreamRestorer<'a> {
             buffers: BTreeMap::new(),
             pending: None,
             queued: Vec::new(),
+            queued_bytes: 0,
+            salvage: String::new(),
         }
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<String, StreamError> {
         let mut out = String::new();
         for event in self.framer.push(chunk)? {
-            out.push_str(&self.handle(event)?);
+            match self.handle(event) {
+                Ok(rendered) => out.push_str(&rendered),
+                // Earlier events in this same chunk were rendered and are
+                // correct. The failure stops the stream; it does not unmake them.
+                Err(error) => {
+                    self.salvage.push_str(&out);
+                    return Err(error);
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// What was already safe to serve when a failure stopped the stream: events
+    /// rendered before the failing one, and whatever the one-event delay was
+    /// still holding. The hold-back buffers are dropped untouched — they may
+    /// contain the very token that could not be restored.
+    pub fn salvage(&mut self) -> String {
+        let mut out = std::mem::take(&mut self.salvage);
+        self.buffers.clear();
+        if let Some(pending) = self.pending.take() {
+            out.push_str(&pending.event.render());
+        }
+        out.push_str(&self.release(String::new()));
+        out
     }
 
     pub fn finish(&mut self) -> Result<String, StreamError> {
@@ -338,7 +375,7 @@ impl<'a> StreamRestorer<'a> {
         // Protocol sentinels are not JSON and carry no text. `[DONE]` ends
         // everything; an event with no data at all ends nothing.
         if data.is_empty() {
-            return Ok(self.hold(event));
+            return self.hold(event);
         }
         if data == "[DONE]" {
             let released = self.flush(&Terminates::All)?;
@@ -363,7 +400,7 @@ impl<'a> StreamRestorer<'a> {
             // text and let the client reassemble the token from the pieces.
             let terminates = self.provider.stream_terminates(&parsed);
             if terminates == Terminates::Nothing {
-                return Ok(self.hold(event));
+                return self.hold(event);
             }
             let released = self.flush(&terminates)?;
             let mut out = self.release(released);
@@ -403,12 +440,16 @@ impl<'a> StreamRestorer<'a> {
     /// Keep an event that ends nothing. With something already waiting it goes
     /// behind, so the provider's order survives; with nothing waiting there is
     /// nothing to wait for.
-    fn hold(&mut self, event: SseEvent) -> String {
+    fn hold(&mut self, event: SseEvent) -> Result<String, StreamError> {
         if self.pending.is_none() {
-            return event.render();
+            return Ok(event.render());
+        }
+        self.queued_bytes += event.render().len();
+        if self.queued_bytes > MAX_QUEUED_BYTES {
+            return Err(StreamError::Stalled);
         }
         self.queued.push(event);
-        String::new()
+        Ok(String::new())
     }
 
     /// Everything held behind the event just released.
@@ -417,6 +458,7 @@ impl<'a> StreamRestorer<'a> {
         for event in std::mem::take(&mut self.queued) {
             out.push_str(&event.render());
         }
+        self.queued_bytes = 0;
         out
     }
 
@@ -489,10 +531,12 @@ pub fn restore_stream(
                 // restored and waiting behind the one-event delay is safe to
                 // serve, and a failed connection does not make it unsafe.
                 Err(error) => {
-                    if let Ok(tail) = restorer.finish() {
-                        if !tail.is_empty() {
-                            yield Ok(Bytes::from(tail));
-                        }
+                    let tail = match restorer.finish() {
+                        Ok(tail) => tail,
+                        Err(_) => restorer.salvage(),
+                    };
+                    if !tail.is_empty() {
+                        yield Ok(Bytes::from(tail));
                     }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
                     return;
@@ -501,7 +545,13 @@ pub fn restore_stream(
             match restorer.push(&chunk) {
                 Ok(out) if out.is_empty() => {}
                 Ok(out) => yield Ok(Bytes::from(out)),
+                // Restoration failed, so the stream ends — but text rendered
+                // before the failing event is correct and is served first.
                 Err(error) => {
+                    let salvaged = restorer.salvage();
+                    if !salvaged.is_empty() {
+                        yield Ok(Bytes::from(salvaged));
+                    }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
                     return;
                 }
@@ -510,7 +560,13 @@ pub fn restore_stream(
         match restorer.finish() {
             Ok(out) if out.is_empty() => {}
             Ok(out) => yield Ok::<_, Infallible>(Bytes::from(out)),
-            Err(error) => yield Ok(Bytes::from(error_event(&error.to_string()))),
+            Err(error) => {
+                let salvaged = restorer.salvage();
+                if !salvaged.is_empty() {
+                    yield Ok(Bytes::from(salvaged));
+                }
+                yield Ok(Bytes::from(error_event(&error.to_string())));
+            }
         }
     };
 
@@ -856,6 +912,78 @@ mod restorer_tests {
             restorer.push(&body).unwrap_err(),
             StreamError::Oversized
         ));
+    }
+
+    #[test]
+    fn a_failure_does_not_unmake_the_events_already_rendered() {
+        // Two good events and a malformed one in a single chunk. The stream
+        // ends, but the text that was already correct is still served.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let chunk = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"two \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"broken\n\n",
+        );
+        assert!(restorer.push(chunk.as_bytes()).is_err());
+        let salvaged = restorer.salvage();
+        assert_eq!(text_for_choice(&salvaged, 0), "one two ");
+    }
+
+    #[test]
+    fn salvage_never_drains_a_hold_back_buffer() {
+        // The buffer may hold the very token that could not be restored.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        restorer
+            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe [PER\"}}]}\n\n")
+            .unwrap();
+        let salvaged = restorer.salvage();
+        assert_eq!(text_for_choice(&salvaged, 0), "safe ");
+        assert!(
+            !salvaged.contains("[PER"),
+            "held text was released: {salvaged}"
+        );
+    }
+
+    #[test]
+    fn endless_keepalives_behind_a_held_event_end_the_stream() {
+        // The per-event cap does not cover a stream that stalls after one delta
+        // and then pings forever.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        restorer
+            .push(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            )
+            .unwrap();
+        let ping = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let mut error = None;
+        for _ in 0..(MAX_QUEUED_BYTES / ping.len() + 2) {
+            if let Err(failure) = restorer.push(ping) {
+                error = Some(failure);
+                break;
+            }
+        }
+        assert!(matches!(error, Some(StreamError::Stalled)), "{error:?}");
+    }
+
+    #[test]
+    fn a_keepalive_run_that_ends_in_text_does_not_accumulate() {
+        // Releasing the queue must reset its budget, or a long stream would trip
+        // the cap on keepalives it already delivered.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+        let ping = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        for _ in 0..2000 {
+            restorer.push(delta).unwrap();
+            restorer.push(ping).unwrap();
+        }
     }
 
     #[test]

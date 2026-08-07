@@ -138,8 +138,10 @@ gets a truncated answer, never a placeholder in place of a name. Streamed tool c
 the buffered path: their arguments are not masked yet. Extended thinking is refused before
 the upstream call rather than at its first streamed block, so the refusal costs no tokens.
 
-If the connection breaks mid-stream, whatever was already restored is served before the
-error event. It was safe to send a moment earlier, and the break does not change that.
+Whatever was already restored is served before the error event, whether the stream ends
+because the connection broke or because a token could not be restored. It was safe to send a
+moment earlier, and the failure does not change that; what stays behind is the hold-back
+buffer, which may hold the token that failed.
 
 The gateway asks the detector for every layer it has, so a request costs what the
 [latency](#latency) section reports; `detector_timeout_secs` defaults to 30 seconds

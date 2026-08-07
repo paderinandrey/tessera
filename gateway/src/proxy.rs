@@ -845,6 +845,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_broken_event_does_not_take_the_good_ones_with_it() {
+        // The stream ends on the malformed event, but the delta before it was
+        // already restored and correct, and the client gets it.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_streaming(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PERSON_1]\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"trunc\n\n",
+        ))
+        .await;
+
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            served.contains(SECRET),
+            "restored text was dropped: {served}"
+        );
+        assert!(
+            served.contains("tessera_restoration_failed"),
+            "the failure was not reported: {served}"
+        );
+        assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
+    }
+
+    #[tokio::test]
     async fn a_streaming_error_response_keeps_the_buffered_path() {
         // A 429 is not a stream, whatever it says it is.
         let detector = detector_returning(json!([])).await;
