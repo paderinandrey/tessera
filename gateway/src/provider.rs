@@ -246,6 +246,15 @@ impl Provider for OpenAi {
         };
         let mut slots = Vec::new();
         for (position, choice) in choices.iter().enumerate() {
+            // Checked before anything may skip this choice: `logprobs` sits
+            // beside `delta`, not inside it, so a choice carrying no delta at
+            // all can still carry token strings — and with another choice in the
+            // same event producing a slot, the envelope is not restored whole.
+            match choice.get("logprobs") {
+                None => {}
+                Some(logprobs) if logprobs_carry_nothing(logprobs) => {}
+                Some(_) => return Err(ShapeError::Unsupported("openai", "logprobs")),
+            }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
@@ -255,14 +264,6 @@ impl Provider for OpenAi {
                 if delta.get(field).is_some_and(|value| !value.is_null()) {
                     return Err(ShapeError::Unsupported("openai", "tool_calls"));
                 }
-            }
-            // Defence in depth: a provider sending token strings we did not ask
-            // for does not get to put the masked output past restoration. An
-            // empty or null `logprobs` field asks for nothing and costs nothing.
-            match choice.get("logprobs") {
-                None => {}
-                Some(logprobs) if logprobs_carry_nothing(logprobs) => {}
-                Some(_) => return Err(ShapeError::Unsupported("openai", "logprobs")),
             }
             // `index` says which completion this chunk belongs to; the array
             // position only says where it sits in this chunk. With `n > 1` they
@@ -892,6 +893,17 @@ mod tests {
                 "{empty} refused"
             );
         }
+    }
+
+    #[test]
+    fn logprobs_on_a_choice_without_a_delta_are_still_checked() {
+        // The first choice produces a slot, so the event takes the rewriting
+        // path and the second choice is forwarded exactly as it came.
+        let event = json!({"choices": [
+            {"index": 0, "delta": {"content": "a"}},
+            {"index": 1, "logprobs": {"content": [{"token": "[PERSON_1]"}]}}
+        ]});
+        assert!(OpenAi.stream_slots(&event).is_err());
     }
 
     #[test]

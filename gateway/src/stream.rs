@@ -479,7 +479,18 @@ impl<'a> StreamRestorer<'a> {
         }
 
         let mapping = self.mapping;
-        let mut rewritten = parsed.clone();
+        // Everything in the event that is not the streamed text is restored
+        // whole, exactly as a pointer-less event is. The slot path rewrites the
+        // deltas and nothing else, so any other string a provider puts here —
+        // today or in a version written after this code — would otherwise be
+        // forwarded verbatim, placeholder and all. Blanking the slots first
+        // keeps their held-back text out of it: that text is the buffer's to
+        // restore, and restoring it twice would be wrong.
+        let mut scrubbed = parsed.clone();
+        for slot in &slots {
+            write_pointer(&mut scrubbed, &slot.pointer, "")?;
+        }
+        let mut rewritten = mapping.restore_value(&scrubbed)?;
         let mut carried = BTreeMap::new();
         for slot in &slots {
             // An upstream that keeps opening runs and never ends them would add
@@ -1179,6 +1190,40 @@ mod restorer_tests {
         rendered.push_str(&restorer.finish().unwrap());
         assert_eq!(text_for_choice(&rendered, 0), "Hallo Weber");
         assert!(!rendered.contains("PERSON_1"), "{rendered}");
+    }
+
+    #[test]
+    fn a_sibling_field_of_the_delta_is_restored_too() {
+        // The slot path rewrites the delta and nothing else. Anything else in
+        // the event is restored whole, so a field this code has never heard of
+        // cannot carry a placeholder out.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\
+\"annotation\":\"about [PERSON_1]\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        assert!(rendered.contains("about Weber"), "{rendered}");
+        assert!(!rendered.contains("PERSON_1"), "{rendered}");
+    }
+
+    #[test]
+    fn restoring_the_rest_does_not_touch_the_held_back_text() {
+        // The delta's own text belongs to the buffer; restoring it here as well
+        // would emit a token the hold-back was still assembling.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a [PER\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1] b\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        assert_eq!(text_for_choice(&rendered, 0), "a Weber b");
     }
 
     #[test]

@@ -282,6 +282,17 @@ Review found four holes in the design as written; the code carries the fixes:
   (null, `{}`, or empty token lists) is forwarded; every other shape, including
   keys we have never seen, ends the stream.
 
+- **Everything in a text event that was not the text went out verbatim.** The
+  slot path rewrote the deltas and forwarded the rest of the event untouched, so
+  any other string — `logprobs` on a choice with no delta, a field added to the
+  protocol next year — carried its placeholder to the client. Review found this
+  twice as separate instances; the class is closed instead. A text event now has
+  every string outside its slots restored whole, exactly as a pointer-less event
+  does. The slots are blanked before that pass so the held-back text stays the
+  buffer's to restore. The `logprobs` refusal stays regardless: those are
+  token-level fragments, and restoring them would leave the probabilities
+  describing text that is no longer there.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.
