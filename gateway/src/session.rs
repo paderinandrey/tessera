@@ -55,10 +55,21 @@ fn salt() -> &'static [u8; 32] {
 /// What the store keys on: a salted fingerprint of the caller's credential,
 /// and the id the caller chose.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
     credential: [u8; 32],
     id: String,
+}
+
+// `derive(Debug)` would print `id` verbatim, and `id` is client-chosen: it may
+// itself be personal data, the same as the raw id `digest()` exists to keep
+// out of logs. A type with a safe printable form and an unsafe one only
+// needs one caller to reach into the wrong one, so there is exactly one
+// `Debug` implementation and it prints only the digest.
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SessionKey").field(&self.digest()).finish()
+    }
 }
 
 impl SessionKey {
@@ -268,5 +279,24 @@ mod tests {
         assert!(!digest.contains("Weber"));
         assert!(!digest.contains("sekrit"));
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn debug_formatting_carries_neither_the_id_nor_the_credential() {
+        // `digest()` is not the only way a `SessionKey` can reach a log line —
+        // `{:?}` is another, and a derived `Debug` would print the raw id.
+        let key = key_from(
+            &headers(&[
+                ("authorization", "Bearer sekrit"),
+                (SESSION_HEADER, "patient.Weber-2026"),
+            ]),
+            &OpenAi,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let formatted = format!("{key:?}");
+        assert!(!formatted.contains("Weber"));
+        assert!(!formatted.contains("sekrit"));
     }
 }
