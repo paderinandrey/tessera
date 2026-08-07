@@ -23,6 +23,10 @@ pub trait Provider: Send + Sync {
     /// know carries no slots and is forwarded as it came: both protocols add
     /// event types over time, and `ping` must not break a stream.
     fn stream_slots(&self, event: &Value) -> Result<Vec<TextSlot>, ShapeError>;
+    /// Which runs of text this event ends. A keepalive ends none: draining a
+    /// buffer on one would release half a placeholder as ordinary text, and the
+    /// client would reassemble the token we were hiding.
+    fn stream_terminates(&self, event: &Value) -> Terminates;
 }
 
 /// Where text sits in one streamed event, and which run of text it belongs to.
@@ -36,6 +40,15 @@ pub trait Provider: Send + Sync {
 pub struct TextSlot {
     pub pointer: String,
     pub key: String,
+}
+
+/// What an event without text of its own does to the runs in progress.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Terminates {
+    /// A keepalive, a comment, an event type added after this was written.
+    Nothing,
+    Runs(Vec<String>),
+    All,
 }
 
 pub struct OpenAi;
@@ -229,6 +242,31 @@ impl Provider for OpenAi {
         }
         Ok(slots)
     }
+
+    fn stream_terminates(&self, event: &Value) -> Terminates {
+        let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+            return Terminates::Nothing;
+        };
+        let mut keys = Vec::new();
+        for (position, choice) in choices.iter().enumerate() {
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                let index = choice
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(position as u64);
+                keys.push(format!("choice/{index}/content"));
+                keys.push(format!("choice/{index}/refusal"));
+            }
+        }
+        if keys.is_empty() {
+            Terminates::Nothing
+        } else {
+            Terminates::Runs(keys)
+        }
+    }
 }
 
 impl Provider for Anthropic {
@@ -333,6 +371,19 @@ impl Provider for Anthropic {
                 }
             }
             _ => Ok(Vec::new()),
+        }
+    }
+
+    fn stream_terminates(&self, event: &Value) -> Terminates {
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_stop") => Terminates::Runs(vec![format!(
+                "block/{}",
+                event.get("index").and_then(Value::as_u64).unwrap_or(0)
+            )]),
+            Some("message_stop") | Some("error") => Terminates::All,
+            // `ping` lands here, and so does every event type these protocols
+            // grow later.
+            _ => Terminates::Nothing,
         }
     }
 }

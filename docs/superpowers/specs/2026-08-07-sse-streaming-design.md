@@ -198,6 +198,14 @@ Review found four holes in the design as written; the code carries the fixes:
 - **Provider error events were forwarded verbatim.** An upstream error quotes
   what we sent it. Events with no text of their own now go through
   `Mapping::restore_value`, as the buffered path's error body already did.
+- **Any event without text drained every buffer.** Anthropic sends `ping`
+  mid-generation, and treating a keepalive as the end of the run released `[PER`
+  as ordinary text with `SON_1]` behind it — the client reassembles exactly the
+  token this slice hides. `Provider::stream_terminates` now says what an event
+  ends: nothing, named runs, or all of them. `content_block_stop` ends its own
+  block; a `finish_reason` ends that choice; `ping` and event types these
+  protocols grow later end nothing and are forwarded, held behind the waiting
+  event so the provider's order survives.
 - **The size cap was checked after the event was assembled.** An oversized event
   arriving complete in one chunk slipped past it. The cap is now enforced while
   framing, before the block is copied.

@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::mapping::{Mapping, MappingError};
-use crate::provider::{read_pointer, write_pointer, Provider, ShapeError};
+use crate::provider::{read_pointer, write_pointer, Provider, ShapeError, Terminates};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -282,6 +282,10 @@ pub struct StreamRestorer<'a> {
     /// not by the pointer, which repeats across interleaved choices.
     buffers: BTreeMap<String, Held<'a>>,
     pending: Option<Pending>,
+    /// Events that arrived behind the waiting one and end nothing — keepalives,
+    /// and event types these protocols grow later. They are held only to keep
+    /// the order the provider sent, never to drain a buffer.
+    queued: Vec<SseEvent>,
 }
 
 /// A run of text in progress, and where its event wrote it last.
@@ -307,6 +311,7 @@ impl<'a> StreamRestorer<'a> {
             framer: SseFramer::new(),
             buffers: BTreeMap::new(),
             pending: None,
+            queued: Vec::new(),
         }
     }
 
@@ -323,15 +328,21 @@ impl<'a> StreamRestorer<'a> {
         if let Some(event) = self.framer.finish() {
             out.push_str(&self.handle(event)?);
         }
-        out.push_str(&self.flush()?);
+        let released = self.flush(&Terminates::All)?;
+        out.push_str(&self.release(released));
         Ok(out)
     }
 
     fn handle(&mut self, event: SseEvent) -> Result<String, StreamError> {
         let data = event.data.as_deref().unwrap_or("");
-        // Protocol sentinels are not JSON and carry no text.
-        if data.is_empty() || data == "[DONE]" {
-            let mut out = self.flush()?;
+        // Protocol sentinels are not JSON and carry no text. `[DONE]` ends
+        // everything; an event with no data at all ends nothing.
+        if data.is_empty() {
+            return Ok(self.hold(event));
+        }
+        if data == "[DONE]" {
+            let released = self.flush(&Terminates::All)?;
+            let mut out = self.release(released);
             out.push_str(&event.render());
             return Ok(out);
         }
@@ -345,9 +356,17 @@ impl<'a> StreamRestorer<'a> {
             // No text of its own — but a provider's error envelope quotes what we
             // sent, so every string in it is restored, exactly as the buffered
             // path does with an error body.
-            let mut out = self.flush()?;
             let mut event = event;
             event.data = Some(self.mapping.restore_value(&parsed)?.to_string());
+            // Only an event that actually ends a run drains its buffer. A
+            // keepalive between two deltas would otherwise release `[PER` as
+            // text and let the client reassemble the token from the pieces.
+            let terminates = self.provider.stream_terminates(&parsed);
+            if terminates == Terminates::Nothing {
+                return Ok(self.hold(event));
+            }
+            let released = self.flush(&terminates)?;
+            let mut out = self.release(released);
             out.push_str(&event.render());
             return Ok(out);
         }
@@ -375,21 +394,50 @@ impl<'a> StreamRestorer<'a> {
             event,
             slots: carried,
         });
-        Ok(previous
+        let released = previous
             .map(|pending| pending.event.render())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(self.release(released))
+    }
+
+    /// Keep an event that ends nothing. With something already waiting it goes
+    /// behind, so the provider's order survives; with nothing waiting there is
+    /// nothing to wait for.
+    fn hold(&mut self, event: SseEvent) -> String {
+        if self.pending.is_none() {
+            return event.render();
+        }
+        self.queued.push(event);
+        String::new()
+    }
+
+    /// Everything held behind the event just released.
+    fn release(&mut self, released: String) -> String {
+        let mut out = released;
+        for event in std::mem::take(&mut self.queued) {
+            out.push_str(&event.render());
+        }
+        out
     }
 
     /// The text run has ended: drain every buffer into the waiting event.
-    fn flush(&mut self) -> Result<String, StreamError> {
+    fn flush(&mut self, terminates: &Terminates) -> Result<String, StreamError> {
+        let ends = |key: &String| match terminates {
+            Terminates::All => true,
+            Terminates::Runs(keys) => keys.contains(key),
+            Terminates::Nothing => false,
+        };
         let mut remainders: Vec<(String, String)> = Vec::new();
         for (key, held) in self.buffers.iter_mut() {
+            if !ends(key) {
+                continue;
+            }
             let rest = held.buffer.finish()?;
             if !rest.is_empty() {
                 remainders.push((key.clone(), rest));
             }
         }
-        self.buffers.clear();
+        self.buffers.retain(|key, _| !ends(key));
 
         let Some(mut pending) = self.pending.take() else {
             // Restored text with nowhere to go is not dropped quietly.
@@ -652,6 +700,111 @@ mod restorer_tests {
             .unwrap();
         let error = restorer.push(b"data: [DONE]\n\n").unwrap_err();
         assert!(matches!(error, StreamError::Unplaceable(_)), "{error}");
+    }
+
+    /// Concatenate every Anthropic text delta the client would have seen.
+    fn anthropic_text(rendered: &str) -> String {
+        let mut out = String::new();
+        for line in rendered.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            for pointer in ["/delta/text", "/content_block/text"] {
+                if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
+                    out.push_str(text);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_keepalive_between_deltas_does_not_release_half_a_placeholder() {
+        // Anthropic sends `ping` mid-generation. Treating it as the end of the
+        // text run would emit `[PER` as ordinary text and `SON_1]` after it, and
+        // the client would reassemble the token this gateway exists to hide.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hallo [PER\"}}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"SON_1]!\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        assert_eq!(anthropic_text(&rendered), "Hallo Weber!");
+        assert!(rendered.contains("event: ping"), "keepalive dropped");
+        assert!(
+            rendered.contains("event: message_stop"),
+            "truncated: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_keepalive_keeps_its_place_in_the_order() {
+        // It arrived after the delta being held, and it goes out after it.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"one \"}}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"two\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        let first = rendered.find("one ").unwrap();
+        let ping = rendered.find("event: ping").unwrap();
+        let second = rendered.find("two").unwrap();
+        assert!(first < ping && ping < second, "reordered: {rendered}");
+    }
+
+    #[test]
+    fn stopping_one_block_leaves_another_block_held() {
+        // `content_block_stop` ends its own run, not every run in flight.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"held [PER\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"SON_1]\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        assert_eq!(anthropic_text(&rendered), "held Weber");
+    }
+
+    #[test]
+    fn an_openai_chunk_without_a_finish_reason_ends_nothing() {
+        // A usage-only chunk arriving mid-run must not drain the buffer.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PER\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SON_1]\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        assert_eq!(text_for_choice(&rendered, 0), "Hallo Weber");
     }
 
     #[test]
