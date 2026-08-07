@@ -152,6 +152,17 @@ impl Provider for OpenAi {
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
         reject_tool_fields(body, "openai")?;
+        // With logprobs on, every choice carries the model's output again as
+        // token strings under `logprobs`. Those are the masked tokens: joined
+        // back together they spell the placeholder, and their probabilities
+        // describe text the client will never see. Restoring them is not
+        // meaningful — token boundaries do not follow placeholder boundaries —
+        // so the request is refused before the call.
+        for field in ["logprobs", "top_logprobs"] {
+            if body.get(field).is_some_and(|value| !value.is_null()) {
+                return Err(ShapeError::Unsupported("openai", "logprobs"));
+            }
+        }
         let mut pointers = Vec::new();
         // Personal data does not only live in `content`. OpenAI's optional
         // per-message `name` and top-level `user` are identifiers, and
@@ -217,6 +228,11 @@ impl Provider for OpenAi {
                 if delta.get(field).is_some_and(|value| !value.is_null()) {
                     return Err(ShapeError::Unsupported("openai", "tool_calls"));
                 }
+            }
+            // Defence in depth: a provider sending logprobs we did not ask for
+            // does not get to put the masked tokens past restoration.
+            if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
+                return Err(ShapeError::Unsupported("openai", "logprobs"));
             }
             // `index` says which completion this chunk belongs to; the array
             // position only says where it sits in this chunk. With `n > 1` they
@@ -770,5 +786,25 @@ mod tests {
         let delta = json!({"type": "content_block_delta", "index": 0,
                            "delta": {"type": "thinking_delta", "thinking": "hm"}});
         assert!(Anthropic.stream_slots(&delta).is_err());
+    }
+
+    #[test]
+    fn a_logprobs_request_is_refused_before_the_call() {
+        // The token strings under `logprobs` are the masked output again.
+        for field in ["logprobs", "top_logprobs"] {
+            let body = json!({
+                "model": "gpt-4o",
+                field: true,
+                "messages": [{"role": "user", "content": "Hallo"}]
+            });
+            assert!(OpenAi.request_pointers(&body).is_err(), "{field} allowed");
+        }
+    }
+
+    #[test]
+    fn streamed_logprobs_are_refused_too() {
+        let event = json!({"choices": [{"index": 0, "delta": {"content": "a"},
+                                        "logprobs": {"content": [{"token": "[PER"}]}}]});
+        assert!(OpenAi.stream_slots(&event).is_err());
     }
 }

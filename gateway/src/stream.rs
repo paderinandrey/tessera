@@ -37,6 +37,8 @@ pub enum StreamError {
          the stream ends"
     )]
     Stalled,
+    #[error("upstream opened more runs of text than this gateway will hold; the stream ends")]
+    TooManyRuns,
     #[error(
         "upstream sent an event this gateway cannot parse; the stream ends rather \
          than forwarding text it could not restore"
@@ -53,6 +55,12 @@ pub const MAX_EVENT_BYTES: usize = 1 << 20;
 /// that stalls after one delta and then sends keepalives forever would
 /// otherwise grow without bound, which the per-event cap does not cover.
 pub const MAX_QUEUED_BYTES: usize = 64 << 10;
+
+/// How many runs of text may be open at once — choices on OpenAI, content
+/// blocks on Anthropic. An upstream that keeps opening new indices and never
+/// ends them would otherwise add a buffer per event for the life of the
+/// response, which neither of the other caps covers.
+pub const MAX_ACTIVE_RUNS: usize = 64;
 
 /// A `[` that never closes would suspend the stream. Past this many bytes the
 /// bracket cannot begin a placeholder, so it is emitted as ordinary text.
@@ -189,7 +197,10 @@ impl SseFramer {
         Self::default()
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, StreamError> {
+    /// Events framed from this chunk, and the failure that stopped framing if
+    /// one did. The two are returned together: an oversized event does not
+    /// unmake the complete ones that preceded it in the same chunk.
+    pub fn push(&mut self, chunk: &[u8]) -> (Vec<SseEvent>, Option<StreamError>) {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
         loop {
@@ -201,7 +212,7 @@ impl SseFramer {
                     // event that arrives complete in one chunk must be refused,
                     // not buffered, cloned and handed on.
                     if end > MAX_EVENT_BYTES {
-                        return Err(StreamError::Oversized);
+                        return (events, Some(StreamError::Oversized));
                     }
                     let block = self.buffer[..end].to_vec();
                     self.buffer.drain(..end + width);
@@ -212,14 +223,14 @@ impl SseFramer {
                 }
                 None => {
                     if self.buffer.len() > MAX_EVENT_BYTES {
-                        return Err(StreamError::Oversized);
+                        return (events, Some(StreamError::Oversized));
                     }
                     self.scanned = self.buffer.len();
                     break;
                 }
             }
         }
-        Ok(events)
+        (events, None)
     }
 
     /// Bytes left over when the body ended. A stream that stops without its
@@ -331,19 +342,29 @@ impl<'a> StreamRestorer<'a> {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<String, StreamError> {
+        let (events, framing_error) = self.framer.push(chunk);
         let mut out = String::new();
-        for event in self.framer.push(chunk)? {
+        for event in events {
             match self.handle(event) {
                 Ok(rendered) => out.push_str(&rendered),
                 // Earlier events in this same chunk were rendered and are
                 // correct. The failure stops the stream; it does not unmake them.
-                Err(error) => {
-                    self.salvage.push_str(&out);
-                    return Err(error);
-                }
+                Err(error) => return Err(self.keep(out, error)),
             }
         }
-        Ok(out)
+        match framing_error {
+            Some(error) => Err(self.keep(out, error)),
+            None => Ok(out),
+        }
+    }
+
+    /// Set output aside for `salvage` and hand the failure on. It goes in front
+    /// of anything already there: `out` is what was rendered before the
+    /// operation that failed, and that operation may have stashed the event it
+    /// was holding.
+    fn keep(&mut self, out: String, error: StreamError) -> StreamError {
+        self.salvage.insert_str(0, &out);
+        error
     }
 
     /// What was already safe to serve when a failure stopped the stream: events
@@ -363,11 +384,20 @@ impl<'a> StreamRestorer<'a> {
     pub fn finish(&mut self) -> Result<String, StreamError> {
         let mut out = String::new();
         if let Some(event) = self.framer.finish() {
-            out.push_str(&self.handle(event)?);
+            match self.handle(event) {
+                Ok(rendered) => out.push_str(&rendered),
+                Err(error) => return Err(self.keep(out, error)),
+            }
         }
-        let released = self.flush(&Terminates::All)?;
-        out.push_str(&self.release(released));
-        Ok(out)
+        match self.flush(&Terminates::All) {
+            Ok(released) => {
+                out.push_str(&self.release(released));
+                Ok(out)
+            }
+            // The final flush can fail on a run it cannot place. What was
+            // rendered before it is still correct.
+            Err(error) => Err(self.keep(out, error)),
+        }
     }
 
     fn handle(&mut self, event: SseEvent) -> Result<String, StreamError> {
@@ -412,6 +442,11 @@ impl<'a> StreamRestorer<'a> {
         let mut rewritten = parsed.clone();
         let mut carried = BTreeMap::new();
         for slot in &slots {
+            // An upstream that keeps opening runs and never ends them would add
+            // a buffer per event for the life of the response.
+            if !self.buffers.contains_key(&slot.key) && self.buffers.len() >= MAX_ACTIVE_RUNS {
+                return Err(StreamError::TooManyRuns);
+            }
             let text = read_pointer(&parsed, &slot.pointer)?;
             let held = self
                 .buffers
@@ -491,23 +526,38 @@ impl<'a> StreamRestorer<'a> {
         if remainders.is_empty() {
             return Ok(pending.event.render());
         }
-        let mut parsed: Value =
-            serde_json::from_str(pending.event.data.as_deref().unwrap_or(""))
-                .map_err(|_| StreamError::Unplaceable("the waiting event".to_owned()))?;
-        for (key, rest) in remainders {
-            // Only into the event that carries this same run. A pointer that
-            // happens to match is not the same completion.
-            let pointer = pending
-                .slots
-                .get(&key)
-                .ok_or_else(|| StreamError::Unplaceable(key.clone()))?;
-            let existing = read_pointer(&parsed, pointer)
-                .map_err(|_| StreamError::Unplaceable(key.clone()))?;
-            write_pointer(&mut parsed, pointer, &format!("{existing}{rest}"))?;
+        // The event as it stands is already rewritten and correct. If a
+        // remainder cannot be placed the stream ends, but that event was safe
+        // before the remainder existed and is safe still.
+        let without_remainders = pending.event.render();
+        match place(&mut pending, remainders) {
+            Ok(()) => Ok(pending.event.render()),
+            Err(error) => {
+                self.salvage.push_str(&without_remainders);
+                Err(error)
+            }
         }
-        pending.event.data = Some(parsed.to_string());
-        Ok(pending.event.render())
     }
+}
+
+/// Append each run's remainder to the event waiting behind it — and only into an
+/// event that carries that same run. With interleaved choices two completions
+/// share a pointer, and writing into the wrong one would hand a client another
+/// client's text.
+fn place(pending: &mut Pending, remainders: Vec<(String, String)>) -> Result<(), StreamError> {
+    let mut parsed: Value = serde_json::from_str(pending.event.data.as_deref().unwrap_or(""))
+        .map_err(|_| StreamError::Unplaceable("the waiting event".to_owned()))?;
+    for (key, rest) in remainders {
+        let pointer = pending
+            .slots
+            .get(&key)
+            .ok_or_else(|| StreamError::Unplaceable(key.clone()))?;
+        let existing =
+            read_pointer(&parsed, pointer).map_err(|_| StreamError::Unplaceable(key.clone()))?;
+        write_pointer(&mut parsed, pointer, &format!("{existing}{rest}"))?;
+    }
+    pending.event.data = Some(parsed.to_string());
+    Ok(())
 }
 
 /// Serve an upstream SSE response, restored as it arrives.
@@ -987,6 +1037,87 @@ mod restorer_tests {
     }
 
     #[test]
+    fn an_oversized_event_does_not_unmake_the_one_before_it() {
+        // The framer must hand back what it already framed, not only the failure.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let mut chunk =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"good \"}}]}\n\ndata: "
+                .to_vec();
+        chunk.extend(std::iter::repeat_n(b'x', MAX_EVENT_BYTES + 1));
+        chunk.extend_from_slice(b"\n\n");
+
+        assert!(matches!(
+            restorer.push(&chunk).unwrap_err(),
+            StreamError::Oversized
+        ));
+        assert_eq!(text_for_choice(&restorer.salvage(), 0), "good ");
+    }
+
+    #[test]
+    fn a_failing_final_flush_does_not_unmake_what_it_already_released() {
+        // The last event arrives without its blank line, releasing the event
+        // behind it; the flush then cannot place choice 0's tail. The released
+        // text is still correct.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        restorer
+            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A [PER\"}}]}\n\n")
+            .unwrap();
+        restorer
+            .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"B\"}}]}\n\n")
+            .unwrap();
+        // No trailing blank line: the framer only yields this on finish.
+        restorer
+            .push(b"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"C\"}}]}")
+            .unwrap();
+
+        assert!(matches!(
+            restorer.finish().unwrap_err(),
+            StreamError::Unplaceable(_)
+        ));
+        assert_eq!(text_for_choice(&restorer.salvage(), 1), "BC");
+    }
+
+    #[test]
+    fn endlessly_opening_new_runs_ends_the_stream() {
+        // Neither the per-event cap nor the queue cap covers a buffer per index.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let mut error = None;
+        for index in 0..(MAX_ACTIVE_RUNS + 2) {
+            let event = format!(
+                "data: {{\"choices\":[{{\"index\":{index},\"delta\":{{\"content\":\"[PER\"}}}}]}}\n\n"
+            );
+            if let Err(failure) = restorer.push(event.as_bytes()) {
+                error = Some(failure);
+                break;
+            }
+        }
+        assert!(matches!(error, Some(StreamError::TooManyRuns)), "{error:?}");
+    }
+
+    #[test]
+    fn runs_that_end_free_their_place() {
+        // A long stream of blocks opened and closed in turn must not trip the cap.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        for index in 0..(MAX_ACTIVE_RUNS * 3) {
+            let delta = format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\
+\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":\"x\"}}}}\n\n"
+            );
+            restorer.push(delta.as_bytes()).unwrap();
+            let stop = format!(
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\
+\"index\":{index}}}\n\n"
+            );
+            restorer.push(stop.as_bytes()).unwrap();
+        }
+    }
+
+    #[test]
     fn an_event_that_never_ends_stops_the_stream() {
         // Buffering the whole response is the cost streaming exists to avoid.
         let mapping = mapped();
@@ -1034,7 +1165,9 @@ mod framer_tests {
     use super::*;
 
     fn unwrap_push(framer: &mut SseFramer, chunk: &[u8]) -> Vec<SseEvent> {
-        framer.push(chunk).unwrap()
+        let (events, error) = framer.push(chunk);
+        assert!(error.is_none(), "framing failed: {error:?}");
+        events
     }
 
     const BODY: &str = "event: content_block_delta\ndata: {\"a\":1}\n\ndata: [DONE]\n\n";

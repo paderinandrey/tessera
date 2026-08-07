@@ -108,8 +108,8 @@ client's. Coming back, the provider's status and its rate-limit headers are pres
 
 **Every failure refuses the request**, and refuses it *before* the upstream call wherever
 the problem is visible there. A detector that errors or exceeds its timeout; a body whose
-shape the gateway has no rule for, including tool definitions, tool traffic and Anthropic's
-extended thinking, whose masking is a later slice; an identifier field present in a form that cannot be masked; a
+shape the gateway has no rule for, including tool definitions, tool traffic, Anthropic's
+extended thinking and OpenAI's `logprobs`, whose token strings are the masked output again; an identifier field present in a form that cannot be masked; a
 span the detector reports that cannot be applied; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing

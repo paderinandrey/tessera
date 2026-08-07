@@ -236,6 +236,22 @@ Review found four holes in the design as written; the code carries the fixes:
   resets each time the queue is released, so a long healthy stream never trips
   it.
 
+- **`logprobs` put the masked output past restoration.** With logprobs on,
+  every choice carries the model's output again as token strings. Joined back
+  together they spell the placeholder, and their probabilities describe text the
+  client will never see. Restoring them is not meaningful — token boundaries do
+  not follow placeholder boundaries — so the request is refused before the call,
+  and a provider that sends them unasked ends the stream.
+- **Three more paths dropped correct output.** The framer discarded events it
+  had already framed when a later event in the same chunk was oversized; the
+  final flush discarded what it had released before failing; and the flush lost
+  the event it was holding when a remainder could not be placed. All three now
+  route through `salvage`, which keeps them in the order they were produced.
+- **The map of active runs was unbounded.** An upstream opening new choice or
+  block indices forever added a buffer per event for the life of the response,
+  which neither of the other caps covers. `MAX_ACTIVE_RUNS = 64`, and a run that
+  ends frees its place.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.
