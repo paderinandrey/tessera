@@ -275,6 +275,13 @@ Review found four holes in the design as written; the code carries the fixes:
   ends at the same offset either way, and the leftover byte reads as an empty
   line, which is skipped. Waiting would delay every event on a CR-only stream.
 
+- **A malformed `logprobs` field slipped past the check.** The test asked
+  whether the field carried tokens, so `"logprobs": "[PERSON_1]"` — not a list,
+  so not "carrying" — passed, and the slot path rewrites `delta` rather than
+  this field, forwarding it verbatim. Inverted: only a field demonstrably empty
+  (null, `{}`, or empty token lists) is forwarded; every other shape, including
+  keys we have never seen, ends the stream.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

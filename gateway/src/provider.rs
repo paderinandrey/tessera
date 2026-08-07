@@ -110,13 +110,24 @@ fn identifier_pointer(
     }
 }
 
-/// Whether a `logprobs` object actually carries token strings.
-fn carries_tokens(logprobs: &Value) -> bool {
-    ["content", "refusal"].iter().any(|field| {
-        logprobs
-            .get(field)
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
+/// Whether a streamed `logprobs` field is one that can be forwarded untouched.
+///
+/// Only shapes that demonstrably carry no text qualify: null, or an object whose
+/// token lists are absent, null or empty. Everything else is refused — not only
+/// a populated list. A field the slot path does not rewrite is forwarded exactly
+/// as it came, so `"logprobs": "[PERSON_1]"` or a key we have never seen would
+/// carry the placeholder straight to the client.
+fn logprobs_carry_nothing(logprobs: &Value) -> bool {
+    let Some(fields) = logprobs.as_object() else {
+        return logprobs.is_null();
+    };
+    fields.iter().all(|(key, value)| match key.as_str() {
+        "content" | "refusal" => match value {
+            Value::Null => true,
+            Value::Array(items) => items.is_empty(),
+            _ => false,
+        },
+        _ => false,
     })
 }
 
@@ -248,8 +259,10 @@ impl Provider for OpenAi {
             // Defence in depth: a provider sending token strings we did not ask
             // for does not get to put the masked output past restoration. An
             // empty or null `logprobs` field asks for nothing and costs nothing.
-            if choice.get("logprobs").is_some_and(carries_tokens) {
-                return Err(ShapeError::Unsupported("openai", "logprobs"));
+            match choice.get("logprobs") {
+                None => {}
+                Some(logprobs) if logprobs_carry_nothing(logprobs) => {}
+                Some(_) => return Err(ShapeError::Unsupported("openai", "logprobs")),
             }
             // `index` says which completion this chunk belongs to; the array
             // position only says where it sits in this chunk. With `n > 1` they
@@ -858,15 +871,48 @@ mod tests {
             .is_ok());
     }
 
+    fn streamed_logprobs(value: Value) -> Value {
+        json!({"choices": [{"index": 0, "delta": {"content": "a"}, "logprobs": value}]})
+    }
+
     #[test]
     fn an_empty_streamed_logprobs_field_is_not_a_refusal() {
         // Providers send `logprobs: null` on every chunk when none were asked
         // for; refusing on that would break every stream.
-        let event = json!({"choices": [{"index": 0, "delta": {"content": "a"}, "logprobs": null}]});
-        assert!(OpenAi.stream_slots(&event).is_ok());
-        let empty = json!({"choices": [{"index": 0, "delta": {"content": "a"},
-                                        "logprobs": {"content": []}}]});
-        assert!(OpenAi.stream_slots(&empty).is_ok());
+        for empty in [
+            json!(null),
+            json!({}),
+            json!({"content": []}),
+            json!({"content": null}),
+        ] {
+            assert!(
+                OpenAi
+                    .stream_slots(&streamed_logprobs(empty.clone()))
+                    .is_ok(),
+                "{empty} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_streamed_logprobs_field_that_is_not_demonstrably_empty_is_refused() {
+        // The slot path rewrites `delta`, not this field: whatever is here is
+        // forwarded exactly as it came.
+        for carrying in [
+            json!("[PERSON_1]"),
+            json!({"content": "[PERSON_1]"}),
+            json!({"content": [{"token": "[PER"}]}),
+            json!({"refusal": [{"token": "[PER"}]}),
+            json!({"tokens": ["[PERSON_1]"]}),
+            json!(7),
+        ] {
+            assert!(
+                OpenAi
+                    .stream_slots(&streamed_logprobs(carrying.clone()))
+                    .is_err(),
+                "{carrying} allowed"
+            );
+        }
     }
 
     #[test]
