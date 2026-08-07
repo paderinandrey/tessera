@@ -151,7 +151,9 @@ async fn handle(
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"))
+            // Media types are case-insensitive, and a parameter may follow.
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
     {
         return Ok(crate::stream::restore_stream(
             response, provider, mapping, returned,
@@ -772,6 +774,34 @@ mod tests {
             served.contains("event: message_stop"),
             "truncated: {served}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_oddly_cased_media_type_is_still_a_stream() {
+        // `Text/Event-Stream; charset=utf-8` is the same media type, and missing
+        // it would buffer a live response and fail to parse it as JSON.
+        let detector = detector_returning(person_span()).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                STREAM_BODY.as_bytes().to_vec(),
+                "Text/Event-Stream; charset=utf-8",
+            ))
+            .mount(&upstream)
+            .await;
+
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(served.contains(SECRET), "not streamed: {served}");
+        assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
     }
 
     #[tokio::test]

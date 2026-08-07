@@ -261,6 +261,10 @@ fn find_blank_line(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
 
 fn parse_event(block: &[u8]) -> Option<SseEvent> {
     let text = String::from_utf8_lossy(block);
+    // A stream may open with a byte order mark. An SSE client ignores it, so a
+    // `data:` line hidden behind one is still data — kept as an unknown line it
+    // would be rendered back verbatim and reach the client unrestored.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut event = SseEvent::new(None, None);
     let mut data: Vec<&str> = Vec::new();
     let mut seen = false;
@@ -1130,6 +1134,18 @@ mod restorer_tests {
     }
 
     #[test]
+    fn a_stream_opening_with_a_byte_order_mark_is_still_restored() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = "\u{feff}data: {\"choices\":[{\"index\":0,\"delta\":\
+{\"content\":\"Hallo [PERSON_1]\"}}]}\n\ndata: [DONE]\n\n";
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        assert_eq!(text_for_choice(&rendered, 0), "Hallo Weber");
+        assert!(!rendered.contains("PERSON_1"), "{rendered}");
+    }
+
+    #[test]
     fn an_unknown_event_type_passes_through() {
         let mapping = mapped();
         let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
@@ -1227,6 +1243,15 @@ mod framer_tests {
         let mut framer = SseFramer::new();
         assert!(unwrap_push(&mut framer, b"data: tail").is_empty());
         assert_eq!(framer.finish().unwrap().data.as_deref(), Some("tail"));
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_data_line() {
+        // Behind a BOM the line is still data; treating it as an unknown field
+        // would render it back untouched.
+        let mut framer = SseFramer::new();
+        let events = unwrap_push(&mut framer, "\u{feff}data: {\"a\":1}\n\n".as_bytes());
+        assert_eq!(events[0].data.as_deref(), Some("{\"a\":1}"));
     }
 
     #[test]

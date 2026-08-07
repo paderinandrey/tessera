@@ -252,6 +252,18 @@ Review found four holes in the design as written; the code carries the fixes:
   which neither of the other caps covers. `MAX_ACTIVE_RUNS = 64`, and a run that
   ends frees its place.
 
+- **`logprobs: false` was refused.** An SDK serializing its default asks for
+  nothing; only an enabled value is turned away now, and a streamed `logprobs`
+  field ends the stream only when it actually carries token strings — providers
+  send `logprobs: null` on every chunk.
+- **A byte order mark hid the first data line.** A stream may open with one, and
+  an SSE client ignores it. Kept as an unknown field the line was rendered back
+  verbatim, so a first delta containing `[PERSON_1]` reached the client
+  unrestored. The framer strips it.
+- **The media type was matched case-sensitively.** `Text/Event-Stream` is the
+  same media type; missing it buffered a live response and failed to parse the
+  transcript as JSON. Compared without case, and without any parameters.
+
 ## Out of scope
 
 Tool-call arguments in a stream stay refused, as they are on the buffered path.

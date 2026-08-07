@@ -110,6 +110,16 @@ fn identifier_pointer(
     }
 }
 
+/// Whether a `logprobs` object actually carries token strings.
+fn carries_tokens(logprobs: &Value) -> bool {
+    ["content", "refusal"].iter().any(|field| {
+        logprobs
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    })
+}
+
 fn content_pointers(
     prefix: &str,
     content: &Value,
@@ -158,10 +168,16 @@ impl Provider for OpenAi {
         // describe text the client will never see. Restoring them is not
         // meaningful — token boundaries do not follow placeholder boundaries —
         // so the request is refused before the call.
-        for field in ["logprobs", "top_logprobs"] {
-            if body.get(field).is_some_and(|value| !value.is_null()) {
-                return Err(ShapeError::Unsupported("openai", "logprobs"));
-            }
+        // Explicitly disabled is not asking for them: an SDK that serializes
+        // its default must not be turned away.
+        match body.get("logprobs") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+            _ => return Err(ShapeError::Unsupported("openai", "logprobs")),
+        }
+        match body.get("top_logprobs") {
+            None | Some(Value::Null) => {}
+            Some(Value::Number(count)) if count.as_u64() == Some(0) => {}
+            _ => return Err(ShapeError::Unsupported("openai", "top_logprobs")),
         }
         let mut pointers = Vec::new();
         // Personal data does not only live in `content`. OpenAI's optional
@@ -229,9 +245,10 @@ impl Provider for OpenAi {
                     return Err(ShapeError::Unsupported("openai", "tool_calls"));
                 }
             }
-            // Defence in depth: a provider sending logprobs we did not ask for
-            // does not get to put the masked tokens past restoration.
-            if choice.get("logprobs").is_some_and(|value| !value.is_null()) {
+            // Defence in depth: a provider sending token strings we did not ask
+            // for does not get to put the masked output past restoration. An
+            // empty or null `logprobs` field asks for nothing and costs nothing.
+            if choice.get("logprobs").is_some_and(carries_tokens) {
                 return Err(ShapeError::Unsupported("openai", "logprobs"));
             }
             // `index` says which completion this chunk belongs to; the array
@@ -788,17 +805,48 @@ mod tests {
         assert!(Anthropic.stream_slots(&delta).is_err());
     }
 
+    fn with_option(field: &str, value: Value) -> Value {
+        json!({
+            "model": "gpt-4o",
+            field: value,
+            "messages": [{"role": "user", "content": "Hallo"}]
+        })
+    }
+
     #[test]
     fn a_logprobs_request_is_refused_before_the_call() {
         // The token strings under `logprobs` are the masked output again.
-        for field in ["logprobs", "top_logprobs"] {
-            let body = json!({
-                "model": "gpt-4o",
-                field: true,
-                "messages": [{"role": "user", "content": "Hallo"}]
-            });
-            assert!(OpenAi.request_pointers(&body).is_err(), "{field} allowed");
-        }
+        assert!(OpenAi
+            .request_pointers(&with_option("logprobs", json!(true)))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&with_option("top_logprobs", json!(5)))
+            .is_err());
+    }
+
+    #[test]
+    fn explicitly_disabled_logprobs_are_allowed() {
+        // An SDK serializing its default asks for nothing and is not turned away.
+        assert!(OpenAi
+            .request_pointers(&with_option("logprobs", json!(false)))
+            .is_ok());
+        assert!(OpenAi
+            .request_pointers(&with_option("logprobs", json!(null)))
+            .is_ok());
+        assert!(OpenAi
+            .request_pointers(&with_option("top_logprobs", json!(0)))
+            .is_ok());
+    }
+
+    #[test]
+    fn an_empty_streamed_logprobs_field_is_not_a_refusal() {
+        // Providers send `logprobs: null` on every chunk when none were asked
+        // for; refusing on that would break every stream.
+        let event = json!({"choices": [{"index": 0, "delta": {"content": "a"}, "logprobs": null}]});
+        assert!(OpenAi.stream_slots(&event).is_ok());
+        let empty = json!({"choices": [{"index": 0, "delta": {"content": "a"},
+                                        "logprobs": {"content": []}}]});
+        assert!(OpenAi.stream_slots(&empty).is_ok());
     }
 
     #[test]
