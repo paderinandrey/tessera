@@ -11,6 +11,7 @@ mod detector;
 mod mapping;
 mod provider;
 mod proxy;
+mod session;
 mod stream;
 
 use std::sync::Arc;
