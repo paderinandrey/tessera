@@ -60,17 +60,42 @@ reviewed that draft on PR #15 and raised two findings.
 completely full of live, valued sessions — no empty entry anywhere — the fallback
 still evicts the globally-oldest one regardless of content, exactly as before this
 slice. A single doomed request can still destroy a live session in that specific
-state. This is real, but its blast radius is smaller than it first reads: the
-victim it evicted is immediately replaced by the doomed request's own (now
-empty) entry, so the *next* doomed request from the same source finds an empty
-entry to reclaim first, not another live one. A burst of cheap failing requests
-costs at most one incidental live eviction, not one per request, and the design
-already treats evicting a whole session as safe (see slice D: "costs coreference,
-never protection"). Closing this completely would mean never evicting a live
-session under any circumstance, which just moves the resource-exhaustion problem
-elsewhere (an unbounded store, or a rejected request when capacity is genuinely
-exhausted by real traffic). Left out of scope; see "Out of scope" below for the
-principled fix this would need if it is ever worth closing.
+state. This is not merely a coreference-availability cost: an entry evicted while
+it is held is exactly the double-session precursor finding 2 below describes — a
+later request for the same id finds nothing in the store, creates a second,
+unsynchronized session, and a response can restore the wrong person's name. That
+makes this confidentiality-class, not availability-class, and it is not
+hypothetical: `an_evicted_session_does_not_interrupt_a_request_holding_it` in the
+implemented test suite runs at `limits(1)`, where the held session is the only
+candidate, and the fallback evicts it while its guard is alive.
+
+Its blast radius is bounded only for a **serial** burst of doomed requests: the
+first one's victim is immediately replaced by that same request's own (now
+empty) entry, so the next doomed request from the same source finds an empty
+entry to reclaim first, not another live one — at most one incidental live
+eviction, steady state. Concurrency defeats this bound directly: each in-flight
+request holds its own entry's lock across `mask_all`, which spans one or more
+round-trips to the detector service, so none of the entries left behind by
+requests 1..i-1 are reclaimable when request *i* runs its own eviction scan —
+every one of them takes the fallback in turn instead. K concurrent doomed
+requests cost min(K, max_sessions) live evictions, not one; the attacker needs no
+special timing beyond not waiting for responses, and the detector's documented
+latency (roughly a second per 1 200 characters) widens this window rather than
+narrowing it. A second, serial way to defeat the bound: a request that masks
+successfully but then fails upstream still calls `absorb`, leaving a non-empty
+entry behind; alternating such requests with fresh session ids costs one live
+eviction each, indefinitely, because no reclaimable residue ever accumulates.
+
+Still accepted for this slice — it is strictly better than the pre-fix behavior,
+where *every* eviction was unconditional rather than only this saturated-and-
+concurrent or non-empty-residue case — but it is not the availability-only "costs
+coreference, never protection" case slice D accepted; that comparison stops
+holding once the evicted entry can be one a live request currently holds.
+Closing this completely would mean never evicting a live session under any
+circumstance, which just moves the resource-exhaustion problem elsewhere (an
+unbounded store, or a rejected request when capacity is genuinely exhausted by
+real traffic). Left out of scope; see "Out of scope" below for the principled fix
+this would need, and for why it belongs ahead of availability-only follow-ups.
 
 **Finding 2 (real, serious, the reason this draft was rewritten).** The proposed
 `try_lock()` check has a gap the first draft did not account for:
@@ -141,8 +166,27 @@ For a freshly created entry this always succeeds: the mutex was just constructed
 inside this same critical section, so nothing else could possibly hold a
 reference to it yet. For a cache hit it succeeds whenever the session is
 currently idle, and fails only when another request already holds it — in which
-case that other request's hold is itself what keeps the entry safe from a
-concurrent eviction scan, so there is nothing to close there.
+case `Claimed.guard` comes back `None`, and the caller in `proxy.rs` waits its
+turn with `lock_owned().await` (`proxy.rs:142-144`).
+
+That wait is not gap-free. A `lock_owned()` future does not register itself as a
+waiter on the mutex until it is first polled, and the caller cannot poll it
+until control returns from this whole function and the store's own
+`std::sync::Mutex` has already been released. If the request that was holding
+the lock finishes — releasing it — in the interval between its release and this
+new caller's future being polled for the first time, the entry is, briefly,
+genuinely unlocked. If that finishing request failed during masking and never
+reached `absorb`, the entry is also empty. A concurrent `acquire_at` call's
+`reclaimable` check, running its own eviction scan in exactly that interval, sees
+a free, empty entry and reclaims it — so when the waiting caller's turn finally
+comes, its session is gone. A later request for the same id then finds nothing
+in the store and starts a second, unsynchronized session: finding 2's mechanism,
+reappearing here on the contended path rather than the fresh-claim path finding 2
+was written against. This window is real but narrow — it requires the previous
+holder to finish inside the gap between two specific instructions, not at some
+arbitrary later point — and it does not undermine the fresh-claim and
+idle-cache-hit cases, which this call closes outright. See "What makes this
+correct now" below for exactly which paths remain exposed and which do not.
 
 The victim-selection logic for a *different* key's insertion is otherwise
 unchanged from the first draft — prefer an entry whose lock can be claimed and
@@ -172,15 +216,35 @@ if map.len() >= self.limits.max_sessions {
 }
 ```
 
-What makes this correct now, where the first draft was not: every session this
-store ever hands out is locked continuously from the moment it is handed out
-(either because this call claimed it synchronously, or because someone else
-already held it and keeps holding it) until whoever holds it releases it. There
-is no longer a window in which a session is "handed out but not yet in use" and
-simultaneously "unlocked, therefore evictable." `reclaimable` can only ever see
-a session that finished its last use — either it never held a value, or its
+What makes this correct now, where the first draft was not — and only for the
+`reclaimable` path specifically, which is what this fix actually changes. A
+session claimed synchronously by this call, or found already idle and
+re-claimed by it, is locked continuously from the moment it is handed out until
+its holder releases it: there is no window in which such a session is "handed
+out but not yet in use" and simultaneously "unlocked, therefore evictable" to
+`reclaimable`'s `try_lock_owned` check. `reclaimable` can only ever see a
+session that finished its last use — either it never held a value, or its
 holder released it after `absorb` — which is exactly the population this fix
-means to reclaim from.
+means to reclaim from. The narrower exception is the contended path described
+above: a caller who was told `guard: None` and has not yet queued on
+`lock_owned()` is not yet protected by its own hold, only by the previous
+holder's, and that hold can end before the new caller queues.
+
+That guarantee does not extend to the rest of `acquire_at`. Two other paths
+remove an entry from the store's map without consulting lock state at all, and
+neither is what this slice changed:
+
+- The `.or_else` fallback a few lines below — reached whenever nothing is
+  currently reclaimable — evicts the globally-oldest entry regardless of
+  whether it is locked. `an_evicted_session_does_not_interrupt_a_request_holding_it`
+  in the test suite exercises exactly this: at `limits(1)`, the held session is
+  the only candidate, and the fallback evicts it while its guard is alive.
+- The `map.retain` TTL sweep at the top of `acquire_at` removes any entry whose
+  `last_seen` has exceeded `idle`, again without asking whether it is locked.
+
+Both are pre-existing behavior this slice did not touch and was not scoped to
+fix; see "Revision history" and "Out of scope" for what closing them fully
+would require.
 
 **3. `proxy.rs`'s `handle()` destructures the claim instead of locking directly:**
 
@@ -224,9 +288,10 @@ real concurrent requests through the HTTP stack.
 - A freshly claimed session — its `Claimed.guard` held, not dropped — is never
   selected as a victim by a concurrent `acquire_at` call for a different key,
   even though its `Mapping` is empty and it is the older of the candidates by
-  `last_seen`. This is the direct proof finding 2 is closed: the first draft had
-  no such guard to hold, and this is exactly the scenario it would have gotten
-  wrong.
+  `last_seen`. This is the direct proof finding 2's own scenario is closed: the
+  first draft had no such guard to hold, and this is exactly the scenario it
+  would have gotten wrong. It does not cover the contended path's narrower
+  residual window — see "The fix" above.
 - A session whose lock is held by a genuine second request to the *same* key
   (contended, not merely unclaimed) is likewise never selected — the existing
   serialize-on-same-key behavior stays intact and is not confused with a
@@ -252,11 +317,16 @@ adjustment.
 
 ## Out of scope
 
-Fully closing finding 1 (a store genuinely saturated with live sessions can still
-lose one to a doomed request) would need per-credential quotas — structurally
+Fully closing finding 1 (a store genuinely saturated with live sessions can
+still lose a held one to a doomed request — reliably under concurrency, and
+serially whenever masking-succeeds-then-upstream-fails leaves non-empty residue;
+see "Revision history" above) would need per-credential quotas — structurally
 excluding cross-tenant eviction rather than just reducing its likelihood, a
-stronger and broader property than this fix provides. A candidate for its own
-future slice, not folded in here, and unaffected by the fix in this document.
+stronger and broader property than this fix provides. This closes a
+confidentiality-class hazard (the double-session state finding 2 identified),
+not an availability nicety, and the next slice that touches this store should
+rank it accordingly. A candidate for its own future slice, not folded in here,
+and unaffected by the fix in this document.
 Bounding a single value's byte size within a session (a different, already-
 tracked follow-up). Anthropic session-path test coverage (already tracked
 separately). Any change to `last_seen` refresh-on-failure, addressed above as a
