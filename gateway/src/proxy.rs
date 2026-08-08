@@ -138,8 +138,11 @@ async fn handle(
     // the conversation's table so it keeps that name across turns too.
     let (masked, mapping) = match key {
         Some(key) => {
-            let session = state.sessions.acquire(&key);
-            let mut guard = session.mapping.lock().await;
+            let claimed = state.sessions.acquire(&key);
+            let mut guard = match claimed.guard {
+                Some(guard) => guard,
+                None => Arc::clone(&claimed.session.mapping).lock_owned().await,
+            };
             let mut work = guard.clone();
             let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
             // After the last `?`, and on a copy until here: a refused request
@@ -857,9 +860,14 @@ mod tests {
         // The stream has not been read yet. If the masking guard were still
         // held, this would fail — and a stream that hung would block its
         // conversation for as long as it hung.
-        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        // `acquire` itself claims the mapping's lock synchronously whenever it
+        // is free, so a successful claim here — without a second, separate
+        // `try_lock` that would deadlock against `claimed`'s own guard — is
+        // exactly the proof that nothing else (in particular, no still-live
+        // stream) is holding it.
+        let claimed = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
         assert!(
-            session.mapping.try_lock().is_ok(),
+            claimed.guard.is_some(),
             "the stream is holding its session lock"
         );
 
@@ -1311,7 +1319,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
 
-        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        let session = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .session;
         assert!(
             session.mapping.lock().await.is_empty(),
             "a refused request left values in the session"
@@ -1361,7 +1372,10 @@ mod tests {
         );
         assert!(body.contains(SECRET) && body.contains("Meier"));
 
-        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        let session = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .session;
         assert_eq!(session.mapping.lock().await.len(), 1);
     }
 

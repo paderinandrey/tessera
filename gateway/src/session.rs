@@ -146,16 +146,41 @@ pub struct Limits {
 
 /// One conversation's table.
 pub struct Session {
-    /// A tokio mutex because it is held across the detector calls that mask a
-    /// request. It is released before the upstream call: a stream may run for
-    /// minutes, and a lock that outlived one would block its session for as
-    /// long as the stream did — forever, if the stream hung.
-    pub mapping: tokio::sync::Mutex<Mapping>,
+    /// Wrapped in its own `Arc` so the store can claim it synchronously via
+    /// `try_lock_owned` inside the same critical section that decides
+    /// whether to hand it back or evict it — closing the window between
+    /// handing a session out and its caller actually locking it, which an
+    /// unrelated eviction could otherwise exploit. Every existing
+    /// `.lock().await` call site keeps working unchanged: `Arc<Mutex<T>>`
+    /// still derefs to `Mutex<T>`.
+    pub mapping: Arc<tokio::sync::Mutex<Mapping>>,
+}
+
+/// What `acquire` hands back: the session, and — when the store could claim
+/// it synchronously, in the same critical section that decided this session
+/// was safe to return — the lock already held. `None` means someone else
+/// currently holds it; the caller waits its turn with `lock_owned().await`,
+/// which is already-proven-safe serialization for two requests to one key.
+pub struct Claimed {
+    pub session: Arc<Session>,
+    pub guard: Option<tokio::sync::OwnedMutexGuard<Mapping>>,
 }
 
 struct Entry {
     session: Arc<Session>,
     last_seen: Instant,
+}
+
+/// Whether `entry`'s session is safe for an unrelated eviction to reclaim:
+/// its lock is free right now, and it holds no committed values. Claiming
+/// the lock here and immediately dropping it only ever succeeds when
+/// nobody else currently needs it — the same guarantee that makes the
+/// return-time claim in `acquire_at` safe.
+fn reclaimable(entry: &Entry) -> bool {
+    match Arc::clone(&entry.session.mapping).try_lock_owned() {
+        Ok(guard) => guard.is_empty(),
+        Err(_) => false,
+    }
 }
 
 pub struct SessionStore {
@@ -180,12 +205,12 @@ impl SessionStore {
         self.limits.max_values
     }
 
-    pub fn acquire(&self, key: &SessionKey) -> Arc<Session> {
+    pub fn acquire(&self, key: &SessionKey) -> Claimed {
         self.acquire_at(key, Instant::now())
     }
 
     /// Time is a parameter so eviction is tested without sleeping.
-    fn acquire_at(&self, key: &SessionKey, now: Instant) -> Arc<Session> {
+    fn acquire_at(&self, key: &SessionKey, now: Instant) -> Claimed {
         // Poisoning is recovered rather than propagated. Nothing in this
         // critical section can panic today, but if something ever does, one
         // failure must not turn every later request into a 500.
@@ -196,36 +221,51 @@ impl SessionStore {
         // task whose health is a new thing to reason about.
         map.retain(|_, entry| now.duration_since(entry.last_seen) < self.limits.idle);
 
-        if let Some(entry) = map.get_mut(key) {
+        let session = if let Some(entry) = map.get_mut(key) {
             entry.last_seen = now;
-            return Arc::clone(&entry.session);
-        }
-
-        if map.len() >= self.limits.max_sessions {
-            let oldest = map
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                map.remove(&oldest);
+            Arc::clone(&entry.session)
+        } else {
+            if map.len() >= self.limits.max_sessions {
+                // Prefer a victim that is already reclaimable — nobody
+                // loses a live conversation to make room for a request
+                // that turns out not to need the space. Fall back to the
+                // globally-oldest entry only when every entry currently
+                // holds something.
+                let victim = map
+                    .iter()
+                    .filter(|(_, entry)| reclaimable(entry))
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .or_else(|| map.iter().min_by_key(|(_, entry)| entry.last_seen))
+                    .map(|(key, _)| key.clone());
+                if let Some(victim) = victim {
+                    map.remove(&victim);
+                }
             }
-        }
 
-        // A whole session is evicted; values within one never are. A value
-        // dropped from a live session can come back from the model on the next
-        // turn, and that is not a lost coreference but a request that dies with
-        // nothing to restore to.
-        let session = Arc::new(Session {
-            mapping: tokio::sync::Mutex::new(Mapping::new()),
-        });
-        map.insert(
-            key.clone(),
-            Entry {
-                session: Arc::clone(&session),
-                last_seen: now,
-            },
-        );
-        session
+            // A whole session is evicted; values within one never are. A
+            // value dropped from a live session can come back from the
+            // model on the next turn, and that is not a lost coreference
+            // but a request that dies with nothing to restore to.
+            let session = Arc::new(Session {
+                mapping: Arc::new(tokio::sync::Mutex::new(Mapping::new())),
+            });
+            map.insert(
+                key.clone(),
+                Entry {
+                    session: Arc::clone(&session),
+                    last_seen: now,
+                },
+            );
+            session
+        };
+
+        // Claimed synchronously, still holding the store's own lock: this
+        // is what closes the window between handing a session back and its
+        // caller actually locking it. A fresh session's mutex is always
+        // claimable here — nothing else could hold a reference to it yet.
+        // An existing one is claimable exactly when it is currently idle.
+        let guard = Arc::clone(&session.mapping).try_lock_owned().ok();
+        Claimed { session, guard }
     }
 
     #[cfg(test)]
@@ -417,13 +457,21 @@ mod tests {
         .unwrap()
     }
 
+    fn span(entity_type: &str, start: usize, end: usize) -> crate::mapping::Span {
+        crate::mapping::Span {
+            entity_type: entity_type.to_owned(),
+            start,
+            end,
+        }
+    }
+
     #[test]
     fn the_same_key_returns_the_same_session() {
         let store = SessionStore::new(limits(4));
         let now = Instant::now();
         let one = store.acquire_at(&key("conv1", "Bearer k"), now);
         let two = store.acquire_at(&key("conv1", "Bearer k"), now);
-        assert!(Arc::ptr_eq(&one, &two));
+        assert!(Arc::ptr_eq(&one.session, &two.session));
     }
 
     #[test]
@@ -432,7 +480,7 @@ mod tests {
         let now = Instant::now();
         let one = store.acquire_at(&key("shared", "Bearer k1"), now);
         let two = store.acquire_at(&key("shared", "Bearer k2"), now);
-        assert!(!Arc::ptr_eq(&one, &two));
+        assert!(!Arc::ptr_eq(&one.session, &two.session));
         assert_eq!(store.live(), 2);
     }
 
@@ -442,35 +490,60 @@ mod tests {
         let start = Instant::now();
         let one = store.acquire_at(&key("conv1", "Bearer k"), start);
         let two = store.acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61));
-        assert!(!Arc::ptr_eq(&one, &two), "a stale table was handed back");
+        assert!(
+            !Arc::ptr_eq(&one.session, &two.session),
+            "a stale table was handed back"
+        );
         assert_eq!(store.live(), 1, "the swept entry was left behind");
     }
 
-    #[test]
-    fn a_full_store_evicts_the_least_recently_used() {
+    #[tokio::test]
+    async fn a_full_store_evicts_the_least_recently_used() {
+        // Both "a" and "b" get real committed values, through their own
+        // claimed guards, so neither is reclaimable regardless of whether
+        // its claim happens to still be held. This isolates the plain
+        // oldest-by-last_seen fallback from the "prefer reclaimable"
+        // behavior, which `a_reclaimable_entry_is_evicted_before_a_live_one`
+        // below covers on its own.
         let store = SessionStore::new(limits(2));
         let start = Instant::now();
-        let a = store.acquire_at(&key("a", "Bearer k"), start);
-        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
+        a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        drop(a_guard);
+
+        let mut b = store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        let mut b_guard = b.guard.take().expect("a fresh session is always claimable");
+        b_guard.mask("Meier", &[span("PERSON", 0, 5)]).unwrap();
+        drop(b_guard);
+
         // Touching "a" makes "b" the oldest.
         store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(2));
         store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(3));
 
         assert_eq!(store.live(), 2);
         let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(4));
-        assert!(Arc::ptr_eq(&a, &a_again), "the touched session was evicted");
+        assert!(
+            Arc::ptr_eq(&a.session, &a_again.session),
+            "the touched session was evicted"
+        );
     }
 
     #[tokio::test]
     async fn an_evicted_session_does_not_interrupt_a_request_holding_it() {
         let store = SessionStore::new(limits(1));
         let start = Instant::now();
-        let held = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut held = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut guard = held
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
         // Another conversation pushes "a" out of a store that holds one.
         store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
-        // The request already holding the Arc finishes normally; its commit is
-        // simply lost to a table nobody will look up again.
-        held.mapping.lock().await.absorb(&Mapping::new(), 10);
+        // The request already holding the guard finishes normally; its
+        // commit is simply lost to a table nobody will look up again.
+        guard.absorb(&Mapping::new(), 10);
     }
 
     #[test]
@@ -481,5 +554,85 @@ mod tests {
             max_values: 0,
         });
         assert!(!store.enabled());
+    }
+
+    #[tokio::test]
+    async fn a_reclaimable_entry_is_evicted_before_a_live_one() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        // "a" becomes a live session: a real value, committed through its
+        // own claimed guard, then released — exactly what a real request
+        // does once masking finishes.
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
+        a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        drop(a_guard);
+
+        // "b" is created but never used, and its own claim is dropped
+        // immediately below by never binding it — it stays reclaimable. It
+        // is also newer than "a" by last_seen, so plain oldest-first would
+        // pick "a" here, not "b".
+        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+
+        // A third, new key needs a slot in a store already at its cap of 2.
+        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2));
+
+        assert_eq!(store.live(), 2);
+        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3));
+        assert!(
+            Arc::ptr_eq(&a.session, &a_again.session),
+            "the live session was evicted ahead of the reclaimable one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_freshly_claimed_session_is_never_treated_as_the_reclaimable_candidate() {
+        // The direct proof the TOCTOU race is closed: hold onto a fresh
+        // claim exactly as `handle()` does while masking, rather than
+        // dropping it, and confirm a concurrent eviction elsewhere cannot
+        // select it — even though its `Mapping` is empty and it is the
+        // older of the two candidates by `last_seen`.
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        let mut claimed_a = store.acquire_at(&key("a", "Bearer k"), start);
+        let guard = claimed_a
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+
+        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2));
+
+        assert_eq!(store.live(), 2);
+        drop(guard);
+        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3));
+        assert!(
+            Arc::ptr_eq(&a_again.session, &claimed_a.session),
+            "a's session was evicted while its claim was still held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_held_by_another_request_is_never_treated_as_the_reclaimable_candidate() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        let mut first = store.acquire_at(&key("a", "Bearer k"), start);
+        let _guard = first
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+        // A second, concurrent request for the SAME key finds it contended
+        // and gets no pre-claimed guard — it would wait with
+        // `lock_owned().await` in real code. Here it is enough to confirm
+        // the claim was not handed out twice.
+        let second = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(1));
+        assert!(
+            second.guard.is_none(),
+            "a contended session was claimed twice"
+        );
+        assert!(Arc::ptr_eq(&first.session, &second.session));
     }
 }
