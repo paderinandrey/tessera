@@ -1330,6 +1330,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_request_does_not_evict_a_live_third_party_session() {
+        // Session "a" commits a real value through an ordinary successful
+        // request. Session "b" then takes the store's second slot with a
+        // request that fails during masking, leaving its entry created but
+        // empty — `acquire` runs, and creates the entry, before `mask_all`
+        // can fail. A third session's request also fails during masking,
+        // and needs a slot in a now-full store: it must evict "b"
+        // (reclaimable), never "a" (live) — even though "a" is the older
+        // of the two by last_seen.
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains(SECRET))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"spans": person_span(), "layers_run": ["deterministic"]}),
+                ),
+            )
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state_with(
+            &detector,
+            &upstream,
+            Limits {
+                idle: Duration::from_secs(1800),
+                max_sessions: 2,
+                max_values: 8,
+            },
+        );
+
+        // "a" gets a real, committed value.
+        call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "a"),
+        )
+        .await;
+
+        // "b" has no "Weber" in it, so the detector 503s and the request
+        // fails — but its session entry was already created, and stays
+        // empty and reclaimable.
+        let (status_b, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "und dann?"}]}),
+            &session_headers("Bearer k1", "b"),
+        )
+        .await;
+        assert_eq!(status_b, StatusCode::BAD_GATEWAY);
+
+        // "c" also fails during masking, and needs a slot in a store
+        // already holding {a, b} at its cap of 2.
+        let (status_c, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "und dann?"}]}),
+            &session_headers("Bearer k1", "c"),
+        )
+        .await;
+        assert_eq!(status_c, StatusCode::BAD_GATEWAY);
+
+        // Session "a" must still hold Weber's placeholder.
+        let session_a = state.sessions.acquire(&test_key("a", "Bearer k1")).session;
+        assert_eq!(
+            session_a
+                .mapping
+                .lock()
+                .await
+                .restore("[PERSON_1]")
+                .unwrap(),
+            "Weber",
+            "a failing request for a different session evicted a's live value"
+        );
+    }
+
+    #[tokio::test]
     async fn a_value_past_the_cap_is_still_masked_and_still_restored() {
         let two_spans = json!([
             {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
