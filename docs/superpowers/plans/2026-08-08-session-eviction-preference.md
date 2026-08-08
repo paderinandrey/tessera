@@ -2,88 +2,190 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When `SessionStore` must evict to make room for a new session, prefer an already-empty entry over the globally-oldest one, so a request that fails during masking can no longer destroy another conversation's live session.
+**Goal:** When `SessionStore` must evict to make room for a new session, prefer an already-reclaimable entry over the globally-oldest one, and close a race in which an unrelated eviction can steal a session out from under the request it was just handed to.
 
-**Architecture:** One function changes: `SessionStore::acquire_at` in `gateway/src/session.rs`. The atomic check-or-insert under the store's `std::sync::Mutex` is untouched — only the victim-selection step inside the existing capacity check changes, using a new non-blocking `probably_empty` helper. No new files, no new config, no change to `proxy.rs`'s request-handling logic — only a new test proving the fix closes the actual finding.
+**Architecture:** `Session.mapping` becomes `Arc<tokio::sync::Mutex<Mapping>>` so a session's lock can be claimed with an owned, non-blocking `try_lock_owned()`. `SessionStore::acquire`/`acquire_at` claim that lock synchronously, inside the same critical section that decides whether to hand a session back or evict to make room, and return a `Claimed { session, guard }` instead of a bare `Arc<Session>`. `proxy.rs`'s `handle()` uses the pre-claimed guard when it has one, waiting normally only when another request already holds it.
 
 **Tech Stack:** Rust 2021, existing `gateway` crate. Tests are `cargo test`, no new dependencies.
 
 ## Global Constraints
 
 - The spec is `docs/superpowers/specs/2026-08-08-session-eviction-preference-design.md`. Where this plan and the spec disagree, the spec wins — stop and ask.
-- Work on branch `fix/session-eviction-preference`, which already exists and already carries the spec commit (PR #15, draft).
-- The store's `std::sync::Mutex` critical section in `acquire_at` must still never contain an `.await`. `try_lock()` on the session's `tokio::sync::Mutex` is non-blocking and does not violate this.
-- A session's `tokio::sync::Mutex` is held by `handle()` continuously from before masking starts through `absorb()`, so a concurrent `try_lock()` on it fails for that entire window — this is the property the fix's correctness rests on, not new machinery to build.
+- Work on branch `fix/session-eviction-preference`, which already exists (PR #15, draft) and already carries two spec commits: the original design, and a revision that closed a TOCTOU race Codex found in the first draft during review. Read the spec's "Revision history" section before starting — it explains why the mechanism below looks different from what a first read of "prefer an empty session" might suggest.
+- **Never call `.lock()` or `.lock_owned()` on a session's mapping while a `Claimed.guard` for that same session is still alive.** `tokio::sync::Mutex` is not reentrant; doing so deadlocks the test (or the request) rather than erroring. Every step below that needs to both hold a claimed guard and read/write the mapping does so through the guard directly (`guard.mask(...)`, `guard.absorb(...)`, `guard.is_empty()`), never by calling `.lock()` again on the side.
+- The store's `std::sync::Mutex` critical section in `acquire_at` must still never contain an `.await`. `try_lock_owned()` is non-blocking and does not violate this.
 - `last_seen` refresh on an existing key stays unconditional, win or lose — not touched by this fix.
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` must all pass before each commit. Run them from `gateway/`.
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` must all pass before each commit. Run them from `gateway/`. Because `SessionStore::acquire`'s return type changes, `session.rs` and `proxy.rs` must be updated together — the crate does not compile with only one of them changed, so there is no way to split this into separately-committable pieces smaller than Task 1 below.
 
 ## File Structure
 
 | File | Responsibility |
 |---|---|
-| `gateway/src/session.rs` | **Modify.** `probably_empty` helper; victim selection inside `acquire_at`'s capacity check; three tests. |
+| `gateway/src/session.rs` | **Modify.** `Session.mapping` becomes `Arc<Mutex<Mapping>>`; new `Claimed` struct; `reclaimable` helper; `acquire`/`acquire_at` claim synchronously and return `Claimed`; existing tests adjusted for the new return type; new tests proving the race is closed and the eviction preference works. |
 | `gateway/src/mapping.rs` | **Modify.** Remove `#[allow(dead_code)]` from `Mapping::is_empty()` — this fix gives it its first live caller. |
-| `gateway/src/proxy.rs` | **Modify.** One integration test proving the finding is closed end to end. |
+| `gateway/src/proxy.rs` | **Modify.** `handle()`'s masking phase destructures `Claimed` instead of calling `.mapping.lock().await` directly; two existing tests' session-inspection lines adjusted for the new return type; one new integration test. |
 
-Two tasks. Task 1 is the fix and its unit-level proof; Task 2 is the integration-level proof that the actual bug — not just its unit abstraction — is closed.
+Two tasks. Task 1 is the mechanism itself — it must include every change needed for the crate to compile and its existing tests to keep passing, because `acquire`'s return type is a breaking change to both files at once. Task 2 adds the integration-level proof that a real failing request, through the full `handle()` path, cannot destroy a different conversation's committed value.
 
 ---
 
-### Task 1: Prefer an empty victim over the globally-oldest one
+### Task 1: Claim a session's lock synchronously; prefer a reclaimable victim
 
 **Files:**
-- Modify: `gateway/src/session.rs:187-229` (`acquire_at`, and the new helper above it)
+- Modify: `gateway/src/session.rs` (throughout — the struct, the store, and its `mod tests`)
 - Modify: `gateway/src/mapping.rs:56-58` (drop `#[allow(dead_code)]` from `is_empty`)
-- Test: `gateway/src/session.rs`, the existing `mod tests`
+- Modify: `gateway/src/proxy.rs:139-153` (the masking phase's `Some(key)` arm), and two existing tests at `gateway/src/proxy.rs:1314` and `:1365` (adjusted only enough to keep compiling and passing — Task 2 adds the new integration test)
 
 **Interfaces:**
-- Consumes: `Mapping::is_empty(&self) -> bool` (already exists, `mapping.rs:62`); `Session { pub mapping: tokio::sync::Mutex<Mapping> }` (already exists, `session.rs:148`).
-- Produces: no new public interface — `probably_empty` is a private free function in `session.rs`. Task 2 does not call anything new; it only observes the changed behavior through `SessionStore::acquire`.
+- Consumes: `Mapping::is_empty(&self) -> bool`, `Mapping::mask`, `Mapping::absorb` (all already exist, unchanged).
+- Produces:
+  - `pub struct Claimed { pub session: Arc<Session>, pub guard: Option<tokio::sync::OwnedMutexGuard<Mapping>> }`
+  - `SessionStore::acquire(&self, &SessionKey) -> Claimed` (was `-> Arc<Session>`)
+  - `Session { pub mapping: Arc<tokio::sync::Mutex<Mapping>> }` (was `pub mapping: tokio::sync::Mutex<Mapping>`)
 
-Background the implementer needs: `acquire_at` (`session.rs:188-229`) already sweeps stale entries, returns early on a cache hit, and otherwise evicts-if-full then inserts. The eviction block, today, is:
-
-```rust
-if map.len() >= self.limits.max_sessions {
-    let oldest = map
-        .iter()
-        .min_by_key(|(_, entry)| entry.last_seen)
-        .map(|(key, _)| key.clone());
-    if let Some(oldest) = oldest {
-        map.remove(&oldest);
-    }
-}
-```
-
-This picks the globally-oldest entry regardless of whether it holds real values. The fix changes only which entry `min_by_key` runs over: entries whose `Mapping` is currently empty, falling back to all entries only if none is empty.
+Task 2 consumes `Claimed`'s `.session` field, exactly as this task leaves it.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `mod tests` in `gateway/src/session.rs`, after `a_full_store_evicts_the_least_recently_used` (which stays exactly as it is — it is an implicit regression guard for this change, since its entries are never written to and it must keep passing unmodified):
+These are written against the target API and will not compile until Step 2 lands — that is the "RED" for this task; there is no meaningful intermediate compiling-but-failing state, because the API itself is changing.
+
+Replace the whole `mod tests` block in `gateway/src/session.rs` from `fn limits(...)` (currently around line 402) through the end of the file with the following — every existing test below is adjusted for `Claimed`, and five new tests are added. Nothing before `fn limits` in the test module changes (the `headers`, `key_from`-focused tests above it are untouched).
 
 ```rust
+    fn limits(max_sessions: usize) -> Limits {
+        Limits {
+            idle: Duration::from_secs(60),
+            max_sessions,
+            max_values: 100,
+        }
+    }
+
+    fn key(id: &str, credential: &str) -> SessionKey {
+        key_from(
+            &headers(&[("authorization", credential), (SESSION_HEADER, id)]),
+            &OpenAi,
+            true,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn span(entity_type: &str, start: usize, end: usize) -> crate::mapping::Span {
+        crate::mapping::Span {
+            entity_type: entity_type.to_owned(),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn the_same_key_returns_the_same_session() {
+        let store = SessionStore::new(limits(4));
+        let now = Instant::now();
+        let one = store.acquire_at(&key("conv1", "Bearer k"), now);
+        let two = store.acquire_at(&key("conv1", "Bearer k"), now);
+        assert!(Arc::ptr_eq(&one.session, &two.session));
+    }
+
+    #[test]
+    fn a_different_credential_is_a_different_session() {
+        let store = SessionStore::new(limits(4));
+        let now = Instant::now();
+        let one = store.acquire_at(&key("shared", "Bearer k1"), now);
+        let two = store.acquire_at(&key("shared", "Bearer k2"), now);
+        assert!(!Arc::ptr_eq(&one.session, &two.session));
+        assert_eq!(store.live(), 2);
+    }
+
+    #[test]
+    fn a_session_idle_past_the_ttl_is_swept() {
+        let store = SessionStore::new(limits(4));
+        let start = Instant::now();
+        let one = store.acquire_at(&key("conv1", "Bearer k"), start);
+        let two = store.acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61));
+        assert!(
+            !Arc::ptr_eq(&one.session, &two.session),
+            "a stale table was handed back"
+        );
+        assert_eq!(store.live(), 1, "the swept entry was left behind");
+    }
+
     #[tokio::test]
-    async fn an_empty_entry_is_evicted_before_a_live_one() {
+    async fn a_full_store_evicts_the_least_recently_used() {
+        // Both "a" and "b" get real committed values, through their own
+        // claimed guards, so neither is reclaimable regardless of whether
+        // its claim happens to still be held. This isolates the plain
+        // oldest-by-last_seen fallback from the "prefer reclaimable"
+        // behavior, which `a_reclaimable_entry_is_evicted_before_a_live_one`
+        // below covers on its own.
         let store = SessionStore::new(limits(2));
         let start = Instant::now();
 
-        // "a" becomes a live session: give it a real value.
-        let a = store.acquire_at(&key("a", "Bearer k"), start);
-        a.mapping
-            .lock()
-            .await
-            .mask(
-                "Weber",
-                &[crate::mapping::Span {
-                    entity_type: "PERSON".into(),
-                    start: 0,
-                    end: 5,
-                }],
-            )
-            .unwrap();
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
+        a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        drop(a_guard);
 
-        // "b" is created but never used — it stays empty. It is also newer
-        // than "a" by last_seen, so plain oldest-first would pick "a" here,
-        // not "b".
+        let mut b = store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        let mut b_guard = b.guard.take().expect("a fresh session is always claimable");
+        b_guard.mask("Meier", &[span("PERSON", 0, 5)]).unwrap();
+        drop(b_guard);
+
+        // Touching "a" makes "b" the oldest.
+        store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(2));
+        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(3));
+
+        assert_eq!(store.live(), 2);
+        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(4));
+        assert!(
+            Arc::ptr_eq(&a.session, &a_again.session),
+            "the touched session was evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evicted_session_does_not_interrupt_a_request_holding_it() {
+        let store = SessionStore::new(limits(1));
+        let start = Instant::now();
+        let mut held = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut guard = held
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+        // Another conversation pushes "a" out of a store that holds one.
+        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        // The request already holding the guard finishes normally; its
+        // commit is simply lost to a table nobody will look up again.
+        guard.absorb(&Mapping::new(), 10);
+    }
+
+    #[test]
+    fn a_zero_idle_reports_sessions_disabled() {
+        let store = SessionStore::new(Limits {
+            idle: Duration::ZERO,
+            max_sessions: 0,
+            max_values: 0,
+        });
+        assert!(!store.enabled());
+    }
+
+    #[tokio::test]
+    async fn a_reclaimable_entry_is_evicted_before_a_live_one() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        // "a" becomes a live session: a real value, committed through its
+        // own claimed guard, then released — exactly what a real request
+        // does once masking finishes.
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
+        a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        drop(a_guard);
+
+        // "b" is created but never used, and its own claim is dropped
+        // immediately below by never binding it — it stays reclaimable. It
+        // is also newer than "a" by last_seen, so plain oldest-first would
+        // pick "a" here, not "b".
         store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
 
         // A third, new key needs a slot in a store already at its cap of 2.
@@ -92,139 +194,292 @@ Add to `mod tests` in `gateway/src/session.rs`, after `a_full_store_evicts_the_l
         assert_eq!(store.live(), 2);
         let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3));
         assert!(
-            Arc::ptr_eq(&a, &a_again),
-            "the live session was evicted ahead of the empty one"
+            Arc::ptr_eq(&a.session, &a_again.session),
+            "the live session was evicted ahead of the reclaimable one"
         );
     }
 
     #[tokio::test]
-    async fn a_locked_session_is_never_treated_as_the_empty_candidate() {
+    async fn a_freshly_claimed_session_is_never_treated_as_the_reclaimable_candidate() {
+        // The direct proof the TOCTOU race is closed: hold onto a fresh
+        // claim exactly as `handle()` does while masking, rather than
+        // dropping it, and confirm a concurrent eviction elsewhere cannot
+        // select it — even though its `Mapping` is empty and it is the
+        // older of the two candidates by `last_seen`.
         let store = SessionStore::new(limits(2));
         let start = Instant::now();
 
-        let a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut claimed_a = store.acquire_at(&key("a", "Bearer k"), start);
+        let guard = claimed_a
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+
         store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
-        // Both "a" and "b" are empty. Hold "a"'s lock, simulating a request
-        // mid-masking — its own emptiness must not make it a preferred
-        // victim while a concurrent caller is using it, even though it is
-        // also the older of the two by last_seen.
-        let guard = a.mapping.lock().await;
-
         store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2));
-        assert_eq!(store.live(), 2);
 
+        assert_eq!(store.live(), 2);
         drop(guard);
         let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3));
         assert!(
-            Arc::ptr_eq(&a, &a_again),
-            "a locked-but-empty session was evicted while in use"
+            Arc::ptr_eq(&a_again.session, &claimed_a.session),
+            "a's session was evicted while its claim was still held"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_held_by_another_request_is_never_treated_as_the_reclaimable_candidate() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        let mut first = store.acquire_at(&key("a", "Bearer k"), start);
+        let _guard = first
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+        // A second, concurrent request for the SAME key finds it contended
+        // and gets no pre-claimed guard — it would wait with
+        // `lock_owned().await` in real code. Here it is enough to confirm
+        // the claim was not handed out twice.
+        let second = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(1));
+        assert!(
+            second.guard.is_none(),
+            "a contended session was claimed twice"
+        );
+        assert!(Arc::ptr_eq(&first.session, &second.session));
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the tests to verify they fail to compile**
 
-Run: `cd gateway && cargo test session:: 2>&1 | tail -30`
-Expected: `an_empty_entry_is_evicted_before_a_live_one` FAILs its `Arc::ptr_eq` assertion — today's code evicts "a" (the oldest) to make room for "c", so `a_again` is a freshly created session, not the original. `a_locked_session_is_never_treated_as_the_empty_candidate` FAILs the same way, for the same underlying reason (today's code has no concept of "locked" or "empty" at all, it only looks at age).
+Run: `cd gateway && cargo test session:: 2>&1 | tail -40`
+Expected: compilation fails — `SessionStore::acquire_at` returns `Arc<Session>`, not something with `.session`/`.guard` fields; `Claimed` does not exist yet.
 
-- [ ] **Step 3: Add the helper and change the eviction selection**
+- [ ] **Step 3: Change `Session` and add `Claimed`**
 
-In `gateway/src/session.rs`, add above `impl SessionStore`:
+In `gateway/src/session.rs`, replace the `Session` struct:
 
 ```rust
-/// Non-blocking: a session whose lock is currently held (mid-masking, by
-/// definition not a candidate here) is conservatively treated as not empty,
-/// never as a false "empty."
-fn probably_empty(entry: &Entry) -> bool {
-    entry
-        .session
-        .mapping
-        .try_lock()
-        .map(|guard| guard.is_empty())
-        .unwrap_or(false)
+/// One conversation's table.
+pub struct Session {
+    /// Wrapped in its own `Arc` so the store can claim it synchronously via
+    /// `try_lock_owned` inside the same critical section that decides
+    /// whether to hand it back or evict it — closing the window between
+    /// handing a session out and its caller actually locking it, which an
+    /// unrelated eviction could otherwise exploit. Every existing
+    /// `.lock().await` call site keeps working unchanged: `Arc<Mutex<T>>`
+    /// still derefs to `Mutex<T>`.
+    pub mapping: Arc<tokio::sync::Mutex<Mapping>>,
 }
 ```
 
-Replace the eviction block inside `acquire_at` (`session.rs:204-212`):
+Add, near it:
 
 ```rust
-        if map.len() >= self.limits.max_sessions {
-            // Prefer a victim that is already empty — nobody loses a live
-            // conversation to make room for a request that turns out not to
-            // need the space. Fall back to the globally-oldest entry only
-            // when every entry currently holds something.
-            let victim = map
-                .iter()
-                .filter(|(_, entry)| probably_empty(entry))
-                .min_by_key(|(_, entry)| entry.last_seen)
-                .or_else(|| map.iter().min_by_key(|(_, entry)| entry.last_seen))
-                .map(|(key, _)| key.clone());
-            if let Some(victim) = victim {
-                map.remove(&victim);
+/// What `acquire` hands back: the session, and — when the store could claim
+/// it synchronously, in the same critical section that decided this session
+/// was safe to return — the lock already held. `None` means someone else
+/// currently holds it; the caller waits its turn with `lock_owned().await`,
+/// which is already-proven-safe serialization for two requests to one key.
+pub struct Claimed {
+    pub session: Arc<Session>,
+    pub guard: Option<tokio::sync::OwnedMutexGuard<Mapping>>,
+}
+```
+
+- [ ] **Step 4: Add the `reclaimable` helper and rewrite `acquire_at`**
+
+Add above `impl SessionStore`:
+
+```rust
+/// Whether `entry`'s session is safe for an unrelated eviction to reclaim:
+/// its lock is free right now, and it holds no committed values. Claiming
+/// the lock here and immediately dropping it only ever succeeds when
+/// nobody else currently needs it — the same guarantee that makes the
+/// return-time claim in `acquire_at` safe.
+fn reclaimable(entry: &Entry) -> bool {
+    match Arc::clone(&entry.session.mapping).try_lock_owned() {
+        Ok(guard) => guard.is_empty(),
+        Err(_) => false,
+    }
+}
+```
+
+Replace `acquire` and `acquire_at`:
+
+```rust
+    pub fn acquire(&self, key: &SessionKey) -> Claimed {
+        self.acquire_at(key, Instant::now())
+    }
+
+    /// Time is a parameter so eviction is tested without sleeping.
+    fn acquire_at(&self, key: &SessionKey, now: Instant) -> Claimed {
+        // Poisoning is recovered rather than propagated. Nothing in this
+        // critical section can panic today, but if something ever does, one
+        // failure must not turn every later request into a 500.
+        let mut map = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+
+        // Sweeping here rather than in a background task: at a thousand
+        // sessions this costs less than a syscall, and there is no separate
+        // task whose health is a new thing to reason about.
+        map.retain(|_, entry| now.duration_since(entry.last_seen) < self.limits.idle);
+
+        let session = if let Some(entry) = map.get_mut(key) {
+            entry.last_seen = now;
+            Arc::clone(&entry.session)
+        } else {
+            if map.len() >= self.limits.max_sessions {
+                // Prefer a victim that is already reclaimable — nobody
+                // loses a live conversation to make room for a request
+                // that turns out not to need the space. Fall back to the
+                // globally-oldest entry only when every entry currently
+                // holds something.
+                let victim = map
+                    .iter()
+                    .filter(|(_, entry)| reclaimable(entry))
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .or_else(|| map.iter().min_by_key(|(_, entry)| entry.last_seen))
+                    .map(|(key, _)| key.clone());
+                if let Some(victim) = victim {
+                    map.remove(&victim);
+                }
             }
+
+            // A whole session is evicted; values within one never are. A
+            // value dropped from a live session can come back from the
+            // model on the next turn, and that is not a lost coreference
+            // but a request that dies with nothing to restore to.
+            let session = Arc::new(Session {
+                mapping: Arc::new(tokio::sync::Mutex::new(Mapping::new())),
+            });
+            map.insert(
+                key.clone(),
+                Entry {
+                    session: Arc::clone(&session),
+                    last_seen: now,
+                },
+            );
+            session
+        };
+
+        // Claimed synchronously, still holding the store's own lock: this
+        // is what closes the window between handing a session back and its
+        // caller actually locking it. A fresh session's mutex is always
+        // claimable here — nothing else could hold a reference to it yet.
+        // An existing one is claimable exactly when it is currently idle.
+        let guard = Arc::clone(&session.mapping).try_lock_owned().ok();
+        Claimed { session, guard }
+    }
+```
+
+The `live()` test helper below `acquire_at` is unchanged — it only counts map entries, unaffected by the return type of `acquire`.
+
+- [ ] **Step 5: Update `proxy.rs`'s masking phase**
+
+In `gateway/src/proxy.rs`, replace the `Some(key)` arm of the masking-phase `match` (currently lines 140-153):
+
+```rust
+        Some(key) => {
+            let claimed = state.sessions.acquire(&key);
+            let mut guard = match claimed.guard {
+                Some(guard) => guard,
+                None => Arc::clone(&claimed.session.mapping).lock_owned().await,
+            };
+            let mut work = guard.clone();
+            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            // After the last `?`, and on a copy until here: a refused request
+            // leaves the session exactly as it was, so a client whose detector
+            // blinked does not carry a hole in its numbering for the rest of
+            // the conversation.
+            guard.absorb(&work, state.sessions.max_values());
+            (masked, work)
+            // `guard` is dropped here — before the upstream call, so a stream
+            // that runs for minutes holds no lock on its session.
         }
 ```
 
-- [ ] **Step 4: Remove the stale `#[allow(dead_code)]` from `Mapping::is_empty`**
+No import changes are needed: `Arc` is already imported at `proxy.rs:1`, and neither `Claimed` nor `OwnedMutexGuard` needs to be named explicitly (both are used only through field access and `match`, which Rust resolves without the type being in scope).
 
-In `gateway/src/mapping.rs`, `is_empty` (around line 61-63) currently reads:
+- [ ] **Step 6: Update the two existing `proxy.rs` tests that inspect a session directly**
+
+At `gateway/src/proxy.rs:1314` (inside `a_refused_request_leaves_the_session_untouched`):
 
 ```rust
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1")).session;
+        assert!(
+            session.mapping.lock().await.is_empty(),
+            "a refused request left values in the session"
+        );
 ```
 
-Delete the `#[allow(dead_code)]` line above it. `probably_empty` (Step 3) is now a live caller.
+At `gateway/src/proxy.rs:1365` (inside `a_value_past_the_cap_is_still_masked_and_still_restored`):
 
-- [ ] **Step 5: Run the tests to verify they pass**
+```rust
+        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1")).session;
+        assert_eq!(session.mapping.lock().await.len(), 1);
+```
 
-Run: `cd gateway && cargo test session:: 2>&1 | tail -20`
-Expected: PASS, including `a_full_store_evicts_the_least_recently_used` unmodified — confirm this explicitly, since it is the regression guard proving the fallback path still matches today's behavior when nothing is empty.
+Both are safe from the deadlock this task's Global Constraints warn about: the `Claimed` value these lines produce is a temporary — its `.guard` (if any) is dropped at the end of the `let` statement, before the next line locks the mapping fresh.
 
-- [ ] **Step 6: Check formatting and lints**
+- [ ] **Step 7: Remove the stale `#[allow(dead_code)]` from `Mapping::is_empty`**
 
-Run: `cd gateway && cargo fmt && cargo clippy --all-targets -- -D warnings`
-Expected: no warnings. If clippy still flags `Mapping::is_empty` as unused, `probably_empty` was not wired correctly in Step 3 — check it is actually called from `acquire_at`, not just defined.
+In `gateway/src/mapping.rs`, delete the `#[allow(dead_code)]` line directly above `pub fn is_empty(&self) -> bool {` (around line 61). `reclaimable` (Step 4) is now a live caller.
 
-- [ ] **Step 7: Run the full suite once**
+- [ ] **Step 8: Run the tests to verify they pass**
 
-Run: `cd gateway && cargo test 2>&1 | tail -10`
-Expected: all tests pass (this only touches `session.rs` and `mapping.rs`, so nothing in `proxy.rs` or `stream.rs` should be affected).
+Run: `cd gateway && cargo test session:: 2>&1 | tail -30`
+Expected: PASS, all nine tests (six adjusted or pre-existing, three new — `a_reclaimable_entry_is_evicted_before_a_live_one`, `a_freshly_claimed_session_is_never_treated_as_the_reclaimable_candidate`, `a_session_held_by_another_request_is_never_treated_as_the_reclaimable_candidate`).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Run the full suite, formatting and lints**
+
+Run: `cd gateway && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -20`
+Expected: no warnings, everything passes — this exercises `proxy.rs`'s Step 5 and Step 6 changes too, since they're part of the same crate. If `Mapping::is_empty` is still flagged as unused, `reclaimable` (Step 4) was not wired correctly.
+
+- [ ] **Step 10: Commit**
 
 ```bash
-git add gateway/src/session.rs gateway/src/mapping.rs
-git commit -m "fix(gateway): prefer an empty session over a live one when evicting
+git add gateway/src/session.rs gateway/src/mapping.rs gateway/src/proxy.rs
+git commit -m "fix(gateway): claim a session's lock synchronously, prefer reclaiming empties
 
-SessionStore::acquire evicted the globally-oldest entry whenever the
-store was full, without regard to whether it held a real conversation's
-values. A request that then failed during masking had already destroyed
-someone else's session for nothing.
+SessionStore::acquire released the store's own lock before the caller
+took the session's — a real, exploitable window on a multi-threaded
+runtime, in which an unrelated eviction could see the session as
+unlocked and steal it out from under the request it was just handed to.
+A third request for the same id would then create a second, unsynced
+session for one conversation: the exact placeholder-collision race the
+session-mapping design excluded, reintroduced by an unrelated request's
+eviction choice.
 
-Eviction now prefers an already-empty entry, found via a non-blocking
-try_lock so a session mid-masking — which holds its lock throughout —
-can never be misjudged as empty. Falls back to the globally-oldest entry
-only when nothing empty exists, matching today's behavior exactly in
-that case."
+Session.mapping is now Arc<Mutex<Mapping>>, so acquire can claim it with
+a non-blocking try_lock_owned inside the same critical section that
+decides whether to hand a session back — a session is locked
+continuously from the moment it is handed out until its holder releases
+it, with no window in between.
+
+Eviction, when needed, now also prefers a reclaimable (idle, empty)
+victim over the globally-oldest one, so a request that fails during
+masking can no longer destroy a live conversation to make room for
+itself in the common case. A store genuinely saturated with live
+sessions can still lose its oldest one to a doomed request — an
+accepted, scoped limitation, not this fix's target."
 ```
 
 ---
 
-### Task 2: Prove the actual finding is closed, not just its unit-level shape
+### Task 2: Prove a failing request cannot evict a live third-party session
 
 **Files:**
 - Test: `gateway/src/proxy.rs`, the existing `mod tests`
 
 **Interfaces:**
-- Consumes: `SessionStore`, `Limits` (`gateway/src/session.rs`, both already imported in `proxy.rs`'s test module); `state_with`, `test_limits`, `test_key`, `session_headers`, `call_with_headers`, `detector_finding_weber`, `person_span` (all existing test helpers in `proxy.rs`, unchanged by Task 1).
+- Consumes: `SessionStore`, `Limits` (already imported in `proxy.rs`'s test module); `state_with`, `test_limits`, `test_key`, `session_headers`, `call_with_headers`, `person_span` (all existing test helpers, unchanged by Task 1).
 - Produces: nothing new — this is the last task in the plan.
 
-Task 1 proves the eviction *policy* is correct in isolation. This task proves the thing Codex actually found — that a failing real HTTP request, going through the full `handle()` path, no longer destroys another conversation's committed value — using the store through the same code path a live gateway uses, not through `acquire_at` directly.
+Task 1 proves the eviction *policy* and the *claim* mechanism correct in isolation. This task proves the thing Codex's original finding on PR #14 actually described — that a failing real HTTP request, through the full `handle()` path, no longer destroys another conversation's committed value — using the store the same way a live gateway does, not through `acquire_at` directly.
 
 - [ ] **Step 1: Write the test**
 
-Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the_session_untouched` (they are testing adjacent properties of the same mechanism, and this one reuses its detector-mock shape: a 200 with `person_span()` for text containing `SECRET`, a 503 for anything else).
+Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the_session_untouched` (they test adjacent properties of the same mechanism, and this one reuses its detector-mock shape: a 200 with `person_span()` for text containing `SECRET`, a 503 for anything else).
 
 ```rust
     #[tokio::test]
@@ -234,9 +489,9 @@ Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the
         // request that fails during masking, leaving its entry created but
         // empty — `acquire` runs, and creates the entry, before `mask_all`
         // can fail. A third session's request also fails during masking,
-        // and needs a slot in a now-full store: it must evict "b" (empty),
-        // never "a" (live) — even though "a" is the older of the two by
-        // last_seen.
+        // and needs a slot in a now-full store: it must evict "b"
+        // (reclaimable), never "a" (live) — even though "a" is the older
+        // of the two by last_seen.
         let detector = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/detect"))
@@ -277,7 +532,7 @@ Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the
 
         // "b" has no "Weber" in it, so the detector 503s and the request
         // fails — but its session entry was already created, and stays
-        // empty.
+        // empty and reclaimable.
         let (status_b, _) = call_with_headers(
             Arc::clone(&state),
             "/v1/chat/completions",
@@ -287,8 +542,8 @@ Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the
         .await;
         assert_eq!(status_b, StatusCode::BAD_GATEWAY);
 
-        // "c" also fails during masking, and needs a slot in a store already
-        // holding {a, b} at its cap of 2.
+        // "c" also fails during masking, and needs a slot in a store
+        // already holding {a, b} at its cap of 2.
         let (status_c, _) = call_with_headers(
             Arc::clone(&state),
             "/v1/chat/completions",
@@ -299,7 +554,7 @@ Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the
         assert_eq!(status_c, StatusCode::BAD_GATEWAY);
 
         // Session "a" must still hold Weber's placeholder.
-        let session_a = state.sessions.acquire(&test_key("a", "Bearer k1"));
+        let session_a = state.sessions.acquire(&test_key("a", "Bearer k1")).session;
         assert_eq!(
             session_a.mapping.lock().await.restore("[PERSON_1]").unwrap(),
             "Weber",
@@ -310,10 +565,10 @@ Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the
 
 - [ ] **Step 2: Run the test to verify it passes**
 
-This is a regression guard on behavior Task 1 already implemented and unit-tested — like Task 6's `a_stream_holds_no_session_lock` test in the original session-mapping plan, it is expected to PASS on its first run, not fail first.
+This is a regression guard on behavior Task 1 already implemented and unit-tested — like the streaming-lock test in the original session-mapping plan, it is expected to PASS on its first run, not fail first; the API it exercises did not exist before Task 1, so there is no meaningful pre-fix version of this exact test to run.
 
 Run: `cd gateway && cargo test a_failing_request_does_not_evict_a_live_third_party_session -- --nocapture 2>&1 | tail -20`
-Expected: PASS. If it fails, that means Task 1's fix does not actually close the finding end to end even though its own unit tests passed — stop and report BLOCKED with the failure output rather than adjusting this test to make it pass.
+Expected: PASS. If it fails, Task 1's fix does not close the finding end to end even though its own unit tests passed — stop and report BLOCKED with the failure output rather than adjusting this test to make it pass.
 
 - [ ] **Step 3: Run the full suite, formatting and lints**
 
@@ -326,11 +581,12 @@ Expected: no warnings, everything passes.
 git add gateway/src/proxy.rs
 git commit -m "test(gateway): a failing request cannot evict another session's value
 
-Task 1 fixed the eviction policy in isolation, with its own unit tests.
-This is the integration-level proof: a real request that fails during
-masking, through the full handle() path, no longer destroys a different
-conversation's committed value. A regression guard on already-delivered
-behavior, so it passes on its first run rather than needing a RED phase."
+Task 1 fixed the eviction policy and the claim mechanism in isolation,
+with their own unit tests. This is the integration-level proof: a real
+request that fails during masking, through the full handle() path, no
+longer destroys a different conversation's committed value. A
+regression guard on already-delivered behavior, so it passes on its
+first run rather than needing a RED phase."
 ```
 
 - [ ] **Step 5: Push and update the PR**
@@ -339,14 +595,14 @@ behavior, so it passes on its first run rather than needing a RED phase."
 git push
 ```
 
-PR #15 already exists (draft, design-only) against `main`. Pushing adds these two commits to it. Do not mark it ready for review or merge — report back to the controller with the commit range for review.
+PR #15 already exists (draft) against `main`, and already carries both spec commits. Pushing adds Task 1's and Task 2's commits to it. Do not mark it ready for review or merge — report back to the controller with the commit range for review, and note that both of Codex's PR #15 findings (the reclaimable-preference gap and the TOCTOU race) are addressed by name in the two design-doc commits and in this implementation, so the controller can point Codex back at the updated PR.
 
 ---
 
 ## Self-Review
 
-**Spec coverage.** The spec's fix (prefer an empty victim, fall back to oldest) maps to Task 1 Step 3. The correctness argument (a session mid-masking holds its lock throughout, so `try_lock` can never misjudge it) maps to Task 1's `a_locked_session_is_never_treated_as_the_empty_candidate` test. The explicit non-change (`last_seen` refresh stays unconditional) is called out in Global Constraints so no task accidentally touches it. The regression guard (`a_full_store_evicts_the_least_recently_used` must keep passing unmodified) is verified in Task 1 Step 5. The integration-level proof the spec's Testing section calls for is Task 2. `Mapping::is_empty()` losing its `#[allow(dead_code)]` is Task 1 Step 4, matching the spec's note that this fix gives it a live caller. Out-of-scope items (per-credential quotas, byte bounds, Anthropic session-path coverage, `last_seen` behavior) have no task, deliberately.
+**Spec coverage.** The spec's structural fix (`Arc<Mutex<Mapping>>`, synchronous `try_lock_owned` claim inside `acquire_at`'s critical section, `Claimed` return type) maps to Task 1 Steps 3-5. The `reclaimable` victim-selection logic (finding 1's fix) maps to Task 1 Step 4 and its `a_reclaimable_entry_is_evicted_before_a_live_one` test. The TOCTOU closure (finding 2's fix) maps to Task 1's `a_freshly_claimed_session_is_never_treated_as_the_reclaimable_candidate` and `a_session_held_by_another_request_is_never_treated_as_the_reclaimable_candidate` tests, which the spec's Testing section calls the direct proof. The explicit non-change (`last_seen` refresh stays unconditional) is called out in Global Constraints so no task accidentally touches it. `Mapping::is_empty()` losing its `#[allow(dead_code)]` is Task 1 Step 7. The integration-level proof the spec's Testing section calls for is Task 2. Out-of-scope items (per-credential quotas, byte bounds, Anthropic session-path coverage) have no task, deliberately.
 
-**Type consistency.** `probably_empty(entry: &Entry) -> bool` is defined once (Task 1 Step 3) and called once, from inside `acquire_at` in the same file — no cross-task signature to keep consistent. Task 2 does not call `probably_empty` or reference `Entry` at all; it only observes behavior through `SessionStore::acquire`, `Session.mapping`, and `Mapping::restore`, all pre-existing and unchanged.
+**Type consistency.** `Claimed { session: Arc<Session>, guard: Option<OwnedMutexGuard<Mapping>> }` is defined once (Task 1 Step 3) and consumed identically everywhere it appears afterward: Task 1's own tests, `proxy.rs`'s `handle()`, `proxy.rs`'s two adjusted existing tests, and Task 2's new test all access `.session` and `.guard` the same way, and every place that holds a `.guard` operates on the mapping through that guard directly rather than calling `.lock()` again — the deadlock this plan's Global Constraints warn about doesn't appear in any step's code. `reclaimable(entry: &Entry) -> bool` is defined once (Task 1 Step 4) and called once, from inside `acquire_at` in the same file.
 
-**Correction from the first draft.** Task 2 originally used the `detector_finding_weber` helper for the failing sessions, whose fallback returns `spans: []` with a 200 — a successful empty detection, not a failure, which would not have exercised the eviction path this test exists to prove. It also originally proposed verifying the test against pre-fix code via `git stash`, which doesn't work once Task 1's fix is already committed (stashing removes only Task 2's uncommitted test, not Task 1's already-committed fix). Both are corrected above: the detector is built inline with the same 503-on-no-match shape `a_refused_request_leaves_the_session_untouched` already uses, and Step 2 is reframed as a pass-on-first-run regression guard, matching how the original session-mapping plan's Task 6 handled the same situation.
+**Corrections from the first draft of this plan.** The first draft assumed only `session.rs` would change and `proxy.rs` would gain only a new test; that was written before Codex's TOCTOU finding, which requires `acquire`'s return type to change, which in turn requires `proxy.rs`'s `handle()` to change in the same commit for the crate to compile. The first draft also proposed a `probably_empty` check using the plain (non-owned) `try_lock()` API and a simpler `an_empty_entry_is_evicted_before_a_live_one` test that manually re-locked a session's mapping after obtaining it from `acquire_at` — under the corrected `Claimed`-returning API, doing that while a claimed guard for the same session is still held would deadlock rather than merely be redundant, which is why every test above that both holds a guard and touches the mapping does so through the guard directly, and why the Global Constraints call this out explicitly rather than leaving it implicit.
