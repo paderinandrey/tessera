@@ -1,17 +1,19 @@
 # Session eviction preference — design
 
 **A narrow follow-up to slice D (session-scoped mapping).** `SessionStore::acquire`
-evicts unconditionally, before the caller's request is known to succeed. A request
-that fails during masking can still have destroyed another conversation's live
-session to make room for itself. This slice changes which entry gets evicted when
-the store is full; nothing else.
+evicts before the caller's request is known to succeed. A request that fails
+during masking can still have destroyed another conversation's live session to
+make room for itself. This slice changes which entry gets evicted when the store
+is full, and closes a second, more serious gap Codex found in this design's own
+first draft while it was still in review.
 
 **Traceability:** flagged by Codex on PR #14
 (github.com/paderinandrey/tessera/pull/14), confirmed real against
 `gateway/src/session.rs:188-224` and `gateway/src/proxy.rs:141`, and recorded as a
-tracked follow-up in project memory (`session-store-eviction-followup`). The
-session-mapping design's rejected alternative — seed a request-local copy, merge
-back after success — is the failure mode any fix here must not reintroduce.
+tracked follow-up in project memory (`session-store-eviction-followup`). This
+design's own first draft was reviewed by Codex on PR #15 before implementation
+began, which caught a race the first draft would have introduced — see
+"Revision history" below.
 
 ## The bug, precisely
 
@@ -37,33 +39,122 @@ Codex's own suggested fix — make the store mutation provisional, roll it back
 when masking fails — is unsafe for this code. `acquire_at`'s check-or-insert runs
 in one critical section under the store's `std::sync::Mutex`, which is what
 guarantees that two concurrent requests for the same brand-new session id share
-one `Arc<Session>` and serialize on its `tokio::sync::Mutex` during masking.
-Deferring the insertion until success is known would remove that guarantee: two
-concurrent first-touch requests for one new id would each mask independently
-against a private `Mapping::new()`, with nothing serializing them, and both would
-try to commit afterward — reintroducing the exact race slice D's design excluded
-(two concurrent requests allocate a placeholder to two different values; the
-loser's response restores the wrong name). A fix that reopens that race is worse
-than the bug it closes.
+one `Arc<Session>` and serialize on its lock during masking. Deferring the
+insertion until success is known would remove that guarantee: two concurrent
+first-touch requests for one new id would each mask independently against a
+private `Mapping::new()`, with nothing serializing them, and both would try to
+commit afterward — reintroducing the exact race slice D's design excluded (two
+concurrent requests allocate a placeholder to two different values; the loser's
+response restores the wrong name). A fix that reopens that race is worse than the
+bug it closes.
 
-## The fix: prefer an already-empty victim
+## Revision history: what Codex's review of the first draft found
 
-The atomic check-or-insert is untouched. Only the victim selection, inside the
-existing `if map.len() >= self.limits.max_sessions` branch, changes: prefer an
-entry whose `Mapping` is empty over the globally-oldest entry, falling back to
-today's oldest-regardless-of-content selection only when no empty entry exists.
+This design's first draft proposed changing only which entry gets evicted —
+preferring an entry whose `Mapping` was empty, checked with a non-blocking
+`try_lock()` from inside `acquire_at`'s existing critical section — without
+changing anything about how a session is handed back to its caller. Codex
+reviewed that draft on PR #15 and raised two findings.
+
+**Finding 1 (real, scoped, left as an accepted limitation).** When the store is
+completely full of live, valued sessions — no empty entry anywhere — the fallback
+still evicts the globally-oldest one regardless of content, exactly as before this
+slice. A single doomed request can still destroy a live session in that specific
+state. This is real, but its blast radius is smaller than it first reads: the
+victim it evicted is immediately replaced by the doomed request's own (now
+empty) entry, so the *next* doomed request from the same source finds an empty
+entry to reclaim first, not another live one. A burst of cheap failing requests
+costs at most one incidental live eviction, not one per request, and the design
+already treats evicting a whole session as safe (see slice D: "costs coreference,
+never protection"). Closing this completely would mean never evicting a live
+session under any circumstance, which just moves the resource-exhaustion problem
+elsewhere (an unbounded store, or a rejected request when capacity is genuinely
+exhausted by real traffic). Left out of scope; see "Out of scope" below for the
+principled fix this would need if it is ever worth closing.
+
+**Finding 2 (real, serious, the reason this draft was rewritten).** The proposed
+`try_lock()` check has a gap the first draft did not account for:
+`SessionStore::acquire` fully completes and releases the store's own
+`std::sync::Mutex` *before* the caller in `proxy.rs` reaches
+`session.mapping.lock().await` (`proxy.rs:141-142`). Between those two lines, on a
+multi-threaded runtime, a session that was just handed out — new or an existing
+one that happened to be idle — is genuinely unlocked and empty from another
+thread's point of view. A concurrent `acquire_at` call for an unrelated key,
+running its eviction scan in exactly that window, would see it as a legitimate
+"empty" victim under the first draft's check and remove it from the store's map.
+
+The caller that was handed that session is unaffected in itself — it still holds
+its own `Arc<Session>`, and slice D already proved that a store-level eviction
+does not disturb a request already holding one. The actual damage happens if a
+*third*, unrelated request for the *same* session id arrives shortly after: it
+finds nothing in the store (the entry was just evicted out from under its
+rightful owner) and creates a brand-new, separate session for that id. Two
+requests are now both "first touches" of the same conversation, with two
+unsynchronized `Mapping`s — precisely the race slice D's design excluded,
+reintroduced here by an entirely unrelated third request's eviction choice. This
+converts an availability bug (lost coreference) into a potential confidentiality
+one (a response could restore the wrong person's name), which is a worse defect
+than the one this slice sets out to fix. It had to be closed before any
+implementation began.
+
+## The fix
+
+Two changes to `session.rs`, landing together because Rust requires the whole
+crate to compile as one unit and the second cannot exist without the first
+requiring a small, coupled change to `proxy.rs`'s `handle()`.
+
+**1. `Session.mapping` is wrapped in its own `Arc`:**
 
 ```rust
-/// Non-blocking: a session whose lock is currently held (mid-masking, by
-/// definition not a candidate here) is conservatively treated as not empty,
-/// never as a false "empty."
-fn probably_empty(entry: &Entry) -> bool {
-    entry
-        .session
-        .mapping
-        .try_lock()
-        .map(|guard| guard.is_empty())
-        .unwrap_or(false)
+pub struct Session {
+    mapping: Arc<tokio::sync::Mutex<Mapping>>,
+}
+```
+
+This is the only structural change needed to make `try_lock_owned()` available —
+it requires its receiver to be `Arc<Mutex<T>>` specifically, not a `Mutex<T>`
+field nested inside another `Arc`-wrapped struct. Every existing `.lock().await`
+call site (`proxy.rs`, and `session.rs`'s own tests) keeps working unchanged:
+`Arc<Mutex<T>>` still derefs to `Mutex<T>`, so `.lock()` resolves exactly as it
+did before. Only code that needs the *owned*, non-blocking form changes.
+
+**2. `acquire`/`acquire_at` claim the lock synchronously, inside the same
+critical section that decides whether to hand a session back, and return that
+claim instead of a bare `Arc<Session>`:**
+
+```rust
+/// What `acquire` hands back: the session, and — when the store could claim
+/// it synchronously, in the same critical section that decided this session
+/// was safe to return — the lock already held. `None` means someone else
+/// currently holds it; the caller waits its turn with `lock_owned().await`,
+/// which is already-proven-safe serialization for two requests to one key.
+pub struct Claimed {
+    pub session: Arc<Session>,
+    pub guard: Option<tokio::sync::OwnedMutexGuard<Mapping>>,
+}
+```
+
+Immediately after `acquire_at` decides which `Arc<Session>` to return — whether a
+cache hit or a freshly created entry — and still holding the store's
+`std::sync::Mutex`, it attempts `Arc::clone(&session.mapping).try_lock_owned()`.
+For a freshly created entry this always succeeds: the mutex was just constructed
+inside this same critical section, so nothing else could possibly hold a
+reference to it yet. For a cache hit it succeeds whenever the session is
+currently idle, and fails only when another request already holds it — in which
+case that other request's hold is itself what keeps the entry safe from a
+concurrent eviction scan, so there is nothing to close there.
+
+The victim-selection logic for a *different* key's insertion is otherwise
+unchanged from the first draft — prefer an entry whose lock can be claimed and
+whose `Mapping` is empty, falling back to the globally-oldest entry when no such
+candidate exists:
+
+```rust
+fn reclaimable(entry: &Entry) -> bool {
+    match Arc::clone(&entry.session.mapping).try_lock_owned() {
+        Ok(guard) => guard.is_empty(),
+        Err(_) => false,
+    }
 }
 ```
 
@@ -71,7 +162,7 @@ fn probably_empty(entry: &Entry) -> bool {
 if map.len() >= self.limits.max_sessions {
     let victim = map
         .iter()
-        .filter(|(_, entry)| probably_empty(entry))
+        .filter(|(_, entry)| reclaimable(entry))
         .min_by_key(|(_, entry)| entry.last_seen)
         .or_else(|| map.iter().min_by_key(|(_, entry)| entry.last_seen))
         .map(|(key, _)| key.clone());
@@ -81,40 +172,37 @@ if map.len() >= self.limits.max_sessions {
 }
 ```
 
-`try_lock` is non-blocking and needs no `.await`; it runs inside the same
-synchronous critical section as today, under the same `std::sync::Mutex`, which
-final review already verified is never held across an `await` — that property is
-unaffected, since nothing here awaits.
+What makes this correct now, where the first draft was not: every session this
+store ever hands out is locked continuously from the moment it is handed out
+(either because this call claimed it synchronously, or because someone else
+already held it and keeps holding it) until whoever holds it releases it. There
+is no longer a window in which a session is "handed out but not yet in use" and
+simultaneously "unlocked, therefore evictable." `reclaimable` can only ever see
+a session that finished its last use — either it never held a value, or its
+holder released it after `absorb` — which is exactly the population this fix
+means to reclaim from.
 
-This makes `Mapping::is_empty()` reachable from the live bin path for the first
-time (it has carried `#[allow(dead_code)]` since slice D's Task 1). That
-attribute is removed as part of this change.
+**3. `proxy.rs`'s `handle()` destructures the claim instead of locking directly:**
 
-## Correctness: a session mid-masking can never be misjudged as empty
+```rust
+let claimed = state.sessions.acquire(&key);
+let mut guard = match claimed.guard {
+    Some(guard) => guard,
+    None => Arc::clone(&claimed.session.mapping).lock_owned().await,
+};
+let mut work = guard.clone();
+let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+guard.absorb(&work, state.sessions.max_values());
+(masked, work)
+```
 
-This is the property the fix depends on, and it is not new machinery — it falls
-out of locking discipline slice D already established. `handle()` takes the
-session's lock before masking starts and holds it continuously through
-`mask_all` and `absorb`, releasing only at the end of the match arm — that is,
-for the entire window during which the session's `Mapping` could look empty from
-outside. While that lock is held, any concurrent `try_lock()` on it fails, so
-`probably_empty` returns `false` — not because of a special case, but as a direct
-consequence of the lock already being held for exactly that window.
+Everything after obtaining `guard` — clone into `work`, mask, `absorb`, drop at
+the end of the match arm before the upstream call — is unchanged from slice D.
 
-A session becomes a candidate for preferential eviction only once its current
-request has fully finished: either it never held any values (a legitimately
-empty session), or its last request failed. Evicting it in that state is safe
-under Task 4's already-proven property — a store-level eviction never disturbs a
-request still holding its own `Arc<Session>`, whether that request finished
-successfully (its committed values live in the `Arc`, independent of the store's
-map) or is still, briefly, in flight for some *other* reason.
-
-One case worth naming explicitly: a session whose last request succeeded but
-masked zero values (ordinary text with nothing to redact) is indistinguishable,
-by this check, from one whose last request failed. Both are `is_empty()` and
-both are equally fair game. This is intentional, not a gap — an empty-by-success
-session has nothing to lose either, so treating it the same as empty-by-failure
-costs nothing and keeps the check simple.
+`try_lock_owned` and `lock_owned` are non-blocking-to-call and blocking-to-await
+respectively, same as the plain (non-owned) forms; neither changes the property
+slice D's final review already verified — the store's `std::sync::Mutex` is never
+held across an `await`, because nothing here awaits while holding it.
 
 ## What stays as it is
 
@@ -124,33 +212,52 @@ another conversation. Not the class of problem this slice addresses.
 
 ## Testing
 
-**`session.rs`**, extending the existing `acquire_at`-with-explicit-time tests:
+A race is not honestly testable by racing — the earlier session-mapping design
+already established this ("A race is not honestly testable; the structural fact
+is."). The claim mechanism is proven the same way: hold onto a `Claimed`'s guard
+deliberately (simulating a caller mid-masking, exactly what `handle()` does) and
+show a concurrent eviction scan cannot select it, rather than attempting to race
+real concurrent requests through the HTTP stack.
 
-- A store at capacity holding one entry with a real committed value and one
-  untouched entry: a new key evicts the *untouched* one, even when it is more
-  recently created than the value-holding one — the direct negation of plain
-  oldest-first selection.
-- A store at capacity holding only entries with real committed values falls back
-  to evicting the globally oldest — the existing
-  `a_full_store_evicts_the_least_recently_used` test already covers this (its
-  entries are never written to, so it is an implicit regression guard) and must
-  keep passing unmodified.
-- A session whose lock is held (a simulated in-flight request) is never chosen
-  as a preferred-empty victim, and the store falls through to the other
-  candidate without panicking.
+**`session.rs`:**
 
-**`proxy.rs`**, proving the actual finding is closed, not just its unit-level
-proxy: session A commits a real value through an ordinary successful request.
-The store is filled to capacity with empty sessions. A request under a new
-session id, guaranteed to fail during detection (as in the existing
-`a_refused_request_leaves_the_session_untouched`), is sent and fails. Session
-A's table still restores its original value afterward.
+- A freshly claimed session — its `Claimed.guard` held, not dropped — is never
+  selected as a victim by a concurrent `acquire_at` call for a different key,
+  even though its `Mapping` is empty and it is the older of the candidates by
+  `last_seen`. This is the direct proof finding 2 is closed: the first draft had
+  no such guard to hold, and this is exactly the scenario it would have gotten
+  wrong.
+- A session whose lock is held by a genuine second request to the *same* key
+  (contended, not merely unclaimed) is likewise never selected — the existing
+  serialize-on-same-key behavior stays intact and is not confused with a
+  reclaimable entry.
+- An entry that is reclaimable (empty, unclaimed) is evicted in preference to a
+  live one, even when it is newer by `last_seen` — the direct negation of plain
+  oldest-first selection, and the finding-1 fix itself.
+- The existing `a_full_store_evicts_the_least_recently_used` test must keep
+  passing with only mechanical adjustment for the new `Claimed` return type
+  (`.session` field access where the test checks identity) — it is the
+  regression guard proving the fallback path still matches pre-slice behavior
+  when nothing is reclaimable.
+- Every other existing `session.rs` test that reads `acquire_at`'s return value
+  needs the same mechanical `.session` adjustment; none needs new assertions.
+
+**`proxy.rs`:** one integration test, unchanged in intent from the first draft —
+session A commits a real value through an ordinary successful request; the store
+fills to capacity with an empty session; a request under a new session id,
+guaranteed to fail during detection, is sent and fails; session A's table still
+restores its original value afterward. Existing tests that inspect a session via
+`state.sessions.acquire(...)` for assertions need the same mechanical `.session`
+adjustment.
 
 ## Out of scope
 
-Per-credential quotas (would structurally exclude cross-tenant eviction
-entirely, a stronger and broader property than this fix provides — a candidate
-for its own future slice, not folded in here). Bounding a single value's byte
-size within a session (a different, already-tracked follow-up). Anthropic
-session-path test coverage (already tracked separately). Any change to
-`last_seen` refresh-on-failure, addressed above as a deliberate non-change.
+Fully closing finding 1 (a store genuinely saturated with live sessions can still
+lose one to a doomed request) would need per-credential quotas — structurally
+excluding cross-tenant eviction rather than just reducing its likelihood, a
+stronger and broader property than this fix provides. A candidate for its own
+future slice, not folded in here, and unaffected by the fix in this document.
+Bounding a single value's byte size within a session (a different, already-
+tracked follow-up). Anthropic session-path test coverage (already tracked
+separately). Any change to `last_seen` refresh-on-failure, addressed above as a
+deliberate non-change.
