@@ -39,6 +39,12 @@ pub enum SessionError {
          than putting every caller who sent no credential into one shared session"
     )]
     NoCredential(&'static str),
+    #[error(
+        "every session in the store is in flight, so there is none to reclaim; the request \
+         is refused rather than evicting a live session, which would leave one conversation \
+         with two unsynchronized tables"
+    )]
+    Saturated,
 }
 
 /// Random per process: the store must hold nothing from which a credential can
@@ -223,12 +229,12 @@ impl SessionStore {
         self.limits.max_values
     }
 
-    pub fn acquire(&self, key: &SessionKey) -> Claimed {
+    pub fn acquire(&self, key: &SessionKey) -> Result<Claimed, SessionError> {
         self.acquire_at(key, Instant::now())
     }
 
     /// Time is a parameter so eviction is tested without sleeping.
-    fn acquire_at(&self, key: &SessionKey, now: Instant) -> Claimed {
+    fn acquire_at(&self, key: &SessionKey, now: Instant) -> Result<Claimed, SessionError> {
         // Poisoning is recovered rather than propagated. Nothing in this
         // critical section can panic today, but if something ever does, one
         // failure must not turn every later request into a 500.
@@ -250,16 +256,26 @@ impl SessionStore {
         } else {
             if map.len() >= self.limits.max_sessions {
                 // One pass and one `try_lock` per entry: the cheapest tier
-                // wins and `last_seen` breaks ties within it. The old
-                // `.or_else` threw that knowledge away and fell back to the
-                // globally-oldest entry, held or not.
+                // wins and `last_seen` breaks ties within it. A winner in
+                // `Tier::Held` means every entry is in flight, and there is
+                // nothing left to take that would not cost somebody their
+                // conversation — so the newcomer is refused instead. That
+                // trades a silent identity swap for a loud 503, which is the
+                // trade this gateway makes everywhere else.
                 let victim = map
                     .iter()
                     .map(|(key, entry)| (tier(entry), entry.last_seen, key))
-                    .min_by_key(|(tier, last_seen, _)| (*tier, *last_seen))
-                    .map(|(_, _, key)| key.clone());
-                if let Some(victim) = victim {
-                    map.remove(&victim);
+                    .min_by_key(|(cost, last_seen, _)| (*cost, *last_seen))
+                    .map(|(cost, _, key)| (cost, key.clone()));
+                match victim {
+                    // `None` is an empty map that is nonetheless full, which
+                    // means `max_sessions == 0` — rejected by `config.rs`
+                    // unless sessions are disabled entirely, in which case
+                    // `key_from` refuses before this is ever reached.
+                    Some((Tier::Held, _)) | None => return Err(SessionError::Saturated),
+                    Some((_, victim)) => {
+                        map.remove(&victim);
+                    }
                 }
             }
 
@@ -286,7 +302,7 @@ impl SessionStore {
         // claimable here — nothing else could hold a reference to it yet.
         // An existing one is claimable exactly when it is currently idle.
         let guard = Arc::clone(&session.mapping).try_lock_owned().ok();
-        Claimed { session, guard }
+        Ok(Claimed { session, guard })
     }
 
     #[cfg(test)]
@@ -490,8 +506,8 @@ mod tests {
     fn the_same_key_returns_the_same_session() {
         let store = SessionStore::new(limits(4));
         let now = Instant::now();
-        let one = store.acquire_at(&key("conv1", "Bearer k"), now);
-        let two = store.acquire_at(&key("conv1", "Bearer k"), now);
+        let one = store.acquire_at(&key("conv1", "Bearer k"), now).unwrap();
+        let two = store.acquire_at(&key("conv1", "Bearer k"), now).unwrap();
         assert!(Arc::ptr_eq(&one.session, &two.session));
     }
 
@@ -499,8 +515,8 @@ mod tests {
     fn a_different_credential_is_a_different_session() {
         let store = SessionStore::new(limits(4));
         let now = Instant::now();
-        let one = store.acquire_at(&key("shared", "Bearer k1"), now);
-        let two = store.acquire_at(&key("shared", "Bearer k2"), now);
+        let one = store.acquire_at(&key("shared", "Bearer k1"), now).unwrap();
+        let two = store.acquire_at(&key("shared", "Bearer k2"), now).unwrap();
         assert!(!Arc::ptr_eq(&one.session, &two.session));
         assert_eq!(store.live(), 2);
     }
@@ -509,14 +525,16 @@ mod tests {
     fn a_session_idle_past_the_ttl_is_swept() {
         let store = SessionStore::new(limits(4));
         let start = Instant::now();
-        let mut one = store.acquire_at(&key("conv1", "Bearer k"), start);
+        let mut one = store.acquire_at(&key("conv1", "Bearer k"), start).unwrap();
         // The claim goes with the request that took it. A session nobody is
         // holding is the case this test is about; `a_held_entry_survives_the_ttl_sweep`
         // covers the other one.
         one.guard
             .take()
             .expect("a fresh session is always claimable");
-        let two = store.acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61));
+        let two = store
+            .acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61))
+            .unwrap();
         assert!(
             !Arc::ptr_eq(&one.session, &two.session),
             "a stale table was handed back"
@@ -529,7 +547,7 @@ mod tests {
         let store = SessionStore::new(limits(4));
         let start = Instant::now();
 
-        let mut held = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut held = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
         let guard = held
             .guard
             .take()
@@ -538,13 +556,17 @@ mod tests {
         // Far past `idle`, and a request is still holding it. Sweeping it
         // would strand that request's commit and let the next request for
         // "a" open a second table for one conversation.
-        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(61));
+        store
+            .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(61))
+            .unwrap();
         assert_eq!(store.live(), 2, "a held entry was swept");
 
         // Released, it is ordinary again: still stale, so the next sweep
         // takes it and "a" comes back as a fresh table.
         drop(guard);
-        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(62));
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(62))
+            .unwrap();
         assert!(
             !Arc::ptr_eq(&held.session, &a_again.session),
             "a stale table outlived its holder"
@@ -562,22 +584,30 @@ mod tests {
         let store = SessionStore::new(limits(2));
         let start = Instant::now();
 
-        let mut a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
         let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
         a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
         drop(a_guard);
 
-        let mut b = store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        let mut b = store
+            .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
         let mut b_guard = b.guard.take().expect("a fresh session is always claimable");
         b_guard.mask("Meier", &[span("PERSON", 0, 5)]).unwrap();
         drop(b_guard);
 
         // Touching "a" makes "b" the oldest.
-        store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(2));
-        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(3));
+        store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(2))
+            .unwrap();
+        store
+            .acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(3))
+            .unwrap();
 
         assert_eq!(store.live(), 2);
-        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(4));
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(4))
+            .unwrap();
         assert!(
             Arc::ptr_eq(&a.session, &a_again.session),
             "the touched session was evicted"
@@ -585,19 +615,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_evicted_session_does_not_interrupt_a_request_holding_it() {
+    async fn a_held_session_is_refused_room_rather_than_evicted() {
         let store = SessionStore::new(limits(1));
         let start = Instant::now();
-        let mut held = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut held = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
         let mut guard = held
             .guard
             .take()
             .expect("a fresh session is always claimable");
-        // Another conversation pushes "a" out of a store that holds one.
-        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
-        // The request already holding the guard finishes normally; its
-        // commit is simply lost to a table nobody will look up again.
+
+        // Another conversation wants the only slot, and the entry holding it
+        // is in flight. It is refused rather than served at "a"'s expense.
+        let refused = store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        assert!(matches!(refused, Err(SessionError::Saturated)));
+
+        // The request holding "a" finishes normally, and its commit still
+        // lands where the next request for "a" will look for it.
         guard.absorb(&Mapping::new(), 10);
+        drop(guard);
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&held.session, &a_again.session),
+            "the held session was lost anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_whose_every_entry_is_held_refuses_a_new_session() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
+        let _a_guard = a.guard.take().expect("a fresh session is always claimable");
+        let mut b = store
+            .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
+        let _b_guard = b.guard.take().expect("a fresh session is always claimable");
+
+        // Both entries are in flight — the state a concurrent burst produces,
+        // where every request holds its guard across its detector round-trip.
+        let refused = store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2));
+        assert!(
+            matches!(refused, Err(SessionError::Saturated)),
+            "a live session was taken to make room"
+        );
+        assert_eq!(store.live(), 2, "the store lost an entry anyway");
+    }
+
+    #[tokio::test]
+    async fn a_saturated_store_still_serves_a_session_it_already_holds() {
+        // Saturation refuses newcomers, never a conversation already in the
+        // store: that path finds its entry by key and never reaches the scan.
+        let store = SessionStore::new(limits(1));
+        let start = Instant::now();
+
+        let held = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
+        let again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&held.session, &again.session));
+        assert!(
+            again.guard.is_none(),
+            "a contended session was claimed twice"
+        );
     }
 
     #[test]
@@ -618,7 +701,7 @@ mod tests {
         // "a" becomes a live session: a real value, committed through its
         // own claimed guard, then released — exactly what a real request
         // does once masking finishes.
-        let mut a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
         let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
         a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
         drop(a_guard);
@@ -627,13 +710,19 @@ mod tests {
         // immediately below by never binding it — it stays reclaimable. It
         // is also newer than "a" by last_seen, so plain oldest-first would
         // pick "a" here, not "b".
-        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        store
+            .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
 
         // A third, new key needs a slot in a store already at its cap of 2.
-        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2));
+        store
+            .acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2))
+            .unwrap();
 
         assert_eq!(store.live(), 2);
-        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3));
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3))
+            .unwrap();
         assert!(
             Arc::ptr_eq(&a.session, &a_again.session),
             "the live session was evicted ahead of the reclaimable one"
@@ -650,18 +739,24 @@ mod tests {
         let store = SessionStore::new(limits(2));
         let start = Instant::now();
 
-        let mut claimed_a = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut claimed_a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
         let guard = claimed_a
             .guard
             .take()
             .expect("a fresh session is always claimable");
 
-        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
-        store.acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2));
+        store
+            .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
+        store
+            .acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2))
+            .unwrap();
 
         assert_eq!(store.live(), 2);
         drop(guard);
-        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3));
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3))
+            .unwrap();
         assert!(
             Arc::ptr_eq(&a_again.session, &claimed_a.session),
             "a's session was evicted while its claim was still held"
@@ -673,7 +768,7 @@ mod tests {
         let store = SessionStore::new(limits(2));
         let start = Instant::now();
 
-        let mut first = store.acquire_at(&key("a", "Bearer k"), start);
+        let mut first = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
         let _guard = first
             .guard
             .take()
@@ -682,7 +777,9 @@ mod tests {
         // and gets no pre-claimed guard — it would wait with
         // `lock_owned().await` in real code. Here it is enough to confirm
         // the claim was not handed out twice.
-        let second = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(1));
+        let second = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
         assert!(
             second.guard.is_none(),
             "a contended session was claimed twice"

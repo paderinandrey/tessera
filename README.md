@@ -137,8 +137,19 @@ does, so it is bounded three ways: `session_idle_secs`, `max_sessions` and
 holds restored text and sends the history again, so a session that was evicted is rebuilt
 from scratch by the next request — `[PERSON_3]` becomes `[PERSON_1]` and nothing else
 changes. Past `max_session_values` a value is still masked and still restored; it is
-simply not remembered. Values are never evicted from within a live session: one that came
-back from the model would end a request with nothing to restore to.
+simply not remembered.
+
+Reaching `max_sessions` is the one bound that can cost a request rather than a
+coreference. A session table is only ever reclaimed from a conversation that has
+no request inside it; when every table in a full store is in flight, a request
+asking for a *new* session is refused with a 503 rather than served by evicting a
+live one. Evicting one would leave that conversation with two unsynchronized
+tables, and two concurrent requests can then give one placeholder to two
+different values — which is a wrong name in a response, not a lost coreference.
+A request for a session the store already holds is never refused.
+
+Values are never evicted from within a live session: one that came back from the model
+would end a request with nothing to restore to.
 
 Detection still runs over every text in every request. The session stabilises a
 placeholder that detection produced; it is never asked to find personal data on its own,
