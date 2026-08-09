@@ -200,6 +200,22 @@ enum Tier {
 }
 
 fn tier(entry: &Entry) -> Tier {
+    // A strong count above one — the map's own reference — means a
+    // `Claimed` clone is alive outside it: some request either holds the
+    // session's mutex right now, or was handed `guard: None` and has not
+    // reached its own `lock_owned().await` yet. That gap is exactly where
+    // the mutex reads as free while a request is still headed for it, and
+    // treating it as free there would let an unrelated eviction take the
+    // table out from under that request — the same wrong-name failure this
+    // file exists to prevent, reached through the "someone is inside it"
+    // door instead of the "the guard is locked" one. A new clone is only
+    // ever minted inside `acquire_at`'s own critical section, which is
+    // exactly the section this scan runs in, so the count can be
+    // stale-high (a request dropped its `Claimed` a moment ago) but never
+    // stale-low — and stale-high only costs an eviction candidate.
+    if Arc::strong_count(&entry.session) > 1 {
+        return Tier::Held;
+    }
     match Arc::clone(&entry.session.mapping).try_lock_owned() {
         Ok(guard) if guard.is_empty() => Tier::FreeAndEmpty,
         Ok(_) => Tier::FreeWithValues,
@@ -525,18 +541,19 @@ mod tests {
     fn a_session_idle_past_the_ttl_is_swept() {
         let store = SessionStore::new(limits(4));
         let start = Instant::now();
-        let mut one = store.acquire_at(&key("conv1", "Bearer k"), start).unwrap();
-        // The claim goes with the request that took it. A session nobody is
-        // holding is the case this test is about; `a_held_entry_survives_the_ttl_sweep`
-        // covers the other one.
-        one.guard
-            .take()
-            .expect("a fresh session is always claimable");
-        let two = store
+        let one = store.acquire_at(&key("conv1", "Bearer k"), start).unwrap();
+        // A `Weak` proves identity without itself counting as an
+        // outstanding claimant. The claim goes with the request that took
+        // it, guard and all — dropping `one` in full, not just its guard,
+        // is what makes this the "nobody holding it" case;
+        // `a_held_entry_survives_the_ttl_sweep` covers the other one.
+        let one_session = Arc::downgrade(&one.session);
+        drop(one);
+        store
             .acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61))
             .unwrap();
         assert!(
-            !Arc::ptr_eq(&one.session, &two.session),
+            one_session.upgrade().is_none(),
             "a stale table was handed back"
         );
         assert_eq!(store.live(), 1, "the swept entry was left behind");
@@ -547,11 +564,9 @@ mod tests {
         let store = SessionStore::new(limits(4));
         let start = Instant::now();
 
-        let mut held = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
-        let guard = held
-            .guard
-            .take()
-            .expect("a fresh session is always claimable");
+        let held = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
+        assert!(held.guard.is_some(), "a fresh session is always claimable");
+        let held_session = Arc::downgrade(&held.session);
 
         // Far past `idle`, and a request is still holding it. Sweeping it
         // would strand that request's commit and let the next request for
@@ -561,14 +576,16 @@ mod tests {
             .unwrap();
         assert_eq!(store.live(), 2, "a held entry was swept");
 
-        // Released, it is ordinary again: still stale, so the next sweep
-        // takes it and "a" comes back as a fresh table.
-        drop(guard);
-        let a_again = store
+        // Released — guard and claim together, exactly as `handle()` drops
+        // `claimed` once masking finishes — it is ordinary again: still
+        // stale, so the next sweep takes it and "a" comes back as a fresh
+        // table.
+        drop(held);
+        store
             .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(62))
             .unwrap();
         assert!(
-            !Arc::ptr_eq(&held.session, &a_again.session),
+            held_session.upgrade().is_none(),
             "a stale table outlived its holder"
         );
     }
@@ -576,8 +593,10 @@ mod tests {
     #[tokio::test]
     async fn a_full_store_evicts_the_least_recently_used() {
         // Both "a" and "b" get real committed values, through their own
-        // claimed guards, so neither is reclaimable regardless of whether
-        // its claim happens to still be held. This isolates the plain
+        // claimed guards, then are dropped in full — guard and claim
+        // together, exactly as `handle()` drops `claimed` once masking
+        // finishes — so neither reads as an outstanding claimant and both
+        // are judged on tier and `last_seen` alone. This isolates the plain
         // oldest-by-last_seen fallback from the "prefer reclaimable"
         // behavior, which `a_reclaimable_entry_is_evicted_before_a_live_one`
         // below covers on its own.
@@ -585,16 +604,23 @@ mod tests {
         let start = Instant::now();
 
         let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
-        let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
-        a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
-        drop(a_guard);
+        a.guard
+            .as_mut()
+            .expect("a fresh session is always claimable")
+            .mask("Weber", &[span("PERSON", 0, 5)])
+            .unwrap();
+        let a_session = Arc::downgrade(&a.session);
+        drop(a);
 
         let mut b = store
             .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
             .unwrap();
-        let mut b_guard = b.guard.take().expect("a fresh session is always claimable");
-        b_guard.mask("Meier", &[span("PERSON", 0, 5)]).unwrap();
-        drop(b_guard);
+        b.guard
+            .as_mut()
+            .expect("a fresh session is always claimable")
+            .mask("Meier", &[span("PERSON", 0, 5)])
+            .unwrap();
+        drop(b);
 
         // Touching "a" makes "b" the oldest.
         store
@@ -608,8 +634,11 @@ mod tests {
         let a_again = store
             .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(4))
             .unwrap();
+        let a_survived = a_session
+            .upgrade()
+            .expect("the touched session was evicted");
         assert!(
-            Arc::ptr_eq(&a.session, &a_again.session),
+            Arc::ptr_eq(&a_survived, &a_again.session),
             "the touched session was evicted"
         );
     }
@@ -744,12 +773,18 @@ mod tests {
         let a_guard = a.guard.take().expect("a fresh session is always claimable");
 
         // "b" is free but holds a committed value, and newer by `last_seen`.
+        // Dropped in full — guard and claim together, exactly as `handle()`
+        // drops `claimed` once masking finishes — so it reads as merely
+        // reclaimable rather than as another outstanding claimant.
         let mut b = store
             .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
             .unwrap();
-        let mut b_guard = b.guard.take().expect("a fresh session is always claimable");
-        b_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
-        drop(b_guard);
+        b.guard
+            .as_mut()
+            .expect("a fresh session is always claimable")
+            .mask("Weber", &[span("PERSON", 0, 5)])
+            .unwrap();
+        drop(b);
 
         // A third, new key needs a slot in a store already at its cap of 2.
         store
@@ -825,5 +860,61 @@ mod tests {
             "a contended session was claimed twice"
         );
         assert!(Arc::ptr_eq(&first.session, &second.session));
+    }
+
+    #[tokio::test]
+    async fn a_pending_contended_claim_is_not_evicted_between_release_and_relock() {
+        // The gap `tier()`'s strong-count check exists for: a contended
+        // second request holds a `Claimed` with `guard: None` and only
+        // registers on the mutex at its own `lock_owned().await`, which
+        // this test never reaches — so between the first holder's release
+        // and that future lock, `try_lock_owned` alone would read the
+        // entry as free.
+        let store = SessionStore::new(limits(1));
+        let start = Instant::now();
+
+        let mut first = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
+        let a_session = Arc::downgrade(&first.session);
+        let guard = first
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+
+        let second = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            second.guard.is_none(),
+            "a contended session was claimed twice"
+        );
+
+        // The first request finishes and releases the mutex. The second
+        // has not locked it yet — the entry's mutex reads as free right
+        // now, but the second request is still headed for it.
+        drop(guard);
+
+        // The store's only slot belongs to "a"; an unrelated key wants it.
+        let refused = store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(2));
+        assert!(
+            matches!(refused, Err(SessionError::Saturated)),
+            "the pending session was evicted instead of refusing"
+        );
+        assert_eq!(store.live(), 1, "the pending entry was evicted anyway");
+
+        // Once both claims are gone, "a" is still the same table — not one
+        // an unrelated eviction quietly replaced underneath the pending
+        // request.
+        drop(second);
+        drop(first);
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3))
+            .unwrap();
+        let survived = a_session
+            .upgrade()
+            .expect("the pending session was evicted");
+        assert!(
+            Arc::ptr_eq(&survived, &a_again.session),
+            "a stale table replaced the pending one"
+        );
     }
 }
