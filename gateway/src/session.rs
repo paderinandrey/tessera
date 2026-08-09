@@ -730,6 +730,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_free_entry_with_values_is_evicted_before_a_held_one() {
+        let store = SessionStore::new(limits(2));
+        let start = Instant::now();
+
+        // "a" is held — its guard is taken and kept — and its mapping is
+        // empty, but it is the OLDER of the two by `last_seen`. Plain
+        // oldest-first would pick "a" here, same as "b" below is newer: this
+        // test only passes if `Tier::Held` outranking `Tier::FreeWithValues`
+        // in the scan's ordering dominates that tiebreak, which is the half
+        // of the tier order this branch's whole guarantee rests on.
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
+        let a_guard = a.guard.take().expect("a fresh session is always claimable");
+
+        // "b" is free but holds a committed value, and newer by `last_seen`.
+        let mut b = store
+            .acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1))
+            .unwrap();
+        let mut b_guard = b.guard.take().expect("a fresh session is always claimable");
+        b_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
+        drop(b_guard);
+
+        // A third, new key needs a slot in a store already at its cap of 2.
+        store
+            .acquire_at(&key("c", "Bearer k"), start + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(store.live(), 2, "the store grew instead of evicting");
+
+        // "a" is still reachable once its guard drops: it was not the one
+        // taken, even though it is older and was in flight the whole time.
+        drop(a_guard);
+        let a_again = store
+            .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&a.session, &a_again.session),
+            "the held entry was evicted ahead of the free one"
+        );
+    }
+
+    #[tokio::test]
     async fn a_freshly_claimed_session_is_never_treated_as_the_reclaimable_candidate() {
         // The direct proof the TOCTOU race is closed: hold onto a fresh
         // claim exactly as `handle()` does while masking, rather than
