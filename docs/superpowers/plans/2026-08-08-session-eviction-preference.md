@@ -45,7 +45,7 @@ Two tasks. Task 1 is the mechanism itself — it must include every change neede
 
 Task 2 consumes `Claimed`'s `.session` field, exactly as this task leaves it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 These are written against the target API and will not compile until Step 2 lands — that is the "RED" for this task; there is no meaningful intermediate compiling-but-failing state, because the API itself is changing.
 
@@ -250,12 +250,12 @@ Replace the whole `mod tests` block in `gateway/src/session.rs` from `fn limits(
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail to compile**
+- [x] **Step 2: Run the tests to verify they fail to compile**
 
 Run: `cd gateway && cargo test session:: 2>&1 | tail -40`
 Expected: compilation fails — `SessionStore::acquire_at` returns `Arc<Session>`, not something with `.session`/`.guard` fields; `Claimed` does not exist yet.
 
-- [ ] **Step 3: Change `Session` and add `Claimed`**
+- [x] **Step 3: Change `Session` and add `Claimed`**
 
 In `gateway/src/session.rs`, replace the `Session` struct:
 
@@ -287,7 +287,7 @@ pub struct Claimed {
 }
 ```
 
-- [ ] **Step 4: Add the `reclaimable` helper and rewrite `acquire_at`**
+- [x] **Step 4: Add the `reclaimable` helper and rewrite `acquire_at`**
 
 Add above `impl SessionStore`:
 
@@ -374,7 +374,7 @@ Replace `acquire` and `acquire_at`:
 
 The `live()` test helper below `acquire_at` is unchanged — it only counts map entries, unaffected by the return type of `acquire`.
 
-- [ ] **Step 5: Update `proxy.rs`'s masking phase**
+- [x] **Step 5: Update `proxy.rs`'s masking phase**
 
 In `gateway/src/proxy.rs`, replace the `Some(key)` arm of the masking-phase `match` (currently lines 140-153):
 
@@ -400,7 +400,7 @@ In `gateway/src/proxy.rs`, replace the `Some(key)` arm of the masking-phase `mat
 
 No import changes are needed: `Arc` is already imported at `proxy.rs:1`, and neither `Claimed` nor `OwnedMutexGuard` needs to be named explicitly (both are used only through field access and `match`, which Rust resolves without the type being in scope).
 
-- [ ] **Step 6: Update the two existing `proxy.rs` tests that inspect a session directly**
+- [x] **Step 6: Update the two existing `proxy.rs` tests that inspect a session directly**
 
 At `gateway/src/proxy.rs:1314` (inside `a_refused_request_leaves_the_session_untouched`):
 
@@ -421,21 +421,21 @@ At `gateway/src/proxy.rs:1365` (inside `a_value_past_the_cap_is_still_masked_and
 
 Both are safe from the deadlock this task's Global Constraints warn about: the `Claimed` value these lines produce is a temporary — its `.guard` (if any) is dropped at the end of the `let` statement, before the next line locks the mapping fresh.
 
-- [ ] **Step 7: Remove the stale `#[allow(dead_code)]` from `Mapping::is_empty`**
+- [x] **Step 7: Remove the stale `#[allow(dead_code)]` from `Mapping::is_empty`**
 
 In `gateway/src/mapping.rs`, delete the `#[allow(dead_code)]` line directly above `pub fn is_empty(&self) -> bool {` (around line 61). `reclaimable` (Step 4) is now a live caller.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 Run: `cd gateway && cargo test session:: 2>&1 | tail -30`
 Expected: PASS, all nine tests (six adjusted or pre-existing, three new — `a_reclaimable_entry_is_evicted_before_a_live_one`, `a_freshly_claimed_session_is_never_treated_as_the_reclaimable_candidate`, `a_session_held_by_another_request_is_never_treated_as_the_reclaimable_candidate`).
 
-- [ ] **Step 9: Run the full suite, formatting and lints**
+- [x] **Step 9: Run the full suite, formatting and lints**
 
 Run: `cd gateway && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -20`
 Expected: no warnings, everything passes — this exercises `proxy.rs`'s Step 5 and Step 6 changes too, since they're part of the same crate. If `Mapping::is_empty` is still flagged as unused, `reclaimable` (Step 4) was not wired correctly.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add gateway/src/session.rs gateway/src/mapping.rs gateway/src/proxy.rs
@@ -477,7 +477,7 @@ accepted, scoped limitation, not this fix's target."
 
 Task 1 proves the eviction *policy* and the *claim* mechanism correct in isolation. This task proves the thing Codex's original finding on PR #14 actually described — that a failing real HTTP request, through the full `handle()` path, no longer destroys another conversation's committed value — using the store the same way a live gateway does, not through `acquire_at` directly.
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the_session_untouched` (they test adjacent properties of the same mechanism, and this one reuses its detector-mock shape: a 200 with `person_span()` for text containing `SECRET`, a 503 for anything else).
 
@@ -563,19 +563,19 @@ Add to `mod tests` in `gateway/src/proxy.rs`, near `a_refused_request_leaves_the
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it passes**
+- [x] **Step 2: Run the test to verify it passes**
 
 This is a regression guard on behavior Task 1 already implemented and unit-tested — like the streaming-lock test in the original session-mapping plan, it is expected to PASS on its first run, not fail first; the API it exercises did not exist before Task 1, so there is no meaningful pre-fix version of this exact test to run.
 
 Run: `cd gateway && cargo test a_failing_request_does_not_evict_a_live_third_party_session -- --nocapture 2>&1 | tail -20`
 Expected: PASS. If it fails, Task 1's fix does not close the finding end to end even though its own unit tests passed — stop and report BLOCKED with the failure output rather than adjusting this test to make it pass.
 
-- [ ] **Step 3: Run the full suite, formatting and lints**
+- [x] **Step 3: Run the full suite, formatting and lints**
 
 Run: `cd gateway && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test 2>&1 | tail -10`
 Expected: no warnings, everything passes.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add gateway/src/proxy.rs
@@ -589,7 +589,7 @@ regression guard on already-delivered behavior, so it passes on its
 first run rather than needing a RED phase."
 ```
 
-- [ ] **Step 5: Push and update the PR**
+- [x] **Step 5: Push and update the PR**
 
 ```bash
 git push
