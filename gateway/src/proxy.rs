@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping::{Mapping, MappingError};
 use crate::provider::{read_pointer, write_pointer, Anthropic, OpenAi, Provider, ShapeError};
-use crate::session::{key_from, Limits, SessionStore};
+use crate::session::{key_from, Limits, SessionError, SessionStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -36,7 +36,14 @@ impl IntoResponse for ProxyError {
             // cannot honour as asked.
             ProxyError::Shape(ShapeError::Request(_))
             | ProxyError::Shape(ShapeError::Unsupported(_, _))
-            | ProxyError::Session(_) => StatusCode::BAD_REQUEST,
+            | ProxyError::Session(SessionError::BadId)
+            | ProxyError::Session(SessionError::Disabled)
+            | ProxyError::Session(SessionError::NoCredential(_)) => StatusCode::BAD_REQUEST,
+            // Saturation is this gateway's own capacity rather than anything
+            // the caller got wrong, and the same request may well succeed a
+            // moment later. No `Retry-After`: the wait is another request's
+            // detector round-trip, and the gateway has no honest number for it.
+            ProxyError::Session(SessionError::Saturated) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::BAD_GATEWAY,
         };
         // The reason names the failure. It never carries the submitted text.
@@ -138,7 +145,7 @@ async fn handle(
     // the conversation's table so it keeps that name across turns too.
     let (masked, mapping) = match key {
         Some(key) => {
-            let claimed = state.sessions.acquire(&key);
+            let claimed = state.sessions.acquire(&key)?;
             let mut guard = match claimed.guard {
                 Some(guard) => guard,
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
@@ -865,7 +872,10 @@ mod tests {
         // `try_lock` that would deadlock against `claimed`'s own guard — is
         // exactly the proof that nothing else (in particular, no still-live
         // stream) is holding it.
-        let claimed = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        let claimed = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .unwrap();
         assert!(
             claimed.guard.is_some(),
             "the stream is holding its session lock"
@@ -1322,6 +1332,7 @@ mod tests {
         let session = state
             .sessions
             .acquire(&test_key("conv-1", "Bearer k1"))
+            .unwrap()
             .session;
         assert!(
             session.mapping.lock().await.is_empty(),
@@ -1403,7 +1414,11 @@ mod tests {
         assert_eq!(status_c, StatusCode::BAD_GATEWAY);
 
         // Session "a" must still hold Weber's placeholder.
-        let session_a = state.sessions.acquire(&test_key("a", "Bearer k1")).session;
+        let session_a = state
+            .sessions
+            .acquire(&test_key("a", "Bearer k1"))
+            .unwrap()
+            .session;
         assert_eq!(
             session_a
                 .mapping
@@ -1462,6 +1477,7 @@ mod tests {
         let session = state
             .sessions
             .acquire(&test_key("conv-1", "Bearer k1"))
+            .unwrap()
             .session;
         assert_eq!(session.mapping.lock().await.len(), 1);
     }
@@ -1548,6 +1564,57 @@ mod tests {
             detector.received_requests().await.unwrap().len(),
             0,
             "a malformed header cost a detection pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saturated_store_refuses_before_the_detector_runs() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state_with(
+            &detector,
+            &upstream,
+            Limits {
+                idle: Duration::from_secs(1800),
+                max_sessions: 1,
+                max_values: 8,
+            },
+        );
+
+        // The only slot belongs to a session another request is inside right
+        // now, exactly as it would be mid-`mask_all`.
+        let mut held = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .unwrap();
+        let _guard = held
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "conv-2"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("in flight"), "{body}");
+        assert_eq!(
+            detector.received_requests().await.unwrap().len(),
+            0,
+            "a refused request cost a detection pass"
+        );
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            0,
+            "a refused request still reached the provider"
         );
     }
 }
