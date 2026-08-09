@@ -138,8 +138,11 @@ async fn handle(
     // the conversation's table so it keeps that name across turns too.
     let (masked, mapping) = match key {
         Some(key) => {
-            let session = state.sessions.acquire(&key);
-            let mut guard = session.mapping.lock().await;
+            let claimed = state.sessions.acquire(&key);
+            let mut guard = match claimed.guard {
+                Some(guard) => guard,
+                None => Arc::clone(&claimed.session.mapping).lock_owned().await,
+            };
             let mut work = guard.clone();
             let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
             // After the last `?`, and on a copy until here: a refused request
@@ -857,9 +860,14 @@ mod tests {
         // The stream has not been read yet. If the masking guard were still
         // held, this would fail — and a stream that hung would block its
         // conversation for as long as it hung.
-        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        // `acquire` itself claims the mapping's lock synchronously whenever it
+        // is free, so a successful claim here — without a second, separate
+        // `try_lock` that would deadlock against `claimed`'s own guard — is
+        // exactly the proof that nothing else (in particular, no still-live
+        // stream) is holding it.
+        let claimed = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
         assert!(
-            session.mapping.try_lock().is_ok(),
+            claimed.guard.is_some(),
             "the stream is holding its session lock"
         );
 
@@ -1311,10 +1319,100 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
 
-        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        let session = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .session;
         assert!(
             session.mapping.lock().await.is_empty(),
             "a refused request left values in the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_request_does_not_evict_a_live_third_party_session() {
+        // Session "a" commits a real value through an ordinary successful
+        // request. Session "b" then takes the store's second slot with a
+        // request that fails during masking, leaving its entry created but
+        // empty — `acquire` runs, and creates the entry, before `mask_all`
+        // can fail. A third session's request also fails during masking,
+        // and needs a slot in a now-full store: it must evict "b"
+        // (reclaimable), never "a" (live) — even though "a" is the older
+        // of the two by last_seen.
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains(SECRET))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"spans": person_span(), "layers_run": ["deterministic"]}),
+                ),
+            )
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state_with(
+            &detector,
+            &upstream,
+            Limits {
+                idle: Duration::from_secs(1800),
+                max_sessions: 2,
+                max_values: 8,
+            },
+        );
+
+        // "a" gets a real, committed value.
+        call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "a"),
+        )
+        .await;
+
+        // "b" has no "Weber" in it, so the detector 503s and the request
+        // fails — but its session entry was already created, and stays
+        // empty and reclaimable.
+        let (status_b, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "und dann?"}]}),
+            &session_headers("Bearer k1", "b"),
+        )
+        .await;
+        assert_eq!(status_b, StatusCode::BAD_GATEWAY);
+
+        // "c" also fails during masking, and needs a slot in a store
+        // already holding {a, b} at its cap of 2.
+        let (status_c, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "und dann?"}]}),
+            &session_headers("Bearer k1", "c"),
+        )
+        .await;
+        assert_eq!(status_c, StatusCode::BAD_GATEWAY);
+
+        // Session "a" must still hold Weber's placeholder.
+        let session_a = state.sessions.acquire(&test_key("a", "Bearer k1")).session;
+        assert_eq!(
+            session_a
+                .mapping
+                .lock()
+                .await
+                .restore("[PERSON_1]")
+                .unwrap(),
+            "Weber",
+            "a failing request for a different session evicted a's live value"
         );
     }
 
@@ -1361,7 +1459,10 @@ mod tests {
         );
         assert!(body.contains(SECRET) && body.contains("Meier"));
 
-        let session = state.sessions.acquire(&test_key("conv-1", "Bearer k1"));
+        let session = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .session;
         assert_eq!(session.mapping.lock().await.len(), 1);
     }
 
