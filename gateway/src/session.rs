@@ -728,12 +728,21 @@ mod tests {
         let start = Instant::now();
 
         // "a" becomes a live session: a real value, committed through its
-        // own claimed guard, then released — exactly what a real request
-        // does once masking finishes.
+        // own claimed guard, then released in full — guard and claim
+        // together, exactly as `handle()` drops `claimed` once masking
+        // finishes — so it reads as merely reclaimable (`FreeWithValues`)
+        // rather than as an outstanding claimant (`Held`). Without this,
+        // "a" would classify `Held` at the "c" acquisition below and this
+        // test would only prove `FreeAndEmpty < Held`, not the
+        // `FreeAndEmpty < FreeWithValues` boundary it is about.
         let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
-        let mut a_guard = a.guard.take().expect("a fresh session is always claimable");
-        a_guard.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
-        drop(a_guard);
+        a.guard
+            .as_mut()
+            .expect("a fresh session is always claimable")
+            .mask("Weber", &[span("PERSON", 0, 5)])
+            .unwrap();
+        let a_session = Arc::downgrade(&a.session);
+        drop(a);
 
         // "b" is created but never used, and its own claim is dropped
         // immediately below by never binding it — it stays reclaimable. It
@@ -752,8 +761,11 @@ mod tests {
         let a_again = store
             .acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(3))
             .unwrap();
+        let survived = a_session
+            .upgrade()
+            .expect("the live session was evicted ahead of the reclaimable one");
         assert!(
-            Arc::ptr_eq(&a.session, &a_again.session),
+            Arc::ptr_eq(&survived, &a_again.session),
             "the live session was evicted ahead of the reclaimable one"
         );
     }
@@ -916,5 +928,30 @@ mod tests {
             Arc::ptr_eq(&survived, &a_again.session),
             "a stale table replaced the pending one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_locked_entry_with_no_pending_claimant_is_still_held() {
+        // The strong-count check short-circuits `tier()` before its
+        // `try_lock_owned` arm ever runs whenever a live `Claimed` is
+        // around — which every other test that produces a held entry
+        // happens to keep. This one drops the `Claimed` in full, so the
+        // only thing left signaling "held" is the lock itself: proof the
+        // `Err(_) => Tier::Held` arm still does its job on its own.
+        let store = SessionStore::new(limits(1));
+        let start = Instant::now();
+
+        let mut a = store.acquire_at(&key("a", "Bearer k"), start).unwrap();
+        let guard = a.guard.take().expect("a fresh session is always claimable");
+        drop(a);
+
+        let refused = store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(1));
+        assert!(
+            matches!(refused, Err(SessionError::Saturated)),
+            "a locked entry with no pending claimant was evicted"
+        );
+        assert_eq!(store.live(), 1, "the locked entry was evicted anyway");
+
+        drop(guard);
     }
 }
