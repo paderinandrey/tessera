@@ -171,15 +171,33 @@ struct Entry {
     last_seen: Instant,
 }
 
-/// Whether `entry`'s session is safe for an unrelated eviction to reclaim:
-/// its lock is free right now, and it holds no committed values. Claiming
-/// the lock here and immediately dropping it only ever succeeds when
-/// nobody else currently needs it — the same guarantee that makes the
+/// How costly an entry is to take from the map, cheapest first. `Ord` is
+/// derived from the declaration order, so the scan can simply take the
+/// minimum.
+///
+/// Claiming the lock here and dropping it immediately only ever succeeds
+/// when nobody else currently needs it — the same guarantee that makes the
 /// return-time claim in `acquire_at` safe.
-fn reclaimable(entry: &Entry) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Tier {
+    /// Nobody holds it and it remembers nothing: taking it costs nothing at all.
+    FreeAndEmpty,
+    /// Nobody holds it, but a conversation loses its coreference. The client
+    /// re-sends the history, so the next request rebuilds the table.
+    FreeWithValues,
+    /// A request is inside it right now. Taking this one strands that request
+    /// and lets the next request for the same id open a second, unsynchronized
+    /// table for one conversation — where two concurrent requests can allocate
+    /// one placeholder to two different values, and a response restores the
+    /// wrong person's name.
+    Held,
+}
+
+fn tier(entry: &Entry) -> Tier {
     match Arc::clone(&entry.session.mapping).try_lock_owned() {
-        Ok(guard) => guard.is_empty(),
-        Err(_) => false,
+        Ok(guard) if guard.is_empty() => Tier::FreeAndEmpty,
+        Ok(_) => Tier::FreeWithValues,
+        Err(_) => Tier::Held,
     }
 }
 
@@ -218,25 +236,28 @@ impl SessionStore {
 
         // Sweeping here rather than in a background task: at a thousand
         // sessions this costs less than a syscall, and there is no separate
-        // task whose health is a new thing to reason about.
-        map.retain(|_, entry| now.duration_since(entry.last_seen) < self.limits.idle);
+        // task whose health is a new thing to reason about. A held entry is
+        // spared whatever its age — removing one is the same mistake as
+        // evicting it under saturation. `||` short-circuits, so the extra
+        // `try_lock` is paid only by entries that are already stale.
+        map.retain(|_, entry| {
+            now.duration_since(entry.last_seen) < self.limits.idle || tier(entry) == Tier::Held
+        });
 
         let session = if let Some(entry) = map.get_mut(key) {
             entry.last_seen = now;
             Arc::clone(&entry.session)
         } else {
             if map.len() >= self.limits.max_sessions {
-                // Prefer a victim that is already reclaimable — nobody
-                // loses a live conversation to make room for a request
-                // that turns out not to need the space. Fall back to the
-                // globally-oldest entry only when every entry currently
-                // holds something.
+                // One pass and one `try_lock` per entry: the cheapest tier
+                // wins and `last_seen` breaks ties within it. The old
+                // `.or_else` threw that knowledge away and fell back to the
+                // globally-oldest entry, held or not.
                 let victim = map
                     .iter()
-                    .filter(|(_, entry)| reclaimable(entry))
-                    .min_by_key(|(_, entry)| entry.last_seen)
-                    .or_else(|| map.iter().min_by_key(|(_, entry)| entry.last_seen))
-                    .map(|(key, _)| key.clone());
+                    .map(|(key, entry)| (tier(entry), entry.last_seen, key))
+                    .min_by_key(|(tier, last_seen, _)| (*tier, *last_seen))
+                    .map(|(_, _, key)| key.clone());
                 if let Some(victim) = victim {
                     map.remove(&victim);
                 }
@@ -488,13 +509,46 @@ mod tests {
     fn a_session_idle_past_the_ttl_is_swept() {
         let store = SessionStore::new(limits(4));
         let start = Instant::now();
-        let one = store.acquire_at(&key("conv1", "Bearer k"), start);
+        let mut one = store.acquire_at(&key("conv1", "Bearer k"), start);
+        // The claim goes with the request that took it. A session nobody is
+        // holding is the case this test is about; `a_held_entry_survives_the_ttl_sweep`
+        // covers the other one.
+        one.guard
+            .take()
+            .expect("a fresh session is always claimable");
         let two = store.acquire_at(&key("conv1", "Bearer k"), start + Duration::from_secs(61));
         assert!(
             !Arc::ptr_eq(&one.session, &two.session),
             "a stale table was handed back"
         );
         assert_eq!(store.live(), 1, "the swept entry was left behind");
+    }
+
+    #[tokio::test]
+    async fn a_held_entry_survives_the_ttl_sweep() {
+        let store = SessionStore::new(limits(4));
+        let start = Instant::now();
+
+        let mut held = store.acquire_at(&key("a", "Bearer k"), start);
+        let guard = held
+            .guard
+            .take()
+            .expect("a fresh session is always claimable");
+
+        // Far past `idle`, and a request is still holding it. Sweeping it
+        // would strand that request's commit and let the next request for
+        // "a" open a second table for one conversation.
+        store.acquire_at(&key("b", "Bearer k"), start + Duration::from_secs(61));
+        assert_eq!(store.live(), 2, "a held entry was swept");
+
+        // Released, it is ordinary again: still stale, so the next sweep
+        // takes it and "a" comes back as a fresh table.
+        drop(guard);
+        let a_again = store.acquire_at(&key("a", "Bearer k"), start + Duration::from_secs(62));
+        assert!(
+            !Arc::ptr_eq(&held.session, &a_again.session),
+            "a stale table outlived its holder"
+        );
     }
 
     #[tokio::test]
