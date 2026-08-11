@@ -22,3 +22,11 @@ anthropic_base = "https://api.anthropic.com"
 session_idle_secs = 1800
 max_sessions = 1000
 max_session_values = 1000
+
+# Where the audit journal is appended, one JSON object per line. Required: the
+# gateway does not start without it. Two records per request — one written and
+# fsynced before the provider is called, one when the request ends — and neither
+# ever carries submitted text. A salt file is kept beside it as
+# <audit_path>.salt so that the tenant and session digests survive a restart;
+# both files hold evidence and belong on storage you back up.
+audit_path = "/var/log/tessera/audit.jsonl"

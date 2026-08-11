@@ -19,6 +19,13 @@ pub struct Config {
     pub bind: String,
     #[serde(default = "default_detector_url")]
     pub detector_url: String,
+    /// Where the audit journal is appended. Required: a deployment with no
+    /// journal cannot show a DPO that anything was pseudonymized, and a
+    /// control that is off by default is not a control. A file that cannot be
+    /// opened for appending stops the process rather than starting one that
+    /// silently proves nothing.
+    #[allow(dead_code)]
+    pub audit_path: String,
     /// Generous on purpose: full detection costs about a second per 1 200
     /// characters, and a conversation history is longer than that. Exceeding
     /// it refuses the request — it never forwards unmasked text.
@@ -90,9 +97,30 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Every config below needs the required key; naming it once keeps the
+    /// tests about the setting each one is actually exercising.
+    fn with_audit(body: &str) -> String {
+        format!("audit_path = \"/tmp/tessera-test-audit.jsonl\"\n{body}")
+    }
+
+    #[test]
+    fn audit_path_is_required() {
+        // A control that can be switched off by omitting a line is worth
+        // nothing in a compliance report.
+        let error = Config::from_toml("").unwrap_err();
+        assert!(error.to_string().contains("audit_path"));
+    }
+
+    #[test]
+    fn audit_path_is_read() {
+        let config = Config::from_toml(r#"audit_path = "/var/log/tessera/audit.jsonl""#)
+            .expect("a config naming an audit log is valid");
+        assert_eq!(config.audit_path, "/var/log/tessera/audit.jsonl");
+    }
+
     #[test]
     fn defaults_are_usable_without_a_file() {
-        let config = Config::from_toml("").expect("empty config is valid");
+        let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
         assert_eq!(config.bind, "127.0.0.1:8080");
         assert_eq!(config.detector_url, "http://127.0.0.1:8000");
         assert_eq!(config.detector_timeout_secs, 30);
@@ -100,14 +128,14 @@ mod tests {
 
     #[test]
     fn values_override_the_defaults() {
-        let config = Config::from_toml(
+        let config = Config::from_toml(&with_audit(
             r#"
             bind = "0.0.0.0:9090"
             detector_url = "http://detector:8000"
             detector_timeout_secs = 5
             openai_base = "https://api.openai.com"
             "#,
-        )
+        ))
         .expect("valid config");
         assert_eq!(config.bind, "0.0.0.0:9090");
         assert_eq!(config.detector_timeout_secs, 5);
@@ -117,18 +145,18 @@ mod tests {
     #[test]
     fn an_unknown_key_is_rejected() {
         // A typo in a security control's configuration must not be silently ignored.
-        let error = Config::from_toml("detector_timeoutt_secs = 5").unwrap_err();
+        let error = Config::from_toml(&with_audit("detector_timeoutt_secs = 5")).unwrap_err();
         assert!(error.to_string().contains("detector_timeoutt_secs"));
     }
 
     #[test]
     fn a_zero_timeout_is_rejected() {
-        assert!(Config::from_toml("detector_timeout_secs = 0").is_err());
+        assert!(Config::from_toml(&with_audit("detector_timeout_secs = 0")).is_err());
     }
 
     #[test]
     fn session_defaults_are_bounded() {
-        let config = Config::from_toml("").expect("empty config is valid");
+        let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
         assert_eq!(config.session_idle_secs, 1800);
         assert_eq!(config.max_sessions, 1000);
         assert_eq!(config.max_session_values, 1000);
@@ -136,13 +164,13 @@ mod tests {
 
     #[test]
     fn session_values_override_the_defaults() {
-        let config = Config::from_toml(
+        let config = Config::from_toml(&with_audit(
             r#"
             session_idle_secs = 60
             max_sessions = 4
             max_session_values = 8
             "#,
-        )
+        ))
         .expect("valid config");
         assert_eq!(config.session_idle_secs, 60);
         assert_eq!(config.max_sessions, 4);
@@ -151,13 +179,13 @@ mod tests {
 
     #[test]
     fn zero_idle_disables_sessions_and_permits_zero_limits() {
-        let config = Config::from_toml(
+        let config = Config::from_toml(&with_audit(
             r#"
             session_idle_secs = 0
             max_sessions = 0
             max_session_values = 0
             "#,
-        )
+        ))
         .expect("a deployment that wants no personal data in memory between requests");
         assert_eq!(config.session_idle_secs, 0);
     }
@@ -165,7 +193,7 @@ mod tests {
     #[test]
     fn a_zero_limit_with_sessions_enabled_is_rejected() {
         // Enabled and unable to hold anything is not a configuration, it is a typo.
-        assert!(Config::from_toml("max_sessions = 0").is_err());
-        assert!(Config::from_toml("max_session_values = 0").is_err());
+        assert!(Config::from_toml(&with_audit("max_sessions = 0")).is_err());
+        assert!(Config::from_toml(&with_audit("max_session_values = 0")).is_err());
     }
 }
