@@ -48,9 +48,11 @@ best-effort, and free to say more.
 4. **Attribution is by salted digest**, of the caller's credential and of the
    session, with a salt that survives restart.
 
-5. **The per-request record is an RAII guard.** Its `Drop` writes the `outcome`
-   line, so every early return and every way a stream can end is covered without
-   a single call site.
+5. **The per-request record is an RAII guard with explicit outcome signals.**
+   Each way a request can end tells the record what happened; `Drop` writes
+   whatever it was told, and writes `aborted` when it was told nothing. The
+   guard guarantees that a line is always written — it does not guess what the
+   line says.
 
 ### Why write before the call rather than after
 
@@ -96,12 +98,25 @@ report the conversation's accumulated total on every turn and the record would
 stop describing the request. `mask_all` (`proxy.rs:116`) currently drops the
 spans it receives; it will return them.
 
-**`result` has three values.** `completed` — the client received the whole
-response. `refused` — the request ended with an error, which may be before the
-upstream call (`upstream: false`) or after it, since a response carrying a
-placeholder no mapping knows is refused too. `stream_failed` — bytes had already
-been sent, so the stream ended mid-flight instead; `status` is then the 200 the
-client already received, and `error` names why it stopped.
+**`result` has four values, and each is signalled rather than inferred.**
+
+- `completed` — the gateway produced a whole response. Not "the client received
+  it": for a buffered response the bytes are handed to axum, and whether the
+  client's connection then survived is not something this gateway observes. The
+  log records what the gateway did.
+- `refused` — the request ended with an error, either before the upstream call
+  (`upstream: false`) or after it, since a response carrying a placeholder no
+  mapping knows is refused too.
+- `stream_failed` — bytes had already gone out, so the stream ended mid-flight
+  instead. `status` is the 200 the client already received and `error` names why
+  it stopped.
+- `aborted` — the record was dropped without any signal. In practice this is a
+  client that disconnected mid-stream, which is the one ending the streaming
+  code does not reach a `return` for.
+
+The fourth value exists because the alternative is a lie. A guard that assumed
+`completed` on an unsignalled drop would report success for every abandoned
+stream.
 
 **`texts` is how many text fields were masked** — the length of
 `provider.request_pointers`. A conversation history is many fields, and a record
@@ -124,21 +139,34 @@ from whether a `masked` line with the same `request` exists, but a refused
 request has only one line, and that line should answer the central question
 without a join.
 
-**`tenant` and `session` are digests.** `SessionKey::digest()` (`session.rs:95`)
-already exists and already exists for this reason — the raw session id is
-client-chosen and `patient-Weber-2026` is a plausible one. Two changes are
-needed:
+**`tenant` and `session` are digests the audit writer computes itself**, 16
+bytes each, rendered as 32 hex characters. The example above shortens them for
+readability; the real fields are long.
 
-- the credential fingerprint is currently computed only inside
-  `SessionKey::new` (`session.rs:82`), so a request with no session header has
-  none. `tenant` needs a fingerprint of the credential independent of whether a
-  session was asked for.
-- `salt()` (`session.rs:53`) is random per process. That is right for sessions,
+The reason for a digest at all is the one `SessionKey::digest()` (`session.rs:95`)
+was written for: the raw session id is client-chosen, and `patient-Weber-2026`
+is a plausible id and an unacceptable log line. But that method is not reused
+here, for three reasons, each of which alone would be enough:
+
+- **It keeps four bytes** (`session.rs:100`). Thirty-two bits are ample for a
+  debug label on a store that holds a thousand entries and dies with the
+  process. They are not ample for a journal: at 100 000 distinct sessions the
+  probability that some pair collides is 0.69, and a collision merges two
+  callers into one audit identity — corrupting precisely the field's purpose.
+  Sixteen bytes make it unreachable. Attribution is worth more bytes than a
+  debug label is.
+- **Its salt is per-process** (`session.rs:53`), which is right for sessions,
   whose data dies with the process, and wrong for a journal read months later:
   the same tenant would appear as a different one after every restart. The
   audit writer takes its own salt from `<audit_path>.salt` — 32 bytes, mode
   0600, created on first run and reused afterwards. Sessions keep their
-  ephemeral salt; the two want opposite things and should not share.
+  ephemeral salt; the two want opposite things and should not share one.
+- **It covers credential and id together**, so a request with no session header
+  has no fingerprint at all — the credential is hashed only inside
+  `SessionKey::new` (`session.rs:82`). `tenant` must exist whether or not a
+  session was asked for, so it is a digest of the credential alone, and
+  `session` is a digest of credential and id. A request without the header
+  records `tenant` and a null `session`.
 
 **`ts` is RFC 3339 UTC**, which adds the `time` crate. An audit line whose
 timestamp needs a converter before a human can read it is a worse artifact than
@@ -154,25 +182,43 @@ relying on `O_APPEND` atomicity — a record with a long `types` map can exceed
 the size at which that atomicity holds, and interleaved lines in the evidence
 base are worse than a lock held for microseconds.
 
-`Record` is the per-request guard. It is constructed as the first statement of
-`handle` (`proxy.rs:131`), before `provider.request_pointers`, so that a body
-whose shape the gateway refuses is still journaled. It accumulates fields as
-they become known: provider immediately, `tenant` and `session` after `key_from`
-(`proxy.rs:142`), `types`/`spans`/`texts` after `mask_all`. It exposes exactly
-two things:
+`Record` is a cheap clonable handle to per-request state — the accumulated
+fields behind a mutex, plus a reference to `Audit`. The `outcome` line is
+written when the **last** handle drops. That indirection is what lets the record
+outlive `handle` on the streaming path while still being finalized by the
+wrapper on the buffered one.
 
-- `masked(&mut self) -> Result<(), AuditError>`, called once, immediately before
-  `state.upstream.post(...)` (`proxy.rs:172`). It serializes, writes and fsyncs
-  inside `spawn_blocking`, so a slow disk does not occupy a runtime worker.
-- `Drop`, which writes the `outcome` line: one `write_all` under the same mutex,
-  no fsync.
+It is constructed in the `openai` and `anthropic` wrappers (`proxy.rs:253`,
+`proxy.rs:264`), not inside `handle`, and this is the correction that matters.
+`handle` returns `Result<Response, ProxyError>`, and a `ProxyError` does not
+become a status until `into_response` (`proxy.rs:31`) runs in the wrapper. A
+guard constructed inside `handle` and dropped on its return would have to invent
+both `status` and `error`: a bare `?` unwinds past the guard without telling it
+which failure occurred. The wrapper is the first place where the outcome is a
+value one can read.
 
-The buffered path drops the `Record` when `handle` returns. The streamed path
-moves it into `restore_stream` (`proxy.rs:215`) alongside `mapping`, and its
-`Drop` fires when the stream ends — normally, by a broken connection, or by an
-unrestorable token. No new code in `stream.rs` beyond taking ownership: the
-three ways a stream can end are already implemented there, and none of them need
-to know an audit log exists.
+So the wrapper holds one handle, passes a clone into `handle`, and on return
+signals `refused(&error)` or `completed(status)` before dropping its own. For a
+buffered response its handle is the last one, and the line is written there.
+
+`handle` fills the fields as they become known — provider immediately, `tenant`
+and `session` after `key_from` (`proxy.rs:142`), `types`/`spans`/`texts` after
+`mask_all` — and calls `masked()` once, immediately before
+`state.upstream.post(...)` (`proxy.rs:172`). That call serializes, writes and
+fsyncs inside `spawn_blocking`, so a slow disk does not occupy a runtime worker,
+and it is the one audit call that returns a `Result` and can refuse the request.
+
+The streamed path passes a clone into `restore_stream` (`proxy.rs:215`)
+alongside `mapping`, so the wrapper's handle is no longer the last and the line
+waits for the stream. `stream.rs` does change, contrary to what an earlier draft
+of this design claimed: its generator has three distinct exits — the upstream
+connection breaking (`stream.rs:643`), restoration failing mid-stream
+(`stream.rs:657`), and restoration failing on the final flush
+(`stream.rs:661`) — and the first two end in a bare `return` while the third
+falls off the end of the generator. No `Drop` can tell the three apart, nor tell
+any of them from a success. Each gains one call naming what happened. A client that disconnects reaches none of
+them, the generator is simply dropped, and that is the ending `aborted` exists
+to describe.
 
 `Drop` being neither async nor fallible is not a limitation here. It matches a
 decision already made: the outcome line does not fsync and may not refuse.
@@ -233,8 +279,19 @@ The tests that matter are invariants, not the presence of a line.
   not called.
 - `types` and `spans` describe the request, not the session: a second turn
   repeating the same name records `{"PERSON": 1}`, not two.
+- The recorded `error` is the failure that actually occurred, not a generic one:
+  a detector timeout records `detector_timeout` and a saturated store records
+  `session_saturated`, each with the status its `IntoResponse` arm produces.
+  This is the invariant a guard that inferred its outcome would violate
+  silently, so it is exercised per variant rather than once.
+- Each of the three stream exits records its own class, and they differ from
+  each other.
+- A client that disconnects mid-stream records `aborted` — not `completed`,
+  which is what an unsignalled drop would otherwise be free to claim.
 - A stream that ends by a broken connection still closes its record; the
-  streamed `Drop` is covered separately from the buffered one.
+  streamed path is covered separately from the buffered one.
+- `tenant` and `session` are 32 hex characters, and a request with no session
+  header still records a `tenant` with a null `session`.
 - No line of the journal contains any substring of the submitted text —
   exercised over a corpus of values, including the case where a value is echoed
   back inside a provider error body.
