@@ -299,9 +299,6 @@ impl Record {
 
     /// Bytes had already gone out, so the stream ended mid-flight. The status
     /// is the one the client already received.
-    // Not yet called outside tests: `stream.rs` calls this once the streamed
-    // path carries its own `Record`, in Task 5.
-    #[allow(dead_code)]
     pub fn stream_failed(&self, error: &'static str) {
         self.outcome("stream_failed", 200, Some(error));
     }
