@@ -46,6 +46,25 @@ pub enum StreamError {
     Malformed,
 }
 
+impl StreamError {
+    /// The fixed vocabulary the journal records. `Mapping`'s inner
+    /// `MappingError::Unknown` carries a token and `Unplaceable` a run key;
+    /// neither reaches the journal, only the class. Matched with no `_` arm:
+    /// a new variant must fail to compile here rather than be silently
+    /// recorded as an existing class.
+    pub(crate) fn audit_class(&self) -> &'static str {
+        match self {
+            StreamError::Mapping(_) => "stream_unrestorable",
+            StreamError::Shape(_) => "stream_shape_error",
+            StreamError::Unplaceable(_) => "stream_unplaceable",
+            StreamError::Oversized => "stream_oversized",
+            StreamError::Stalled => "stream_stalled",
+            StreamError::TooManyRuns => "stream_too_many_runs",
+            StreamError::Malformed => "stream_malformed",
+        }
+    }
+}
+
 /// How much of an unfinished event to hold. A response that never sends a blank
 /// line would otherwise be buffered whole, which is the memory cost streaming
 /// exists to avoid. Provider events are a few hundred bytes.
@@ -620,6 +639,7 @@ pub fn restore_stream(
     provider: &'static dyn Provider,
     mapping: Mapping,
     headers: HeaderMap,
+    record: crate::audit::Record,
 ) -> Response {
     let body = async_stream::stream! {
         let mut upstream = response.bytes_stream();
@@ -640,6 +660,7 @@ pub fn restore_stream(
                         yield Ok(Bytes::from(tail));
                     }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
+                    record.stream_failed("stream_broken");
                     return;
                 }
             };
@@ -654,6 +675,7 @@ pub fn restore_stream(
                         yield Ok(Bytes::from(salvaged));
                     }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
+                    record.stream_failed(error.audit_class());
                     return;
                 }
             }
@@ -662,6 +684,7 @@ pub fn restore_stream(
             Ok(out) if out.is_empty() => {}
             Ok(out) => yield Ok::<_, Infallible>(Bytes::from(out)),
             Err(error) => {
+                record.stream_failed(error.audit_class());
                 let salvaged = restorer.salvage();
                 if !salvaged.is_empty() {
                     yield Ok(Bytes::from(salvaged));

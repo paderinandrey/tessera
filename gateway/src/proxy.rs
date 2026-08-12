@@ -301,7 +301,11 @@ async fn handle(
             .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
     {
         return Ok(crate::stream::restore_stream(
-            response, provider, mapping, returned,
+            response,
+            provider,
+            mapping,
+            returned,
+            record.clone(),
         ));
     }
 
@@ -370,10 +374,11 @@ async fn serve(
     let record = Record::new(Arc::clone(&state.audit), provider.name(), route);
     match handle(state, provider, headers, body, &record).await {
         Ok(response) => {
-            // True for a buffered response. A streamed one is not yet given
-            // its own handle — that is Task 5 — so today this is recorded the
-            // moment the response begins, not when the client finishes
-            // receiving it.
+            // For a buffered response this is the outcome. For a streamed one
+            // it is a placeholder the stream's own handle supersedes when it
+            // ends — `restore_stream` holds a clone of `record` and calls
+            // `stream_failed` on every exit that is not a plain success, so
+            // the last word on a streamed request's outcome is always its own.
             record.completed(response.status().as_u16());
             response
         }
@@ -2030,5 +2035,109 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("readable");
         assert!(!text.contains(SECRET), "the journal does not");
         assert!(!text.contains("PERSON_1"), "nor a placeholder name");
+    }
+
+    /// An SSE upstream that sends `body` and then closes.
+    async fn streaming_upstream(route: &str, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_matcher(route))
+            .respond_with(
+                // `set_body_string` sets its own `text/plain` mime and wins
+                // over a header inserted separately, so the stream's
+                // content-type has to be set through the body call itself —
+                // otherwise the response is routed as a buffered one.
+                ResponseTemplate::new(200)
+                    .set_body_raw(body.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_whole_stream_records_completed() {
+        let detector = detector_finding_weber().await;
+        let upstream = streaming_upstream(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"stream": true, "messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let lines = journal(&path);
+        assert_eq!(
+            lines[0]["stream"], true,
+            "the masked record knows it is a stream"
+        );
+        assert_eq!(lines[1]["result"], "completed");
+        assert_eq!(
+            lines[1]["ms"].as_u64().expect("a duration"),
+            lines[1]["ms"].as_u64().expect("a duration"),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrestorable_token_records_stream_failed() {
+        // The provider invents a placeholder no mapping knows. Bytes have
+        // already gone out, so the stream ends rather than the request being
+        // refused — and the record says so with the status the client got.
+        let detector = detector_finding_weber().await;
+        let upstream = streaming_upstream(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[PERSON_9]\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"stream": true, "messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the head was already sent");
+        assert!(
+            body.contains("error"),
+            "the client is told the stream failed"
+        );
+
+        let lines = journal(&path);
+        assert_eq!(lines[1]["result"], "stream_failed");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(lines[1]["error"], "stream_unrestorable");
+        assert_eq!(lines[1]["upstream"], true);
+    }
+
+    #[tokio::test]
+    async fn the_stream_finishes_the_record_not_the_wrapper() {
+        // If the wrapper finalized a streamed request, the outcome would be
+        // written before a single event had been restored.
+        let detector = detector_returning(json!([])).await;
+        let upstream = streaming_upstream(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        call(
+            state,
+            "/v1/chat/completions",
+            json!({"stream": true, "messages": [{"role": "user", "content": "hello"}]}),
+        )
+        .await;
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "exactly one outcome, written once");
+        assert_eq!(lines[1]["event"], "outcome");
     }
 }
