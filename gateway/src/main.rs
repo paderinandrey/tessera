@@ -6,6 +6,7 @@
 //! know all end the request rather than forwarding unmasked text or handing a
 //! placeholder to the client.
 
+mod audit;
 mod config;
 mod detector;
 mod mapping;
