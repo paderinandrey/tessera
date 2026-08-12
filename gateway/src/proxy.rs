@@ -193,6 +193,16 @@ async fn handle(
     body: Value,
     record: &Record,
 ) -> Result<Response, ProxyError> {
+    // Attribution first, before even the shape check: a request refused for
+    // its body or its session id should still say whose it was. Resolved
+    // once — `credential_of` borrows from `headers`, which outlives the
+    // function — so the digest sent here and the one sent below cannot drift
+    // apart into two different readings of the same header.
+    let credential = crate::session::credential_of(&headers, provider);
+    if let Some(credential) = credential {
+        record.attribute(state.audit.digest(&[credential]), None);
+    }
+
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let pointers = provider.request_pointers(&body)?;
 
@@ -200,20 +210,11 @@ async fn handle(
         record.streaming();
     }
 
-    // Attribution first: a request refused for its session id should still say
-    // whose it was.
-    if let Some(credential) = crate::session::credential_of(&headers, provider) {
-        record.attribute(state.audit.digest(&[credential]), None);
-    }
-
     // Resolved before detection: a malformed header must cost nothing, not a
     // second per 1 200 characters.
     let key = key_from(&headers, provider, state.sessions.enabled())?;
 
-    if let (Some(credential), Some(key)) = (
-        crate::session::credential_of(&headers, provider),
-        key.as_ref(),
-    ) {
+    if let (Some(credential), Some(key)) = (credential, key.as_ref()) {
         record.attribute(
             state.audit.digest(&[credential]),
             Some(state.audit.digest(&[credential, key.id().as_bytes()])),
@@ -369,8 +370,10 @@ async fn serve(
     let record = Record::new(Arc::clone(&state.audit), provider.name(), route);
     match handle(state, provider, headers, body, &record).await {
         Ok(response) => {
-            // A streamed response holds its own handle, so this signal is
-            // overwritten by whatever the stream reports when it ends.
+            // True for a buffered response. A streamed one is not yet given
+            // its own handle — that is Task 5 — so today this is recorded the
+            // moment the response begins, not when the client finishes
+            // receiving it.
             record.completed(response.status().as_u16());
             response
         }
@@ -1929,19 +1932,28 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_turn_counts_its_own_request_not_the_table() {
-        let detector = detector_finding_weber().await;
+        // The detector reports a PERSON at a fixed span regardless of the
+        // text, so each turn masks exactly one value of its own — but a
+        // different one each time. The session's mapping therefore
+        // accumulates to two entries while each request's own count stays at
+        // one; a version that read the count off the mapping instead of the
+        // request would report two on the second turn.
+        let detector = detector_returning(person_span()).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
             json!({"choices": [{"message": {"content": "ok"}}]}),
         )
         .await;
         let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
-        let body = json!({"messages": [{"role": "user", "content": "Weber called"}]});
-        for _ in 0..2 {
+        let bodies = [
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+            json!({"messages": [{"role": "user", "content": "Meier called"}]}),
+        ];
+        for body in bodies {
             call_with_headers(
                 Arc::clone(&state),
                 "/v1/chat/completions",
-                body.clone(),
+                body,
                 &session_headers("sk-tenant", "chat-1"),
             )
             .await;
