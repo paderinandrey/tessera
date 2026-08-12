@@ -652,6 +652,11 @@ pub fn restore_stream(
                 // restored and waiting behind the one-event delay is safe to
                 // serve, and a failed connection does not make it unsafe.
                 Err(error) => {
+                    // Recorded before anything is yielded: a generator parked
+                    // at a `yield` runs no further statement if it is dropped
+                    // there, so a signal placed after the last one would never
+                    // fire for a client that vanishes right as it arrives.
+                    record.stream_failed("stream_broken");
                     let tail = match restorer.finish() {
                         Ok(tail) => tail,
                         Err(_) => restorer.salvage(),
@@ -660,7 +665,6 @@ pub fn restore_stream(
                         yield Ok(Bytes::from(tail));
                     }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
-                    record.stream_failed("stream_broken");
                     return;
                 }
             };
@@ -670,19 +674,26 @@ pub fn restore_stream(
                 // Restoration failed, so the stream ends — but text rendered
                 // before the failing event is correct and is served first.
                 Err(error) => {
+                    record.stream_failed(error.audit_class());
                     let salvaged = restorer.salvage();
                     if !salvaged.is_empty() {
                         yield Ok(Bytes::from(salvaged));
                     }
                     yield Ok(Bytes::from(error_event(&error.to_string())));
-                    record.stream_failed(error.audit_class());
                     return;
                 }
             }
         }
         match restorer.finish() {
-            Ok(out) if out.is_empty() => {}
-            Ok(out) => yield Ok::<_, Infallible>(Bytes::from(out)),
+            Ok(out) => {
+                // Recorded before the yield for the same reason as the two
+                // failure exits above: this is the only place a whole stream's
+                // success is ever signalled.
+                record.completed(200);
+                if !out.is_empty() {
+                    yield Ok::<_, Infallible>(Bytes::from(out));
+                }
+            }
             Err(error) => {
                 record.stream_failed(error.audit_class());
                 let salvaged = restorer.salvage();
