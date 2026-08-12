@@ -5,17 +5,22 @@
 //! placeholder name. What it writes is counts, a fixed vocabulary of error
 //! classes, and salted digests of the caller's credential and session.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use time::format_description::well_known::Rfc3339;
 
 /// What the client is told when the journal cannot be written. It names no
 /// path: the filesystem layout is of no use to the caller and of some use to
 /// an attacker. The detail goes to `tracing` at the call site.
-// Not yet raised: the per-request `Record` guard that returns it is Task 3.
+// Not yet reachable outside tests: `Record::masked` raises this, but nothing
+// outside tests constructs a `Record` until `proxy.rs` does in Task 4.
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
@@ -167,6 +172,194 @@ impl Audit {
         }
         Ok(())
     }
+}
+
+/// A handle to one request's audit state. Cloning is cheap and the `outcome`
+/// line is written when the **last** handle drops — which is the `openai` /
+/// `anthropic` wrapper on the buffered path and the stream on the streamed one.
+///
+/// The guard guarantees that a line is written. It does not guess what the line
+/// says: every ending signals what happened, and an ending that signals nothing
+/// is recorded as `aborted` rather than assumed to be a success.
+// Not yet constructed outside tests: `proxy.rs` creates one per request in Task 4.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct Record(Arc<Inner>);
+
+#[allow(dead_code)]
+struct Inner {
+    audit: Arc<Audit>,
+    id: String,
+    started: Instant,
+    provider: &'static str,
+    route: &'static str,
+    state: Mutex<State>,
+}
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct State {
+    tenant: Option<String>,
+    session: Option<String>,
+    stream: bool,
+    texts: usize,
+    spans: usize,
+    types: BTreeMap<String, usize>,
+    upstream: bool,
+    outcome: Option<(&'static str, u16, Option<&'static str>)>,
+}
+
+// Not yet called outside tests: `proxy.rs` calls these in Task 4.
+#[allow(dead_code)]
+impl Record {
+    pub fn new(audit: Arc<Audit>, provider: &'static str, route: &'static str) -> Self {
+        Self(Arc::new(Inner {
+            audit,
+            // Eight random bytes rather than a hash of anything in the request:
+            // an id derived from content would be a fingerprint of content.
+            id: random_id(),
+            started: Instant::now(),
+            provider,
+            route,
+            state: Mutex::new(State::default()),
+        }))
+    }
+
+    fn with<R>(&self, edit: impl FnOnce(&mut State) -> R) -> R {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        edit(&mut state)
+    }
+
+    /// The caller's salted digests. `session` is `None` when the request asked
+    /// for no session; `tenant` is always present, because it is a digest of
+    /// the credential alone.
+    pub fn attribute(&self, tenant: String, session: Option<String>) {
+        self.with(|state| {
+            state.tenant = Some(tenant);
+            state.session = session;
+        });
+    }
+
+    /// What detection found in *this request's* texts: distinct values per
+    /// type, and occurrences in total. Never the values.
+    pub fn detected(&self, texts: usize, spans: usize, types: BTreeMap<String, usize>) {
+        self.with(|state| {
+            state.texts = texts;
+            state.spans = spans;
+            state.types = types;
+        });
+    }
+
+    pub fn streaming(&self) {
+        self.with(|state| state.stream = true);
+    }
+
+    /// Write the `masked` line and wait for it to reach the disk. Called once,
+    /// immediately before the upstream request is sent: this is the ordering
+    /// the whole journal exists for.
+    pub async fn masked(&self) -> Result<(), AuditError> {
+        let line = self.with(|state| {
+            state.upstream = true;
+            json!({
+                "ts": now(),
+                "event": "masked",
+                "request": self.0.id,
+                "provider": self.0.provider,
+                "route": self.0.route,
+                "tenant": state.tenant,
+                "session": state.session,
+                "stream": state.stream,
+                "texts": state.texts,
+                "spans": state.spans,
+                "types": state.types,
+            })
+            .to_string()
+        });
+        let audit = Arc::clone(&self.0.audit);
+        // fsync on a runtime worker would park it for the length of a disk
+        // round-trip; every other request on that worker waits behind it.
+        tokio::task::spawn_blocking(move || audit.append(&line, true))
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "the audit writer task failed");
+                AuditError::Unavailable
+            })?
+            .map_err(|error| {
+                // The path and the errno stay here. The client is told only
+                // that the journal is unavailable.
+                tracing::error!(%error, "could not write the audit record");
+                AuditError::Unavailable
+            })
+    }
+
+    /// The gateway produced a whole response and handed it to axum. Not "the
+    /// client received it": whether the connection survived afterwards is not
+    /// something this gateway observes, and the record claims only what it saw.
+    pub fn completed(&self, status: u16) {
+        self.outcome("completed", status, None);
+    }
+
+    pub fn refused(&self, status: u16, error: &'static str) {
+        self.outcome("refused", status, Some(error));
+    }
+
+    /// Bytes had already gone out, so the stream ended mid-flight. The status
+    /// is the one the client already received.
+    pub fn stream_failed(&self, error: &'static str) {
+        self.outcome("stream_failed", 200, Some(error));
+    }
+
+    fn outcome(&self, result: &'static str, status: u16, error: Option<&'static str>) {
+        self.with(|state| state.outcome = Some((result, status, error)));
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        // No signal means the request ended in a way none of the exits reach —
+        // in practice a client that disconnected mid-stream.
+        let (result, status, error) = state.outcome.unwrap_or(("aborted", 0, None));
+        let line = json!({
+            "ts": now(),
+            "event": "outcome",
+            "request": self.id,
+            "upstream": state.upstream,
+            "status": status,
+            "result": result,
+            "error": error,
+            "ms": self.started.elapsed().as_millis() as u64,
+        })
+        .to_string();
+        // Nothing left to refuse: the request already happened. A full disk
+        // refuses the *next* request at `masked`, so the journal stops the
+        // gateway rather than quietly shedding records.
+        if let Err(error) = self.audit.append(&line, false) {
+            tracing::error!(%error, request = %self.id, "could not write the audit outcome");
+        }
+    }
+}
+
+// Not yet reachable outside tests: only `Record`, constructed in Task 4, calls these.
+#[allow(dead_code)]
+fn now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[allow(dead_code)]
+fn random_id() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).expect("the OS must provide randomness");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn salt_path(path: &Path) -> PathBuf {
@@ -321,5 +514,202 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("readable");
         assert_eq!(text.lines().count(), 2, "a restart must not erase evidence");
+    }
+
+    use std::sync::Arc;
+
+    fn lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+            .collect()
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<Audit>, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(Audit::open(&path).expect("opens"));
+        (dir, audit, path)
+    }
+
+    fn types(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        pairs
+            .iter()
+            .map(|(name, count)| ((*name).to_owned(), *count))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_masked_record_names_what_was_found() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "anthropic", "/v1/messages");
+        record.attribute("a41f9c02".repeat(4), Some("3bd7e105".repeat(4)));
+        record.detected(4, 9, types(&[("PERSON", 2), ("IBAN", 1)]));
+        record.streaming();
+        record.masked().await.expect("writes");
+        record.completed(200);
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "masked");
+        assert_eq!(lines[0]["provider"], "anthropic");
+        assert_eq!(lines[0]["route"], "/v1/messages");
+        assert_eq!(lines[0]["stream"], true);
+        assert_eq!(lines[0]["texts"], 4);
+        assert_eq!(lines[0]["spans"], 9);
+        assert_eq!(lines[0]["types"]["PERSON"], 2);
+        assert_eq!(lines[0]["session"], "3bd7e105".repeat(4));
+        assert!(lines[0]["ts"].as_str().expect("a timestamp").ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn the_two_records_share_one_request_id() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "openai", "/v1/chat/completions");
+        record.masked().await.expect("writes");
+        record.completed(200);
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines[0]["request"], lines[1]["request"]);
+        assert_eq!(lines[1]["event"], "outcome");
+        assert_eq!(lines[1]["result"], "completed");
+        assert_eq!(lines[1]["upstream"], true);
+        assert_eq!(lines[1]["status"], 200);
+        assert!(lines[1]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn two_records_do_not_share_a_request_id() {
+        let (_dir, audit, path) = fixture();
+        for _ in 0..2 {
+            let record = Record::new(Arc::clone(&audit), "openai", "/v1/chat/completions");
+            record.completed(200);
+        }
+        let lines = lines(&path);
+        assert_ne!(lines[0]["request"], lines[1]["request"]);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_before_the_upstream_call_is_one_line() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "openai", "/v1/chat/completions");
+        record.refused(502, "detector_timeout");
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 1, "nothing was sent, so nothing was masked");
+        assert_eq!(lines[0]["event"], "outcome");
+        assert_eq!(
+            lines[0]["upstream"], false,
+            "the central question, answerable without a join"
+        );
+        assert_eq!(lines[0]["result"], "refused");
+        assert_eq!(lines[0]["error"], "detector_timeout");
+        assert_eq!(lines[0]["status"], 502);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_the_upstream_call_still_says_bytes_left() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "openai", "/v1/chat/completions");
+        record.masked().await.expect("writes");
+        record.refused(502, "mapping_unknown_placeholder");
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines[1]["result"], "refused");
+        assert_eq!(lines[1]["upstream"], true);
+    }
+
+    #[tokio::test]
+    async fn an_unsignalled_drop_is_aborted_rather_than_completed() {
+        // A guard that assumed success on an unsignalled drop would report
+        // `completed` for every abandoned stream.
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "anthropic", "/v1/messages");
+        record.masked().await.expect("writes");
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines[1]["result"], "aborted");
+        assert!(lines[1]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_stream_failure_keeps_the_status_the_client_already_got() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "anthropic", "/v1/messages");
+        record.masked().await.expect("writes");
+        record.stream_failed("stream_unrestorable");
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines[1]["result"], "stream_failed");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(lines[1]["error"], "stream_unrestorable");
+    }
+
+    #[tokio::test]
+    async fn the_outcome_waits_for_the_last_handle() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "anthropic", "/v1/messages");
+        record.masked().await.expect("writes");
+        let carried = record.clone();
+        record.completed(200);
+        drop(record);
+        assert_eq!(lines(&path).len(), 1, "the stream still holds a handle");
+
+        carried.stream_failed("stream_broken");
+        drop(carried);
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["result"], "stream_failed", "the last signal wins");
+    }
+
+    #[tokio::test]
+    async fn only_one_outcome_is_written_however_many_handles() {
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "openai", "/v1/chat/completions");
+        let clones: Vec<Record> = (0..5).map(|_| record.clone()).collect();
+        record.completed(200);
+        drop(record);
+        drop(clones);
+        assert_eq!(lines(&path).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_masked_write_refuses_rather_than_returning_ok() {
+        // The guarantee the slice exists for. If this returned Ok, an
+        // unrecorded request would reach the provider.
+        let record = Record::new(
+            Arc::new(failing_audit_for_tests()),
+            "openai",
+            "/v1/chat/completions",
+        );
+        let error = record
+            .masked()
+            .await
+            .expect_err("a journal that cannot be written refuses");
+        assert_eq!(error.to_string(), "audit unavailable");
+        assert!(
+            !error.to_string().contains('/'),
+            "the client is told nothing about the filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_outcome_write_does_not_panic() {
+        // Nothing left to refuse: the request already happened. Dropping the
+        // record must not take the process down with it.
+        let record = Record::new(
+            Arc::new(failing_audit_for_tests()),
+            "openai",
+            "/v1/chat/completions",
+        );
+        record.completed(200);
+        drop(record);
     }
 }
