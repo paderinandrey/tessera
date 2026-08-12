@@ -263,7 +263,6 @@ impl Record {
     /// the whole journal exists for.
     pub async fn masked(&self) -> Result<(), AuditError> {
         let line = self.with(|state| {
-            state.upstream = true;
             json!({
                 "ts": now(),
                 "event": "masked",
@@ -293,7 +292,11 @@ impl Record {
                 // that the journal is unavailable.
                 tracing::error!(%error, "could not write the audit record");
                 AuditError::Unavailable
-            })
+            })?;
+        // Only a written line makes the claim true: an outcome recorded after
+        // a failed write here must still say the bytes never left.
+        self.with(|state| state.upstream = true);
+        Ok(())
     }
 
     /// The gateway produced a whole response and handed it to axum. Not "the
@@ -386,6 +389,32 @@ pub(crate) fn failing_audit_for_tests() -> Audit {
     }
 
     Audit::with_sink(Box::new(FailingSink), [7u8; SALT_BYTES])
+}
+
+/// A journal whose lines reach the sink but are never confirmed durable:
+/// `write_line` succeeds while `sync` always fails. This is what an fsync
+/// failure on an otherwise healthy filesystem looks like, unlike
+/// `failing_audit_for_tests` above, where nothing is ever written at all —
+/// and it is the case that must not let `Record::masked` claim success.
+#[cfg(test)]
+pub(crate) fn sync_failing_audit_for_tests(path: &Path) -> Audit {
+    struct SyncFailingSink(File);
+
+    impl Sink for SyncFailingSink {
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            Sink::write_line(&mut self.0, line)
+        }
+        fn sync(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("fsync failed"))
+        }
+    }
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("opens");
+    Audit::with_sink(Box::new(SyncFailingSink(file)), [7u8; SALT_BYTES])
 }
 
 #[cfg(test)]
@@ -697,6 +726,33 @@ mod tests {
         assert!(
             !error.to_string().contains('/'),
             "the client is told nothing about the filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_masked_write_that_fails_to_sync_leaves_upstream_false() {
+        // `upstream` states whether bytes left the perimeter. A `masked` call
+        // that returns `Err` must not let a later outcome line claim they did,
+        // even though the line was queued before the fsync failed.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let record = Record::new(
+            Arc::new(sync_failing_audit_for_tests(&path)),
+            "openai",
+            "/v1/chat/completions",
+        );
+        record
+            .masked()
+            .await
+            .expect_err("a journal that cannot confirm durability refuses");
+        drop(record);
+
+        let lines = lines(&path);
+        let outcome = lines.last().expect("the drop wrote something");
+        assert_eq!(outcome["event"], "outcome");
+        assert_eq!(
+            outcome["upstream"], false,
+            "the masked write was never confirmed durable"
         );
     }
 
