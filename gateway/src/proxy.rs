@@ -2217,4 +2217,85 @@ mod tests {
         assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
         assert_eq!(lines[1]["result"], "aborted");
     }
+
+    #[tokio::test]
+    async fn a_stream_dropped_after_its_first_yield_still_records_the_failure() {
+        // `restorer.push` fails on this body's very first event, so the error
+        // arm's `record.stream_failed(...)` is the first thing the generator
+        // ever does — and the `error_event` bytes it renders afterwards are
+        // its first `yield`. A single poll drives the generator exactly to
+        // that `yield` and no further: dropping the stream there proves the
+        // signal ran before it, not after. With the signal placed after the
+        // `yield` instead, a generator parked there and dropped never reaches
+        // it, and the outcome falls back to `aborted` — the exact bug this
+        // test exists to catch.
+        use futures_util::StreamExt;
+
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[PERSON_9]\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let response = streamed_response(state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the head was already sent"
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await;
+        assert!(first.is_some(), "the error event is the first thing sent");
+        drop(body);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
+        assert_eq!(lines[1]["result"], "stream_failed");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_after_the_upstream_breaks_still_records_the_failure() {
+        // The same shape as the restoration-failure case above, on the other
+        // exit that reorders a signal ahead of its `yield`: the connection
+        // breaks before a single body byte arrives, so the break is caught on
+        // the first read and `record.stream_failed("stream_broken")` is the
+        // first thing the generator does. Its `error_event` yield is the
+        // first `yield` at all, so one poll parks the generator exactly
+        // there.
+        use futures_util::StreamExt;
+
+        let detector = detector_returning(json!([])).await;
+        let base = truncating_upstream("").await;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: base.clone(),
+            anthropic_base: base,
+            sessions: SessionStore::new(test_limits()),
+            audit,
+        });
+
+        let response = streamed_response(state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the head was already sent"
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await;
+        assert!(first.is_some(), "the error event is the first thing sent");
+        drop(body);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
+        assert_eq!(lines[1]["result"], "stream_failed");
+        assert_eq!(lines[1]["error"], "stream_broken");
+    }
 }
