@@ -19,9 +19,6 @@ use time::format_description::well_known::Rfc3339;
 /// What the client is told when the journal cannot be written. It names no
 /// path: the filesystem layout is of no use to the caller and of some use to
 /// an attacker. The detail goes to `tracing` at the call site.
-// Not yet reachable outside tests: `Record::masked` raises this, but nothing
-// outside tests constructs a `Record` until `proxy.rs` does in Task 4.
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
     #[error("audit unavailable")]
@@ -60,8 +57,6 @@ impl Sink for File {
     }
 }
 
-// Not yet constructed outside tests: `main.rs` opens the journal in Task 4.
-#[allow(dead_code)]
 pub struct Audit {
     /// A mutex rather than a bet on `O_APPEND` atomicity: a record with a long
     /// `types` map can exceed the size at which that atomicity holds, and
@@ -71,8 +66,6 @@ pub struct Audit {
     salt: [u8; SALT_BYTES],
 }
 
-// Not yet called outside tests: `main.rs` wires these in Task 4.
-#[allow(dead_code)]
 impl Audit {
     /// Open the journal for appending and load the salt beside it, creating
     /// either if absent. Returns an error rather than degrading: a gateway
@@ -181,12 +174,9 @@ impl Audit {
 /// The guard guarantees that a line is written. It does not guess what the line
 /// says: every ending signals what happened, and an ending that signals nothing
 /// is recorded as `aborted` rather than assumed to be a success.
-// Not yet constructed outside tests: `proxy.rs` creates one per request in Task 4.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct Record(Arc<Inner>);
 
-#[allow(dead_code)]
 struct Inner {
     audit: Arc<Audit>,
     id: String,
@@ -196,7 +186,6 @@ struct Inner {
     state: Mutex<State>,
 }
 
-#[allow(dead_code)]
 #[derive(Default)]
 struct State {
     tenant: Option<String>,
@@ -209,8 +198,6 @@ struct State {
     outcome: Option<(&'static str, u16, Option<&'static str>)>,
 }
 
-// Not yet called outside tests: `proxy.rs` calls these in Task 4.
-#[allow(dead_code)]
 impl Record {
     pub fn new(audit: Arc<Audit>, provider: &'static str, route: &'static str) -> Self {
         Self(Arc::new(Inner {
@@ -312,6 +299,9 @@ impl Record {
 
     /// Bytes had already gone out, so the stream ended mid-flight. The status
     /// is the one the client already received.
+    // Not yet called outside tests: `stream.rs` calls this once the streamed
+    // path carries its own `Record`, in Task 5.
+    #[allow(dead_code)]
     pub fn stream_failed(&self, error: &'static str) {
         self.outcome("stream_failed", 200, Some(error));
     }
@@ -350,15 +340,12 @@ impl Drop for Inner {
     }
 }
 
-// Not yet reachable outside tests: only `Record`, constructed in Task 4, calls these.
-#[allow(dead_code)]
 fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
-#[allow(dead_code)]
 fn random_id() -> String {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).expect("the OS must provide randomness");

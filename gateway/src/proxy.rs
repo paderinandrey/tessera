@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+use crate::audit::Record;
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping::{Mapping, MappingError};
@@ -26,11 +28,13 @@ pub enum ProxyError {
     Upstream(String),
     #[error("{0}")]
     Session(#[from] crate::session::SessionError),
+    #[error("{0}")]
+    Audit(#[from] crate::audit::AuditError),
 }
 
-impl IntoResponse for ProxyError {
-    fn into_response(self) -> Response {
-        let status = match self {
+impl ProxyError {
+    fn status(&self) -> StatusCode {
+        match self {
             // A body we cannot read is the client's to fix, and it is refused
             // rather than forwarded unmasked. So is a session the gateway
             // cannot honour as asked.
@@ -43,11 +47,42 @@ impl IntoResponse for ProxyError {
             // the caller got wrong, and the same request may well succeed a
             // moment later. No `Retry-After`: the wait is another request's
             // detector round-trip, and the gateway has no honest number for it.
-            ProxyError::Session(SessionError::Saturated) => StatusCode::SERVICE_UNAVAILABLE,
+            // A journal that cannot be written is the same kind of fact about
+            // this gateway rather than about the caller.
+            ProxyError::Session(SessionError::Saturated) | ProxyError::Audit(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::BAD_GATEWAY,
-        };
+        }
+    }
+
+    /// The fixed vocabulary the journal records. A class rather than the
+    /// message, so that no expression in the audit writer could interpolate
+    /// submitted text even if a message one day carried it.
+    fn audit_class(&self) -> &'static str {
+        match self {
+            ProxyError::Shape(ShapeError::Request(_)) => "shape_request",
+            ProxyError::Shape(ShapeError::Unsupported(_, _)) => "shape_unsupported",
+            ProxyError::Shape(_) => "shape_response",
+            ProxyError::Detector(DetectorError::Transport(_)) => "detector_transport",
+            ProxyError::Detector(DetectorError::Status(_)) => "detector_status",
+            ProxyError::Mapping(MappingError::Unknown(_)) => "mapping_unknown_placeholder",
+            ProxyError::Mapping(MappingError::BadSpan(_)) => "mapping_bad_span",
+            ProxyError::Mapping(MappingError::BadEntityType(_)) => "mapping_bad_entity_type",
+            ProxyError::Upstream(_) => "upstream_failed",
+            ProxyError::Session(SessionError::BadId) => "session_bad_id",
+            ProxyError::Session(SessionError::Disabled) => "session_disabled",
+            ProxyError::Session(SessionError::NoCredential(_)) => "session_no_credential",
+            ProxyError::Session(SessionError::Saturated) => "session_saturated",
+            ProxyError::Audit(_) => "audit_write_failed",
+        }
+    }
+}
+
+impl IntoResponse for ProxyError {
+    fn into_response(self) -> Response {
         // The reason names the failure. It never carries the submitted text.
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        (self.status(), Json(json!({ "error": self.to_string() }))).into_response()
     }
 }
 
@@ -83,10 +118,11 @@ pub struct AppState {
     pub openai_base: String,
     pub anthropic_base: String,
     pub sessions: SessionStore,
+    pub audit: Arc<crate::audit::Audit>,
 }
 
 impl AppState {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config, audit: Arc<crate::audit::Audit>) -> Self {
         Self {
             detector: DetectorClient::new(
                 config.detector_url.clone(),
@@ -100,6 +136,7 @@ impl AppState {
                 max_sessions: config.max_sessions,
                 max_values: config.max_session_values,
             }),
+            audit,
         }
     }
 
@@ -111,21 +148,42 @@ impl AppState {
     }
 }
 
-/// Detect and mask every text the provider pointed at. Shared by both branches
-/// of `handle`: inline it would exist twice and diverge at the first edit.
+/// Detect and mask every text the provider pointed at, and report what was
+/// found. Shared by both branches of `handle`: inline it would exist twice and
+/// diverge at the first edit.
+///
+/// The counts describe *this request's* texts. Counting the mapping instead
+/// would report a session's running total on every turn, and the record would
+/// stop describing the request. The values themselves live in the local set
+/// only long enough to be counted and never leave this function.
 async fn mask_all(
     detector: &DetectorClient,
     body: &Value,
     pointers: &[String],
     mapping: &mut Mapping,
-) -> Result<Value, ProxyError> {
+) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
     let mut masked = body.clone();
+    let mut total = 0usize;
+    let mut distinct: HashSet<(String, String)> = HashSet::new();
     for pointer in pointers {
         let text = read_pointer(body, pointer)?;
         let spans = detector.detect(&text).await?;
+        total += spans.len();
+        let characters: Vec<char> = text.chars().collect();
+        for span in &spans {
+            // Offsets are in characters, and a span the mapping would reject
+            // is counted only if it addresses real text.
+            if let Some(value) = characters.get(span.start..span.end) {
+                distinct.insert((span.entity_type.clone(), value.iter().collect()));
+            }
+        }
         write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
     }
-    Ok(masked)
+    let mut types: BTreeMap<String, usize> = BTreeMap::new();
+    for (entity_type, _) in distinct {
+        *types.entry(entity_type).or_default() += 1;
+    }
+    Ok((masked, total, types))
 }
 
 async fn handle(
@@ -133,13 +191,34 @@ async fn handle(
     provider: &'static dyn Provider,
     headers: HeaderMap,
     body: Value,
+    record: &Record,
 ) -> Result<Response, ProxyError> {
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let pointers = provider.request_pointers(&body)?;
 
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        record.streaming();
+    }
+
+    // Attribution first: a request refused for its session id should still say
+    // whose it was.
+    if let Some(credential) = crate::session::credential_of(&headers, provider) {
+        record.attribute(state.audit.digest(&[credential]), None);
+    }
+
     // Resolved before detection: a malformed header must cost nothing, not a
     // second per 1 200 characters.
     let key = key_from(&headers, provider, state.sessions.enabled())?;
+
+    if let (Some(credential), Some(key)) = (
+        crate::session::credential_of(&headers, provider),
+        key.as_ref(),
+    ) {
+        record.attribute(
+            state.audit.digest(&[credential]),
+            Some(state.audit.digest(&[credential, key.id().as_bytes()])),
+        );
+    }
 
     // One mapping for the whole request so a value keeps one name; seeded from
     // the conversation's table so it keeps that name across turns too.
@@ -151,7 +230,9 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
-            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            let (masked, spans, types) =
+                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            record.detected(pointers.len(), spans, types);
             // After the last `?`, and on a copy until here: a refused request
             // leaves the session exactly as it was, so a client whose detector
             // blinked does not carry a hole in its numbering for the rest of
@@ -163,10 +244,16 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
-            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            let (masked, spans, types) =
+                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            record.detected(pointers.len(), spans, types);
             (masked, work)
         }
     };
+
+    // Durable before anything leaves the perimeter. This ordering is the whole
+    // reason the journal exists, so it happens here and not a line later.
+    record.masked().await?;
 
     // Only what is masked leaves the process.
     let mut request = state.upstream.post(format!(
@@ -255,10 +342,7 @@ async fn openai(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    match handle(state, &OpenAi, headers, body).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
+    serve(state, &OpenAi, "/v1/chat/completions", headers, body).await
 }
 
 async fn anthropic(
@@ -266,9 +350,34 @@ async fn anthropic(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    match handle(state, &Anthropic, headers, body).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
+    serve(state, &Anthropic, "/v1/messages", headers, body).await
+}
+
+/// Where the request's outcome becomes a value one can record.
+///
+/// The record is constructed here rather than inside `handle` because a
+/// `ProxyError` has no status until `into_response` runs, and a bare `?` inside
+/// `handle` unwinds past any guard without saying which failure occurred. A
+/// guard that dropped on `handle`'s return would have to invent both fields.
+async fn serve(
+    state: Arc<AppState>,
+    provider: &'static dyn Provider,
+    route: &'static str,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
+    let record = Record::new(Arc::clone(&state.audit), provider.name(), route);
+    match handle(state, provider, headers, body, &record).await {
+        Ok(response) => {
+            // A streamed response holds its own handle, so this signal is
+            // overwritten by whatever the stream reports when it ends.
+            record.completed(response.status().as_u16());
+            response
+        }
+        Err(error) => {
+            record.refused(error.status().as_u16(), error.audit_class());
+            error.into_response()
+        }
     }
 }
 
@@ -285,6 +394,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+    use wiremock::matchers::path as path_matcher;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -338,14 +448,34 @@ mod tests {
         }
     }
 
-    fn state_with(detector: &MockServer, upstream: &MockServer, limits: Limits) -> Arc<AppState> {
-        Arc::new(AppState {
+    /// A state whose journal is a fresh file, returned alongside it so a test
+    /// can read what was written.
+    fn state_with(
+        detector: &MockServer,
+        upstream: &MockServer,
+        limits: Limits,
+    ) -> (Arc<AppState>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(limits),
-        })
+            audit,
+        });
+        (state, dir, path)
+    }
+
+    /// The journal's lines, parsed. The `TempDir` must outlive the call.
+    fn journal(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .expect("readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect()
     }
 
     fn session_headers<'a>(credential: &'a str, id: &'a str) -> [(&'a str, &'a str); 2] {
@@ -386,7 +516,7 @@ mod tests {
     }
 
     fn state(detector: &MockServer, upstream: &MockServer) -> Arc<AppState> {
-        state_with(detector, upstream, test_limits())
+        state_with(detector, upstream, test_limits()).0
     }
 
     async fn call(state: Arc<AppState>, route: &str, body: Value) -> (StatusCode, String) {
@@ -766,12 +896,19 @@ mod tests {
     }
 
     fn state_for(detector: &MockServer, upstream_base: String) -> Arc<AppState> {
+        // The `TempDir` is dropped here rather than threaded through: nothing
+        // in the streaming tests reads the journal back, and the open file
+        // handle keeps working after the directory entry is unlinked.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let audit =
+            Arc::new(crate::audit::Audit::open(&dir.path().join("audit.jsonl")).expect("opens"));
         Arc::new(AppState {
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
             anthropic_base: upstream_base,
             sessions: SessionStore::new(test_limits()),
+            audit,
         })
     }
 
@@ -1379,7 +1516,8 @@ mod tests {
                 max_sessions: 2,
                 max_values: 8,
             },
-        );
+        )
+        .0;
 
         // "a" gets a real, committed value.
         call_with_headers(
@@ -1454,7 +1592,8 @@ mod tests {
                 max_sessions: 8,
                 max_values: 1,
             },
-        );
+        )
+        .0;
 
         let (status, body) = call_with_headers(
             Arc::clone(&state),
@@ -1523,7 +1662,8 @@ mod tests {
                 max_sessions: 0,
                 max_values: 0,
             },
-        );
+        )
+        .0;
 
         let (status, body) = call_with_headers(
             Arc::clone(&state),
@@ -1583,7 +1723,8 @@ mod tests {
                 max_sessions: 1,
                 max_values: 8,
             },
-        );
+        )
+        .0;
 
         // The only slot belongs to a session another request is inside right
         // now, exactly as it would be mid-`mask_all`.
@@ -1616,5 +1757,266 @@ mod tests {
             0,
             "a refused request still reached the provider"
         );
+    }
+
+    #[tokio::test]
+    async fn a_served_request_leaves_two_records() {
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "masked");
+        assert_eq!(lines[0]["provider"], "openai");
+        assert_eq!(lines[0]["types"]["PERSON"], 1);
+        assert_eq!(lines[0]["spans"], 1);
+        assert_eq!(lines[1]["result"], "completed");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(lines[0]["request"], lines[1]["request"]);
+    }
+
+    #[tokio::test]
+    async fn a_detector_failure_leaves_one_record_and_calls_nobody() {
+        let detector = failing_detector().await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "outcome");
+        assert_eq!(lines[0]["upstream"], false);
+        assert_eq!(lines[0]["result"], "refused");
+        assert_eq!(lines[0]["error"], "detector_status");
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "nothing may reach the provider when the request is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_refusal_records_its_own_class() {
+        // The invariant a guard that inferred its outcome would violate
+        // silently, so it is exercised per variant rather than once.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            &[(SESSION_HEADER, "not a valid id!")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(journal(&path)[0]["error"], "session_bad_id");
+
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(state, "/v1/chat/completions", json!({"messages": "wrong"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(journal(&path)[0]["error"], "shape_request");
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_cannot_be_written_refuses_before_the_provider() {
+        // Fail-closed end to end: no evidence, no request.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit: Arc::new(crate::audit::failing_audit_for_tests()),
+        });
+
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("audit unavailable"));
+        assert!(
+            !body.contains('/'),
+            "no filesystem detail reaches the client"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "an unrecorded request must not reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_masked_record_precedes_the_provider_call() {
+        // Asserted structurally: the upstream mock reads the journal as it
+        // answers, so the ordering is observed rather than timed.
+        let detector = detector_finding_weber().await;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let upstream = MockServer::start().await;
+        let counter = Arc::clone(&seen);
+        let watched = path.clone();
+        Mock::given(method("POST"))
+            .and(path_matcher("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                *counter.lock().expect("lock") = std::fs::read_to_string(&watched)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"choices": [{"message": {"content": "ok"}}]}))
+            })
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit,
+        });
+        call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            1,
+            "the masked record must be on disk before the provider is called"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_turn_counts_its_own_request_not_the_table() {
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let body = json!({"messages": [{"role": "user", "content": "Weber called"}]});
+        for _ in 0..2 {
+            call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                body.clone(),
+                &session_headers("sk-tenant", "chat-1"),
+            )
+            .await;
+        }
+
+        let lines = journal(&path);
+        let masked: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked.len(), 2);
+        assert_eq!(
+            masked[1]["types"]["PERSON"], 1,
+            "the second turn describes the request, not the session's running total"
+        );
+        assert_eq!(
+            masked[0]["tenant"], masked[1]["tenant"],
+            "one credential is one tenant"
+        );
+        assert_eq!(masked[0]["session"], masked[1]["session"]);
+        assert_eq!(masked[0]["tenant"].as_str().expect("a digest").len(), 32);
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_session_still_has_a_tenant() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            &[("authorization", "sk-tenant")],
+        )
+        .await;
+
+        let lines = journal(&path);
+        assert!(lines[0]["tenant"].is_string());
+        assert!(lines[0]["session"].is_null());
+    }
+
+    #[tokio::test]
+    async fn the_journal_never_carries_the_submitted_value() {
+        let detector = detector_finding_weber().await;
+        // The provider echoes the placeholder back inside an error body, which
+        // is restored to the real value on the way out — the one path where a
+        // value exists on the response side too.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_matcher("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(json!({"error": {"message": "[PERSON_1] is rate limited"}})),
+            )
+            .mount(&upstream)
+            .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body.contains(SECRET),
+            "the client does get the restored value"
+        );
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(!text.contains(SECRET), "the journal does not");
+        assert!(!text.contains("PERSON_1"), "nor a placeholder name");
     }
 }

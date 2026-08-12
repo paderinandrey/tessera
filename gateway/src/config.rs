@@ -24,7 +24,6 @@ pub struct Config {
     /// control that is off by default is not a control. A file that cannot be
     /// opened for appending stops the process rather than starting one that
     /// silently proves nothing.
-    #[allow(dead_code)]
     pub audit_path: String,
     /// Generous on purpose: full detection costs about a second per 1 200
     /// characters, and a conversation history is longer than that. Exceeding
