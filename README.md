@@ -193,6 +193,50 @@ because a tight timeout would turn protection into a denial of service. Configur
 TOML and rejects unknown keys — a typo in a security control should fail loudly rather
 than leave a default in place.
 
+### Audit
+
+Every request appends to `audit_path`, one JSON object per line, and the gateway
+does not start without it — a control that can be switched off by omitting a
+line is worth nothing in a compliance report.
+
+A request leaves two records. The first is written **and fsynced before the
+provider is called**, so evidence that a request was pseudonymized cannot be
+lost by the crash that follows it; if it cannot be written, the request is
+refused with a 503 rather than served unrecorded. The second is written when the
+request ends — including minutes later, when a stream does.
+
+```json
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
+{"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
+```
+
+A request refused before the provider is called leaves one line, and it answers
+the only question that matters on its own: `"upstream": false`.
+
+The record counts and never quotes. `types` counts distinct values per type and
+`spans` counts occurrences; the gap between them is a value named more than once
+within the same request, not anything a session did — detection runs over every
+text on every request whether or not one is attached, so the coreference a
+session buys across turns leaves no trace here. Neither the values, hashes of
+them, their offsets nor the placeholder names are written. `error` is drawn from
+a fixed vocabulary rather than formatted from a message, so no expression in the
+writer could interpolate submitted text. `result` is one of `completed`,
+`refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
+defaults to on drop — in practice, a client that disconnects while a stream is
+still open, recorded as itself rather than as a success nobody observed.
+
+`tenant` and `session` are salted digests, never a key and never the raw session
+id — a client may well name its session after the person in it. The salt lives
+in `<audit_path>.salt`, created on first run with owner-only permissions, so one
+credential keeps one identity across restarts. It is evidence too: back it up
+with the journal. Losing only the salt is not caught — the gateway treats its
+absence as a first run and mints a new one, so every digest written before that
+point becomes unattributable; only a salt file that exists but is not exactly 32
+bytes refuses to start.
+
+Rotation and retention are the operator's, and the file is opened for appending
+only.
+
 ## Evaluation
 
 The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic
