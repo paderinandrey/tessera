@@ -317,10 +317,18 @@ impl Drop for Inner {
         // No signal means the request ended in a way none of the exits reach —
         // in practice a client that disconnected mid-stream.
         let (result, status, error) = state.outcome.unwrap_or(("aborted", 0, None));
+        // `tenant` and `session` are repeated from the `masked` line rather
+        // than left to a join, because a request refused before `masked` has
+        // no `masked` line to join to: without them, the one line a refusal
+        // produces cannot say whose request it was, which is the first field
+        // anyone investigating a run of refusals asks for. The redundancy on
+        // the two-line case costs a few bytes.
         let line = json!({
             "ts": now(),
             "event": "outcome",
             "request": self.id,
+            "tenant": state.tenant,
+            "session": state.session,
             "upstream": state.upstream,
             "status": status,
             "result": result,
@@ -609,12 +617,17 @@ mod tests {
     async fn a_refusal_before_the_upstream_call_is_one_line() {
         let (_dir, audit, path) = fixture();
         let record = Record::new(audit, "openai", "/v1/chat/completions");
+        record.attribute("a41f9c02".repeat(4), Some("3bd7e105".repeat(4)));
         record.refused(502, "detector_timeout");
         drop(record);
 
         let lines = lines(&path);
         assert_eq!(lines.len(), 1, "nothing was sent, so nothing was masked");
         assert_eq!(lines[0]["event"], "outcome");
+        // The one line is the whole record, so it carries the attribution
+        // there is no `masked` line to join to for.
+        assert_eq!(lines[0]["tenant"], "a41f9c02".repeat(4));
+        assert_eq!(lines[0]["session"], "3bd7e105".repeat(4));
         assert_eq!(
             lines[0]["upstream"], false,
             "the central question, answerable without a join"

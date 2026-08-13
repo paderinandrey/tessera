@@ -79,14 +79,19 @@ Two shapes. A streamed request with a session:
 
 ```json
 {"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02","session":"3bd7e105","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
-{"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
+{"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02","session":"3bd7e105","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
 A request refused before the upstream call is one self-contained line:
 
 ```json
-{"ts":"2026-08-11T09:14:22.418Z","event":"outcome","request":"91c4a70b6de83f12","upstream":false,"status":502,"result":"refused","error":"detector_timeout","ms":30012}
+{"ts":"2026-08-11T09:14:22.418Z","event":"outcome","request":"91c4a70b6de83f12","tenant":"a41f9c02","session":null,"upstream":false,"status":502,"result":"refused","error":"detector_timeout","ms":30012}
 ```
+
+`tenant` and `session` are repeated on the outcome line rather than left to a
+join on `request`: a request refused before `masked` has no `masked` line to
+join to, and a refusal attributable to nobody is exactly the line a DPO reading
+a run of refusals cannot use.
 
 **`types` counts distinct values, `spans` counts occurrences.** The difference
 between them is the coreference the product sells: nine mentions, four people.

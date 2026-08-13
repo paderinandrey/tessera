@@ -207,11 +207,20 @@ request ends — including minutes later, when a stream does.
 
 ```json
 {"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
-{"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
+{"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
 A request refused before the provider is called leaves one line, and it answers
-the only question that matters on its own: `"upstream": false`.
+on its own both questions that matter — whether bytes left, and whose request it
+was:
+
+```json
+{"ts":"2026-08-11T09:14:22.418Z","event":"outcome","request":"91c4a70b6de83f12","tenant":"a41f9c02…","session":null,"upstream":false,"status":503,"result":"refused","error":"audit_write_failed","ms":12}
+```
+
+That is why `tenant` and `session` appear on the outcome line as well as the
+masked one: a refusal has no masked line to join to, and the redundancy on the
+two-line case costs a few bytes.
 
 The record counts and never quotes. `types` counts distinct values per type and
 `spans` counts occurrences; the gap between them is a value named more than once

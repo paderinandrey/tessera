@@ -2092,6 +2092,67 @@ mod tests {
         let lines = journal(&path);
         assert!(lines[0]["tenant"].is_string());
         assert!(lines[0]["session"].is_null());
+        assert_eq!(
+            lines[0]["tenant"], lines[1]["tenant"],
+            "both lines of one request name the same tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_before_masking_still_says_whose_it_was() {
+        // The claim the attribution block makes by sitting above the shape
+        // check. A refusal this early leaves one line and no `masked` line to
+        // join to, so if that line has no `tenant` the request is attributable
+        // to nobody — which is the first thing anyone reading a run of
+        // refusals wants to know.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"messages": "wrong"}),
+            &[("authorization", "sk-tenant")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The same credential again, refused one step later for its session id
+        // — still before anything was masked.
+        let (status, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            &session_headers("sk-tenant", "not a valid id!"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let lines = journal(&path);
+        assert_eq!(
+            lines.len(),
+            2,
+            "neither request was masked, so one line each"
+        );
+        assert_eq!(lines[0]["error"], "shape_request");
+        assert_eq!(lines[1]["error"], "session_bad_id");
+        let tenant = lines[0]["tenant"]
+            .as_str()
+            .expect("a refusal before masking still names its tenant");
+        assert_eq!(tenant.len(), 32);
+        assert_eq!(
+            lines[0]["tenant"], lines[1]["tenant"],
+            "one credential is one tenant, however the request was refused"
+        );
+        assert!(
+            lines[1]["session"].is_null(),
+            "an id the gateway rejected is not an identity it records"
+        );
     }
 
     #[tokio::test]
