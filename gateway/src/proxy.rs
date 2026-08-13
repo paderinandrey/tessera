@@ -52,7 +52,16 @@ impl ProxyError {
             ProxyError::Session(SessionError::Saturated) | ProxyError::Audit(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            _ => StatusCode::BAD_GATEWAY,
+            // Everything the upstream or the detector got wrong, and every
+            // shape failure on the way back. Written out rather than left to a
+            // wildcard so that a new variant has to be given a status here, as
+            // `audit_class` already makes it be given a class: a wildcard
+            // turns a variant somebody forgot into a silent 502.
+            ProxyError::Shape(ShapeError::Response(_))
+            | ProxyError::Shape(ShapeError::Pointer(_))
+            | ProxyError::Detector(_)
+            | ProxyError::Mapping(_)
+            | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -169,12 +178,17 @@ async fn mask_all(
         let text = read_pointer(body, pointer)?;
         let spans = detector.detect(&text).await?;
         total += spans.len();
-        let characters: Vec<char> = text.chars().collect();
-        for span in &spans {
-            // Offsets are in characters, and a span the mapping would reject
-            // is counted only if it addresses real text.
-            if let Some(value) = characters.get(span.start..span.end) {
-                distinct.insert((span.entity_type.clone(), value.iter().collect()));
+        // The `Vec<char>` is a copy of the whole text, and a conversation
+        // history is many texts: it is built only when there is a span to
+        // address into it.
+        if !spans.is_empty() {
+            let characters: Vec<char> = text.chars().collect();
+            for span in &spans {
+                // Offsets are in characters, and a span the mapping would
+                // reject is counted only if it addresses real text.
+                if let Some(value) = characters.get(span.start..span.end) {
+                    distinct.insert((span.entity_type.clone(), value.iter().collect()));
+                }
             }
         }
         write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
@@ -205,10 +219,10 @@ async fn handle(
     record: &Record,
 ) -> Result<Handled, ProxyError> {
     // Attribution first, before even the shape check: a request refused for
-    // its body or its session id should still say whose it was. Resolved
-    // once — `credential_of` borrows from `headers`, which outlives the
-    // function — so the digest sent here and the one sent below cannot drift
-    // apart into two different readings of the same header.
+    // its body or its session id should still say whose it was, and its
+    // outcome line is the only line such a request leaves. Read once, so the
+    // digest sent here and the one sent below cannot drift apart into two
+    // different readings of the same header.
     let credential = crate::session::credential_of(&headers, provider);
     if let Some(credential) = credential {
         record.attribute(state.audit.digest(&[credential]), None);

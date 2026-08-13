@@ -365,6 +365,12 @@ impl Record {
 
     /// Bytes had already gone out, so the stream ended mid-flight. The status
     /// is the one the client already received.
+    ///
+    /// Hardcoded rather than carried from the upstream response, and accurate
+    /// rather than lucky: `restore_stream` builds a fresh `Response::new(...)`
+    /// for the body it streams, so the client's status on this path is always
+    /// 200 whatever the provider answered. There is no other value it could
+    /// have had by the time a stream can fail.
     pub fn stream_failed(&self, error: &'static str) {
         self.outcome("stream_failed", 200, Some(error));
     }
@@ -414,7 +420,14 @@ impl Drop for Inner {
 fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+        .unwrap_or_else(|error| {
+            // A 1970 timestamp in an evidence file is a worse artifact than a
+            // line in the log beside it: without this, a reader would have to
+            // guess whether the epoch means a clock problem or a formatting
+            // one, and nothing anywhere would say which.
+            tracing::error!(%error, "could not format the audit timestamp");
+            "1970-01-01T00:00:00Z".to_owned()
+        })
 }
 
 fn random_id() -> String {
