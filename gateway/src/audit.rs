@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use time::format_description::well_known::Rfc3339;
 
 /// What the client is told when the journal cannot be written. It names no
@@ -33,6 +33,31 @@ pub enum AuditError {
 const DIGEST_BYTES: usize = 16;
 
 const SALT_BYTES: usize = 32;
+
+/// What a detected type is counted as when its name is not one. Lowercase, so
+/// it cannot collide with a real type: the grammar admits capitals and
+/// underscores only, and a bucket that a detector could also name would hide
+/// the very thing it exists to flag.
+const UNVALIDATED_TYPE: &str = "unvalidated";
+
+/// The grammar a type name must match to reach a journal line, shared with the
+/// placeholder grammar in `mapping` so the two cannot drift into disagreeing
+/// about what a type is.
+fn is_entity_type(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= crate::mapping::MAX_ENTITY_TYPE
+        && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
+/// A salted digest, and the only thing `Record::attribute` accepts.
+///
+/// The inner string is private and `Audit::digest` is the sole constructor, so
+/// a raw credential or a client-chosen session id cannot reach a journal line
+/// by being handed to the wrong parameter. Both call sites already passed a
+/// digest; this is what makes that a property of the type rather than a fact
+/// about the two call sites as they happen to read today.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Digest(String);
 
 /// Where a journal line goes. A trait rather than a bare `File` because the
 /// guarantee this slice exists for — a journal that cannot be written refuses
@@ -155,7 +180,7 @@ impl Audit {
     /// Parts are length-prefixed so that `["ab", "c"]` and `["a", "bc"]` do not
     /// collide: a tenant whose credential ends where another's session id
     /// begins would otherwise share an identity.
-    pub fn digest(&self, parts: &[&[u8]]) -> String {
+    pub fn digest(&self, parts: &[&[u8]]) -> Digest {
         let mut hasher = Sha256::new();
         hasher.update(self.salt);
         for part in parts {
@@ -163,10 +188,12 @@ impl Audit {
             hasher.update(part);
         }
         let digest: [u8; 32] = hasher.finalize().into();
-        digest[..DIGEST_BYTES]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        Digest(
+            digest[..DIGEST_BYTES]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
     }
 
     /// Append one line. `sync` is true only for the `masked` record, which must
@@ -209,8 +236,8 @@ struct Inner {
 
 #[derive(Default)]
 struct State {
-    tenant: Option<String>,
-    session: Option<String>,
+    tenant: Option<Digest>,
+    session: Option<Digest>,
     stream: bool,
     texts: usize,
     spans: usize,
@@ -245,7 +272,7 @@ impl Record {
     /// The caller's salted digests. `session` is `None` when the request asked
     /// for no session; `tenant` is always present, because it is a digest of
     /// the credential alone.
-    pub fn attribute(&self, tenant: String, session: Option<String>) {
+    pub fn attribute(&self, tenant: Digest, session: Option<Digest>) {
         self.with(|state| {
             state.tenant = Some(tenant);
             state.session = session;
@@ -254,11 +281,29 @@ impl Record {
 
     /// What detection found in *this request's* texts: distinct values per
     /// type, and occurrences in total. Never the values.
+    ///
+    /// The keys arrive from the detector's `span.entity_type`, which is an
+    /// unrestricted string on the wire. Today nothing unvalidated can reach
+    /// here — `mapping.mask` refuses any type outside the placeholder grammar
+    /// before `mask_all` ever returns — but that is an ordering in another
+    /// module, invisible from this one, and a journal line is the last place
+    /// to rely on one. So the check is repeated here: a key that is not a
+    /// legible type name is counted under `UNVALIDATED_TYPE` instead of being
+    /// copied into the evidence.
     pub fn detected(&self, texts: usize, spans: usize, types: BTreeMap<String, usize>) {
+        let mut checked: BTreeMap<String, usize> = BTreeMap::new();
+        for (name, count) in types {
+            let key = if is_entity_type(&name) {
+                name
+            } else {
+                UNVALIDATED_TYPE.to_owned()
+            };
+            *checked.entry(key).or_default() += count;
+        }
         self.with(|state| {
             state.texts = texts;
             state.spans = spans;
-            state.types = types;
+            state.types = checked;
         });
     }
 
@@ -467,8 +512,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let audit = Audit::open(&dir.path().join("audit.jsonl")).expect("opens");
         let digest = audit.digest(&[b"sk-secret"]);
-        assert_eq!(digest.len(), 32);
+        assert_eq!(digest.0.len(), 32);
         assert!(digest
+            .0
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
     }
@@ -664,7 +710,9 @@ mod tests {
     async fn a_masked_record_names_what_was_found() {
         let (_dir, audit, path) = fixture();
         let record = Record::new(audit, "anthropic", "/v1/messages");
-        record.attribute("a41f9c02".repeat(4), Some("3bd7e105".repeat(4)));
+        let tenant = Digest("a41f9c02".repeat(4));
+        let session = Digest("3bd7e105".repeat(4));
+        record.attribute(tenant, Some(session));
         record.detected(4, 9, types(&[("PERSON", 2), ("IBAN", 1)]));
         record.streaming();
         record.masked().await.expect("writes");
@@ -682,6 +730,47 @@ mod tests {
         assert_eq!(lines[0]["types"]["PERSON"], 2);
         assert_eq!(lines[0]["session"], "3bd7e105".repeat(4));
         assert!(lines[0]["ts"].as_str().expect("a timestamp").ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn a_type_name_that_is_not_one_never_reaches_a_line() {
+        // The keys come from the detector's `entity_type`, an unrestricted
+        // string on the wire. A detector that echoed the text it found into
+        // that field would put submitted text in the evidence — which is the
+        // one thing the journal may never contain — and this module must not
+        // depend on `mapping.mask` having refused it two calls earlier.
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "openai", "/v1/chat/completions");
+        record.detected(
+            1,
+            4,
+            types(&[
+                ("PERSON", 1),
+                ("Weber, Hauptstrasse 4", 1),
+                ("person", 1),
+                (&"A".repeat(crate::mapping::MAX_ENTITY_TYPE + 1), 1),
+            ]),
+        );
+        record.masked().await.expect("writes");
+        record.completed(200);
+        drop(record);
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            !text.contains("Weber"),
+            "a detector's type name reached the journal verbatim: {text}"
+        );
+
+        let lines = lines(&path);
+        assert_eq!(lines[0]["types"]["PERSON"], 1, "a legible type is kept");
+        assert_eq!(
+            lines[0]["types"][UNVALIDATED_TYPE], 3,
+            "the three illegible names are counted, not quoted"
+        );
+        assert!(
+            !UNVALIDATED_TYPE.chars().any(|c| c.is_ascii_uppercase()),
+            "the bucket must be a name no detector's type could also be"
+        );
     }
 
     #[tokio::test]
@@ -716,7 +805,10 @@ mod tests {
     async fn a_refusal_before_the_upstream_call_is_one_line() {
         let (_dir, audit, path) = fixture();
         let record = Record::new(audit, "openai", "/v1/chat/completions");
-        record.attribute("a41f9c02".repeat(4), Some("3bd7e105".repeat(4)));
+        record.attribute(
+            Digest("a41f9c02".repeat(4)),
+            Some(Digest("3bd7e105".repeat(4))),
+        );
         record.refused(502, "detector_timeout");
         drop(record);
 
