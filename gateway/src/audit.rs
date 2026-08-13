@@ -282,23 +282,45 @@ impl Record {
     /// What detection found in *this request's* texts: distinct values per
     /// type, and occurrences in total. Never the values.
     ///
-    /// The keys arrive from the detector's `span.entity_type`, which is an
-    /// unrestricted string on the wire. Today nothing unvalidated can reach
-    /// here — `mapping.mask` refuses any type outside the placeholder grammar
-    /// before `mask_all` ever returns — but that is an ordering in another
-    /// module, invisible from this one, and a journal line is the last place
-    /// to rely on one. So the check is repeated here: a key that is not a
-    /// legible type name is counted under `UNVALIDATED_TYPE` instead of being
-    /// copied into the evidence.
+    /// The keys arrive from the detector's `span.entity_type`, an unrestricted
+    /// string on the wire, and this check is the only thing standing between
+    /// that string and a journal line. It is load-bearing on the ordinary
+    /// path, not a guard against a state the gateway cannot reach:
+    /// `Mapping::placeholder_for` returns the cached placeholder on a
+    /// `by_value` hit *before* it validates the type, so every span over a
+    /// value that is already mapped — a repeat within one text, or anything
+    /// seeded from an earlier turn of a session — passes the mapping with its
+    /// type unexamined and arrives here intact. A 200-OK request is enough to
+    /// produce one.
+    ///
+    /// So a key that is not a legible type name is counted under
+    /// `UNVALIDATED_TYPE` rather than copied into the evidence. Deleting this
+    /// loop puts detector-controlled text into the journal on a successful
+    /// request; `a_repeated_value_carries_its_type_past_the_mapping_unvalidated`
+    /// in `proxy.rs` is that request.
     pub fn detected(&self, texts: usize, spans: usize, types: BTreeMap<String, usize>) {
         let mut checked: BTreeMap<String, usize> = BTreeMap::new();
+        let mut unvalidated = 0usize;
         for (name, count) in types {
             let key = if is_entity_type(&name) {
                 name
             } else {
+                unvalidated += 1;
                 UNVALIDATED_TYPE.to_owned()
             };
             *checked.entry(key).or_default() += count;
+        }
+        if unvalidated > 0 {
+            // The fact, never the key: the key is the untrusted string this
+            // function exists to keep out of the evidence, and a log is not a
+            // safer place for it than the journal. A detector and a mapping
+            // that disagree about what a type is should not wait for an audit
+            // to be noticed.
+            tracing::warn!(
+                count = unvalidated,
+                "the detector reported entity types outside the placeholder grammar; \
+                 they are counted as unvalidated rather than named"
+            );
         }
         self.with(|state| {
             state.texts = texts;

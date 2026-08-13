@@ -2087,6 +2087,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repeated_value_carries_its_type_past_the_mapping_unvalidated() {
+        // The path that makes the audit module's own type check load-bearing
+        // rather than defensive. `Mapping::placeholder_for` returns the cached
+        // placeholder on a `by_value` hit *before* it validates the type, so
+        // the second span over a value already mapped — here in one text, but
+        // equally any value seeded from an earlier turn of a session — reaches
+        // `mask_all` with its `entity_type` unexamined. This is an ordinary
+        // 200-OK request, and without the check in `Record::detected` the
+        // detector's string would be a key in the evidence file.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "Weber, Hauptstrasse 4", "start": 10, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber und Weber"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the mapping accepted the request");
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            !text.contains(SECRET),
+            "a detector's type name reached the journal on the ordinary path: {text}"
+        );
+        let lines = journal(&path);
+        assert_eq!(lines[0]["types"]["PERSON"], 1);
+        assert_eq!(
+            lines[0]["types"]["unvalidated"], 1,
+            "the type that skipped the mapping's check is counted, not quoted"
+        );
+    }
+
+    #[tokio::test]
     async fn a_request_without_a_session_still_has_a_tenant() {
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning(
