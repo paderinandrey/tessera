@@ -238,13 +238,22 @@ still open, recorded as itself rather than as a success nobody observed.
 id — a client may well name its session after the person in it. The salt lives
 in `<audit_path>.salt`, created on first run with owner-only permissions, so one
 credential keeps one identity across restarts. It is evidence too: back it up
-with the journal. Losing only the salt is not caught — the gateway treats its
-absence as a first run and mints a new one, so every digest written before that
-point becomes unattributable; only a salt file that exists but is not exactly 32
-bytes refuses to start.
+with the journal.
 
-Rotation and retention are the operator's, and the file is opened for appending
-only.
+Losing it stops the gateway rather than renumbering the journal underneath you.
+A salt that exists but is not exactly 32 bytes refuses to start, and so does a
+salt that is *missing* beside a journal that already has lines — a partial
+restore or a rebuilt container that dropped only the salt would otherwise look
+like a first run and start writing a `tenant` that disagrees with every line
+above it, with nothing marking the boundary. The error names both remedies:
+restore the salt, or move the journal aside to begin a new one.
+
+Two limits stay honest. A salt *replaced* by a different valid 32-byte salt
+cannot be detected by anything — it is indistinguishable from the real one. And
+rotation still works: retention and rotation are the operator's, done externally
+around a restart by moving the journal aside and keeping the salt, which starts
+normally and carries the same digests across. The file itself is opened for
+appending only.
 
 ## Evaluation
 

@@ -80,7 +80,11 @@ impl Audit {
         {
             File::open(parent)?.sync_all()?;
         }
-        let salt = Self::load_salt(&salt_path(path))?;
+        // Emptiness by length, not by existence: the line above just created
+        // the file, so by here it always exists. An empty journal is the one
+        // state in which minting a salt renumbers nothing.
+        let journal_is_empty = file.metadata()?.len() == 0;
+        let salt = Self::load_salt(&salt_path(path), journal_is_empty)?;
         Ok(Self {
             sink: Mutex::new(Box::new(file)),
             salt,
@@ -95,7 +99,17 @@ impl Audit {
         }
     }
 
-    fn load_salt(path: &Path) -> std::io::Result<[u8; SALT_BYTES]> {
+    /// The salt beside the journal, minted on a first run and reused after.
+    ///
+    /// A salt that exists but is not exactly 32 bytes refuses, and so does a
+    /// salt that is *absent* beside a journal that already has lines: the
+    /// consequence is the same either way — every `tenant` written from here
+    /// on disagrees with every line above it, with no marker at the boundary —
+    /// so a partial restore that lost only the salt must not look like a first
+    /// run. `journal_is_empty` is what tells the two apart, and it is also what
+    /// keeps external rotation working: a journal moved aside leaves an empty
+    /// one beside the kept salt, and the digests carry on unchanged.
+    fn load_salt(path: &Path, journal_is_empty: bool) -> std::io::Result<[u8; SALT_BYTES]> {
         let mut salt = [0u8; SALT_BYTES];
         match File::open(path) {
             Ok(mut file) => {
@@ -111,6 +125,13 @@ impl Audit {
                 Ok(salt)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !journal_is_empty {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "the audit salt file is missing beside a journal that already has lines; \
+                         restore it, or move the journal aside to start a new one",
+                    ));
+                }
                 getrandom::getrandom(&mut salt)
                     .map_err(|_| std::io::Error::other("the OS must provide randomness"))?;
                 let mut options = OpenOptions::new();
@@ -492,6 +513,84 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         std::fs::write(dir.path().join("audit.jsonl.salt"), b"short").expect("writes");
         assert!(Audit::open(&path).is_err());
+    }
+
+    #[test]
+    fn an_oversized_salt_refuses_to_open() {
+        // Thirty-three bytes is not a file we wrote, and reading the first 32
+        // of it would attribute the journal with a salt nobody chose.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(dir.path().join("audit.jsonl.salt"), [0u8; SALT_BYTES + 1]).expect("writes");
+        assert!(Audit::open(&path).is_err());
+    }
+
+    #[test]
+    fn a_lost_salt_beside_a_written_journal_refuses_to_open() {
+        // The asymmetry this closes: a truncated salt refused already, while
+        // an absent one silently minted a replacement — same consequence,
+        // every tenant below the boundary renumbered and nothing marking it.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        Audit::open(&path)
+            .expect("opens")
+            .append(r#"{"event":"outcome"}"#, true)
+            .expect("appends");
+        std::fs::remove_file(dir.path().join("audit.jsonl.salt")).expect("removes");
+
+        let message = match Audit::open(&path) {
+            Ok(_) => panic!("a journal that renumbers its tenants must not start"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("restore") && message.contains("move the journal aside"),
+            "the operator is told both remedies: {message}"
+        );
+    }
+
+    #[test]
+    fn a_lost_salt_beside_an_empty_journal_is_an_ordinary_first_run() {
+        // Nothing has been attributed yet, so there is nothing to disagree
+        // with. This is every first run, and it must not need a salt to exist.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        Audit::open(&path).expect("a first run mints its own salt");
+        std::fs::remove_file(dir.path().join("audit.jsonl.salt")).expect("removes");
+
+        Audit::open(&path).expect("an empty journal is still a first run");
+        assert_eq!(
+            std::fs::read(dir.path().join("audit.jsonl.salt"))
+                .expect("readable")
+                .len(),
+            SALT_BYTES
+        );
+    }
+
+    #[test]
+    fn external_rotation_keeps_the_salt_and_so_keeps_the_digests() {
+        // Rotation is out of scope and therefore external: the operator moves
+        // the journal aside around a restart and keeps the salt. That leaves
+        // an empty journal beside a present salt, which must start normally
+        // and go on attributing the same credential to the same tenant —
+        // otherwise the rotation the design relies on splits the identities it
+        // was supposed to preserve.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let first = Audit::open(&path).expect("opens");
+        first
+            .append(r#"{"event":"outcome"}"#, true)
+            .expect("appends");
+        let tenant = first.digest(&[b"sk-secret"]);
+        drop(first);
+
+        std::fs::rename(&path, dir.path().join("audit.jsonl.1")).expect("rotates");
+
+        let second = Audit::open(&path).expect("a rotated journal starts normally");
+        assert_eq!(
+            second.digest(&[b"sk-secret"]),
+            tenant,
+            "rotation must not renumber the tenants it carries across"
+        );
     }
 
     #[test]

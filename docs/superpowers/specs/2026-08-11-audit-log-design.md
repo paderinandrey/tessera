@@ -235,10 +235,15 @@ error from the existing `deny_unknown_fields` parser (`config.rs:16`) rather
 than a silent empty string. `main.rs` opens the file with `O_APPEND | O_CREAT`
 before `bind`, and fsyncs the containing directory once — on a first run the
 directory entry itself is what a machine failure would lose. A file that cannot
-be opened stops the process. A `.salt` file that exists but is shorter than 32
+be opened stops the process. A `.salt` file that exists but is not exactly 32
 bytes also stops it: regenerating a salt silently would split the journal in the
 middle, and a journal that quietly renumbers its tenants is worse than one that
-refuses to start.
+refuses to start. A salt that is *absent* stops it for the same reason, unless
+the journal has no bytes in it — emptiness by length rather than by existence,
+since `open` creates the journal before the salt is read. That one exception is
+what keeps a first run a first run and keeps external rotation working: a
+journal moved aside beside a kept salt is an empty journal with a valid salt,
+and the digests carry on unchanged.
 
 **A failed `masked` write** becomes `ProxyError::Audit` → **503**, by the same
 reasoning as `SessionError::Saturated` (`proxy.rs:46`): it is this gateway's own
