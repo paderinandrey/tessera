@@ -221,6 +221,14 @@ and `session` after `key_from` (`proxy.rs:142`), `types`/`spans`/`texts` after
 fsyncs inside `spawn_blocking`, so a slow disk does not occupy a runtime worker,
 and it is the one audit call that returns a `Result` and can refuse the request.
 
+The fsync is issued outside the sink's lock, through a second descriptor onto
+the same file: `Sink` writes lines under the lock, `Flush` commits them without
+it. Otherwise a slow disk would still reach the runtime, by a different route —
+the outcome line is written from `Drop`, on whatever thread holds the last
+handle, and it would queue behind some other request's fsync for the whole
+round-trip. Ordering survives the split because an fsync commits everything
+written to the file before it rather than one particular write.
+
 The streamed path passes a clone into `restore_stream` (`proxy.rs:215`)
 alongside `mapping`, so the wrapper's handle is no longer the last and the line
 waits for the stream. `stream.rs` does change, contrary to what an earlier draft

@@ -66,7 +66,20 @@ pub struct Digest(String);
 /// that fails on demand is the only honest way to test it.
 pub(crate) trait Sink: Send {
     fn write_line(&mut self, line: &str) -> std::io::Result<()>;
-    fn sync(&mut self) -> std::io::Result<()>;
+
+    /// A second handle onto the same destination, kept beside the sink rather
+    /// than inside it. See `Flush`.
+    fn flusher(&self) -> std::io::Result<Box<dyn Flush>>;
+}
+
+/// The half of a sink that makes what was written durable, split out because
+/// it is the slow half and needs no exclusive access: `File::sync_all` takes
+/// `&self`, so a cloned descriptor can be fsynced while the sink itself is
+/// free to take the next line. An fsync commits everything written to the file
+/// before it rather than one particular write, so a flush issued after the
+/// sink's lock is released still covers the line written under it.
+pub(crate) trait Flush: Send + Sync {
+    fn sync(&self) -> std::io::Result<()>;
 }
 
 impl Sink for File {
@@ -77,7 +90,13 @@ impl Sink for File {
         self.write_all(format!("{line}\n").as_bytes())
     }
 
-    fn sync(&mut self) -> std::io::Result<()> {
+    fn flusher(&self) -> std::io::Result<Box<dyn Flush>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+}
+
+impl Flush for File {
+    fn sync(&self) -> std::io::Result<()> {
         self.sync_all()
     }
 }
@@ -88,6 +107,10 @@ pub struct Audit {
     /// interleaved lines in an evidence base are worse than a lock held for
     /// microseconds.
     sink: Mutex<Box<dyn Sink>>,
+    /// Outside the mutex on purpose: an fsync costs a disk round-trip, and the
+    /// outcome line is written wherever the last handle to a record drops —
+    /// including a runtime worker with nothing to do with the audit.
+    flush: Box<dyn Flush>,
     salt: [u8; SALT_BYTES],
 }
 
@@ -118,18 +141,23 @@ impl Audit {
         {
             File::open(parent)?.sync_all()?;
         }
+        Self::with_flusher(Box::new(file), salt)
+    }
+
+    /// The one constructor: a sink and the flush handle it hands out, which
+    /// must be taken here because nothing may reach inside the mutex to ask
+    /// for one later.
+    fn with_flusher(sink: Box<dyn Sink>, salt: [u8; SALT_BYTES]) -> std::io::Result<Self> {
         Ok(Self {
-            sink: Mutex::new(Box::new(file)),
+            flush: sink.flusher()?,
+            sink: Mutex::new(sink),
             salt,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn with_sink(sink: Box<dyn Sink>, salt: [u8; SALT_BYTES]) -> Self {
-        Self {
-            sink: Mutex::new(sink),
-            salt,
-        }
+        Self::with_flusher(sink, salt).expect("a test sink hands out its flusher")
     }
 
     /// The salt beside the journal, minted on a first run and reused after.
@@ -211,13 +239,20 @@ impl Audit {
         // A thread that panicked mid-write is not reachable: a line is one
         // `write_all` under this lock. Recovering costs less than refusing to
         // serve because some other thread panicked.
-        let mut sink = self.sink.lock().unwrap_or_else(|error| {
-            tracing::warn!("the audit lock was poisoned; recovering");
-            error.into_inner()
-        });
-        sink.write_line(line)?;
+        {
+            let mut sink = self.sink.lock().unwrap_or_else(|error| {
+                tracing::warn!("the audit lock was poisoned; recovering");
+                error.into_inner()
+            });
+            sink.write_line(line)?;
+        }
+        // The lock is gone by here, and the fsync is what it was protecting
+        // nothing from: ordering between lines is settled by the writes above,
+        // and this commits everything written before it, not one line. Holding
+        // the lock across a disk round-trip would park whichever thread wanted
+        // the next line — in the outcome line's case, a runtime worker.
         if sync {
-            sink.sync()?;
+            self.flush.sync()?;
         }
         Ok(())
     }
@@ -494,12 +529,19 @@ fn salt_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 pub(crate) fn failing_audit_for_tests() -> Audit {
     struct FailingSink;
+    struct FailingFlush;
 
     impl Sink for FailingSink {
         fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
             Err(std::io::Error::other("the disk is full"))
         }
-        fn sync(&mut self) -> std::io::Result<()> {
+        fn flusher(&self) -> std::io::Result<Box<dyn Flush>> {
+            Ok(Box::new(FailingFlush))
+        }
+    }
+
+    impl Flush for FailingFlush {
+        fn sync(&self) -> std::io::Result<()> {
             Err(std::io::Error::other("the disk is full"))
         }
     }
@@ -515,12 +557,19 @@ pub(crate) fn failing_audit_for_tests() -> Audit {
 #[cfg(test)]
 pub(crate) fn sync_failing_audit_for_tests(path: &Path) -> Audit {
     struct SyncFailingSink(File);
+    struct SyncFailingFlush;
 
     impl Sink for SyncFailingSink {
         fn write_line(&mut self, line: &str) -> std::io::Result<()> {
             Sink::write_line(&mut self.0, line)
         }
-        fn sync(&mut self) -> std::io::Result<()> {
+        fn flusher(&self) -> std::io::Result<Box<dyn Flush>> {
+            Ok(Box::new(SyncFailingFlush))
+        }
+    }
+
+    impl Flush for SyncFailingFlush {
+        fn sync(&self) -> std::io::Result<()> {
             Err(std::io::Error::other("fsync failed"))
         }
     }
@@ -721,6 +770,100 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("readable");
         assert_eq!(text, "{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn a_line_does_not_wait_behind_another_fsync() {
+        // The outcome line is written wherever the last handle to a record
+        // drops, which on the streamed path is a tokio worker. If the sink's
+        // lock covered the fsync, that worker would park for the length of
+        // some unrelated request's disk round-trip.
+        //
+        // The gate makes that observable without timing anything that passes:
+        // the flush announces itself and then stays in progress until this
+        // test lets it out, so the second line is written *while* an fsync is
+        // running. It arrives at once when the lock was released, and not at
+        // all — until the deadline below — when it was not.
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::time::Duration;
+
+        struct Gate {
+            entered: Mutex<Sender<()>>,
+            release: Mutex<Receiver<()>>,
+        }
+        struct GatedSink(File, Arc<Gate>);
+        struct GatedFlush(Arc<Gate>);
+
+        impl Sink for GatedSink {
+            fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+                Sink::write_line(&mut self.0, line)
+            }
+            fn flusher(&self) -> std::io::Result<Box<dyn Flush>> {
+                Ok(Box::new(GatedFlush(Arc::clone(&self.1))))
+            }
+        }
+
+        impl Flush for GatedFlush {
+            fn sync(&self) -> std::io::Result<()> {
+                let gate = &self.0;
+                gate.entered
+                    .lock()
+                    .expect("a gate")
+                    .send(())
+                    .expect("the test is listening");
+                gate.release
+                    .lock()
+                    .expect("a gate")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the test releases the flush");
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.path().join("audit.jsonl"))
+            .expect("opens");
+        let (entered, flush_started) = channel();
+        let (release, released) = channel();
+        let audit = Arc::new(Audit::with_sink(
+            Box::new(GatedSink(
+                file,
+                Arc::new(Gate {
+                    entered: Mutex::new(entered),
+                    release: Mutex::new(released),
+                }),
+            )),
+            [7u8; SALT_BYTES],
+        ));
+
+        let flushing = std::thread::spawn({
+            let audit = Arc::clone(&audit);
+            move || audit.append(r#"{"a":1}"#, true).expect("appends")
+        });
+        flush_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fsync began");
+
+        let (wrote, second_line) = channel();
+        let writing = std::thread::spawn({
+            let audit = Arc::clone(&audit);
+            move || {
+                audit.append(r#"{"b":2}"#, false).expect("appends");
+                let _ = wrote.send(());
+            }
+        });
+        let arrived = second_line.recv_timeout(Duration::from_secs(5));
+
+        release.send(()).expect("the flush is still waiting");
+        flushing.join().expect("the flushing thread");
+        writing.join().expect("the writing thread");
+        assert!(
+            arrived.is_ok(),
+            "a line waited on a lock held across another line's fsync"
+        );
     }
 
     #[test]
