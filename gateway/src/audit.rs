@@ -97,19 +97,27 @@ impl Audit {
     /// that cannot write evidence does not start.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        // A newly created file's directory entry is what a machine failure
-        // would lose, and the entry is not covered by fsyncing the file.
+        // Emptiness by length, not by existence: the line above just created
+        // the file, so by here it always exists. An empty journal is the one
+        // state in which minting a salt renumbers nothing.
+        let journal_is_empty = file.metadata()?.len() == 0;
+        let salt = Self::load_salt(&salt_path(path), journal_is_empty)?;
+        // Both files may have just been created, and a newly created file's
+        // directory entry is what a machine failure would lose: `sync_all` on
+        // a file commits its contents, never the entry that names it.
+        //
+        // After `load_salt`, not before it, and once rather than twice: a
+        // directory fsync commits every entry the directory has at the time,
+        // so this one covers the journal created above as well as a salt just
+        // minted. The salt is the half that must not be lost alone — a journal
+        // whose entry survived without its salt refuses every restart until an
+        // operator intervenes by hand.
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             File::open(parent)?.sync_all()?;
         }
-        // Emptiness by length, not by existence: the line above just created
-        // the file, so by here it always exists. An empty journal is the one
-        // state in which minting a salt renumbers nothing.
-        let journal_is_empty = file.metadata()?.len() == 0;
-        let salt = Self::load_salt(&salt_path(path), journal_is_empty)?;
         Ok(Self {
             sink: Mutex::new(Box::new(file)),
             salt,

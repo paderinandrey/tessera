@@ -242,7 +242,11 @@ decision already made: the outcome line does not fsync and may not refuse.
 error from the existing `deny_unknown_fields` parser (`config.rs:16`) rather
 than a silent empty string. `main.rs` opens the file with `O_APPEND | O_CREAT`
 before `bind`, and fsyncs the containing directory once — on a first run the
-directory entry itself is what a machine failure would lose. A file that cannot
+directory entry itself is what a machine failure would lose, for the salt as
+much as for the journal, so that one fsync comes *after* the salt is minted and
+covers both entries. Losing the salt's entry alone is the expensive half: by
+the rule below, a journal that survives without its salt refuses every restart
+until an operator intervenes. A file that cannot
 be opened stops the process. A `.salt` file that exists but is not exactly 32
 bytes also stops it: regenerating a salt silently would split the journal in the
 middle, and a journal that quietly renumbers its tenants is worse than one that
