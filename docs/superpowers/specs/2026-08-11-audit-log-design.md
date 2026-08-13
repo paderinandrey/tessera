@@ -144,6 +144,14 @@ from whether a `masked` line with the same `request` exists, but a refused
 request has only one line, and that line should answer the central question
 without a join.
 
+It is set before the provider call rather than after it returns, and that
+asymmetry is deliberate: a request that times out or is reset mid-flight *did*
+send its bytes, so a flag set only on success would under-report — and for this
+journal a false "nothing left" is far more dangerous than a false "something
+left". The claim is therefore withdrawn in exactly one case, where the opposite
+is definitively knowable: `reqwest::Error::is_connect`, a connection that was
+never established (a refused port or a failed DNS lookup), and nothing else.
+
 **`tenant` and `session` are digests the audit writer computes itself**, 16
 bytes each, rendered as 32 hex characters. The example above shortens them for
 readability; the real fields are long.

@@ -374,6 +374,21 @@ impl Record {
         Ok(())
     }
 
+    /// Withdraw the claim `masked` made: the provider was never reached, so
+    /// nothing this request carried left the perimeter.
+    ///
+    /// `masked` sets `upstream` before the call is made rather than after it
+    /// returns, and deliberately: a request that fails mid-flight did send its
+    /// bytes, and a journal that said otherwise would under-report exactly what
+    /// it exists to report. Over-reporting is the safe direction, so `true`
+    /// stands unless the opposite is *definitively* knowable — which it is only
+    /// when no connection was ever established. `reqwest::Error::is_connect` is
+    /// that case, and in this version it covers a refused connection and a
+    /// failed DNS lookup alike; a timeout or a broken pipe is not it.
+    pub fn did_not_reach_upstream(&self) {
+        self.with(|state| state.upstream = false);
+    }
+
     /// The gateway produced a whole response and handed it to axum. Not "the
     /// client received it": whether the connection survived afterwards is not
     /// something this gateway observes, and the record claims only what it saw.

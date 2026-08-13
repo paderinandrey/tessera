@@ -305,11 +305,17 @@ async fn handle(
             request = request.header(header, value);
         }
     }
-    let response = request
-        .json(&masked)
-        .send()
-        .await
-        .map_err(|error| ProxyError::Upstream(error.to_string()))?;
+    let response = request.json(&masked).send().await.map_err(|error| {
+        // A connection that was never established carried no bytes, which
+        // is the one failure here that says so for certain. Every other
+        // way `send` can fail — a timeout, a reset, a truncated body —
+        // may have left bytes on the wire, and those keep the claim
+        // `masked` made.
+        if error.is_connect() {
+            record.did_not_reach_upstream();
+        }
+        ProxyError::Upstream(error.to_string())
+    })?;
 
     let status = StatusCode::from_u16(response.status().as_u16())
         .map_err(|error| ProxyError::Upstream(error.to_string()))?;
@@ -2036,6 +2042,100 @@ mod tests {
             *seen.lock().expect("lock"),
             1,
             "the masked record must be on disk before the provider is called"
+        );
+    }
+
+    /// A port bound and released: nothing listens there, so a connection to it
+    /// is refused before a byte of the request is written.
+    fn a_dead_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        listener.local_addr().expect("an address").port()
+    }
+
+    fn state_against(
+        detector: &MockServer,
+        base: String,
+    ) -> (Arc<AppState>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: base.clone(),
+            anthropic_base: base,
+            sessions: SessionStore::new(test_limits()),
+            audit,
+        });
+        (state, dir, path)
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_was_never_reached_records_that_nothing_left() {
+        // `masked` claims the bytes left before they do, because a request
+        // that dies mid-flight did send them and a journal that said otherwise
+        // would under-report the one thing it exists to report. A refused
+        // connection is the single failure that is knowably the other way:
+        // `upstream: true` here would tell an auditor a request reached a
+        // provider that never accepted one.
+        let detector = detector_finding_weber().await;
+        let (state, _dir, path) =
+            state_against(&detector, format!("http://127.0.0.1:{}", a_dead_port()));
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the request was masked, then refused");
+        assert_eq!(lines[0]["event"], "masked");
+        assert_eq!(lines[1]["result"], "refused");
+        assert_eq!(lines[1]["error"], "upstream_failed");
+        assert_eq!(
+            lines[1]["upstream"], false,
+            "the connection was never established, so nothing left the perimeter"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_accepted_and_vanished_still_records_bytes_leaving() {
+        // The other side of the correction above, and what keeps it narrow: a
+        // provider that accepts the connection and then disappears has already
+        // read whatever the socket carried. `send` fails here too, and this is
+        // the case where the conservative claim must stand — under-reporting a
+        // request that did leave is the dangerous direction for a privacy
+        // journal, and a correction that fired on every `send` error would do
+        // exactly that.
+        let detector = detector_finding_weber().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Accepted, then closed with no response at all.
+                drop(stream);
+            }
+        });
+        let (state, _dir, path) = state_against(&detector, base);
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let lines = journal(&path);
+        assert_eq!(lines[1]["error"], "upstream_failed");
+        assert_eq!(
+            lines[1]["upstream"], true,
+            "the connection was established, so the conservative claim stands"
         );
     }
 
