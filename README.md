@@ -203,7 +203,9 @@ A request leaves two records. The first is written **and fsynced before the
 provider is called**, so evidence that a request was pseudonymized cannot be
 lost by the crash that follows it; if it cannot be written, the request is
 refused with a 503 rather than served unrecorded. The second is written when the
-request ends — including minutes later, when a stream does.
+request ends — including minutes later, when a stream does. The examples below
+group the fields for reading; on disk each line serializes its keys in
+alphabetical order, which nothing depends on.
 
 ```json
 {"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
@@ -229,7 +231,13 @@ text on every request whether or not one is attached, so the coreference a
 session buys across turns leaves no trace here. Neither the values, hashes of
 them, their offsets nor the placeholder names are written. `error` is drawn from
 a fixed vocabulary rather than formatted from a message, so no expression in the
-writer could interpolate submitted text. `result` is one of `completed`,
+writer could interpolate submitted text. A type name the detector reports that
+is not a legible type — the mapping lets one through whenever the value was
+already masked earlier in the same request or in an earlier turn — is counted
+under `unvalidated` rather than written out, since the name itself came from
+outside the perimeter. Seeing that key means the detector and the gateway
+disagree about what a type is; the gateway also says so in its own log.
+`result` is one of `completed`,
 `refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
 defaults to on drop — in practice, a client that disconnects while a stream is
 still open, recorded as itself rather than as a success nobody observed.

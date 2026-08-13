@@ -100,8 +100,8 @@ Both are computed from the spans the detector returned for *this request's*
 texts, not from the session's table. A session-backed mapping is seeded from
 earlier turns (`proxy.rs:153` clones the guard), so counting the table would
 report the conversation's accumulated total on every turn and the record would
-stop describing the request. `mask_all` (`proxy.rs:116`) currently drops the
-spans it receives; it will return them.
+stop describing the request. `mask_all` returns the spans it counts, rather than
+dropping them as it did before this slice.
 
 **`result` has four values, and each is signalled rather than inferred.**
 
