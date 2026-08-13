@@ -245,6 +245,15 @@ async fn handle(
             let (masked, spans, types) =
                 mask_all(&state.detector, &body, &pointers, &mut work).await?;
             record.detected(pointers.len(), spans, types);
+            // Durable before anything leaves the perimeter, and before the
+            // session commits: this is the last expression that can refuse the
+            // request, and a request that never left must leave the session
+            // exactly as it was. It costs holding the session's lock across an
+            // fsync — a few milliseconds against a detector round-trip of about
+            // a second, and the alternative is a caller's values sitting in the
+            // store for `session_idle_secs` on behalf of a request nobody was
+            // allowed to make.
+            record.masked().await?;
             // After the last `?`, and on a copy until here: a refused request
             // leaves the session exactly as it was, so a client whose detector
             // blinked does not carry a hole in its numbering for the rest of
@@ -259,13 +268,12 @@ async fn handle(
             let (masked, spans, types) =
                 mask_all(&state.detector, &body, &pointers, &mut work).await?;
             record.detected(pointers.len(), spans, types);
+            // The same ordering with nothing to commit: the journal is still
+            // durable before the upstream call, which is what it exists for.
+            record.masked().await?;
             (masked, work)
         }
     };
-
-    // Durable before anything leaves the perimeter. This ordering is the whole
-    // reason the journal exists, so it happens here and not a line later.
-    record.masked().await?;
 
     // Only what is masked leaves the process.
     let mut request = state.upstream.post(format!(
@@ -1523,6 +1531,47 @@ mod tests {
         assert!(
             session.mapping.lock().await.is_empty(),
             "a refused request left values in the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_by_the_journal_leaves_the_session_untouched() {
+        // The other refusal class: masking succeeded, so the values exist and
+        // are ready to commit, and the journal is what refuses. Nothing left
+        // the perimeter, so nothing of the caller's may stay behind — neither
+        // in the session's table nor against its value budget.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit: Arc::new(crate::audit::failing_audit_for_tests()),
+        });
+
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "conv-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let session = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .unwrap()
+            .session;
+        assert!(
+            session.mapping.lock().await.is_empty(),
+            "a request the journal refused left values in the session"
         );
     }
 
