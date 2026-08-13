@@ -265,6 +265,27 @@ what keeps a first run a first run and keeps external rotation working: a
 journal moved aside beside a kept salt is an empty journal with a valid salt,
 and the digests carry on unchanged.
 
+**A journal that ends mid-record** is the cost of the outcome line not being
+fsynced: a process or machine death can leave a partial JSON object with no
+newline after it. Reopening in append mode would then concatenate the next
+record onto that fragment, so a crash would corrupt not only the line it
+interrupted — which is unavoidable — but also the first record written after the
+restart, which is a `masked` line that was fsynced precisely because it is
+evidence. So `open` appends one newline when the journal is non-empty and does
+not end in one, and warns.
+
+The three alternatives are worse. Refusing to start makes a failure the journal
+inflicted on itself require an operator before the gateway serves again.
+Truncating the fragment destroys a record in an append-only evidence file to
+tidy it, and an interrupted record is itself something an auditor may want.
+Doing nothing is the bug. The newline is not fsynced and nothing waits for it:
+the write is idempotent, so a second crash before it reaches the disk is
+repaired by the next start, and the next `masked` line fsyncs, which commits
+everything written to the file before it. It runs *after* `load_salt`, so the
+one startup that refuses leaves the journal byte-identical to how it found it,
+and only on a non-empty journal, so it cannot turn a first run into the
+non-empty journal the salt-loss rule refuses.
+
 **A failed `masked` write** becomes `ProxyError::Audit` → **503**, by the same
 reasoning as `SessionError::Saturated` (`proxy.rs:46`): it is this gateway's own
 health rather than anything the caller got wrong, and the same request may
@@ -328,6 +349,11 @@ The tests that matter are invariants, not the presence of a line.
 - The salt file is created once and reused: two successive runs against the same
   path produce the same `tenant` for the same credential, and a truncated salt
   file refuses startup.
+- A journal ending mid-record — the state a crash leaves — keeps its fragment
+  and the record written after the restart parses on a line of its own. A
+  journal already ending in a newline gains no blank line, an empty one is left
+  empty and so is still a first run, and a startup that refuses on the salt
+  rule leaves the journal byte-identical.
 
 ## Out of scope
 

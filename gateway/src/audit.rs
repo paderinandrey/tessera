@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -119,12 +119,17 @@ impl Audit {
     /// either if absent. Returns an error rather than degrading: a gateway
     /// that cannot write evidence does not start.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         // Emptiness by length, not by existence: the line above just created
         // the file, so by here it always exists. An empty journal is the one
         // state in which minting a salt renumbers nothing.
-        let journal_is_empty = file.metadata()?.len() == 0;
+        let length = file.metadata()?.len();
+        let journal_is_empty = length == 0;
         let salt = Self::load_salt(&salt_path(path), journal_is_empty)?;
+        // After the salt, so that the one `open` that refuses leaves the
+        // journal exactly as it found it: a startup that does not serve should
+        // not have written to the evidence it declined to use.
+        Self::close_truncated_record(&mut file, path, length)?;
         // Both files may have just been created, and a newly created file's
         // directory entry is what a machine failure would lose: `sync_all` on
         // a file commits its contents, never the entry that names it.
@@ -142,6 +147,57 @@ impl Audit {
             File::open(parent)?.sync_all()?;
         }
         Self::with_flusher(Box::new(file), salt)
+    }
+
+    /// Terminate a record the previous process was killed in the middle of.
+    ///
+    /// The outcome line does not fsync — by the time it is written there is
+    /// nothing left to refuse — so a process or machine death can leave the
+    /// journal ending in a fragment with no newline. That much is the price of
+    /// the choice and is not recoverable. What is recoverable is the next
+    /// record: reopening in append mode would concatenate it onto the fragment,
+    /// so a crash would also destroy a line written *after* the restart,
+    /// including a `masked` line that was fsynced and is supposed to be
+    /// evidence. One newline confines the damage to the interrupted line.
+    ///
+    /// The fragment is kept rather than truncated away, and the gateway starts
+    /// rather than refusing: this is an append-only evidence file, an
+    /// interrupted record is itself something an auditor may want to see, and
+    /// the damage was done by this journal's own durability rule rather than by
+    /// anything an operator did or could fix by hand.
+    ///
+    /// `length` is the journal's size before this process wrote anything, so an
+    /// empty journal is left empty — the salt-loss rule reads emptiness to tell
+    /// a first run from a partial restore, and a first run that crashed at the
+    /// wrong moment must not become unstartable.
+    fn close_truncated_record(file: &mut File, path: &Path, length: u64) -> std::io::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        // A separate descriptor because the journal's own is opened for
+        // appending only. Reading the last byte is enough: JSONL puts nothing
+        // after a line's terminator.
+        let mut reader = File::open(path)?;
+        reader.seek(SeekFrom::Start(length - 1))?;
+        let mut last = [0u8; 1];
+        reader.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(());
+        }
+        file.write_all(b"\n")?;
+        // Not fsynced, and nothing waits for it: the write is idempotent, so a
+        // second crash before it reaches the disk is repaired by the next
+        // start, and the first `masked` line after this one fsyncs, which
+        // commits everything written to the file before it.
+        //
+        // The fragment is never quoted. It is a partial journal line, and a
+        // journal line is written from a request; the log is not a safer place
+        // for it than the journal would have been.
+        tracing::warn!(
+            "the audit journal ended in a truncated record, which a crash leaves behind; \
+             it was closed with a newline so the records after it stay readable"
+        );
+        Ok(())
     }
 
     /// The one constructor: a sink and the flush handle it hands out, which
@@ -881,6 +937,110 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("readable");
         assert_eq!(text.lines().count(), 2, "a restart must not erase evidence");
+    }
+
+    #[test]
+    fn a_record_a_crash_interrupted_does_not_swallow_the_next_one() {
+        // The outcome line does not fsync, so a machine failure can leave the
+        // journal ending mid-object. Appending onto that fragment would
+        // corrupt the first record written after the restart too — including a
+        // `masked` record, which is fsynced precisely because it is evidence.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        Audit::open(&path)
+            .expect("opens")
+            .append(r#"{"event":"outcome","request":"aa"}"#, true)
+            .expect("appends");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("opens")
+            .write_all(br#"{"event":"outcome","req"#)
+            .expect("the machine died here");
+
+        Audit::open(&path)
+            .expect("a crashed journal starts without an operator")
+            .append(r#"{"event":"masked","request":"bb"}"#, true)
+            .expect("appends");
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let all: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            all.len(),
+            3,
+            "the fragment is kept, not truncated away: {text}"
+        );
+        assert_eq!(
+            all[1], r#"{"event":"outcome","req"#,
+            "the interrupted line keeps exactly what reached the disk"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(all[2]).expect("the record after a crash parses on its own line");
+        assert_eq!(after["request"], "bb");
+    }
+
+    #[test]
+    fn a_journal_that_ends_cleanly_gains_no_blank_line() {
+        // Every ordinary restart takes this path, and a newline appended to a
+        // journal that already had one would put an empty line between every
+        // run — a parse error for any reader that does not tolerate one.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        Audit::open(&path)
+            .expect("opens")
+            .append(r#"{"a":1}"#, true)
+            .expect("appends");
+
+        Audit::open(&path)
+            .expect("reopens")
+            .append(r#"{"b":2}"#, true)
+            .expect("appends");
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert_eq!(text, "{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn an_empty_journal_stays_empty_and_so_stays_a_first_run() {
+        // The repair must not make an empty journal non-empty: emptiness is
+        // what tells a first run from a partial restore that lost its salt, so
+        // a first run interrupted at the wrong moment would otherwise refuse
+        // every restart afterwards.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        Audit::open(&path).expect("a first run mints its own salt");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len(),
+            0,
+            "a first run writes nothing to the journal"
+        );
+
+        std::fs::remove_file(dir.path().join("audit.jsonl.salt")).expect("removes");
+        Audit::open(&path).expect("an untouched journal is still a first run");
+        assert_eq!(std::fs::metadata(&path).expect("stat").len(), 0);
+    }
+
+    #[test]
+    fn a_startup_that_refuses_leaves_the_journal_as_it_found_it() {
+        // The salt rule refuses before the repair runs. A gateway that does not
+        // serve should not have written to the evidence file it declined to
+        // open — least of all a journal an operator is about to restore a salt
+        // beside, byte for byte.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        Audit::open(&path).expect("opens");
+        std::fs::write(&path, br#"{"event":"outcome","req"#).expect("writes a fragment");
+        std::fs::remove_file(dir.path().join("audit.jsonl.salt")).expect("removes");
+
+        assert!(
+            Audit::open(&path).is_err(),
+            "a journal that renumbers its tenants must not start"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("readable"),
+            br#"{"event":"outcome","req"#,
+            "a refused startup wrote to the journal anyway"
+        );
     }
 
     use std::sync::Arc;

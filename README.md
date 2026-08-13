@@ -256,6 +256,14 @@ like a first run and start writing a `tenant` that disagrees with every line
 above it, with nothing marking the boundary. The error names both remedies:
 restore the salt, or move the journal aside to begin a new one.
 
+Only the first of a request's two records is fsynced, so a crash can leave the
+journal ending in a half-written second one. The next start appends the newline
+that record never got, says so in its log, and serves — no operator, no flag. The
+interrupted line stays exactly as short as the crash left it, because a record
+that was cut off is itself a fact about that run; what the newline buys is that
+every record written after the restart is a whole line of its own, rather than
+being glued onto the fragment and lost with it.
+
 Two limits stay honest. A salt *replaced* by a different valid 32-byte salt
 cannot be detected by anything — it is indistinguishable from the real one. And
 rotation still works: retention and rotation are the operator's, done externally
