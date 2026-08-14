@@ -235,6 +235,13 @@ Create `gateway/Dockerfile`:
 # Pinned rather than `stable`: the repository pins no toolchain, so a build
 # today and a build in six months are otherwise different builds.
 FROM rust:1.97-slim-trixie AS build
+# `openssl-sys` links system OpenSSL and finds it through pkg-config; the slim
+# image carries neither, so without this the build fails at link time rather
+# than at any point that names OpenSSL. Build stage only — these never reach
+# the runtime image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
