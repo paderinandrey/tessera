@@ -27,6 +27,10 @@ max_session_values = 1000
 # gateway does not start without it. Two records per request — one written and
 # fsynced before the provider is called, one when the request ends — and neither
 # ever carries submitted text. A salt file is kept beside it as
-# <audit_path>.salt so that the tenant and session digests survive a restart;
-# both files hold evidence and belong on storage you back up.
-audit_path = "/var/log/tessera/audit.jsonl"
+# <audit_path>.salt; both hold evidence, they must stay together, and a journal
+# whose salt has gone missing refuses to start rather than renumbering every
+# tenant beneath you.
+#
+# This default is relative on purpose, so that following the quickstart writes
+# where you ran it. A deployment wants an absolute path on storage you back up.
+audit_path = "tessera-audit.jsonl"
