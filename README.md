@@ -42,8 +42,8 @@ tessera/
   gateway/     Rust reverse proxy: drop-in base URL for OpenAI- and Anthropic-shaped
                requests, placeholder substitution and restoration, buffered and
                streamed, with per-conversation sessions and an audit journal built in.
-  evaluation/  Public synthetic corpus and metrics harness (planned). The manually
-               annotated corpus stays private and never enters this repository.
+  evaluation/  Public synthetic corpus and metrics harness. The manually annotated
+               corpus stays private and never enters this repository.
 ```
 
 ## Running it
@@ -52,7 +52,7 @@ Two containers, and nothing else to install:
 
 ```
 docker compose up -d --build              # gateway on 127.0.0.1:${TESSERA_PORT:-8080}
-docker compose run --rm weights           # once: downloads the NER weights
+docker compose run --rm weights           # once: 2 GB of NER weights
 ```
 
 The gateway serves before the weights are there. Without them the detector runs
@@ -69,21 +69,29 @@ so it is a one-time cost per host rather than a cost of every `up`.
 Only the gateway is published, and on `${TESSERA_PORT:-8080}` rather than a
 fixed `8080` — a variable, because a host that already has something bound to
 8080 should not have to edit a file to try Tessera; set `TESSERA_PORT` before
-`up` to use another port instead. The detector answers on the compose network
-and nowhere else: `POST /detect` takes arbitrary text and authenticates
-nobody, so exposing it would be a way to run text through the model outside
-the gateway, and therefore outside the audit journal.
+`up` to use another port instead. The host address is a variable too, and
+defaults to loopback: the gateway authenticates no caller, it forwards
+whatever credential arrives, so reaching it from beyond this host is a
+deliberate act, done by setting `TESSERA_BIND`, never a side effect of the
+default. The detector answers on the compose network and nowhere else:
+`POST /detect` takes arbitrary text and authenticates nobody, so exposing it
+would be a way to run text through the model outside the gateway, and
+therefore outside the audit journal.
 
 The journal and its salt share the `audit` volume and must stay together — a
 journal with records whose salt has gone missing refuses to start rather than
 silently renumbering every tenant beneath you. Back up that volume, not just
-the file.
+the file. `docker compose down` stops the stack and keeps the journal, its
+salt and the downloaded weights; add `-v` only when you mean to discard them
+— journal and salt together, since one without the other is what refuses to
+start back up.
 
 ### Seeing it work without an API key
 
 ```
+export TESSERA_PORT=8080
 docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml up -d --build
-curl -X POST http://127.0.0.1:${TESSERA_PORT:-8080}/v1/chat/completions \
+curl -X POST http://127.0.0.1:${TESSERA_PORT}/v1/chat/completions \
   -H 'content-type: application/json' -H 'authorization: Bearer sk-demo' \
   -d '{"messages":[{"role":"user","content":"Meine IBAN lautet CH9300762011623852957."}]}'
 ```
@@ -114,7 +122,7 @@ Found values are masked by default (`FR76…89`) so a saved report is not itself
 a PII leak; `--show-values` prints them verbatim.
 
 The NER layer (PERSON, LOCATION, ORG) runs automatically when its weights are present
-(`make model`, several hundred megabytes, cached under `~/.cache/tessera/models`).
+(`make model`, 2 GB, cached under `~/.cache/tessera/models`).
 Without them the scan runs the deterministic layer alone and says so; `--ner` makes their
 absence an error, `--no-ner` skips the layer even when they are installed.
 
