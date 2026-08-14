@@ -72,10 +72,12 @@ fixed `8080` — a variable, because a host that already has something bound to
 `up` to use another port instead. The host address is a variable too, and
 defaults to loopback: the gateway authenticates no caller, it forwards
 whatever credential arrives, so reaching it from beyond this host is a
-deliberate act, done by setting `TESSERA_BIND`, never a side effect of the
-default. The detector answers on the compose network and nowhere else:
-`POST /detect` takes arbitrary text and authenticates nobody, so exposing it
-would be a way to run text through the model outside the gateway, and
+deliberate act — `TESSERA_BIND=0.0.0.0` — and never a side effect of the
+default. Set it and anything that can route to this host can spend your
+provider credit and read the answers, so put an authenticating proxy in front
+of it before you do. The detector answers on the compose network and nowhere
+else: `POST /detect` takes arbitrary text and authenticates nobody, so exposing
+it would be a way to run text through the model outside the gateway, and
 therefore outside the audit journal.
 
 The journal and its salt share the `audit` volume and must stay together — a
@@ -89,7 +91,7 @@ start back up.
 ### Seeing it work without an API key
 
 ```
-export TESSERA_PORT=8080
+export TESSERA_PORT=${TESSERA_PORT:-8080}
 docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml up -d --build
 curl -X POST http://127.0.0.1:${TESSERA_PORT}/v1/chat/completions \
   -H 'content-type: application/json' -H 'authorization: Bearer sk-demo' \
@@ -475,7 +477,10 @@ stable signal and p95 as an upper bound until these run on dedicated hardware.
 
 ## Status
 
-Early development — Wave 0 (detector core). Not ready for production use.
+Early development. The detector, the gateway — sessions, streaming, the audit
+journal — and the two-container stack above all work end to end. Not ready for
+production use: the gateway authenticates no caller, and nothing here has been
+run in anger.
 
 ## License
 
