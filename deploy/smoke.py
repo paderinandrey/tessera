@@ -11,6 +11,7 @@ TESSERA_PORT to match if the stack was published somewhere other than 8080.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -30,6 +31,12 @@ GATEWAY = f"http://127.0.0.1:{PORT}"
 IBAN = "CH9300762011623852957"
 EMAIL = "weber@example.ch"
 TEXT = f"Meine IBAN lautet {IBAN}, erreichbar bin ich unter {EMAIL}."
+
+# The gateway numbers placeholders from one counter shared across entity types
+# (gateway/src/mapping.rs), so which number the IBAN gets depends on the order
+# the detector emitted the spans in. The token has to be read back from the
+# run rather than predicted.
+MINTED_IBAN = re.compile(r"\[IBAN_\d+\]")
 
 
 def compose(*args: str) -> str:
@@ -66,6 +73,21 @@ def ask() -> str:
     return answer["choices"][0]["message"]["content"]
 
 
+def read_file(service: str, path: str) -> str:
+    """Read a file out of a running container, naming the failure if absent.
+
+    A missing file here means the stack did not do what it claims — the
+    provider was never called, or the journal is not where the config says.
+    That deserves the same named failure as a transport error rather than a
+    CalledProcessError traceback.
+    """
+    try:
+        return compose("exec", "-T", service, "cat", path)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout or "").strip()
+        fail(f"could not read {path} from {service}: {detail[:300]}")
+
+
 def journal() -> tuple[str, list[dict]]:
     """The journal as written and as parsed.
 
@@ -73,19 +95,38 @@ def journal() -> tuple[str, list[dict]]:
     a re-serialisation of them, because escaping is exactly where a leaked
     value would hide from a round-trip.
     """
-    raw = compose("exec", "-T", "gateway", "cat", "/var/lib/tessera/audit.jsonl")
+    raw = read_file("gateway", "/var/lib/tessera/audit.jsonl")
     return raw, [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+def running_services() -> list[dict]:
+    """`compose ps`, normalised across Compose versions.
+
+    Some releases emit one JSON object per line and others a single array, so
+    the shape is decided at runtime rather than assumed from the version this
+    happened to be written against.
+    """
+    out = compose("ps", "--format", "json").strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        data = [json.loads(line) for line in out.splitlines() if line.strip()]
+    return data if isinstance(data, list) else [data]
 
 
 def main() -> None:
     restored = ask()
 
     # 1. The provider saw placeholders and no values.
-    received = compose("exec", "-T", "mock-provider", "cat", "/received/received.json")
+    received = read_file("mock-provider", "/received/received.json")
     if IBAN in received or EMAIL in received:
         fail("a submitted value reached the provider")
-    if "[IBAN_" not in received:
+    minted = MINTED_IBAN.search(received)
+    if not minted:
         fail(f"the provider did not receive a masked IBAN; it got: {received}")
+    placeholder = minted.group()
 
     # 2. The client got its values back. The stand-in echoes the placeholders
     #    it was given, so a restored answer names the real IBAN.
@@ -97,7 +138,11 @@ def main() -> None:
     events = [line["event"] for line in lines]
     if events[-2:] != ["masked", "outcome"]:
         fail(f"expected a masked line then an outcome line, got: {events}")
-    for forbidden in (IBAN, EMAIL, "IBAN_1", "sk-smoke"):
+    # The placeholder is the one this run actually minted, not a guessed
+    # number: the counter is shared across entity types, so a detector that
+    # emitted the email span first makes the IBAN [IBAN_2] and a hardcoded
+    # "IBAN_1" becomes a line that reads well and can never fail.
+    for forbidden in (IBAN, EMAIL, placeholder.strip("[]"), "sk-smoke"):
         if forbidden in raw:
             fail(f"the journal carries {forbidden!r}")
     if lines[-1]["result"] != "completed":
@@ -108,7 +153,18 @@ def main() -> None:
     #    detector published to an ephemeral host port is just as exposed, and
     #    an unrelated service already holding that port would otherwise read
     #    as a pass.
-    running = [json.loads(line) for line in compose("ps", "--format", "json").splitlines()]
+    #    Both checks are kept: `ps` sees a published port that the probe would
+    #    miss on an ephemeral host port, and the probe sees an exposure that
+    #    `ports:` does not describe — `network_mode: host` publishes nothing
+    #    and exposes everything.
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3)
+    except Exception:
+        pass
+    else:
+        fail("the detector answers on the host at 127.0.0.1:8000")
+
+    running = running_services()
     detectors = [s for s in running if s.get("Service") == "detector"]
     if not detectors:
         # Otherwise a renamed service turns this assertion into an empty loop
