@@ -5,7 +5,7 @@
 
 bind = "0.0.0.0:8080"
 detector_url = "http://detector:8000"
-detector_timeout_secs = 60
+detector_timeout_secs = 30
 
 openai_base = "http://mock-provider:9099"
 anthropic_base = "http://mock-provider:9099"
