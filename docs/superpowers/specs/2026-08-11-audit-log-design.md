@@ -252,7 +252,11 @@ than a silent empty string. `main.rs` opens the file with `O_APPEND | O_CREAT`
 before `bind`, and fsyncs the containing directory once — on a first run the
 directory entry itself is what a machine failure would lose, for the salt as
 much as for the journal, so that one fsync comes *after* the salt is minted and
-covers both entries. Losing the salt's entry alone is the expensive half: by
+covers both entries. The containing directory of a bare `audit_path` is the
+working directory: `Path::parent` answers the empty path there, and the empty
+path is opened as `.` rather than read as "no directory to fsync". A relative
+`audit_path` is what a quickstart produces, so treating it as the one case that
+needs no fsync would exempt the deployment most likely to be a first run. Losing the salt's entry alone is the expensive half: by
 the rule below, a journal that survives without its salt refuses every restart
 until an operator intervenes. A file that cannot
 be opened stops the process. A `.salt` file that exists but is not exactly 32

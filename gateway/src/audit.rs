@@ -167,12 +167,18 @@ impl Audit {
         // minted. The salt is the half that must not be lost alone — a journal
         // whose entry survived without its salt refuses every restart until an
         // operator intervenes by hand.
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            File::open(parent)?.sync_all()?;
-        }
+        //
+        // `Path::parent` answers the empty path for a bare filename, and the
+        // directory that empty path means is the working directory — so it is
+        // opened as `.` rather than skipped. Skipping it left the common case
+        // uncovered: a relative `audit_path` is what the quickstart produces,
+        // and it is precisely the deployment where the journal and its salt
+        // were both created a moment ago and neither entry is durable yet.
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        File::open(parent)?.sync_all()?;
         Self::with_flusher(Box::new(file), salt)
     }
 
