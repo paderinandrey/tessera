@@ -125,6 +125,18 @@ struct Writer {
     /// running gateway, where the refused request is followed by a `masked`
     /// record that would otherwise be fsynced onto the fragment and sent
     /// upstream as evidence no reader can parse.
+    ///
+    /// Armed by the error alone, because the error is all there is:
+    /// `write_line` reports *that* it failed and never how far it got, so a
+    /// failure that placed no bytes at all — `EBADF`, or an `ENOSPC` that
+    /// rejected the first `write` outright — arms it too, and the next append
+    /// then writes a blank line into a journal nothing had damaged. That is
+    /// deliberate, and it is the cheap way to be wrong: a blank line costs a
+    /// JSONL reader one skipped line, while guessing the other way merges two
+    /// records into one that does not parse at all — and the record it would
+    /// swallow is a `masked` line, the evidence for a request that reached the
+    /// provider. An unconditional newline here is a chosen failure, not an
+    /// oversight to tidy away.
     unterminated: bool,
 }
 
@@ -348,7 +360,9 @@ impl Audit {
                 // An empty line is exactly the terminator the fragment is
                 // missing. It is written before the flag is cleared, so a
                 // repair that fails itself leaves the next append to try again
-                // rather than appending onto the fragment.
+                // rather than appending onto the fragment. It is unconditional
+                // on purpose — see `Writer::unterminated` for why a write that
+                // placed nothing still earns a newline.
                 writer.sink.write_line("")?;
                 writer.unterminated = false;
                 // The fragment is never quoted: it is a partial journal line,
@@ -368,10 +382,13 @@ impl Audit {
         // and this commits everything written before it, not one line. Holding
         // the lock across a disk round-trip would park whichever thread wanted
         // the next line — in the outcome line's case, a runtime worker.
-        // A failed sync is not the damage above and needs no repair: the sink
-        // reported the line and its terminator written, so the file ends at a
-        // record boundary whether or not those bytes reached the platter. What
-        // is unconfirmed is durability, which is why `masked` refuses on it.
+        // A failed sync is not the damage above and deliberately arms nothing:
+        // the sink reported the line and its terminator written, so the file
+        // ends at a record boundary whether or not those bytes reached the
+        // platter. What is unconfirmed is durability, which is why `masked`
+        // refuses on it. Treating the two failures alike — the symmetry this
+        // asymmetry invites — would put a blank line after every record an
+        // otherwise healthy filesystem could not confirm.
         if sync {
             self.flush.sync()?;
         }
