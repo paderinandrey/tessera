@@ -41,10 +41,65 @@ tessera/
                validation, NER (GLiNER/ONNX), context boosting. Stable HTTP contract.
   gateway/     Rust reverse proxy: drop-in base URL for OpenAI- and Anthropic-shaped
                requests, placeholder substitution and restoration, buffered and
-               streamed. Sessions and audit are the next slices.
+               streamed, with per-conversation sessions and an audit journal built in.
   evaluation/  Public synthetic corpus and metrics harness (planned). The manually
                annotated corpus stays private and never enters this repository.
 ```
+
+## Running it
+
+Two containers, and nothing else to install:
+
+```
+docker compose up -d --build              # gateway on 127.0.0.1:${TESSERA_PORT:-8080}
+docker compose run --rm weights           # once: downloads the NER weights
+```
+
+The gateway serves before the weights are there. Without them the detector runs
+its deterministic layer alone — checksum-validated identifiers, the layer that
+scores 1.000 — and a partial install stays visible rather than silent: the
+detector's own `GET /health` reports `ner: false` and why, though it answers
+only on the compose network, never on the host. The download is a separate
+command on purpose: a gateway that belongs inside your perimeter should not
+reach the internet on its own, and a first start that blocks for minutes is
+indistinguishable from one that has hung. It is the same download `make model`
+does for a local, non-containerized detector; here it lands on a named volume,
+so it is a one-time cost per host rather than a cost of every `up`.
+
+Only the gateway is published, and on `${TESSERA_PORT:-8080}` rather than a
+fixed `8080` — a variable, because a host that already has something bound to
+8080 should not have to edit a file to try Tessera; set `TESSERA_PORT` before
+`up` to use another port instead. The detector answers on the compose network
+and nowhere else: `POST /detect` takes arbitrary text and authenticates
+nobody, so exposing it would be a way to run text through the model outside
+the gateway, and therefore outside the audit journal.
+
+The journal and its salt share the `audit` volume and must stay together — a
+journal with records whose salt has gone missing refuses to start rather than
+silently renumbering every tenant beneath you. Back up that volume, not just
+the file.
+
+### Seeing it work without an API key
+
+```
+docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml up -d --build
+curl -X POST http://127.0.0.1:${TESSERA_PORT:-8080}/v1/chat/completions \
+  -H 'content-type: application/json' -H 'authorization: Bearer sk-demo' \
+  -d '{"messages":[{"role":"user","content":"Meine IBAN lautet CH9300762011623852957."}]}'
+```
+
+The overlay replaces the provider with a stand-in that records what reached it,
+so one request shows both directions at once:
+
+```
+docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml \
+  exec mock-provider cat /received/received.json
+```
+
+The answer you got back carries the real IBAN. What the provider received
+carries a placeholder in its place, never the value itself. `make compose-smoke`
+asserts exactly that, plus that the journal recorded the request without
+quoting any of it.
 
 ## CLI
 
