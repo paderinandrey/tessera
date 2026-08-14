@@ -34,14 +34,23 @@ lint:
 # Brings the demo stack up, sends one request through it, and tears the stack
 # and its volumes down whether the check passed or failed — a smoke test that
 # leaves a gateway and a journal behind has changed the machine it ran on.
+#
+# One shell for the whole recipe, because that promise is otherwise only kept
+# when the check itself runs: as separate recipe lines a failed `up` aborts
+# make before the teardown is ever reached, which is what happens whenever the
+# published port is already taken or the detector misses its health deadline.
 compose-smoke:
-	$(COMPOSE_DEMO) up -d --build
-	@echo "waiting for the gateway on port $(TESSERA_PORT)"
-	@for i in $$(seq 1 60); do \
-	  curl -fsS http://127.0.0.1:$(TESSERA_PORT)/health >/dev/null 2>&1 && break; \
-	  sleep 2; \
-	done
-	python3 deploy/smoke.py; status=$$?; \
+	@status=0; \
+	trap '$(COMPOSE_DEMO) down -v; exit 130' INT TERM; \
+	$(COMPOSE_DEMO) up -d --build || status=$$?; \
+	if [ $$status -eq 0 ]; then \
+	  echo "waiting for the gateway on port $(TESSERA_PORT)"; \
+	  for i in $$(seq 1 60); do \
+	    curl -fsS http://127.0.0.1:$(TESSERA_PORT)/health >/dev/null 2>&1 && break; \
+	    sleep 2; \
+	  done; \
+	  python3 deploy/smoke.py || status=$$?; \
+	fi; \
 	$(COMPOSE_DEMO) down -v; \
 	exit $$status
 
