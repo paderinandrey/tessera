@@ -84,9 +84,13 @@ pub(crate) trait Flush: Send + Sync {
 
 impl Sink for File {
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        // One `write_all` for the line and its terminator together: two calls
-        // would let a failure between them leave a line with no newline, and
-        // the next record would append to it.
+        // One `write_all` for the line and its terminator together, so that no
+        // *successful* line can be left without its newline by a failure
+        // between two calls. It does not make the pair atomic, and nothing here
+        // could: `write_all` loops over `write`, so a disk that fills
+        // mid-record accepts a prefix, reports the error, and leaves that
+        // prefix in the file with no newline after it. Closing that fragment
+        // before the next record is `Audit::append`'s job, not this one's.
         self.write_all(format!("{line}\n").as_bytes())
     }
 
@@ -101,12 +105,35 @@ impl Flush for File {
     }
 }
 
+/// The sink and what the last write left at the end of the file.
+///
+/// The two are one mutex-guarded value rather than a sink and a flag beside it,
+/// because the repair below is only a repair if the terminating newline and the
+/// record after it are written by the same holder of the lock. A flag read
+/// outside the lock — an `AtomicBool`, say — would let two threads each see the
+/// damage, or let one write its record between another's newline and record.
+struct Writer {
+    sink: Box<dyn Sink>,
+    /// Set when `write_line` returned an error, which may have left a partial
+    /// record with no newline after it: `write_all` loops over `write`, so a
+    /// disk that fills mid-record keeps the prefix it accepted. The next append
+    /// must therefore start a line rather than continue that one.
+    ///
+    /// Not durable across a restart, and it need not be: `Audit::open` repairs
+    /// exactly the same damage by reading the journal's last byte. This flag is
+    /// what covers the case that never restarts — a transient `ENOSPC` on a
+    /// running gateway, where the refused request is followed by a `masked`
+    /// record that would otherwise be fsynced onto the fragment and sent
+    /// upstream as evidence no reader can parse.
+    unterminated: bool,
+}
+
 pub struct Audit {
     /// A mutex rather than a bet on `O_APPEND` atomicity: a record with a long
     /// `types` map can exceed the size at which that atomicity holds, and
     /// interleaved lines in an evidence base are worse than a lock held for
     /// microseconds.
-    sink: Mutex<Box<dyn Sink>>,
+    writer: Mutex<Writer>,
     /// Outside the mutex on purpose: an fsync costs a disk round-trip, and the
     /// outcome line is written wherever the last handle to a record drops —
     /// including a runtime worker with nothing to do with the audit.
@@ -206,7 +233,10 @@ impl Audit {
     fn with_flusher(sink: Box<dyn Sink>, salt: [u8; SALT_BYTES]) -> std::io::Result<Self> {
         Ok(Self {
             flush: sink.flusher()?,
-            sink: Mutex::new(sink),
+            writer: Mutex::new(Writer {
+                sink,
+                unterminated: false,
+            }),
             salt,
         })
     }
@@ -296,17 +326,46 @@ impl Audit {
         // `write_all` under this lock. Recovering costs less than refusing to
         // serve because some other thread panicked.
         {
-            let mut sink = self.sink.lock().unwrap_or_else(|error| {
+            let mut writer = self.writer.lock().unwrap_or_else(|error| {
                 tracing::warn!("the audit lock was poisoned; recovering");
                 error.into_inner()
             });
-            sink.write_line(line)?;
+            if writer.unterminated {
+                // Repair rather than refuse for the rest of the process's life,
+                // and for the same reason `Audit::open` repairs rather than
+                // refuses: a transient `ENOSPC` would otherwise become an
+                // outage that outlives the condition that caused it. The
+                // fragment stays where it is — this is an append-only evidence
+                // file and the bytes are already on disk — and a newline
+                // confines the damage to the one interrupted line.
+                //
+                // An empty line is exactly the terminator the fragment is
+                // missing. It is written before the flag is cleared, so a
+                // repair that fails itself leaves the next append to try again
+                // rather than appending onto the fragment.
+                writer.sink.write_line("")?;
+                writer.unterminated = false;
+                // The fragment is never quoted: it is a partial journal line,
+                // and a journal line is written from a request.
+                tracing::warn!(
+                    "a partial audit record was left by a failed write; it was closed with a \
+                     newline so the records after it stay readable"
+                );
+            }
+            if let Err(error) = writer.sink.write_line(line) {
+                writer.unterminated = true;
+                return Err(error);
+            }
         }
         // The lock is gone by here, and the fsync is what it was protecting
         // nothing from: ordering between lines is settled by the writes above,
         // and this commits everything written before it, not one line. Holding
         // the lock across a disk round-trip would park whichever thread wanted
         // the next line — in the outcome line's case, a runtime worker.
+        // A failed sync is not the damage above and needs no repair: the sink
+        // reported the line and its terminator written, so the file ends at a
+        // record boundary whether or not those bytes reached the platter. What
+        // is unconfirmed is durability, which is why `masked` refuses on it.
         if sync {
             self.flush.sync()?;
         }
@@ -976,6 +1035,72 @@ mod tests {
         );
         let after: serde_json::Value =
             serde_json::from_str(all[2]).expect("the record after a crash parses on its own line");
+        assert_eq!(after["request"], "bb");
+    }
+
+    #[test]
+    fn a_record_after_a_failed_write_starts_on_its_own_line() {
+        // The same damage as a crash, in a process that never restarts, so the
+        // repair in `open` can never reach it: `write_all` loops over `write`,
+        // so a disk that fills mid-record leaves a prefix behind with no
+        // newline. That request is refused, correctly. The *next* `masked`
+        // record is the one at stake — written when space is freed, fsynced,
+        // and sent upstream as the evidence for a request that reached the
+        // provider. Concatenated onto the fragment it is not a JSONL record at
+        // all.
+        struct FillsMidRecord {
+            file: File,
+            failed: bool,
+        }
+
+        impl Sink for FillsMidRecord {
+            fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+                if !self.failed {
+                    self.failed = true;
+                    let bytes = line.as_bytes();
+                    self.file.write_all(&bytes[..bytes.len() / 2])?;
+                    return Err(std::io::Error::other("the disk filled mid-record"));
+                }
+                Sink::write_line(&mut self.file, line)
+            }
+            fn flusher(&self) -> std::io::Result<Box<dyn Flush>> {
+                Ok(Box::new(self.file.try_clone()?))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("opens");
+        let audit = Audit::with_sink(
+            Box::new(FillsMidRecord {
+                file,
+                failed: false,
+            }),
+            [7u8; SALT_BYTES],
+        );
+
+        let first = r#"{"event":"masked","request":"aa"}"#;
+        audit
+            .append(first, true)
+            .expect_err("the disk filled mid-record");
+        audit
+            .append(r#"{"event":"masked","request":"bb"}"#, true)
+            .expect("the sink is usable again once space is freed");
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let all: Vec<&str> = text.lines().collect();
+        assert_eq!(all.len(), 2, "the fragment swallowed the record: {text}");
+        assert_eq!(
+            all[0],
+            &first[..first.len() / 2],
+            "the fragment keeps exactly what reached the disk"
+        );
+        let after: serde_json::Value = serde_json::from_str(all[1])
+            .expect("the record after a failed write parses on its own line");
         assert_eq!(after["request"], "bb");
     }
 

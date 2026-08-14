@@ -264,6 +264,11 @@ that was cut off is itself a fact about that run; what the newline buys is that
 every record written after the restart is a whole line of its own, rather than
 being glued onto the fragment and lost with it.
 
+A disk that fills in the middle of a record does the same damage without a
+restart to repair it, so the running gateway repairs it too: the request whose
+record was cut short is refused, and the next record written — once there is room
+again — starts on its own line, with a line in the log saying why.
+
 Two limits stay honest. A salt *replaced* by a different valid 32-byte salt
 cannot be detected by anything — it is indistinguishable from the real one. And
 rotation still works: retention and rotation are the operator's, done externally

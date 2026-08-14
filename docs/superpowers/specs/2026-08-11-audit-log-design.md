@@ -286,6 +286,23 @@ one startup that refuses leaves the journal byte-identical to how it found it,
 and only on a non-empty journal, so it cannot turn a first run into the
 non-empty journal the salt-loss rule refuses.
 
+**A write that fails part-way through a record** is the same damage in a process
+that never restarts, so the repair above cannot reach it. `write_all` loops over
+`write`: a disk that fills mid-record accepts a prefix and then errors, leaving
+that prefix with no newline after it. The request is refused, correctly — but the
+sink stays usable, and when space is freed the next `masked` record would be
+appended onto the fragment, fsynced as one corrupt line, and its request sent
+upstream with evidence no reader can parse.
+
+So `Audit` remembers that a write failed and writes a terminating newline before
+the next record, warning as `open` does. The flag lives inside the sink's mutex
+rather than beside it: the newline and the record after it are a repair only if
+one holder of the lock writes both. It is deliberately not durable across a
+restart, because `open` already repairs the same damage by reading the last byte.
+A failed fsync is *not* this damage and gets no newline — the sink reported the
+line and its terminator written, so the file still ends at a record boundary;
+what is unconfirmed there is durability, which is what `masked` refuses on.
+
 **A failed `masked` write** becomes `ProxyError::Audit` → **503**, by the same
 reasoning as `SessionError::Saturated` (`proxy.rs:46`): it is this gateway's own
 health rather than anything the caller got wrong, and the same request may
@@ -354,6 +371,10 @@ The tests that matter are invariants, not the presence of a line.
   journal already ending in a newline gains no blank line, an empty one is left
   empty and so is still a first run, and a startup that refuses on the salt
   rule leaves the journal byte-identical.
+- A sink that accepts half a record and then errors, and accepts the next record
+  in full — a full disk on a running gateway — keeps the fragment and puts the
+  record after it on a line of its own. The blank line the repair would leave on
+  an undamaged journal is what the per-call line count above rules out.
 
 ## Out of scope
 
