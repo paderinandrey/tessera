@@ -1,0 +1,34 @@
+# Adds a stand-in provider and points the gateway at it:
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml up
+#
+# An overlay rather than a profile, because a profile cannot override another
+# service's configuration — and a fictitious provider address switched by a
+# variable is exactly the default nobody should be one typo away from
+# shipping.
+
+services:
+  mock-provider:
+    image: python:3.14-slim-trixie
+    volumes:
+      - ./deploy/mock_provider.py:/mock_provider.py:ro
+      - received:/received
+    command: ["python", "/mock_provider.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9099/').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    depends_on:
+      detector:
+        condition: service_healthy
+      mock-provider:
+        condition: service_healthy
+    volumes:
+      - audit:/var/lib/tessera
+      - ./deploy/tessera.demo.toml:/etc/tessera/tessera.toml:ro
+
+volumes:
+  received:

@@ -1,0 +1,17 @@
+# The container configuration with both providers pointed at the stand-in, so
+# the demo needs no API key and spends no tokens. This file is mounted only by
+# the demo overlay: a fictitious provider address must never be one variable
+# away from a production start.
+
+bind = "0.0.0.0:8080"
+detector_url = "http://detector:8000"
+detector_timeout_secs = 60
+
+openai_base = "http://mock-provider:9099"
+anthropic_base = "http://mock-provider:9099"
+
+session_idle_secs = 1800
+max_sessions = 1000
+max_session_values = 1000
+
+audit_path = "/var/lib/tessera/audit.jsonl"
