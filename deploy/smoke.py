@@ -19,8 +19,13 @@ import urllib.error
 import urllib.request
 from typing import NoReturn
 
+# The project name must match the one `make compose-smoke` brings the stack up
+# with, and it is not the default: derived from the directory it would be
+# `tessera`, the same project as a documented `docker compose up -d --build`, and
+# this run recreates the gateway and ends in `down -v`.
 COMPOSE = [
     "docker", "compose",
+    "-p", "tessera-smoke",
     "-f", "docker-compose.yml",
     "-f", "deploy/docker-compose.demo.yml",
 ]
@@ -162,7 +167,10 @@ def main() -> None:
     except Exception:
         pass
     else:
-        fail("the detector answers on the host at 127.0.0.1:8000")
+        fail(
+            "the detector answers on the host at 127.0.0.1:8000 — "
+            "or something unrelated is listening on 8000"
+        )
 
     running = running_services()
     detectors = [s for s in running if s.get("Service") == "detector"]

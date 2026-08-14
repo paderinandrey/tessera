@@ -5,7 +5,13 @@
 TESSERA_PORT ?= 8080
 export TESSERA_PORT
 
-COMPOSE_DEMO = docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml
+# Its own compose project, because the recipe ends in `down -v`. Without -p the
+# project name comes from this directory and is `tessera` — the same project the
+# documented `docker compose up -d --build` creates — so the teardown would take
+# the developer's audit journal, its salt and the 2 GB weights volume with it.
+# Isolated, the worst a running dev stack can cause is a port collision, which
+# fails loudly.
+COMPOSE_DEMO = docker compose -p tessera-smoke -f docker-compose.yml -f deploy/docker-compose.demo.yml
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
