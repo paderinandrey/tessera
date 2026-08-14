@@ -1,4 +1,11 @@
-.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint
+.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke
+
+# The host port the stack publishes. Overridable because 8080 is a popular
+# port; both compose and the smoke test read it from the environment.
+TESSERA_PORT ?= 8080
+export TESSERA_PORT
+
+COMPOSE_DEMO = docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
@@ -23,6 +30,20 @@ test:
 
 lint:
 	cd detector && uv run ruff check . ../evaluation && uv run mypy src
+
+# Brings the demo stack up, sends one request through it, and tears the stack
+# and its volumes down whether the check passed or failed — a smoke test that
+# leaves a gateway and a journal behind has changed the machine it ran on.
+compose-smoke:
+	$(COMPOSE_DEMO) up -d --build
+	@echo "waiting for the gateway on port $(TESSERA_PORT)"
+	@for i in $$(seq 1 60); do \
+	  curl -fsS http://127.0.0.1:$(TESSERA_PORT)/health >/dev/null 2>&1 && break; \
+	  sleep 2; \
+	done
+	python3 deploy/smoke.py; status=$$?; \
+	$(COMPOSE_DEMO) down -v; \
+	exit $$status
 
 model:
 	uv run --project detector --group ner python -c "\
