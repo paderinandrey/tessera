@@ -51,7 +51,7 @@ jobs:
       # what they pull in transitively. Removing it silently restores a 4 GB
       # CUDA stack and `uv lock` reports success, so the property is asserted
       # rather than trusted to a comment.
-      - run: uv run --group ner python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__"
+      - run: uv run --locked --group ner --group serve python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__"
       - name: Cache NER weights
         uses: actions/cache@v4
         with:
