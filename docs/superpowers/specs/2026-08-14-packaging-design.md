@@ -83,16 +83,47 @@ at all.
 
 ### Why the detector image is large, and what it is not
 
-The `ner` dependency group pulls `gliner`, which requires `torch` (505 MB) and
-`transformers` (56 MB) even though inference runs through ONNX Runtime (71 MB).
-Installed, the runtime dependencies come to roughly 750 MB, so the detector image
-lands near 1 GB before any weights.
+The `ner` dependency group pulls `gliner`, which requires `torch` and
+`transformers` even though inference runs through ONNX Runtime. From PyPI, the
+Linux torch wheel drags the whole CUDA stack behind it and the image lands at
+5.34 GB. Taken from PyTorch's CPU index instead (below) it is 1.32 GB: torch
+637 MB installed, `transformers` 109 MB, `onnxruntime` 51 MB, a 1.2 GB virtual
+environment before any weights.
 
-That is a real cost and it is not this slice's to fix. Removing the torch
-dependency means either vendoring the tokenizer GLiNER uses or driving ONNX
+The remainder is a real cost and it is not this slice's to fix. Removing the
+torch dependency means either vendoring the tokenizer GLiNER uses or driving ONNX
 Runtime directly — a change to the detector's NER layer with its own quality
 risk, measured against the existing gates. Recorded here so the number is not
 mistaken for something packaging did.
+
+### Why the build trusts a second package index
+
+`[[tool.uv.index]] pytorch-cpu` in `detector/pyproject.toml` takes torch from
+PyTorch's own CPU wheel index rather than PyPI. What that bought: nineteen
+packages left the lock — eighteen CUDA and NVIDIA runtimes plus `triton` — and
+the image fell from 5.34 GB to 1.32 GB. All of it shipped in every detector
+image, none of it was loaded by anything, and all of it was attack surface for a
+GPU this product never opens.
+
+What it cost is a second trust root. Every Linux install now fetches its torch
+wheel from infrastructure PyTorch operates instead of from PyPI, and that is a
+supply-chain decision, not a size optimisation. Two hosts are involved and they
+are not the same one: the declared index is `download.pytorch.org/whl/cpu`, but
+it lists its wheels with absolute links to `download-r2.pytorch.org`, so every
+torch URL in `uv.lock` is on the latter. A build (`uv sync --locked`) contacts
+`download-r2.pytorch.org` only; `download.pytorch.org` is contacted when the lock
+is regenerated. An operator running an egress allowlist needs the first to build
+and both to re-lock.
+
+Three things bound it. `explicit = true`, so the index is consulted for torch and
+for nothing else — no other package can be resolved from it, deliberately or by a
+name that happens to exist there. A `sys_platform == 'linux'` marker, so macOS
+stays on PyPI, where torch's wheels are CPU-only already and the file is
+byte-identical; a second host to trust buys nothing there. And a per-wheel sha256
+in the lock, which is what reduces the claim from "we trust this infrastructure"
+to "we trusted it once, at lock time, and pinned the result" — a compromise of
+that host after the lock was written produces a hash mismatch and a failed build,
+not a silent substitution.
 
 ### Why the TLS stack stays as it is
 
@@ -232,16 +263,19 @@ carrying a valid IBAN and an email address, then asserts:
 
 Then the regression that this slice's own constraint demands:
 
-- after `docker compose restart gateway`, the gateway starts and appends to the
-  same journal — proving the salt and the journal survived together on one
-  volume, which is the failure a first user would otherwise find for us.
+- after `docker compose up -d --force-recreate --no-deps gateway`, the gateway
+  starts and appends to the same journal — proving the salt and the journal
+  survived together on one volume, which is the failure a first user would
+  otherwise find for us. Recreated rather than restarted: `restart` reuses the
+  container and therefore its writable layer, so a journal written outside any
+  volume survives it and the assertion passes while proving nothing.
 
 And one negative check, because the topology claims it:
 
 - the detector's port is not reachable from the host.
 
 **In CI this runs on pushes to `main`, not on every pull request.** Building a
-~1 GB image on every PR costs more than the test catches at that frequency; the
+1.3 GB image on every PR costs more than the test catches at that frequency; the
 existing three jobs already gate the code itself.
 
 ## Out of scope

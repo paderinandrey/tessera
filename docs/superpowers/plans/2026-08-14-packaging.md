@@ -435,6 +435,12 @@ The weights mountpoint is the path find_model() already looks at, so the
 pinned revision in models.py stays the only place it is written down."
 ```
 
+A follow-up task not planned here took torch from PyTorch's CPU wheel index on
+Linux and cut this image from 5.34 GB to 1.32 GB, dropping nineteen GPU packages
+with it. That is a supply-chain change as much as a size one — a second trust
+root, two hosts, and what bounds them — and it is reasoned about in the design
+under "Why the build trusts a second package index", not here.
+
 ---
 
 ### Task 4: the compose stack
@@ -592,15 +598,18 @@ curl -sS --max-time 3 http://127.0.0.1:8000/health && echo "REACHABLE — this i
 
 Expected: not reachable.
 
-- [ ] **Step 6: Verify the journal survives a restart**
+- [ ] **Step 6: Verify the journal survives a container recreation**
 
-This is the constraint the audit slice created, seen from outside:
+This is the constraint the audit slice created, seen from outside. Recreated
+rather than restarted: `restart` reuses the container and therefore its writable
+layer, so a journal written outside any volume survives it and the check passes
+while proving nothing.
 
 ```bash
 curl -fsS -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' -H 'authorization: Bearer sk-smoke' \
   -d '{"messages":[{"role":"user","content":"IBAN CH9300762011623852957"}]}' > /dev/null || true
-docker compose restart gateway
+docker compose up -d --force-recreate --no-deps gateway
 sleep 5
 docker compose exec gateway sh -c 'wc -l < /var/lib/tessera/audit.jsonl'
 curl -fsS http://127.0.0.1:8080/health
@@ -808,7 +817,7 @@ curl -fsS -X POST http://127.0.0.1:8080/v1/chat/completions \
 docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml exec mock-provider cat /received/received.json
 ```
 
-Expected: the client's response carries the real IBAN and email restored; `received.json` carries `[IBAN_1]` and `[EMAIL_2]` and neither real value.
+Expected: the client's response carries the real IBAN and email restored; `received.json` carries an `[IBAN_n]` and an `[EMAIL_n]` and neither real value. Do not expect particular numbers: the gateway numbers placeholders from one counter shared across entity types, so they follow the order the detector emitted the spans in.
 
 - [ ] **Step 5: Tear down and commit**
 
@@ -856,12 +865,18 @@ Run through `make compose-smoke`, which brings the stack up first.
 """
 
 import json
+import re
 import subprocess
 import sys
 import urllib.request
 
+# Its own compose project: the recipe that runs this ends in `down -v`, and the
+# default project name is the directory's — the same project a developer's own
+# `docker compose up` uses, whose journal, salt and weights volume that would
+# then remove.
 COMPOSE = [
     "docker", "compose",
+    "-p", "tessera-smoke",
     "-f", "docker-compose.yml",
     "-f", "deploy/docker-compose.demo.yml",
 ]
@@ -869,6 +884,11 @@ COMPOSE = [
 IBAN = "CH9300762011623852957"
 EMAIL = "weber@example.ch"
 TEXT = f"Meine IBAN lautet {IBAN}, erreichbar bin ich unter {EMAIL}."
+
+# The gateway numbers placeholders from one counter shared across entity types,
+# so which number the IBAN gets depends on the order the detector emitted the
+# spans in. The token has to be read back from the run, never predicted.
+MINTED_IBAN = re.compile(r"\[IBAN_\d+\]")
 
 
 def compose(*args: str) -> str:
@@ -897,8 +917,10 @@ def main() -> None:
     received = compose("exec", "-T", "mock-provider", "cat", "/received/received.json")
     if IBAN in received or EMAIL in received:
         fail("a submitted value reached the provider")
-    if "[IBAN_" not in received:
+    minted = MINTED_IBAN.search(received)
+    if not minted:
         fail(f"the provider did not receive a masked IBAN; it got: {received}")
+    placeholder = minted.group()
 
     # 2. The client got its values back. The stand-in echoes the placeholders
     #    it was given, so a restored answer names the real IBAN.
@@ -911,7 +933,11 @@ def main() -> None:
     events = [line["event"] for line in lines]
     if events[-2:] != ["masked", "outcome"]:
         fail(f"expected a masked line then an outcome line, got: {events}")
-    for forbidden in (IBAN, EMAIL, "IBAN_1", "sk-smoke"):
+    # The placeholder is the one this run actually minted: the counter is
+    # shared across entity types, so a detector that emitted the email span
+    # first makes the IBAN [IBAN_2] and a hardcoded "IBAN_1" becomes a line
+    # that reads well and can never fail.
+    for forbidden in (IBAN, EMAIL, placeholder.strip("[]"), "sk-smoke"):
         if forbidden in journal:
             fail(f"the journal carries {forbidden!r}")
     if lines[-1]["result"] != "completed":
@@ -925,10 +951,15 @@ def main() -> None:
     else:
         fail("the detector is published to the host")
 
-    # 5. The journal and its salt survive a restart together. Separated, the
-    #    gateway refuses to start — the failure a first user would find for us.
+    # 5. The journal and its salt survive a container recreation together.
+    #    Separated, the gateway refuses to start — the failure a first user
+    #    would find for us.
+    #
+    #    Recreated rather than restarted: `restart` reuses the container and
+    #    therefore its writable layer, so a journal written outside any volume
+    #    survives it and the check passes while proving nothing.
     before = len(lines)
-    compose("restart", "gateway")
+    compose("up", "-d", "--force-recreate", "--no-deps", "gateway")
     for _ in range(30):
         try:
             urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2).read()
@@ -938,11 +969,11 @@ def main() -> None:
 
             time.sleep(2)
     else:
-        fail("the gateway did not come back after a restart")
+        fail("the gateway did not come back after being recreated")
     journal = compose("exec", "-T", "gateway", "cat", "/var/lib/tessera/audit.jsonl")
     after = len([line for line in journal.splitlines() if line.strip()])
     if after < before:
-        fail(f"the journal lost lines across a restart: {before} then {after}")
+        fail(f"the journal lost lines when the container was recreated: {before} then {after}")
 
     print(f"smoke: ok ({after} journal lines, nothing quoted)")
 
@@ -979,7 +1010,7 @@ The smoke test is worthless if it passes whatever the stack does. Break the stac
 
 1. Point `deploy/tessera.demo.toml`'s `detector_url` at a port nothing listens on → the request is refused, and the test fails on the restored-value or journal-result check rather than passing.
 2. Publish the detector in `docker-compose.yml` (`ports: ["8000:8000"]`) → assertion 4 fails.
-3. Mount the audit volume at a different path in the gateway so the salt and journal separate across a restart → assertion 5 fails.
+3. Mount the audit volume at a different path in the gateway so the salt and journal separate across a container recreation → assertion 5 fails.
 4. Make the stand-in echo the request body verbatim instead of the placeholder list → assertion 1 or 3 fails.
 
 Restore after each. Report the four observed failures — a smoke test whose failures nobody has seen is a guess.
@@ -1011,8 +1042,8 @@ Not that the images build — a build already proves that. This sends one
 request through the packaged stack and checks that the provider received
 placeholders and no values, that the client got its values back, that the
 journal recorded the request without quoting it, that the detector is not
-published to the host, and that the journal and its salt survive a restart
-together.
+published to the host, and that the journal and its salt survive a container
+recreation together.
 
 The last one is this slice's own constraint: separated, the gateway
 refuses to start after the first container recreation, and that is a
@@ -1083,8 +1114,9 @@ docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml \
 ```
 
 The answer you got back carries the real IBAN. What the provider received
-carries `[IBAN_1]`. `make compose-smoke` asserts exactly that, plus that the
-journal recorded the request without quoting any of it.
+carries a placeholder in its place, never the value itself. `make compose-smoke`
+asserts exactly that, plus that the journal recorded the request without quoting
+any of it.
 ```
 
 - [ ] **Step 2: Check the surrounding claims are now true**
