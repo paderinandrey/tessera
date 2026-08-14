@@ -29,7 +29,11 @@ services:
       detector:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      # The host side is a variable because 8080 is a popular port and a
+      # machine that already runs something there would otherwise have to
+      # edit this file to try Tessera at all. The default keeps every
+      # documented command working unchanged.
+      - "${TESSERA_PORT:-8080}:8080"
     volumes:
       - audit:/var/lib/tessera
       - ./deploy/tessera.container.toml:/etc/tessera/tessera.toml:ro
