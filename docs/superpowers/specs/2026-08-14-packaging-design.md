@@ -110,10 +110,12 @@ wheel from infrastructure PyTorch operates instead of from PyPI, and that is a
 supply-chain decision, not a size optimisation. Two hosts are involved and they
 are not the same one: the declared index is `download.pytorch.org/whl/cpu`, but
 it lists its wheels with absolute links to `download-r2.pytorch.org`, so every
-torch URL in `uv.lock` is on the latter. A build (`uv sync --locked`) contacts
-`download-r2.pytorch.org` only; `download.pytorch.org` is contacted when the lock
-is regenerated. An operator running an egress allowlist needs the first to build
-and both to re-lock.
+torch URL in `uv.lock` is on the latter. A build (`uv sync --locked`) therefore
+fetches its wheel from `download-r2.pytorch.org`, and regenerating the lock
+(`uv lock`) reads the listing from `download.pytorch.org`. Whether a locked build
+also reaches the declared index — for a listing it does not need, since it has
+the URL and the hash — has not been tested here, so an operator running an egress
+allowlist should permit both hosts rather than infer one from this paragraph.
 
 Three things bound it. `explicit = true`, so the index is consulted for torch and
 for nothing else — no other package can be resolved from it, deliberately or by a

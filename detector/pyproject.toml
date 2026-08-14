@@ -51,12 +51,13 @@ ner = [
 # here too would only add a second host to trust for no change in what gets
 # installed. `explicit = true` keeps everything but torch itself on PyPI.
 #
-# Two hosts, not one, and an egress allowlist needs to know which. The index
+# Two hosts, not one, and an egress allowlist has to permit both. The index
 # below lists its wheels with absolute links to `download-r2.pytorch.org`, so
-# every torch URL in uv.lock is on that host: a build — `uv sync --locked`,
-# which is what the Dockerfile runs — contacts `download-r2.pytorch.org` only,
-# and never the host named here. `download.pytorch.org` is contacted when the
-# lock is regenerated (`uv lock`, `uv add`), to read that listing.
+# every torch URL in uv.lock is on that host and that is where a build —
+# `uv sync --locked`, which is what the Dockerfile runs — fetches the wheel
+# from. The host named here is read when the lock is regenerated (`uv lock`,
+# `uv add`). Whether a locked build also reaches it has not been tested, so
+# allowlist both rather than the r2 host alone.
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"

@@ -73,12 +73,18 @@ fixed `8080` — a variable, because a host that already has something bound to
 defaults to loopback: the gateway authenticates no caller, it forwards
 whatever credential arrives, so reaching it from beyond this host is a
 deliberate act — `TESSERA_BIND=0.0.0.0` — and never a side effect of the
-default. Set it and anything that can route to this host can spend your
-provider credit and read the answers, so put an authenticating proxy in front
-of it before you do. The detector answers on the compose network and nowhere
-else: `POST /detect` takes arbitrary text and authenticates nobody, so exposing
-it would be a way to run text through the model outside the gateway, and
-therefore outside the audit journal.
+default. It holds no key of its own, so what you publish is not your provider
+credit but an unauthenticated relay out through your egress and into a journal
+whose worth is that it records your traffic and not a stranger's: strangers can
+fill the session table until legitimate callers are refused with a 503, and
+anyone who already holds one of your callers' keys can guess a session id — they
+are chosen by the client and need not be secret — and read that conversation's
+real values back out of its table, which going to the provider directly would
+never have given them. Put an authenticating proxy in front of it before you do.
+The detector answers on the compose network and nowhere else: `POST /detect`
+takes arbitrary text and authenticates nobody, so exposing it would be a way to
+run text through the model outside the gateway, and therefore outside the audit
+journal.
 
 The journal and its salt share the `audit` volume and must stay together — a
 journal with records whose salt has gone missing refuses to start rather than
