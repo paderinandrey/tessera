@@ -51,19 +51,28 @@ tessera/
 Two containers, and nothing else to install:
 
 ```
-docker compose up -d --build              # gateway on 127.0.0.1:${TESSERA_PORT:-8080}
 docker compose run --rm weights           # once: 2 GB of NER weights
+docker compose up -d --build              # gateway on 127.0.0.1:${TESSERA_PORT:-8080}
 ```
 
-The gateway serves before the weights are there. Without them the detector runs
-its deterministic layer alone — checksum-validated identifiers, the layer that
-scores 1.000 — and a partial install stays visible rather than silent: the
-detector's own `GET /health` reports `ner: false` and why, though it answers
-only on the compose network, never on the host. The download is a separate
-command on purpose: a gateway that belongs inside your perimeter should not
-reach the internet on its own, and a first start that blocks for minutes is
-indistinguishable from one that has hung. It is the same download `make model`
-does for a local, non-containerized detector; here it lands on a named volume,
+**Download the weights first.** The detector builds its pipeline once, at
+startup, because loading the model takes seconds and paying that per request
+would be absurd — so a detector that started without weights stays
+deterministic-only until it is restarted, however much you download afterwards.
+Adding them to a running stack therefore needs `docker compose restart detector`,
+and skipping that restart is the one way to end up with a successful 2 GB
+download, a gateway that looks installed, and names, places and health mentions
+still reaching the provider unmasked.
+
+The gateway does serve before the weights are there, deliberately. Without them
+the detector runs its deterministic layer alone — checksum-validated
+identifiers, the layer that scores 1.000 — and a partial install stays visible
+rather than silent: the detector's own `GET /health` reports `ner: false` and
+why, though it answers only on the compose network, never on the host. The
+download is a separate command on purpose: a gateway that belongs inside your
+perimeter should not reach the internet on its own, and a first start that
+blocks for minutes is indistinguishable from one that has hung. It is the same
+download `make model` does for a local, non-containerized detector; here it lands on a named volume,
 so it is a one-time cost per host rather than a cost of every `up`.
 
 Only the gateway is published, and on `${TESSERA_PORT:-8080}` rather than a
