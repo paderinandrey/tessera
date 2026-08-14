@@ -34,6 +34,30 @@ ner = [
     "gliner>=0.2.22",
     "onnxruntime>=1.20",
     "huggingface-hub>=0.28",
+    # gliner's own dependency, named here only so the CPU-index pin below
+    # reaches it: uv applies [tool.uv.sources] to direct dependencies, not to
+    # transitive ones. The floor is the version gliner already resolved to.
+    "torch>=2.13",
+]
+
+# gliner pulls in torch, and torch's default PyPI wheel for Linux drags the
+# whole CUDA stack along with it — cuDNN, nccl, triton, the lot. The NER layer
+# runs GLiNER through ONNX Runtime on CPU and never opens a GPU, so all of it
+# is dead weight: it took the detector image to 5.34 GB. PyTorch's own CPU
+# index carries the same version built without CUDA.
+#
+# Scoped to Linux on purpose. torch's macOS wheels are CPU-only on PyPI
+# already — the CPU index serves the byte-identical file — so pointing macOS
+# here too would only add a second host to trust for no change in what gets
+# installed. `explicit = true` keeps everything but torch itself on PyPI.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
 ]
 
 [build-system]
