@@ -46,6 +46,12 @@ jobs:
         with:
           working-directory: detector
       - run: uv sync --locked --group ner --group serve
+      # torch>=2.13 in the ner group is what makes the CPU-index pin apply —
+      # uv resolves [tool.uv.sources] for a project's own requirements, not for
+      # what they pull in transitively. Removing it silently restores a 4 GB
+      # CUDA stack and `uv lock` reports success, so the property is asserted
+      # rather than trusted to a comment.
+      - run: uv run --group ner python -c "import torch; assert torch.__version__.endswith('+cpu'), torch.__version__"
       - name: Cache NER weights
         uses: actions/cache@v4
         with:
@@ -77,3 +83,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
+
+  compose:
+    # Only on main: building a ~1 GB detector image on every pull request
+    # costs more than this catches at that frequency, and the three jobs
+    # above already gate the code itself.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - run: make compose-smoke
