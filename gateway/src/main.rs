@@ -6,6 +6,7 @@
 //! know all end the request rather than forwarding unmasked text or handing a
 //! placeholder to the client.
 
+mod audit;
 mod config;
 mod detector;
 mod mapping;
@@ -30,9 +31,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let bind = config.bind.clone();
-    let state = Arc::new(AppState::from_config(&config));
+    let audit = Arc::new(audit::Audit::open(std::path::Path::new(
+        &config.audit_path,
+    ))?);
+    let state = Arc::new(AppState::from_config(&config, audit));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(%bind, detector = %config.detector_url, "gateway listening");
+    tracing::info!(
+        %bind,
+        detector = %config.detector_url,
+        audit = %config.audit_path,
+        "gateway listening"
+    );
     axum::serve(listener, router(state)).await?;
     Ok(())
 }

@@ -193,6 +193,89 @@ because a tight timeout would turn protection into a denial of service. Configur
 TOML and rejects unknown keys — a typo in a security control should fail loudly rather
 than leave a default in place.
 
+### Audit
+
+Every request appends to `audit_path`, one JSON object per line, and the gateway
+does not start without it — a control that can be switched off by omitting a
+line is worth nothing in a compliance report.
+
+A request leaves two records. The first is written **and fsynced before the
+provider is called**, so evidence that a request was pseudonymized cannot be
+lost by the crash that follows it; if it cannot be written, the request is
+refused with a 503 rather than served unrecorded. The second is written when the
+request ends — including minutes later, when a stream does. The examples below
+group the fields for reading; on disk each line serializes its keys in
+alphabetical order, which nothing depends on.
+
+```json
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
+{"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
+```
+
+A request refused before the provider is called leaves one line, and it answers
+on its own both questions that matter — whether bytes left, and whose request it
+was:
+
+```json
+{"ts":"2026-08-11T09:14:22.418Z","event":"outcome","request":"91c4a70b6de83f12","tenant":"a41f9c02…","session":null,"upstream":false,"status":503,"result":"refused","error":"audit_write_failed","ms":12}
+```
+
+That is why `tenant` and `session` appear on the outcome line as well as the
+masked one: a refusal has no masked line to join to, and the redundancy on the
+two-line case costs a few bytes.
+
+The record counts and never quotes. `types` counts distinct values per type and
+`spans` counts occurrences; the gap between them is a value named more than once
+within the same request, not anything a session did — detection runs over every
+text on every request whether or not one is attached, so the coreference a
+session buys across turns leaves no trace here. Neither the values, hashes of
+them, their offsets nor the placeholder names are written. `error` is drawn from
+a fixed vocabulary rather than formatted from a message, so no expression in the
+writer could interpolate submitted text. A type name the detector reports that
+is not a legible type — the mapping lets one through whenever the value was
+already masked earlier in the same request or in an earlier turn — is counted
+under `unvalidated` rather than written out, since the name itself came from
+outside the perimeter. Seeing that key means the detector and the gateway
+disagree about what a type is; the gateway also says so in its own log.
+`result` is one of `completed`,
+`refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
+defaults to on drop — in practice, a client that disconnects while a stream is
+still open, recorded as itself rather than as a success nobody observed.
+
+`tenant` and `session` are salted digests, never a key and never the raw session
+id — a client may well name its session after the person in it. The salt lives
+in `<audit_path>.salt`, created on first run with owner-only permissions, so one
+credential keeps one identity across restarts. It is evidence too: back it up
+with the journal.
+
+Losing it stops the gateway rather than renumbering the journal underneath you.
+A salt that exists but is not exactly 32 bytes refuses to start, and so does a
+salt that is *missing* beside a journal that already has lines — a partial
+restore or a rebuilt container that dropped only the salt would otherwise look
+like a first run and start writing a `tenant` that disagrees with every line
+above it, with nothing marking the boundary. The error names both remedies:
+restore the salt, or move the journal aside to begin a new one.
+
+Only the first of a request's two records is fsynced, so a crash can leave the
+journal ending in a half-written second one. The next start appends the newline
+that record never got, says so in its log, and serves — no operator, no flag. The
+interrupted line stays exactly as short as the crash left it, because a record
+that was cut off is itself a fact about that run; what the newline buys is that
+every record written after the restart is a whole line of its own, rather than
+being glued onto the fragment and lost with it.
+
+A disk that fills in the middle of a record does the same damage without a
+restart to repair it, so the running gateway repairs it too: the request whose
+record was cut short is refused, and the next record written — once there is room
+again — starts on its own line, with a line in the log saying why.
+
+Two limits stay honest. A salt *replaced* by a different valid 32-byte salt
+cannot be detected by anything — it is indistinguishable from the real one. And
+rotation still works: retention and rotation are the operator's, done externally
+around a restart by moving the journal aside and keeping the salt, which starts
+normally and carries the same digests across. The file itself is opened for
+appending only.
+
 ## Evaluation
 
 The public synthetic corpus (FR/DE plus code-switching, checksum-valid synthetic

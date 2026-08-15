@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+use crate::audit::Record;
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping::{Mapping, MappingError};
@@ -26,11 +28,13 @@ pub enum ProxyError {
     Upstream(String),
     #[error("{0}")]
     Session(#[from] crate::session::SessionError),
+    #[error("{0}")]
+    Audit(#[from] crate::audit::AuditError),
 }
 
-impl IntoResponse for ProxyError {
-    fn into_response(self) -> Response {
-        let status = match self {
+impl ProxyError {
+    fn status(&self) -> StatusCode {
+        match self {
             // A body we cannot read is the client's to fix, and it is refused
             // rather than forwarded unmasked. So is a session the gateway
             // cannot honour as asked.
@@ -43,11 +47,51 @@ impl IntoResponse for ProxyError {
             // the caller got wrong, and the same request may well succeed a
             // moment later. No `Retry-After`: the wait is another request's
             // detector round-trip, and the gateway has no honest number for it.
-            ProxyError::Session(SessionError::Saturated) => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::BAD_GATEWAY,
-        };
+            // A journal that cannot be written is the same kind of fact about
+            // this gateway rather than about the caller.
+            ProxyError::Session(SessionError::Saturated) | ProxyError::Audit(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            // Everything the upstream or the detector got wrong, and every
+            // shape failure on the way back. Written out rather than left to a
+            // wildcard so that a new variant has to be given a status here, as
+            // `audit_class` already makes it be given a class: a wildcard
+            // turns a variant somebody forgot into a silent 502.
+            ProxyError::Shape(ShapeError::Response(_))
+            | ProxyError::Shape(ShapeError::Pointer(_))
+            | ProxyError::Detector(_)
+            | ProxyError::Mapping(_)
+            | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    /// The fixed vocabulary the journal records. A class rather than the
+    /// message, so that no expression in the audit writer could interpolate
+    /// submitted text even if a message one day carried it.
+    fn audit_class(&self) -> &'static str {
+        match self {
+            ProxyError::Shape(ShapeError::Request(_)) => "shape_request",
+            ProxyError::Shape(ShapeError::Unsupported(_, _)) => "shape_unsupported",
+            ProxyError::Shape(_) => "shape_response",
+            ProxyError::Detector(DetectorError::Transport(_)) => "detector_transport",
+            ProxyError::Detector(DetectorError::Status(_)) => "detector_status",
+            ProxyError::Mapping(MappingError::Unknown(_)) => "mapping_unknown_placeholder",
+            ProxyError::Mapping(MappingError::BadSpan(_)) => "mapping_bad_span",
+            ProxyError::Mapping(MappingError::BadEntityType(_)) => "mapping_bad_entity_type",
+            ProxyError::Upstream(_) => "upstream_failed",
+            ProxyError::Session(SessionError::BadId) => "session_bad_id",
+            ProxyError::Session(SessionError::Disabled) => "session_disabled",
+            ProxyError::Session(SessionError::NoCredential(_)) => "session_no_credential",
+            ProxyError::Session(SessionError::Saturated) => "session_saturated",
+            ProxyError::Audit(_) => "audit_write_failed",
+        }
+    }
+}
+
+impl IntoResponse for ProxyError {
+    fn into_response(self) -> Response {
         // The reason names the failure. It never carries the submitted text.
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        (self.status(), Json(json!({ "error": self.to_string() }))).into_response()
     }
 }
 
@@ -83,10 +127,11 @@ pub struct AppState {
     pub openai_base: String,
     pub anthropic_base: String,
     pub sessions: SessionStore,
+    pub audit: Arc<crate::audit::Audit>,
 }
 
 impl AppState {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config, audit: Arc<crate::audit::Audit>) -> Self {
         Self {
             detector: DetectorClient::new(
                 config.detector_url.clone(),
@@ -100,6 +145,7 @@ impl AppState {
                 max_sessions: config.max_sessions,
                 max_values: config.max_session_values,
             }),
+            audit,
         }
     }
 
@@ -111,21 +157,58 @@ impl AppState {
     }
 }
 
-/// Detect and mask every text the provider pointed at. Shared by both branches
-/// of `handle`: inline it would exist twice and diverge at the first edit.
+/// Detect and mask every text the provider pointed at, and report what was
+/// found. Shared by both branches of `handle`: inline it would exist twice and
+/// diverge at the first edit.
+///
+/// The counts describe *this request's* texts. Counting the mapping instead
+/// would report a session's running total on every turn, and the record would
+/// stop describing the request. The values themselves live in the local set
+/// only long enough to be counted and never leave this function.
 async fn mask_all(
     detector: &DetectorClient,
     body: &Value,
     pointers: &[String],
     mapping: &mut Mapping,
-) -> Result<Value, ProxyError> {
+) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
     let mut masked = body.clone();
+    let mut total = 0usize;
+    let mut distinct: HashSet<(String, String)> = HashSet::new();
     for pointer in pointers {
         let text = read_pointer(body, pointer)?;
         let spans = detector.detect(&text).await?;
+        total += spans.len();
+        // The `Vec<char>` is a copy of the whole text, and a conversation
+        // history is many texts: it is built only when there is a span to
+        // address into it.
+        if !spans.is_empty() {
+            let characters: Vec<char> = text.chars().collect();
+            for span in &spans {
+                // Offsets are in characters, and a span the mapping would
+                // reject is counted only if it addresses real text.
+                if let Some(value) = characters.get(span.start..span.end) {
+                    distinct.insert((span.entity_type.clone(), value.iter().collect()));
+                }
+            }
+        }
         write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
     }
-    Ok(masked)
+    let mut types: BTreeMap<String, usize> = BTreeMap::new();
+    for (entity_type, _) in distinct {
+        *types.entry(entity_type).or_default() += 1;
+    }
+    Ok((masked, total, types))
+}
+
+/// Which branch `handle` took. `serve` uses this to decide whether it is the
+/// one that gets to record this request's outcome: a streamed response's own
+/// handle — the clone `handle` hands to `restore_stream` — already claims
+/// that job, and `serve` calling `completed` too would race the drop that
+/// actually decides it, leaving whichever call ran last to overwrite whatever
+/// the other one wrote.
+enum Handled {
+    Buffered(Response),
+    Streamed(Response),
 }
 
 async fn handle(
@@ -133,13 +216,35 @@ async fn handle(
     provider: &'static dyn Provider,
     headers: HeaderMap,
     body: Value,
-) -> Result<Response, ProxyError> {
+    record: &Record,
+) -> Result<Handled, ProxyError> {
+    // Attribution first, before even the shape check: a request refused for
+    // its body or its session id should still say whose it was, and its
+    // outcome line is the only line such a request leaves. Read once, so the
+    // digest sent here and the one sent below cannot drift apart into two
+    // different readings of the same header.
+    let credential = crate::session::credential_of(&headers, provider);
+    if let Some(credential) = credential {
+        record.attribute(state.audit.digest(&[credential]), None);
+    }
+
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let pointers = provider.request_pointers(&body)?;
+
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        record.streaming();
+    }
 
     // Resolved before detection: a malformed header must cost nothing, not a
     // second per 1 200 characters.
     let key = key_from(&headers, provider, state.sessions.enabled())?;
+
+    if let (Some(credential), Some(key)) = (credential, key.as_ref()) {
+        record.attribute(
+            state.audit.digest(&[credential]),
+            Some(state.audit.digest(&[credential, key.id().as_bytes()])),
+        );
+    }
 
     // One mapping for the whole request so a value keeps one name; seeded from
     // the conversation's table so it keeps that name across turns too.
@@ -151,7 +256,18 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
-            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            let (masked, spans, types) =
+                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            record.detected(pointers.len(), spans, types);
+            // Durable before anything leaves the perimeter, and before the
+            // session commits: this is the last expression that can refuse the
+            // request, and a request that never left must leave the session
+            // exactly as it was. It costs holding the session's lock across an
+            // fsync — a few milliseconds against a detector round-trip of about
+            // a second, and the alternative is a caller's values sitting in the
+            // store for `session_idle_secs` on behalf of a request nobody was
+            // allowed to make.
+            record.masked().await?;
             // After the last `?`, and on a copy until here: a refused request
             // leaves the session exactly as it was, so a client whose detector
             // blinked does not carry a hole in its numbering for the rest of
@@ -163,7 +279,12 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
-            let masked = mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            let (masked, spans, types) =
+                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+            record.detected(pointers.len(), spans, types);
+            // The same ordering with nothing to commit: the journal is still
+            // durable before the upstream call, which is what it exists for.
+            record.masked().await?;
             (masked, work)
         }
     };
@@ -184,11 +305,17 @@ async fn handle(
             request = request.header(header, value);
         }
     }
-    let response = request
-        .json(&masked)
-        .send()
-        .await
-        .map_err(|error| ProxyError::Upstream(error.to_string()))?;
+    let response = request.json(&masked).send().await.map_err(|error| {
+        // A connection that was never established carried no bytes, which
+        // is the one failure here that says so for certain. Every other
+        // way `send` can fail — a timeout, a reset, a truncated body —
+        // may have left bytes on the wire, and those keep the claim
+        // `masked` made.
+        if error.is_connect() {
+            record.did_not_reach_upstream();
+        }
+        ProxyError::Upstream(error.to_string())
+    })?;
 
     let status = StatusCode::from_u16(response.status().as_u16())
         .map_err(|error| ProxyError::Upstream(error.to_string()))?;
@@ -212,9 +339,13 @@ async fn handle(
             .and_then(|value| value.split(';').next())
             .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
     {
-        return Ok(crate::stream::restore_stream(
-            response, provider, mapping, returned,
-        ));
+        return Ok(Handled::Streamed(crate::stream::restore_stream(
+            response,
+            provider,
+            mapping,
+            returned,
+            record.clone(),
+        )));
     }
 
     let raw = response
@@ -227,13 +358,17 @@ async fn handle(
         // client needs; turning a 429 into a generic 502 loses them. The body
         // may still echo what we sent, so it is restored before it goes back —
         // and an error body is not always JSON, so text is handled too.
-        return Ok(match serde_json::from_slice::<Value>(&raw) {
-            Ok(parsed) => (status, returned, Json(mapping.restore_value(&parsed)?)).into_response(),
-            Err(_) => {
-                let text = String::from_utf8_lossy(&raw);
-                (status, returned, mapping.restore(&text)?).into_response()
-            }
-        });
+        return Ok(Handled::Buffered(
+            match serde_json::from_slice::<Value>(&raw) {
+                Ok(parsed) => {
+                    (status, returned, Json(mapping.restore_value(&parsed)?)).into_response()
+                }
+                Err(_) => {
+                    let text = String::from_utf8_lossy(&raw);
+                    (status, returned, mapping.restore(&text)?).into_response()
+                }
+            },
+        ));
     }
 
     let upstream: Value =
@@ -247,7 +382,9 @@ async fn handle(
     }
     // The same quota headers matter on a 200: a client that only learns its
     // remaining budget from errors learns it too late.
-    Ok((returned, Json(restored)).into_response())
+    Ok(Handled::Buffered(
+        (returned, Json(restored)).into_response(),
+    ))
 }
 
 async fn openai(
@@ -255,10 +392,7 @@ async fn openai(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    match handle(state, &OpenAi, headers, body).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
+    serve(state, &OpenAi, "/v1/chat/completions", headers, body).await
 }
 
 async fn anthropic(
@@ -266,9 +400,41 @@ async fn anthropic(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    match handle(state, &Anthropic, headers, body).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
+    serve(state, &Anthropic, "/v1/messages", headers, body).await
+}
+
+/// Where the request's outcome becomes a value one can record.
+///
+/// The record is constructed here rather than inside `handle` because a
+/// `ProxyError` has no status until `into_response` runs, and a bare `?` inside
+/// `handle` unwinds past any guard without saying which failure occurred. A
+/// guard that dropped on `handle`'s return would have to invent both fields.
+async fn serve(
+    state: Arc<AppState>,
+    provider: &'static dyn Provider,
+    route: &'static str,
+    headers: HeaderMap,
+    body: Value,
+) -> Response {
+    let record = Record::new(Arc::clone(&state.audit), provider.name(), route);
+    match handle(state, provider, headers, body, &record).await {
+        // The wrapper is the only handle a buffered response ever gets, so
+        // this is the whole outcome.
+        Ok(Handled::Buffered(response)) => {
+            record.completed(response.status().as_u16());
+            response
+        }
+        // `restore_stream` holds its own clone of `record` and calls
+        // `completed` or `stream_failed` itself once the stream actually
+        // ends. Recording anything here too would race that drop: whichever
+        // call happened to run last would overwrite the other's answer, and
+        // a wrapper that always wins would put back the bug this exists to
+        // fix — an outcome decided before the stream ever ran.
+        Ok(Handled::Streamed(response)) => response,
+        Err(error) => {
+            record.refused(error.status().as_u16(), error.audit_class());
+            error.into_response()
+        }
     }
 }
 
@@ -285,6 +451,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+    use wiremock::matchers::path as path_matcher;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -338,14 +505,34 @@ mod tests {
         }
     }
 
-    fn state_with(detector: &MockServer, upstream: &MockServer, limits: Limits) -> Arc<AppState> {
-        Arc::new(AppState {
+    /// A state whose journal is a fresh file, returned alongside it so a test
+    /// can read what was written.
+    fn state_with(
+        detector: &MockServer,
+        upstream: &MockServer,
+        limits: Limits,
+    ) -> (Arc<AppState>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(limits),
-        })
+            audit,
+        });
+        (state, dir, path)
+    }
+
+    /// The journal's lines, parsed. The `TempDir` must outlive the call.
+    fn journal(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .expect("readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect()
     }
 
     fn session_headers<'a>(credential: &'a str, id: &'a str) -> [(&'a str, &'a str); 2] {
@@ -386,7 +573,7 @@ mod tests {
     }
 
     fn state(detector: &MockServer, upstream: &MockServer) -> Arc<AppState> {
-        state_with(detector, upstream, test_limits())
+        state_with(detector, upstream, test_limits()).0
     }
 
     async fn call(state: Arc<AppState>, route: &str, body: Value) -> (StatusCode, String) {
@@ -723,10 +910,17 @@ mod tests {
         );
     }
 
-    async fn upstream_streaming(body: &str) -> MockServer {
+    /// An SSE upstream that sends `body` and then closes.
+    ///
+    /// The content-type has to travel through `set_body_raw`'s mime
+    /// parameter, not a separately inserted header: `ResponseTemplate`
+    /// stores a body call's mime apart from its headers and applies it last,
+    /// so a header inserted earlier is silently overwritten by whichever body
+    /// call runs after it.
+    async fn upstream_streaming(route: &str, body: &str) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
+            .and(path_matcher(route))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body.as_bytes().to_vec(), "text/event-stream"),
@@ -766,12 +960,19 @@ mod tests {
     }
 
     fn state_for(detector: &MockServer, upstream_base: String) -> Arc<AppState> {
+        // The `TempDir` is dropped here rather than threaded through: nothing
+        // in the streaming tests reads the journal back, and the open file
+        // handle keeps working after the directory entry is unlinked.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let audit =
+            Arc::new(crate::audit::Audit::open(&dir.path().join("audit.jsonl")).expect("opens"));
         Arc::new(AppState {
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
             anthropic_base: upstream_base,
             sessions: SessionStore::new(test_limits()),
+            audit,
         })
     }
 
@@ -827,7 +1028,7 @@ mod tests {
         // The placeholder is split across two events; the client must see the
         // value once, whole, and never the token.
         let detector = detector_returning(person_span()).await;
-        let upstream = upstream_streaming(STREAM_BODY).await;
+        let upstream = upstream_streaming("/v1/chat/completions", STREAM_BODY).await;
 
         let (status, served) = call(
             state(&detector, &upstream),
@@ -846,7 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_holds_no_session_lock() {
         let detector = detector_returning(person_span()).await;
-        let upstream = upstream_streaming(STREAM_BODY).await;
+        let upstream = upstream_streaming("/v1/chat/completions", STREAM_BODY).await;
         let state = state(&detector, &upstream);
 
         let request = Request::builder()
@@ -967,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn a_streaming_response_is_served_as_a_stream() {
         let detector = detector_returning(json!([])).await;
-        let upstream = upstream_streaming("data: [DONE]\n\n").await;
+        let upstream = upstream_streaming("/v1/chat/completions", "data: [DONE]\n\n").await;
         let response = router(state(&detector, &upstream))
             .oneshot(
                 Request::builder()
@@ -994,7 +1195,7 @@ mod tests {
         // Dropping the flag would make the provider answer with a whole body the
         // client is not waiting for.
         let detector = detector_returning(json!([])).await;
-        let upstream = upstream_streaming("data: [DONE]\n\n").await;
+        let upstream = upstream_streaming("/v1/chat/completions", "data: [DONE]\n\n").await;
         call(
             state(&detector, &upstream),
             "/v1/chat/completions",
@@ -1012,10 +1213,13 @@ mod tests {
         // Bytes have already gone out, so the request cannot be refused. It ends
         // instead — the client never receives a token in place of a name.
         let detector = detector_returning(json!([])).await;
-        let upstream = upstream_streaming(concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hallo [PERSON_9]\"}}]}\n\n",
-            "data: [DONE]\n\n",
-        ))
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hallo [PERSON_9]\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        )
         .await;
 
         let (status, served) = call(
@@ -1039,10 +1243,13 @@ mod tests {
         // The stream ends on the malformed event, but the delta before it was
         // already restored and correct, and the client gets it.
         let detector = detector_returning(person_span()).await;
-        let upstream = upstream_streaming(concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PERSON_1]\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"trunc\n\n",
-        ))
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hallo [PERSON_1]\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"trunc\n\n",
+            ),
+        )
         .await;
 
         let (status, served) = call(
@@ -1074,9 +1281,16 @@ mod tests {
             .and(path("/v1/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(429)
-                    .insert_header("content-type", "text/event-stream")
                     .insert_header("retry-after", "3")
-                    .set_body_json(json!({"error": {"message": "slow down"}})),
+                    // `set_body_raw`'s mime, not a separate header: a header
+                    // inserted alongside `set_body_json` would be overwritten
+                    // by that call's own `application/json` mime, and this
+                    // test's whole premise is a response that claims to be a
+                    // stream while carrying a non-success status.
+                    .set_body_raw(
+                        json!({"error": {"message": "slow down"}}).to_string(),
+                        "text/event-stream",
+                    ),
             )
             .mount(&upstream)
             .await;
@@ -1341,6 +1555,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_refused_by_the_journal_leaves_the_session_untouched() {
+        // The other refusal class: masking succeeded, so the values exist and
+        // are ready to commit, and the journal is what refuses. Nothing left
+        // the perimeter, so nothing of the caller's may stay behind — neither
+        // in the session's table nor against its value budget.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit: Arc::new(crate::audit::failing_audit_for_tests()),
+        });
+
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k1", "conv-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let session = state
+            .sessions
+            .acquire(&test_key("conv-1", "Bearer k1"))
+            .unwrap()
+            .session;
+        assert!(
+            session.mapping.lock().await.is_empty(),
+            "a request the journal refused left values in the session"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failing_request_does_not_evict_a_live_third_party_session() {
         // Session "a" commits a real value through an ordinary successful
         // request. Session "b" then takes the store's second slot with a
@@ -1379,7 +1634,8 @@ mod tests {
                 max_sessions: 2,
                 max_values: 8,
             },
-        );
+        )
+        .0;
 
         // "a" gets a real, committed value.
         call_with_headers(
@@ -1454,7 +1710,8 @@ mod tests {
                 max_sessions: 8,
                 max_values: 1,
             },
-        );
+        )
+        .0;
 
         let (status, body) = call_with_headers(
             Arc::clone(&state),
@@ -1523,7 +1780,8 @@ mod tests {
                 max_sessions: 0,
                 max_values: 0,
             },
-        );
+        )
+        .0;
 
         let (status, body) = call_with_headers(
             Arc::clone(&state),
@@ -1583,7 +1841,8 @@ mod tests {
                 max_sessions: 1,
                 max_values: 8,
             },
-        );
+        )
+        .0;
 
         // The only slot belongs to a session another request is inside right
         // now, exactly as it would be mid-`mask_all`.
@@ -1616,5 +1875,696 @@ mod tests {
             0,
             "a refused request still reached the provider"
         );
+    }
+
+    #[tokio::test]
+    async fn a_served_request_leaves_two_records() {
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "masked");
+        assert_eq!(lines[0]["provider"], "openai");
+        assert_eq!(lines[0]["types"]["PERSON"], 1);
+        assert_eq!(lines[0]["spans"], 1);
+        assert_eq!(lines[1]["result"], "completed");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(lines[0]["request"], lines[1]["request"]);
+    }
+
+    #[tokio::test]
+    async fn a_detector_failure_leaves_one_record_and_calls_nobody() {
+        let detector = failing_detector().await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "outcome");
+        assert_eq!(lines[0]["upstream"], false);
+        assert_eq!(lines[0]["result"], "refused");
+        assert_eq!(lines[0]["error"], "detector_status");
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "nothing may reach the provider when the request is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_refusal_records_its_own_class() {
+        // The invariant a guard that inferred its outcome would violate
+        // silently, so it is exercised per variant rather than once.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            &[(SESSION_HEADER, "not a valid id!")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(journal(&path)[0]["error"], "session_bad_id");
+
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(state, "/v1/chat/completions", json!({"messages": "wrong"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(journal(&path)[0]["error"], "shape_request");
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_cannot_be_written_refuses_before_the_provider() {
+        // Fail-closed end to end: no evidence, no request.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit: Arc::new(crate::audit::failing_audit_for_tests()),
+        });
+
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("audit unavailable"));
+        assert!(
+            !body.contains('/'),
+            "no filesystem detail reaches the client"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "an unrecorded request must not reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_masked_record_precedes_the_provider_call() {
+        // Asserted structurally: the upstream mock reads the journal as it
+        // answers, so the ordering is observed rather than timed.
+        let detector = detector_finding_weber().await;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let upstream = MockServer::start().await;
+        let counter = Arc::clone(&seen);
+        let watched = path.clone();
+        Mock::given(method("POST"))
+            .and(path_matcher("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                *counter.lock().expect("lock") = std::fs::read_to_string(&watched)
+                    .map(|text| text.lines().count())
+                    .unwrap_or(0);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"choices": [{"message": {"content": "ok"}}]}))
+            })
+            .mount(&upstream)
+            .await;
+
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit,
+        });
+        call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            1,
+            "the masked record must be on disk before the provider is called"
+        );
+    }
+
+    /// A port bound and released: nothing listens there, so a connection to it
+    /// is refused before a byte of the request is written.
+    fn a_dead_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        listener.local_addr().expect("an address").port()
+    }
+
+    fn state_against(
+        detector: &MockServer,
+        base: String,
+    ) -> (Arc<AppState>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: base.clone(),
+            anthropic_base: base,
+            sessions: SessionStore::new(test_limits()),
+            audit,
+        });
+        (state, dir, path)
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_was_never_reached_records_that_nothing_left() {
+        // `masked` claims the bytes left before they do, because a request
+        // that dies mid-flight did send them and a journal that said otherwise
+        // would under-report the one thing it exists to report. A refused
+        // connection is the single failure that is knowably the other way:
+        // `upstream: true` here would tell an auditor a request reached a
+        // provider that never accepted one.
+        let detector = detector_finding_weber().await;
+        let (state, _dir, path) =
+            state_against(&detector, format!("http://127.0.0.1:{}", a_dead_port()));
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the request was masked, then refused");
+        assert_eq!(lines[0]["event"], "masked");
+        assert_eq!(lines[1]["result"], "refused");
+        assert_eq!(lines[1]["error"], "upstream_failed");
+        assert_eq!(
+            lines[1]["upstream"], false,
+            "the connection was never established, so nothing left the perimeter"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_accepted_and_vanished_still_records_bytes_leaving() {
+        // The other side of the correction above, and what keeps it narrow: a
+        // provider that accepts the connection and then disappears has already
+        // read whatever the socket carried. `send` fails here too, and this is
+        // the case where the conservative claim must stand — under-reporting a
+        // request that did leave is the dangerous direction for a privacy
+        // journal, and a correction that fired on every `send` error would do
+        // exactly that.
+        let detector = detector_finding_weber().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Accepted, then closed with no response at all.
+                drop(stream);
+            }
+        });
+        let (state, _dir, path) = state_against(&detector, base);
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let lines = journal(&path);
+        assert_eq!(lines[1]["error"], "upstream_failed");
+        assert_eq!(
+            lines[1]["upstream"], true,
+            "the connection was established, so the conservative claim stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_turn_counts_its_own_request_not_the_table() {
+        // The detector reports a PERSON at a fixed span regardless of the
+        // text, so each turn masks exactly one value of its own — but a
+        // different one each time. The session's mapping therefore
+        // accumulates to two entries while each request's own count stays at
+        // one; a version that read the count off the mapping instead of the
+        // request would report two on the second turn.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let bodies = [
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+            json!({"messages": [{"role": "user", "content": "Meier called"}]}),
+        ];
+        for body in bodies {
+            call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                body,
+                &session_headers("sk-tenant", "chat-1"),
+            )
+            .await;
+        }
+
+        let lines = journal(&path);
+        let masked: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked.len(), 2);
+        assert_eq!(
+            masked[1]["types"]["PERSON"], 1,
+            "the second turn describes the request, not the session's running total"
+        );
+        assert_eq!(
+            masked[0]["tenant"], masked[1]["tenant"],
+            "one credential is one tenant"
+        );
+        assert_eq!(masked[0]["session"], masked[1]["session"]);
+        assert_eq!(masked[0]["tenant"].as_str().expect("a digest").len(), 32);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_value_carries_its_type_past_the_mapping_unvalidated() {
+        // The path that makes the audit module's own type check load-bearing
+        // rather than defensive. `Mapping::placeholder_for` returns the cached
+        // placeholder on a `by_value` hit *before* it validates the type, so
+        // the second span over a value already mapped — here in one text, but
+        // equally any value seeded from an earlier turn of a session — reaches
+        // `mask_all` with its `entity_type` unexamined. This is an ordinary
+        // 200-OK request, and without the check in `Record::detected` the
+        // detector's string would be a key in the evidence file.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "Weber, Hauptstrasse 4", "start": 10, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber und Weber"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the mapping accepted the request");
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            !text.contains(SECRET),
+            "a detector's type name reached the journal on the ordinary path: {text}"
+        );
+        let lines = journal(&path);
+        assert_eq!(lines[0]["types"]["PERSON"], 1);
+        assert_eq!(
+            lines[0]["types"]["unvalidated"], 1,
+            "the type that skipped the mapping's check is counted, not quoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_session_still_has_a_tenant() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            &[("authorization", "sk-tenant")],
+        )
+        .await;
+
+        let lines = journal(&path);
+        assert!(lines[0]["tenant"].is_string());
+        assert!(lines[0]["session"].is_null());
+        assert_eq!(
+            lines[0]["tenant"], lines[1]["tenant"],
+            "both lines of one request name the same tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_before_masking_still_says_whose_it_was() {
+        // The claim the attribution block makes by sitting above the shape
+        // check. A refusal this early leaves one line and no `masked` line to
+        // join to, so if that line has no `tenant` the request is attributable
+        // to nobody — which is the first thing anyone reading a run of
+        // refusals wants to know.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"messages": "wrong"}),
+            &[("authorization", "sk-tenant")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The same credential again, refused one step later for its session id
+        // — still before anything was masked.
+        let (status, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+            &session_headers("sk-tenant", "not a valid id!"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let lines = journal(&path);
+        assert_eq!(
+            lines.len(),
+            2,
+            "neither request was masked, so one line each"
+        );
+        assert_eq!(lines[0]["error"], "shape_request");
+        assert_eq!(lines[1]["error"], "session_bad_id");
+        let tenant = lines[0]["tenant"]
+            .as_str()
+            .expect("a refusal before masking still names its tenant");
+        assert_eq!(tenant.len(), 32);
+        assert_eq!(
+            lines[0]["tenant"], lines[1]["tenant"],
+            "one credential is one tenant, however the request was refused"
+        );
+        assert!(
+            lines[1]["session"].is_null(),
+            "an id the gateway rejected is not an identity it records"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_journal_never_carries_the_submitted_value() {
+        let detector = detector_finding_weber().await;
+        // The provider echoes the placeholder back inside an error body, which
+        // is restored to the real value on the way out — the one path where a
+        // value exists on the response side too.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_matcher("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(json!({"error": {"message": "[PERSON_1] is rate limited"}})),
+            )
+            .mount(&upstream)
+            .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body.contains(SECRET),
+            "the client does get the restored value"
+        );
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(!text.contains(SECRET), "the journal does not");
+        assert!(!text.contains("PERSON_1"), "nor a placeholder name");
+    }
+
+    #[tokio::test]
+    async fn a_whole_stream_records_completed() {
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"stream": true, "messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let lines = journal(&path);
+        assert_eq!(
+            lines[0]["stream"], true,
+            "the masked record knows it is a stream"
+        );
+        assert_eq!(lines[1]["result"], "completed");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(
+            lines[1]["upstream"], true,
+            "bytes did leave before the stream finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrestorable_token_records_stream_failed() {
+        // The provider invents a placeholder no mapping knows. Bytes have
+        // already gone out, so the stream ends rather than the request being
+        // refused — and the record says so with the status the client got.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[PERSON_9]\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"stream": true, "messages": [{"role": "user", "content": "Weber called"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the head was already sent");
+        assert!(
+            body.contains("error"),
+            "the client is told the stream failed"
+        );
+
+        let lines = journal(&path);
+        assert_eq!(lines[1]["result"], "stream_failed");
+        assert_eq!(lines[1]["status"], 200);
+        assert_eq!(lines[1]["error"], "stream_unrestorable");
+        assert_eq!(lines[1]["upstream"], true);
+    }
+
+    /// Build a streaming request and hand back the unread `Response` — the
+    /// body's generator has not been polled once, so nothing in it has run.
+    async fn streamed_response(state: Arc<AppState>) -> Response {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"stream": true, "messages": [{"role": "user", "content": "hello"}]})
+                    .to_string(),
+            ))
+            .unwrap();
+        router(state).oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_stream_finishes_the_record_not_the_wrapper() {
+        // If the wrapper finalized a streamed request, the outcome line would
+        // already exist the instant `handle` returns — before the body is
+        // drained, let alone a single event restored.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let response = streamed_response(state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            journal(&path).len(),
+            1,
+            "only the masked line exists before the body is ever read"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .contains("[DONE]"));
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "exactly one outcome, written once");
+        assert_eq!(lines[1]["event"], "outcome");
+        assert_eq!(lines[1]["result"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_is_recorded_as_aborted() {
+        // The client vanished before the stream ever ran: no upstream break,
+        // no restoration failure, no success either. None of
+        // `restore_stream`'s three signalling exits fires, so the record must
+        // not assume success just because nothing else was said.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let response = streamed_response(state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Neither `serve` nor the generator ever calls `completed`: the
+        // wrapper's own handle is already gone (`serve` returned), and the
+        // generator inside this unread body has not run a single statement.
+        drop(response);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
+        assert_eq!(lines[1]["result"], "aborted");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_after_its_first_yield_still_records_the_failure() {
+        // `restorer.push` fails on this body's very first event, so the error
+        // arm's `record.stream_failed(...)` is the first thing the generator
+        // ever does — and the `error_event` bytes it renders afterwards are
+        // its first `yield`. A single poll drives the generator exactly to
+        // that `yield` and no further: dropping the stream there proves the
+        // signal ran before it, not after. With the signal placed after the
+        // `yield` instead, a generator parked there and dropped never reaches
+        // it, and the outcome falls back to `aborted` — the exact bug this
+        // test exists to catch.
+        use futures_util::StreamExt;
+
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_streaming(
+            "/v1/chat/completions",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[PERSON_9]\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let response = streamed_response(state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the head was already sent"
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await;
+        assert!(first.is_some(), "the error event is the first thing sent");
+        drop(body);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
+        assert_eq!(lines[1]["result"], "stream_failed");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_after_the_upstream_breaks_still_records_the_failure() {
+        // The same shape as the restoration-failure case above, on the other
+        // exit that reorders a signal ahead of its `yield`: the connection
+        // breaks before a single body byte arrives, so the break is caught on
+        // the first read and `record.stream_failed("stream_broken")` is the
+        // first thing the generator does. Its `error_event` yield is the
+        // first `yield` at all, so one poll parks the generator exactly
+        // there.
+        use futures_util::StreamExt;
+
+        let detector = detector_returning(json!([])).await;
+        let base = truncating_upstream("").await;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            upstream: reqwest::Client::new(),
+            openai_base: base.clone(),
+            anthropic_base: base,
+            sessions: SessionStore::new(test_limits()),
+            audit,
+        });
+
+        let response = streamed_response(state).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the head was already sent"
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await;
+        assert!(first.is_some(), "the error event is the first thing sent");
+        drop(body);
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
+        assert_eq!(lines[1]["result"], "stream_failed");
+        assert_eq!(lines[1]["error"], "stream_broken");
     }
 }

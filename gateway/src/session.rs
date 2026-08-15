@@ -102,6 +102,23 @@ impl SessionKey {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+
+    /// The raw id, for the audit writer to digest with its own salt. It is not
+    /// `Display` and it is not in `Debug`: this is the one caller allowed to
+    /// see it, and it hashes what it sees.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The caller's credential, for a fingerprint that does not depend on whether
+/// a session was asked for. `key_from` hashes the credential only when a
+/// session id is present, so attribution needs its own way in.
+pub fn credential_of<'a>(headers: &'a HeaderMap, provider: &dyn Provider) -> Option<&'a [u8]> {
+    headers
+        .get(provider.credential_header())
+        .map(|value| value.as_bytes())
+        .filter(|value| !value.is_empty())
 }
 
 fn valid_id(id: &str) -> bool {
