@@ -267,7 +267,7 @@ async fn handle(
             let mut work = guard.clone();
             let (masked, spans, types) =
                 mask_all(&state.detector, &body, &pointers, &mut work).await?;
-            record.detected(pointers.len(), spans, types);
+            record.detected(pointers.len(), spans, types, work.redacted_count());
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
             // request, and a request that never left must leave the session
@@ -290,7 +290,7 @@ async fn handle(
             let mut work = Mapping::new();
             let (masked, spans, types) =
                 mask_all(&state.detector, &body, &pointers, &mut work).await?;
-            record.detected(pointers.len(), spans, types);
+            record.detected(pointers.len(), spans, types, work.redacted_count());
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
             record.masked().await?;
@@ -685,6 +685,42 @@ mod tests {
             "the value rode to the provider inside the type name: {sent}"
         );
         assert!(sent.contains("[REDACTED_1]"), "not masked at all: {sent}");
+    }
+
+    #[tokio::test]
+    async fn the_journal_says_a_type_it_names_was_masked_generically() {
+        // `types` is built from the detector's response, before the mapping
+        // rules on it, so a line can name WEBER while the provider received
+        // [REDACTED_1]. Deliberately: the two checks stay independent. What
+        // must not happen is the divergence going unrecorded, leaving an
+        // auditor to reconcile a name against traffic that never carried it.
+        let detector = detector_returning(json!([
+            {"entity_type": "WEBER", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        let (status, _) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "WEBER schreibt"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let lines = journal(&path);
+        assert_eq!(lines[0]["types"]["WEBER"], 1);
+        assert_eq!(
+            lines[0]["redacted"], 1,
+            "the line names a type no placeholder carried and does not say so: {}",
+            lines[0]
+        );
     }
 
     #[tokio::test]

@@ -423,6 +423,7 @@ struct State {
     texts: usize,
     spans: usize,
     types: BTreeMap<String, usize>,
+    redacted: usize,
     upstream: bool,
     outcome: Option<(&'static str, u16, Option<&'static str>)>,
 }
@@ -479,7 +480,23 @@ impl Record {
     /// loop puts detector-controlled text into the journal on a successful
     /// request; `a_repeated_value_carries_its_type_past_the_mapping_unvalidated`
     /// in `proxy.rs` is that request.
-    pub fn detected(&self, texts: usize, spans: usize, types: BTreeMap<String, usize>) {
+    ///
+    /// `redacted` is how many spans the *mapping* declined to name, which is a
+    /// different question from the one this loop asks and is answered by a
+    /// different rule: a type this check finds legible — `WEBER` is — can still
+    /// be one the mapping does not declare, in which case the provider received
+    /// `[REDACTED_1]` while this line says `WEBER`. An auditor reconciling the
+    /// journal against the traffic would get a mismatch on the artifact the
+    /// product exists to produce. The count is passed in rather than derived
+    /// here, and `types` is still built without consulting the mapping, so that
+    /// recording the divergence does not make either check depend on the other.
+    pub fn detected(
+        &self,
+        texts: usize,
+        spans: usize,
+        types: BTreeMap<String, usize>,
+        redacted: usize,
+    ) {
         let mut checked: BTreeMap<String, usize> = BTreeMap::new();
         let mut unvalidated = 0usize;
         for (name, count) in types {
@@ -507,6 +524,7 @@ impl Record {
             state.texts = texts;
             state.spans = spans;
             state.types = checked;
+            state.redacted = redacted;
         });
     }
 
@@ -531,6 +549,7 @@ impl Record {
                 "texts": state.texts,
                 "spans": state.spans,
                 "types": state.types,
+                "redacted": state.redacted,
             })
             .to_string()
         });
@@ -1222,7 +1241,7 @@ mod tests {
         let tenant = Digest("a41f9c02".repeat(4));
         let session = Digest("3bd7e105".repeat(4));
         record.attribute(tenant, Some(session));
-        record.detected(4, 9, types(&[("PERSON", 2), ("IBAN", 1)]));
+        record.detected(4, 9, types(&[("PERSON", 2), ("IBAN", 1)]), 0);
         record.streaming();
         record.masked().await.expect("writes");
         record.completed(200);
@@ -1239,6 +1258,26 @@ mod tests {
         assert_eq!(lines[0]["types"]["PERSON"], 2);
         assert_eq!(lines[0]["session"], "3bd7e105".repeat(4));
         assert!(lines[0]["ts"].as_str().expect("a timestamp").ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn a_masked_record_says_how_many_types_were_not_the_gateways_own() {
+        // Without this the line above is ambiguous: `types` naming WEBER is
+        // consistent both with a placeholder that carried WEBER upstream and
+        // with one masked as [REDACTED_1], and only the second is what happened.
+        let (_dir, audit, path) = fixture();
+        let record = Record::new(audit, "openai", "/v1/chat/completions");
+        record.detected(1, 2, types(&[("PERSON", 1), ("WEBER", 1)]), 1);
+        record.masked().await.expect("writes");
+        record.completed(200);
+        drop(record);
+
+        let lines = lines(&path);
+        assert_eq!(lines[0]["types"]["WEBER"], 1, "the type is still named");
+        assert_eq!(
+            lines[0]["redacted"], 1,
+            "the line does not say the placeholder carried a name the gateway declines"
+        );
     }
 
     #[tokio::test]
@@ -1259,6 +1298,7 @@ mod tests {
                 ("person", 1),
                 (&"A".repeat(crate::mapping::MAX_ENTITY_TYPE + 1), 1),
             ]),
+            0,
         );
         record.masked().await.expect("writes");
         record.completed(200);

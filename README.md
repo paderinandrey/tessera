@@ -298,7 +298,7 @@ group the fields for reading; on disk each line serializes its keys in
 alphabetical order, which nothing depends on.
 
 ```json
-{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0}
 {"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
@@ -327,6 +327,11 @@ already masked earlier in the same request or in an earlier turn — is counted
 under `unvalidated` rather than written out, since the name itself came from
 outside the perimeter. Seeing that key means the detector and the gateway
 disagree about what a type is; the gateway also says so in its own log.
+`redacted` counts the values the mapping masked as `[REDACTED_n]` because their
+type was not one it declares — which `types` does not show, since it is built
+from what the detector reported and not from what the placeholder ended up
+carrying. A line naming `WEBER` and a `redacted` of 1 says the provider received
+`[REDACTED_1]`, not `[WEBER_1]`.
 `result` is one of `completed`,
 `refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
 defaults to on drop — in practice, a client that disconnects while a stream is
