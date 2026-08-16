@@ -77,7 +77,6 @@ impl ProxyError {
             ProxyError::Detector(DetectorError::Status(_)) => "detector_status",
             ProxyError::Mapping(MappingError::Unknown(_)) => "mapping_unknown_placeholder",
             ProxyError::Mapping(MappingError::BadSpan(_)) => "mapping_bad_span",
-            ProxyError::Mapping(MappingError::BadEntityType(_)) => "mapping_bad_entity_type",
             ProxyError::Upstream(_) => "upstream_failed",
             ProxyError::Session(SessionError::BadId) => "session_bad_id",
             ProxyError::Session(SessionError::Disabled) => "session_disabled",

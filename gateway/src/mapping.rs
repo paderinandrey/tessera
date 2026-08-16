@@ -20,15 +20,6 @@ pub enum MappingError {
              forwarded with the value still in it"
     )]
     BadSpan(&'static str),
-    #[error(
-        "entity type {0:?} cannot be written as a restorable placeholder; the request is \
-             refused rather than masked with a token restoration would not recognize"
-    )]
-    // Nothing constructs this once an unrecognised type masks as REDACTED
-    // instead of refusing. Left in place for the audit class in proxy.rs
-    // that still names it; what replaces it is a later change, not this one.
-    #[allow(dead_code)]
-    BadEntityType(String),
 }
 
 /// The longest entity type that can be written as a placeholder. Restoration in
@@ -428,25 +419,31 @@ mod tests {
     }
 
     #[test]
-    fn an_entity_type_outside_the_grammar_is_refused() {
-        // "[person_1]" or "[PERSON-ROLE_1]" would not be recognized on the way
-        // back, so it would reach the client unrestored.
+    fn a_type_outside_the_grammar_is_masked_rather_than_refused() {
+        // It used to be refused. Masking is the same protection and does not
+        // break a gateway whose detector has grown a type it does not know.
         let mut mapping = Mapping::new();
-        assert!(mapping.mask("Weber", &[span("person", 0, 5)]).is_err());
-        assert!(mapping.mask("Weber", &[span("PERSON-ROLE", 0, 5)]).is_err());
-        assert!(mapping.mask("Weber", &[span("", 0, 5)]).is_err());
+        assert_eq!(
+            mapping
+                .mask("Weber", &[span("person", 0, 5)])
+                .expect("masked, not refused"),
+            "[REDACTED_1]"
+        );
     }
 
     #[test]
-    fn an_entity_type_too_long_to_survive_a_stream_is_refused() {
-        // Restoration in a stream holds back a bounded number of bytes. A
-        // placeholder longer than that bound would be released as text and
-        // handed to the client unrestored, so it is never issued.
-        let mut mapping = Mapping::new();
+    fn a_type_too_long_to_survive_a_stream_is_masked_rather_than_refused() {
+        // A name longer than MAX_ENTITY_TYPE cannot be in the vocabulary — the
+        // test above proves that of the list — so it takes the same path as any
+        // other unknown type and never reaches the stream's hold-back buffer.
         let long = "A".repeat(MAX_ENTITY_TYPE + 1);
-        assert!(mapping.mask("Weber", &[span(&long, 0, 5)]).is_err());
-        let longest = "A".repeat(MAX_ENTITY_TYPE);
-        assert!(mapping.mask("Weber", &[span(&longest, 0, 5)]).is_ok());
+        let mut mapping = Mapping::new();
+        assert_eq!(
+            mapping
+                .mask("Weber", &[span(&long, 0, 5)])
+                .expect("masked, not refused"),
+            "[REDACTED_1]"
+        );
     }
 
     #[test]
