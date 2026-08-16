@@ -84,9 +84,10 @@ pub const MAX_ACTIVE_RUNS: usize = 64;
 /// A `[` that never closes would suspend the stream. Past this many bytes the
 /// bracket cannot begin a placeholder, so it is emitted as ordinary text.
 ///
-/// This is a bound on what the masker can issue, not a guess:
-/// `mapping::MAX_ENTITY_TYPE` keeps every placeholder under it, so releasing a
-/// bracket here can never orphan a real token.
+/// This is a bound on what the masker can issue, not a guess: a placeholder
+/// carries a name from `mapping::ENTITY_TYPES`, which a test there holds to
+/// `mapping::MAX_ENTITY_TYPE`, so releasing a bracket here can never orphan a
+/// real token.
 pub const MAX_HELD: usize = 64;
 
 /// Restores placeholders in text arriving piece by piece. A placeholder
@@ -1529,19 +1530,30 @@ mod buffer_tests {
     fn the_longest_placeholder_the_masker_can_issue_still_fits_the_cap() {
         // The cap must bound what masking issues, or a legitimate token would be
         // released as text and reach the client unrestored.
-        let entity_type = "A".repeat(crate::mapping::MAX_ENTITY_TYPE);
+        //
+        // The type is the longest one the gateway *declares*: an invented name
+        // of any length masks as [REDACTED_n] now, so measuring one would
+        // measure the fallback and say nothing about the bound.
+        let entity_type = crate::mapping::ENTITY_TYPES
+            .iter()
+            .max_by_key(|entity_type| entity_type.len())
+            .expect("the vocabulary is not empty");
         let mut mapping = Mapping::new();
         let masked = mapping
             .mask(
                 "Weber",
                 &[Span {
-                    entity_type: entity_type.clone(),
+                    entity_type: (*entity_type).to_owned(),
                     start: 0,
                     end: 5,
                 }],
             )
             .unwrap();
-        assert!(masked.len() <= MAX_HELD, "{} bytes", masked.len());
+        // The number is a usize, and this mapping issued 1. The placeholder the
+        // cap has to survive is the one a long-running session issues, so the
+        // widest a counter can print is what is measured.
+        let widest = "[_]".len() + entity_type.len() + usize::MAX.to_string().len();
+        assert!(widest <= MAX_HELD, "{widest} bytes for [{entity_type}_N]");
 
         let mut buffer = RestoreBuffer::new(&mapping);
         let mut out = String::new();

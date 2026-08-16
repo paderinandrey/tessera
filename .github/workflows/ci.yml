@@ -23,6 +23,20 @@ jobs:
       - run: uv run pytest
       - run: uv run ruff check . ../evaluation
       - run: uv run mypy src
+      # The gateway keeps its own copy of the entity-type vocabulary, because
+      # asking the detector which types it emits would be worthless against a
+      # detector that lies. The copy is only safe while something notices it
+      # drifting.
+      #
+      # This step guards gateway/src/mapping.rs, not the detector, so this job
+      # must not grow a `paths:` filter — a plausible `paths: detector/**` would
+      # remove the guard on every pull request that only touches the gateway,
+      # which is every pull request that can add a type to the list. The compose
+      # job below shows this repository does gate jobs on conditions.
+      #
+      # Through the Makefile so the target cannot rot unnoticed: it is what a
+      # developer runs, and what the failure message tells them to re-run.
+      - run: make -C .. check-entity-types
       # The committed corpus must regenerate byte-identical (seeded) — this
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py

@@ -191,11 +191,21 @@ the problem is visible there. A detector that errors or exceeds its timeout; a b
 shape the gateway has no rule for, including tool definitions, tool traffic, Anthropic's
 extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
 OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
-span the detector reports that cannot be applied; and a placeholder in the response that no
+span the detector reports at a position that cannot be applied — inverted, past the end of the
+text, or overlapping another; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing
 unmasked is forwarded, and no placeholder is ever handed to the client in place of a value.
 No error body or log line carries the submitted text.
+
+Placeholders carry the type the detector reported, but only when it is one this gateway
+declares — twenty-two of them, the catalog's eight deterministic identifiers plus the
+fourteen the NER layer can label. A type outside that list is masked as `[REDACTED_1]`
+instead. Syntax cannot tell a type name from a value shaped like one: a detector returning
+`WEBER` as the type of a span covering `WEBER` would otherwise put that value in the token
+the provider receives. The gateway keeps its own copy of the list rather than asking the
+detector, since the detector's answer is what the check defends against, and CI fails if the
+two drift apart.
 
 ### Sessions
 
@@ -288,7 +298,7 @@ group the fields for reading; on disk each line serializes its keys in
 alphabetical order, which nothing depends on.
 
 ```json
-{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1}}
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0}
 {"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
@@ -317,6 +327,11 @@ already masked earlier in the same request or in an earlier turn — is counted
 under `unvalidated` rather than written out, since the name itself came from
 outside the perimeter. Seeing that key means the detector and the gateway
 disagree about what a type is; the gateway also says so in its own log.
+`redacted` counts the values the mapping masked as `[REDACTED_n]` because their
+type was not one it declares — which `types` does not show, since it is built
+from what the detector reported and not from what the placeholder ended up
+carrying. A line naming `WEBER` and a `redacted` of 1 says the provider received
+`[REDACTED_1]`, not `[WEBER_1]`.
 `result` is one of `completed`,
 `refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
 defaults to on drop — in practice, a client that disconnects while a stream is
