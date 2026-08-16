@@ -29,13 +29,24 @@ def gateway_types() -> set[str]:
     match = DECLARATION.search(MAPPING.read_text(encoding="utf-8"))
     if match is None:
         sys.exit(f"{MAPPING}: no ENTITY_TYPES declaration found")
-    return set(NAME.findall(match.group(1)))
+    # A comment explaining a rename or removal naturally quotes the old name
+    # (e.g. `// dropped "OLD_TYPE" — folded into ...`). Matching NAME against
+    # the raw span would count that mention as a declaration and the check
+    # would wave through exactly the drift it exists to catch. No entity type
+    # contains "//" — the grammar is letters and underscores — so stripping
+    # each line's comment first is safe here.
+    without_comments = "\n".join(
+        line.split("//", 1)[0] for line in match.group(1).splitlines()
+    )
+    return set(NAME.findall(without_comments))
 
 
 def detector_types() -> set[str]:
     found: set[str] = set()
     for path in CATALOGS:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        # Both catalogs use these two top-level keys today; a third section
+        # would be silently invisible here, on both sides of the comparison.
         for section in ("identifiers", "entities"):
             for entry in document.get(section) or ():
                 found.add(entry["entity_type"])
