@@ -653,6 +653,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_value_returned_as_its_own_type_never_reaches_the_upstream() {
+        // The leak this slice exists for, at the boundary that defines it: a
+        // detector returning the span's own value as its `entity_type` would
+        // put that value in the placeholder's name, and the placeholder is what
+        // the provider receives. `mapping.rs` asserts what `mask` returns;
+        // nothing but this asserts what leaves the process.
+        let detector = detector_returning(json!([
+            {"entity_type": "WEBER", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "WEBER schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let sent = String::from_utf8(received.body.clone()).unwrap();
+        assert!(
+            !sent.contains("WEBER"),
+            "the value rode to the provider inside the type name: {sent}"
+        );
+        assert!(sent.contains("[REDACTED_1]"), "not masked at all: {sent}");
+    }
+
+    #[tokio::test]
     async fn the_client_gets_the_original_back() {
         let detector = detector_returning(person_span()).await;
         let upstream = upstream_returning(
