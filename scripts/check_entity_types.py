@@ -22,101 +22,52 @@ CATALOGS = (
 DECLARATION = re.compile(
     r"pub const ENTITY_TYPES: \[&str; (\d+)\] = \[(.*?)\];", re.DOTALL
 )
-# One array element, alone on its line: `    "PERSON",`. The shape of the entry
-# is matched rather than the shape of a name so that `ARTICLE9` — a name the
-# placeholder grammar would not admit — is seen and reported rather than
-# silently skipped as unparsable.
-ENTRY = re.compile(r'^\s*"([^"]*)",\s*$', re.MULTILINE)
-
-
-def char_literal(source: str, index: int) -> int:
-    """Length of the character literal at `index`, or 0 if there is none."""
-    width = 4 if source[index + 1 : index + 2] == "\\" else 3
-    return width if source[index + width - 1 : index + width] == "'" else 0
-
-
-def uncommented(source: str) -> str:
-    """`source` with every comment replaced by blanks, as the compiler sees it.
-
-    Three versions of this check in a row were defeated by a comment spelling
-    nobody had listed: a quoted name in a `//` comment, then the same in a
-    one-line `/* */`, then an entry inside a `/* */` spanning lines. Each fix
-    answered its example. This one answers the question instead — no comment
-    text of either form, at any nesting depth, reaches the entry matcher.
-
-    A scanner and not a `re.sub`, because Rust's block comments nest: against
-    `/* outer /* inner */ "PERSON", */` a non-greedy `/\\*.*?\\*/` stops at the
-    first `*/` and hands the entry to the matcher as if it were code. String
-    literals are tracked for the mirror-image reason — `"/*"` is a legal entry
-    and must not open a comment — and so are character literals, since `'"'`
-    elsewhere in the file would otherwise open a string that never closes.
-    Newlines survive so the entry matcher still sees one entry per line.
-    """
-    out: list[str] = []
-    depth = 0
-    in_string = False
-    index = 0
-    while index < len(source):
-        char, pair = source[index], source[index : index + 2]
-        if depth:
-            if pair in ("/*", "*/"):
-                depth += 1 if pair == "/*" else -1
-                out.append("  ")
-                index += 2
-                continue
-            out.append("\n" if char == "\n" else " ")
-            index += 1
-        elif in_string:
-            # A backslash escape is copied whole, so that `"\""` does not end
-            # the literal on its escaped quote.
-            width = 2 if char == "\\" else 1
-            in_string = char != '"'
-            out.append(source[index : index + width])
-            index += width
-        elif pair == "/*":
-            depth = 1
-            out.append("  ")
-            index += 2
-        elif pair == "//":
-            end = source.find("\n", index)
-            end = len(source) if end == -1 else end
-            out.append(" " * (end - index))
-            index = end
-        elif char == "'" and (width := char_literal(source, index)):
-            # `'"'`, copied whole. A lifetime is left alone: `&'static str` has
-            # no closing quote where a character literal would have one.
-            out.append(source[index : index + width])
-            index += width
-        else:
-            in_string = char == '"'
-            out.append(char)
-            index += 1
-    return "".join(out)
+# One array element, alone on its line: `    "PERSON",`, with an explanatory
+# `//` after it allowed — that is ordinary Rust and turning it into a CI failure
+# about a vocabulary that has not drifted teaches people to distrust this check.
+# The shape of the entry is matched rather than the shape of a name so that
+# `ARTICLE9` — a name the placeholder grammar would not admit — is seen and
+# reported rather than silently skipped as unparsable.
+ENTRY = re.compile(r'^\s*"([^"]*)",\s*(?://.*)?$', re.MULTILINE)
 
 
 def gateway_types() -> set[str]:
-    # The whole file, not just the declaration: a commented-out copy of an older
-    # ENTITY_TYPES above the real one would otherwise be the first thing the
-    # declaration pattern found.
-    match = DECLARATION.search(uncommented(MAPPING.read_text(encoding="utf-8")))
+    source = MAPPING.read_text(encoding="utf-8")
+    # Rust defines this constant once. A second copy of the declaration is
+    # therefore either commented out or dead, and this script cannot tell which
+    # of the two the compiler reads — it reads the first. A commented-out copy
+    # carrying the names as they used to be would be read here in place of the
+    # array below it, and unlike a commented-out *entry* the length check cannot
+    # notice, because a copy brings its own length. Counting the definition is
+    # what closes that, and it needs no theory of comments either.
+    if source.count("pub const ENTITY_TYPES") != 1:
+        sys.exit(
+            f"{MAPPING}: ENTITY_TYPES is written "
+            f"{source.count('pub const ENTITY_TYPES')} times. Only one of them "
+            "is the array the gateway compiles, and this check cannot tell which."
+        )
+    match = DECLARATION.search(source)
     if match is None:
         sys.exit(f"{MAPPING}: no ENTITY_TYPES declaration found")
     declared, entries = int(match.group(1)), ENTRY.findall(match.group(2))
-    # The array's own length, cross-checked against the entries read out of it.
-    # This is the half that does not depend on knowing every way to hide a name:
-    # whatever the trick, an entry the compiler does not see is one the length
-    # does not count, and a length that disagrees with the array does not build.
-    # So a name visible to only one of the two sides shows up here as a miscount
-    # — `#[cfg(...)]` on an entry does, and no comment rule would have caught it
-    # — and a name both sides see is compared below. The anchor is the written
-    # length: were `ENTITY_TYPES` ever to become a slice with no length in its
-    # type, the pattern above stops matching and this script exits saying so
-    # rather than quietly losing half its guarantee.
+    # The array's own length, against the entries read out of it. Three versions
+    # of this check in a row were defeated by a way of hiding a name that nobody
+    # had listed — a `//` comment quoting one, then a one-line `/* */`, then a
+    # `/* */` spanning lines with the entry inside it — and each fix answered
+    # only the example it was given. This one needs no list: the length is in
+    # the type and rustc holds it to the elements, so a name that only one of
+    # the two readers can see is a miscount here, whatever hid it. Nothing below
+    # depends on knowing what a comment looks like.
+    #
+    # The anchor is the written length. Were `ENTITY_TYPES` ever to become a
+    # slice with no length in its type, the pattern above stops matching and
+    # this script exits saying so, rather than quietly losing half its guarantee.
     if len(entries) != declared:
         sys.exit(
-            f"{MAPPING}: ENTITY_TYPES declares {declared} entries and {len(entries)} "
-            "were read from it. One of them is written in a way this check cannot "
-            "see — reformat the array to one quoted name per line."
+            f"{MAPPING}: ENTITY_TYPES is declared with {declared} entries and "
+            f"{len(entries)} were read from it. Either an entry is commented out "
+            "or written in a way this check cannot see, or the length no longer "
+            "matches the array. One quoted name per line reconciles them."
         )
     return set(entries)
 
