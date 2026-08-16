@@ -22,12 +22,18 @@ pub enum MappingError {
     BadSpan(&'static str),
 }
 
-/// The longest entity type that can be written as a placeholder. Restoration in
-/// a stream holds back a bounded number of bytes while a token completes, so a
-/// placeholder longer than that bound would be released as ordinary text and
-/// reach the client unrestored. Bounding it here makes that impossible rather
-/// than unlikely: `[` + 40 + `_` + at most 20 digits + `]` is 63 bytes, inside
-/// `stream::MAX_HELD`.
+/// The longest entity type that can be written as a placeholder.
+///
+/// Nothing in this module checks it against an incoming type any more: a name
+/// is taken only when it is in `ENTITY_TYPES`, and what holds that list to this
+/// bound is `every_declared_type_fits_a_streamed_placeholder` below. The bound
+/// is worth asserting because restoration in a stream holds back a fixed number
+/// of bytes while a token completes, so a longer name would be released as
+/// ordinary text and reach the client unrestored: `[` + 40 + `_` + at most 20
+/// digits + `]` is 63 bytes, inside `stream::MAX_HELD`.
+///
+/// Its one use at runtime is `audit::is_entity_type`, bounding what may become
+/// a key in the journal.
 pub const MAX_ENTITY_TYPE: usize = 40;
 
 /// The entity types this gateway's detector declares — eight from its
@@ -442,21 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn a_type_too_long_to_survive_a_stream_is_masked_rather_than_refused() {
-        // A name longer than MAX_ENTITY_TYPE cannot be in the vocabulary — the
-        // test above proves that of the list — so it takes the same path as any
-        // other unknown type and never reaches the stream's hold-back buffer.
-        let long = "A".repeat(MAX_ENTITY_TYPE + 1);
-        let mut mapping = Mapping::new();
-        assert_eq!(
-            mapping
-                .mask("Weber", &[span(&long, 0, 5)])
-                .expect("masked, not refused"),
-            "[REDACTED_1]"
-        );
-    }
-
-    #[test]
     fn masking_is_offset_correct_on_multibyte_text() {
         // The detector counts characters; Rust slices bytes.
         let mut mapping = Mapping::new();
@@ -581,6 +572,22 @@ mod tests {
                 masked,
                 format!("[{entity_type}_1]"),
                 "{entity_type} did not keep its name"
+            );
+        }
+    }
+
+    #[test]
+    fn every_name_a_placeholder_can_carry_is_one_restoration_recognises() {
+        // What is left of the old `[A-Z_]` input check, moved to the only names
+        // that can still reach a placeholder: the list, and the fallback every
+        // other type — empty, lower-case, longer than MAX_ENTITY_TYPE — is
+        // masked under. `is_placeholder` is what restoration uses to decide a
+        // token is ours, so a name it does not admit would mask cleanly and
+        // then be handed to the client instead of the value, as a success.
+        for entity_type in ENTITY_TYPES.iter().chain([&REDACTED_TYPE]) {
+            assert!(
+                is_placeholder(&format!("[{entity_type}_1]")),
+                "{entity_type} cannot be written as a placeholder restoration recognises"
             );
         }
     }
