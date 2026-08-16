@@ -23,6 +23,11 @@ jobs:
       - run: uv run pytest
       - run: uv run ruff check . ../evaluation
       - run: uv run mypy src
+      # The gateway keeps its own copy of the entity-type vocabulary, because
+      # asking the detector which types it emits would be worthless against a
+      # detector that lies. The copy is only safe while something notices it
+      # drifting.
+      - run: uv run python ../scripts/check_entity_types.py
       # The committed corpus must regenerate byte-identical (seeded) — this
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
