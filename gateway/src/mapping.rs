@@ -83,6 +83,10 @@ pub struct Mapping {
     /// they map to themselves and name nobody.
     order: Vec<String>,
     next: usize,
+    /// How many spans arrived with a type outside our vocabulary. Reported once
+    /// per request rather than per span: a detector that disagrees about types
+    /// disagrees about all of them, and one line per span would be a flood.
+    redacted: usize,
 }
 
 impl Mapping {
@@ -98,6 +102,11 @@ impl Mapping {
 
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// How many spans this mapping had to mask under the generic type.
+    pub fn redacted_count(&self) -> usize {
+        self.redacted
     }
 
     pub fn mask(&mut self, text: &str, spans: &[Span]) -> Result<String, MappingError> {
@@ -197,6 +206,7 @@ impl Mapping {
         let entity_type = if ENTITY_TYPES.contains(&entity_type) {
             entity_type
         } else {
+            self.redacted += 1;
             REDACTED_TYPE
         };
         // Skip numbers already taken by a literal in the caller's own text.
@@ -589,6 +599,16 @@ mod tests {
         // A detector returning REDACTED would be indistinguishable from the
         // gateway's own fallback, so the vocabulary must not contain it.
         assert!(!ENTITY_TYPES.contains(&REDACTED_TYPE));
+    }
+
+    #[test]
+    fn the_mapping_counts_what_it_had_to_redact() {
+        let mut mapping = Mapping::new();
+        mapping
+            .mask("WEBER Weber", &[span("WEBER", 0, 5), span("PERSON", 6, 11)])
+            .expect("masked");
+
+        assert_eq!(mapping.redacted_count(), 1, "one unknown type, one count");
     }
 
     #[test]

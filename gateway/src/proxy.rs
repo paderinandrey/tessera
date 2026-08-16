@@ -196,6 +196,16 @@ async fn mask_all(
     for (entity_type, _) in distinct {
         *types.entry(entity_type).or_default() += 1;
     }
+    if mapping.redacted_count() > 0 {
+        // The count, never the name: the name is the untrusted string this
+        // check exists to keep out of anything we write down. A detector and a
+        // gateway that disagree about what a type is should not wait for an
+        // audit to be noticed.
+        tracing::warn!(
+            count = mapping.redacted_count(),
+            "the detector reported entity types outside this gateway's vocabulary"
+        );
+    }
     Ok((masked, total, types))
 }
 
