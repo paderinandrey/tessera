@@ -515,6 +515,19 @@ mod tests {
     }
 
     #[test]
+    fn absorb_does_not_carry_the_redacted_count_into_the_session() {
+        // The count describes one request. A session that inherited it would
+        // repeat an old request's disagreement on every later turn, forever.
+        let mut session = Mapping::new();
+        let mut work = session.clone();
+        work.mask("WEBER", &[span("WEBER", 0, 5)]).unwrap();
+        assert_eq!(work.redacted_count(), 1);
+
+        session.absorb(&work, 10);
+        assert_eq!(session.redacted_count(), 0);
+    }
+
+    #[test]
     fn a_clone_does_not_write_back_to_its_source() {
         let session = Mapping::new();
         let mut work = session.clone();
