@@ -113,7 +113,9 @@ The constant exists because streaming restoration holds back a bounded number of
 bytes while a token completes, so a placeholder longer than that bound would be
 released as ordinary text and reach the client unrestored. That reasoning is
 about `stream::MAX_HELD`, not about what the detector sends, and it survives the
-list unchanged — a `debug_assert` that no name in the vocabulary exceeds it.
+list unchanged — a test that no name in the vocabulary exceeds it. A test rather
+than a `debug_assert`, which does not run in a release build and so would assert
+nothing in the only build that serves traffic.
 
 ## Behaviour
 
@@ -129,17 +131,24 @@ One `tracing::warn!` per request that contained an unknown type, carrying the
 count. **Not the name** — the name came from outside the perimeter and is exactly
 what this design refuses to write down.
 
-### The journal's own check stays
+### The journal's own check stays, and remains the only one on its path
 
-`Record::detected` already buckets illegible keys under `unvalidated`, and that
-check is load-bearing today: `placeholder_for` returns the cached placeholder on
-a `by_value` hit *before* validating the type, so a value masked earlier in the
-same request carries the detector's string past the mapping untouched.
+`Record::detected` buckets illegible keys under `unvalidated`, and this design
+does not remove it. Both checks remain because masking and audit must not depend
+on each other — a future change to one should not silently widen the other.
 
-This design does not remove it. Both checks remain because masking and audit
-must not depend on each other — a future change to one should not silently widen
-the other. After this slice the journal's check becomes a second line rather
-than the only thing between a detector's string and the evidence file.
+That independence is not an aspiration here, it is the wiring: `proxy.rs` clones
+`span.entity_type` from the detector's response to build `types` *before*
+`mapping.mask` runs, so the vocabulary is not on the journal's path at all.
+Nothing this design adds stands between a detector's string and the evidence
+file. `Record::detected`'s own comment says so and is correct.
+
+What follows is that a legible name the vocabulary does not declare — `WEBER` —
+reaches a journal line while the provider receives `[REDACTED_1]`. The masked
+record therefore carries the mapping's redacted count beside `types`, so the
+divergence is recorded rather than left for an auditor to discover as a
+mismatch. The count is passed in; `types` is still built without consulting the
+mapping.
 
 ## Drift protection
 

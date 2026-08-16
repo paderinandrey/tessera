@@ -199,7 +199,7 @@ unmasked is forwarded, and no placeholder is ever handed to the client in place 
 No error body or log line carries the submitted text.
 
 Placeholders carry the type the detector reported, but only when it is one this gateway
-declares — twenty-two of them, the catalog's eight checksum-validated identifiers plus the
+declares — twenty-two of them, the catalog's eight deterministic identifiers plus the
 fourteen the NER layer can label. A type outside that list is masked as `[REDACTED_1]`
 instead. Syntax cannot tell a type name from a value shaped like one: a detector returning
 `WEBER` as the type of a span covering `WEBER` would otherwise put that value in the token

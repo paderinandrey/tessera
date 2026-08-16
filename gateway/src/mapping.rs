@@ -46,7 +46,7 @@ pub const MAX_ENTITY_TYPE: usize = 40;
 /// catalogs disagree, so adding a type stays a deliberate change in two places
 /// rather than a silent divergence.
 pub const ENTITY_TYPES: [&str; 22] = [
-    // Deterministic, checksum-validated (identifiers.yaml)
+    // Deterministic (identifiers.yaml)
     "CH_AVS",
     "CREDIT_CARD",
     "DE_STEUERNUMMER",
