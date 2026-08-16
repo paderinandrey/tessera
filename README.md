@@ -41,10 +41,90 @@ tessera/
                validation, NER (GLiNER/ONNX), context boosting. Stable HTTP contract.
   gateway/     Rust reverse proxy: drop-in base URL for OpenAI- and Anthropic-shaped
                requests, placeholder substitution and restoration, buffered and
-               streamed. Sessions and audit are the next slices.
-  evaluation/  Public synthetic corpus and metrics harness (planned). The manually
-               annotated corpus stays private and never enters this repository.
+               streamed, with per-conversation sessions and an audit journal built in.
+  evaluation/  Public synthetic corpus and metrics harness. The manually annotated
+               corpus stays private and never enters this repository.
 ```
+
+## Running it
+
+Two containers, and nothing else to install:
+
+```
+docker compose run --rm weights           # once: 2 GB of NER weights
+docker compose up -d --build              # gateway on 127.0.0.1:${TESSERA_PORT:-8080}
+```
+
+**Download the weights first.** The detector builds its pipeline once, at
+startup, because loading the model takes seconds and paying that per request
+would be absurd — so a detector that started without weights stays
+deterministic-only until it is restarted, however much you download afterwards.
+Adding them to a running stack therefore needs `docker compose restart detector`,
+and skipping that restart is the one way to end up with a successful 2 GB
+download, a gateway that looks installed, and names, places and health mentions
+still reaching the provider unmasked.
+
+The gateway does serve before the weights are there, deliberately. Without them
+the detector runs its deterministic layer alone — checksum-validated
+identifiers, the layer that scores 1.000 — and a partial install stays visible
+rather than silent: the detector's own `GET /health` reports `ner: false` and
+why, though it answers only on the compose network, never on the host. The
+download is a separate command on purpose: a gateway that belongs inside your
+perimeter should not reach the internet on its own, and a first start that
+blocks for minutes is indistinguishable from one that has hung. It is the same
+download `make model` does for a local, non-containerized detector; here it lands on a named volume,
+so it is a one-time cost per host rather than a cost of every `up`.
+
+Only the gateway is published, and on `${TESSERA_PORT:-8080}` rather than a
+fixed `8080` — a variable, because a host that already has something bound to
+8080 should not have to edit a file to try Tessera; set `TESSERA_PORT` before
+`up` to use another port instead. The host address is a variable too, and
+defaults to loopback: the gateway authenticates no caller, it forwards
+whatever credential arrives, so reaching it from beyond this host is a
+deliberate act — `TESSERA_BIND=0.0.0.0` — and never a side effect of the
+default. It holds no key of its own, so what you publish is not your provider
+credit but an unauthenticated relay out through your egress and into a journal
+whose worth is that it records your traffic and not a stranger's: strangers can
+fill the session table until legitimate callers are refused with a 503, and
+anyone who already holds one of your callers' keys can guess a session id — they
+are chosen by the client and need not be secret — and read that conversation's
+real values back out of its table, which going to the provider directly would
+never have given them. Put an authenticating proxy in front of it before you do.
+The detector answers on the compose network and nowhere else: `POST /detect`
+takes arbitrary text and authenticates nobody, so exposing it would be a way to
+run text through the model outside the gateway, and therefore outside the audit
+journal.
+
+The journal and its salt share the `audit` volume and must stay together — a
+journal with records whose salt has gone missing refuses to start rather than
+silently renumbering every tenant beneath you. Back up that volume, not just
+the file. `docker compose down` stops the stack and keeps the journal, its
+salt and the downloaded weights; add `-v` only when you mean to discard them
+— journal and salt together, since one without the other is what refuses to
+start back up.
+
+### Seeing it work without an API key
+
+```
+export TESSERA_PORT=${TESSERA_PORT:-8080}
+docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml up -d --build
+curl -X POST http://127.0.0.1:${TESSERA_PORT}/v1/chat/completions \
+  -H 'content-type: application/json' -H 'authorization: Bearer sk-demo' \
+  -d '{"messages":[{"role":"user","content":"Meine IBAN lautet CH9300762011623852957."}]}'
+```
+
+The overlay replaces the provider with a stand-in that records what reached it,
+so one request shows both directions at once:
+
+```
+docker compose -f docker-compose.yml -f deploy/docker-compose.demo.yml \
+  exec mock-provider cat /received/received.json
+```
+
+The answer you got back carries the real IBAN. What the provider received
+carries a placeholder in its place, never the value itself. `make compose-smoke`
+asserts exactly that, plus that the journal recorded the request without
+quoting any of it.
 
 ## CLI
 
@@ -59,7 +139,7 @@ Found values are masked by default (`FR76…89`) so a saved report is not itself
 a PII leak; `--show-values` prints them verbatim.
 
 The NER layer (PERSON, LOCATION, ORG) runs automatically when its weights are present
-(`make model`, several hundred megabytes, cached under `~/.cache/tessera/models`).
+(`make model`, 2 GB, cached under `~/.cache/tessera/models`).
 Without them the scan runs the deterministic layer alone and says so; `--ner` makes their
 absence an error, `--no-ner` skips the layer even when they are installed.
 
@@ -412,7 +492,10 @@ stable signal and p95 as an upper bound until these run on dedicated hardware.
 
 ## Status
 
-Early development — Wave 0 (detector core). Not ready for production use.
+Early development. The detector, the gateway — sessions, streaming, the audit
+journal — and the two-container stack above all work end to end. Not ready for
+production use: the gateway authenticates no caller, and nothing here has been
+run in anger.
 
 ## License
 

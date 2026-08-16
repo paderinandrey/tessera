@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -438,8 +438,21 @@ async fn serve(
     }
 }
 
+/// Liveness for an orchestrator: this process is up, and it is up *with* a
+/// journal, since `main` opens the journal before it binds and a failure
+/// there stops the process rather than starting one that proves nothing.
+///
+/// It deliberately reports nothing about the detector. This endpoint takes no
+/// credential, so probing the detector from here would be a way to drive
+/// detection without one; and a detector outage refuses individual requests
+/// by design rather than making this gateway unhealthy.
+async fn health() -> Response {
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/health", get(health))
         .route("/v1/chat/completions", post(openai))
         .route("/v1/messages", post(anthropic))
         .with_state(state)
@@ -2566,5 +2579,77 @@ mod tests {
         assert_eq!(lines.len(), 2, "the dropped handle still writes its line");
         assert_eq!(lines[1]["result"], "stream_failed");
         assert_eq!(lines[1]["error"], "stream_broken");
+    }
+
+    #[tokio::test]
+    async fn health_answers_without_a_credential() {
+        // An orchestrator has no API key and must still be able to ask.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("routed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_does_not_drive_the_detector() {
+        // An unauthenticated endpoint that reached the detector on request
+        // would be a way to run detection without a credential — and a
+        // detector outage is a per-request refusal by design, not a reason to
+        // call this gateway unhealthy.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("routed");
+
+        assert!(
+            detector
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "health must not call the detector"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_writes_no_audit_record() {
+        // A liveness probe runs every few seconds forever. Journaling it would
+        // bury the evidence under lines about nothing.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("routed");
+
+        let journal = std::fs::read_to_string(&path).expect("readable");
+        assert!(journal.is_empty(), "health wrote to the journal: {journal}");
     }
 }

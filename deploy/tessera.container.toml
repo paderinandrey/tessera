@@ -1,0 +1,22 @@
+# The gateway's configuration inside the compose stack. Three values differ
+# from gateway/tessera.example.toml, and each has to:
+#
+#   - detector_url names the compose service, not loopback;
+#   - audit_path points inside the audit volume, which is also where the
+#     salt file lands — they must share one volume, because a journal with
+#     lines and no salt beside it refuses to start;
+#   - bind is 0.0.0.0, because a container that binds loopback is
+#     unreachable from outside itself.
+
+bind = "0.0.0.0:8080"
+detector_url = "http://detector:8000"
+detector_timeout_secs = 30
+
+openai_base = "https://api.openai.com"
+anthropic_base = "https://api.anthropic.com"
+
+session_idle_secs = 1800
+max_sessions = 1000
+max_session_values = 1000
+
+audit_path = "/var/lib/tessera/audit.jsonl"

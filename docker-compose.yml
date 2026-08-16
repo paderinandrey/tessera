@@ -1,0 +1,78 @@
+# Two services run by default. Only the gateway publishes a port: /detect
+# takes arbitrary text and authenticates nobody, so exposing it would hand
+# out a way to run text through the model outside the gateway — and
+# therefore outside the journal.
+
+services:
+  detector:
+    build: ./detector
+    image: tessera-detector:dev
+    volumes:
+      # Mounted where find_model() already looks. Read-only: only the
+      # `weights` service writes here.
+      - models:/home/tessera/.cache/tessera/models:ro
+    healthcheck:
+      # No shell HTTP client in a slim Python image, and none needed.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      # With weights present the model loads before /health answers, and 2 GB
+      # of ONNX takes a while.
+      start_period: 180s
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    image: tessera-gateway:dev
+    depends_on:
+      detector:
+        condition: service_healthy
+    ports:
+      # The host port is a variable because 8080 is a popular port and a
+      # machine that already runs something there would otherwise have to
+      # edit this file to try Tessera at all. The default keeps every
+      # documented command working unchanged.
+      #
+      # The host address is a variable too, defaulting to loopback: the
+      # gateway authenticates no caller, it forwards whatever credential
+      # arrives, so publishing it beyond the host has to be a deliberate
+      # act, not a side effect of a default with no host IP in it.
+      - "${TESSERA_BIND:-127.0.0.1}:${TESSERA_PORT:-8080}:8080"
+    volumes:
+      - audit:/var/lib/tessera
+      - ./deploy/tessera.container.toml:/etc/tessera/tessera.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot, and under a profile so `up` ignores it:
+  #   docker compose run --rm weights
+  # A gateway sold into a closed perimeter should not reach the internet on
+  # its own, and a first `up` that silently blocks on 2 GB is
+  # indistinguishable from one that has hung.
+  weights:
+    profiles: ["setup"]
+    build: ./detector
+    image: tessera-detector:dev
+    volumes:
+      - models:/home/tessera/.cache/tessera/models
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        from huggingface_hub import snapshot_download
+        from tessera_detector.models import HF_REPO_ID, HF_REVISION, model_cache_dir
+        p = model_cache_dir()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        snapshot_download(HF_REPO_ID, revision=HF_REVISION, local_dir=str(p),
+                          ignore_patterns=["onnx/model_*.onnx"])
+        print("weights in", p)
+
+volumes:
+  models:
+  # The journal and its salt both live here. They must not be separated.
+  audit:
