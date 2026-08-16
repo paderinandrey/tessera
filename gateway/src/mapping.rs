@@ -24,6 +24,10 @@ pub enum MappingError {
         "entity type {0:?} cannot be written as a restorable placeholder; the request is \
              refused rather than masked with a token restoration would not recognize"
     )]
+    // Nothing constructs this once an unrecognised type masks as REDACTED
+    // instead of refusing. Left in place for the audit class in proxy.rs
+    // that still names it; what replaces it is a later change, not this one.
+    #[allow(dead_code)]
     BadEntityType(String),
 }
 
@@ -34,6 +38,49 @@ pub enum MappingError {
 /// than unlikely: `[` + 40 + `_` + at most 20 digits + `]` is 63 bytes, inside
 /// `stream::MAX_HELD`.
 pub const MAX_ENTITY_TYPE: usize = 40;
+
+/// The entity types this gateway's detector declares — eight from its
+/// identifier catalog and fourteen from its NER configuration.
+///
+/// The list lives here, and not behind a question to the detector, because the
+/// detector's response is what it defends against: a compromised one asked to
+/// declare its own vocabulary would simply declare a submitted value to be a
+/// type. `scripts/check_entity_types.py` fails CI when this list and the
+/// catalogs disagree, so adding a type stays a deliberate change in two places
+/// rather than a silent divergence.
+pub const ENTITY_TYPES: [&str; 22] = [
+    // Deterministic, checksum-validated (identifiers.yaml)
+    "CH_AVS",
+    "CREDIT_CARD",
+    "DE_STEUERNUMMER",
+    "DE_STEUER_ID",
+    "EMAIL",
+    "FR_NIF",
+    "FR_NIR",
+    "IBAN",
+    // Quasi-identifiers (ner.yaml)
+    "LOCATION",
+    "ORG",
+    "PERSON",
+    // GDPR Article 9 special categories (ner.yaml)
+    "BIOMETRIC",
+    "ETHNICITY",
+    "GENETIC",
+    "HEALTH",
+    "PHILOSOPHICAL_BELIEF",
+    "POLITICAL_AFFILIATION",
+    "POLITICAL_OPINION",
+    "RELIGION",
+    "SEXUAL_ORIENTATION",
+    "SEX_LIFE",
+    "TRADE_UNION",
+];
+
+/// What a span masks as when its type is not one of ours. The value is hidden
+/// either way; what is lost is the model knowing what kind of thing it was.
+/// Deliberately absent from the detector's catalogs — a detector returning it
+/// would be indistinguishable from this fallback.
+pub const REDACTED_TYPE: &str = "REDACTED";
 
 #[derive(Debug, Default, Clone)]
 pub struct Mapping {
@@ -152,18 +199,15 @@ impl Mapping {
         if let Some(existing) = self.by_value.get(&value) {
             return Ok(existing.clone());
         }
-        // The detector's entity_type is an unrestricted string, but only types
-        // matching the restoration grammar produce a token restoration will
-        // recognize. Anything else would sail through masked and come back
-        // unrestored, so it refuses instead.
-        if entity_type.is_empty()
-            || entity_type.len() > MAX_ENTITY_TYPE
-            || !entity_type
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c == '_')
-        {
-            return Err(MappingError::BadEntityType(entity_type.to_owned()));
-        }
+        // Syntax cannot tell a type name from a value shaped like one, and
+        // `WEBER` for a span covering WEBER passes any grammar. So the name is
+        // taken only when it is one we declared; anything else is still masked,
+        // under a name that carries nothing of the value.
+        let entity_type = if ENTITY_TYPES.contains(&entity_type) {
+            entity_type
+        } else {
+            REDACTED_TYPE
+        };
         // Skip numbers already taken by a literal in the caller's own text.
         let placeholder = loop {
             self.next += 1;
@@ -486,5 +530,80 @@ mod tests {
         // nobody, and a session that remembered it would restore it to itself
         // for every later caller of this conversation.
         assert!(session.restore("[PERSON_9]").is_err());
+    }
+
+    #[test]
+    fn a_value_masquerading_as_a_type_does_not_reach_the_placeholder() {
+        // The leak this slice exists for: a detector that returns the span's
+        // own value as its type would otherwise put that value in the token
+        // the provider receives.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask("WEBER", &[span("WEBER", 0, 5)])
+            .expect("an unknown type is masked, not refused");
+
+        assert_eq!(masked, "[REDACTED_1]");
+        assert!(
+            !masked.contains("WEBER"),
+            "the submitted value reached the placeholder: {masked}"
+        );
+    }
+
+    #[test]
+    fn every_declared_type_keeps_its_own_name() {
+        // Without this, a fix that rejects everything passes the test above.
+        for entity_type in ENTITY_TYPES {
+            let mut mapping = Mapping::new();
+            let masked = mapping
+                .mask("Weber", &[span(entity_type, 0, 5)])
+                .expect("a declared type masks");
+            assert_eq!(
+                masked,
+                format!("[{entity_type}_1]"),
+                "{entity_type} did not keep its name"
+            );
+        }
+    }
+
+    #[test]
+    fn two_unknown_types_stay_distinguishable() {
+        // REDACTED draws from the shared counter, so two values do not collapse
+        // into one token and tell the model they are the same thing.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask("WEBER MEIER", &[span("WEBER", 0, 5), span("MEIER", 6, 11)])
+            .expect("both are masked");
+
+        assert_eq!(masked, "[REDACTED_1] [REDACTED_2]");
+    }
+
+    #[test]
+    fn an_unknown_type_restores_to_its_value() {
+        // Masking under a generic name must not cost restoration.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask("WEBER", &[span("WEBER", 0, 5)])
+            .expect("masked");
+        assert_eq!(mapping.restore(&masked).expect("restores"), "WEBER");
+    }
+
+    #[test]
+    fn redacted_is_not_a_type_the_detector_can_claim() {
+        // A detector returning REDACTED would be indistinguishable from the
+        // gateway's own fallback, so the vocabulary must not contain it.
+        assert!(!ENTITY_TYPES.contains(&REDACTED_TYPE));
+    }
+
+    #[test]
+    fn every_declared_type_fits_a_streamed_placeholder() {
+        // MAX_ENTITY_TYPE stops being an input check and becomes an assertion
+        // about this list: a longer name would be released as ordinary text by
+        // the stream's hold-back buffer and reach the client unrestored.
+        for entity_type in ENTITY_TYPES {
+            assert!(
+                entity_type.len() <= MAX_ENTITY_TYPE,
+                "{entity_type} is too long to survive a stream"
+            );
+        }
     }
 }
