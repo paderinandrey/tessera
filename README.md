@@ -191,11 +191,21 @@ the problem is visible there. A detector that errors or exceeds its timeout; a b
 shape the gateway has no rule for, including tool definitions, tool traffic, Anthropic's
 extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
 OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
-span the detector reports that cannot be applied; and a placeholder in the response that no
+span the detector reports at a position that cannot be applied — inverted, past the end of the
+text, or overlapping another; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing
 unmasked is forwarded, and no placeholder is ever handed to the client in place of a value.
 No error body or log line carries the submitted text.
+
+Placeholders carry the type the detector reported, but only when it is one this gateway
+declares — twenty-two of them, the catalog's eight checksum-validated identifiers plus the
+fourteen the NER layer can label. A type outside that list is masked as `[REDACTED_1]`
+instead. Syntax cannot tell a type name from a value shaped like one: a detector returning
+`WEBER` as the type of a span covering `WEBER` would otherwise put that value in the token
+the provider receives. The gateway keeps its own copy of the list rather than asking the
+detector, since the detector's answer is what the check defends against, and CI fails if the
+two drift apart.
 
 ### Sessions
 
