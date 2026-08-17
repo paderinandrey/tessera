@@ -352,6 +352,80 @@ mod tests {
     }
 
     #[test]
+    fn numbering_runs_across_types_rather_than_per_type() {
+        // One counter for the whole mapping, so the number says "the nth value
+        // this mapping saw" and not "the nth PERSON". A per-type counter would
+        // read more naturally and would also make the number a function of the
+        // type mix, which is what the two tests below rely on it not being.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask(
+                "Weber DE89370400440532013000",
+                &[span("PERSON", 0, 5), span("IBAN", 6, 28)],
+            )
+            .unwrap();
+        assert_eq!(masked, "[PERSON_1] [IBAN_2]");
+    }
+
+    #[test]
+    fn a_growing_prefix_reissues_the_same_numbers() {
+        // What lets a client work without `X-Tessera-Session` at all. A harness
+        // resends the whole conversation every turn and gets a fresh mapping
+        // each time; numbers are assigned by order of first appearance, and an
+        // appended turn leaves that order alone, so the numbering reproduces
+        // itself with no store behind it. Numbering that depended on anything
+        // but appearance order would take that away silently.
+        let mut turn_one = Mapping::new();
+        let first = turn_one
+            .mask(
+                "Weber und Bauer",
+                &[span("PERSON", 0, 5), span("PERSON", 10, 15)],
+            )
+            .unwrap();
+        assert_eq!(first, "[PERSON_1] und [PERSON_2]");
+
+        let mut turn_two = Mapping::new();
+        let second = turn_two
+            .mask(
+                "Weber und Bauer und Klein",
+                &[
+                    span("PERSON", 0, 5),
+                    span("PERSON", 10, 15),
+                    span("PERSON", 20, 25),
+                ],
+            )
+            .unwrap();
+        assert_eq!(second, "[PERSON_1] und [PERSON_2] und [PERSON_3]");
+    }
+
+    #[test]
+    fn a_truncated_prefix_renumbers_but_stays_self_consistent() {
+        // A harness trims history to fit its context window, which changes who
+        // appears first: Bauer was the second value last turn and is the first
+        // one now. That is safe only because the request is masked and restored
+        // through one mapping and the client holds the real values, so there is
+        // no cross-request placeholder continuity to violate. The round-trip is
+        // the half worth asserting — the number alone proves nothing.
+        let mut turn_one = Mapping::new();
+        assert_eq!(
+            turn_one
+                .mask(
+                    "Weber und Bauer",
+                    &[span("PERSON", 0, 5), span("PERSON", 10, 15)]
+                )
+                .unwrap(),
+            "[PERSON_1] und [PERSON_2]"
+        );
+
+        let mut truncated = Mapping::new();
+        let masked = truncated
+            .mask("Bauer allein", &[span("PERSON", 0, 5)])
+            .unwrap();
+        assert_eq!(masked, "[PERSON_1] allein");
+        assert_eq!(truncated.restore(&masked).unwrap(), "Bauer allein");
+    }
+
+    #[test]
     fn restoring_puts_the_values_back() {
         let mut mapping = Mapping::new();
         mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap();
