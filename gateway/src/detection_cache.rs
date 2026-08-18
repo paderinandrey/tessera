@@ -99,6 +99,17 @@ impl DetectionCache {
         self.digest(&[key.version, key.tenant, key.text].concat())
     }
 
+    // A separate method rather than a block inside `get`, because a function
+    // body is a scope no later edit can accidentally widen: the guard this
+    // acquires is dropped when this call returns, full stop, with no local
+    // in the caller for a future edit to hold onto. `get` cannot lock
+    // `self.inner` again while still holding a guard from this call —
+    // `Mutex` is not reentrant, and doing so would deadlock the very next
+    // acquisition it makes.
+    fn known_version(&self) -> Option<Digest32> {
+        self.inner.lock().ok()?.known_version
+    }
+
     fn key(&self, version: Digest32, credential: Option<&[u8]>, text: &str) -> Key {
         Key {
             version,
@@ -136,14 +147,9 @@ impl DetectionCache {
         // three digests, so a stale key can at worst produce a stale but
         // exact hit for this same text, never someone else's.
         //
-        // Scoped so the guard is dropped before the hashing below. A
-        // `let`-bound guard here would live to the end of the method, and
-        // the second acquisition would deadlock against it — `Mutex` is not
-        // reentrant.
-        let version = {
-            let inner = self.inner.lock().ok()?;
-            inner.known_version?
-        };
+        // `known_version()` returns rather than lending its guard, so there
+        // is no guard here for this method to hold across the hashing below.
+        let version = self.known_version()?;
         let key = self.key(version, credential, text);
         // A second poisoning, in the window between the two acquisitions
         // above, is defence in depth rather than a proven path: no test

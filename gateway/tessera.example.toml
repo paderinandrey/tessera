@@ -40,6 +40,16 @@ audit_path = "tessera-audit.jsonl"
 # each turn, so without this a ten-turn conversation pays for its first turn ten
 # times. Entries hold a digest of the text and the spans found in it — never the
 # text itself — and are invalidated automatically when the detector's weights or
-# catalogs change. Roughly 300 bytes each, so the default is single-digit
-# megabytes. Zero disables it.
+# catalogs change.
+#
+# This key bounds how many entries the cache holds, not how much memory it
+# uses: an entry costs about 130 bytes fixed plus about 65 per span found in
+# the text, and nothing here bounds span count. For chat-shaped text — a turn
+# with a name or two — that is roughly 300 bytes an entry, so the default
+# costs a few megabytes. A span-dense text does not fit that shape: a 20 KB
+# tool result with an entity every 25 characters is around 800 spans, on the
+# order of 50 KB in that one entry alone, and the default ceiling of it would
+# be hundreds of megabytes. A deployment that expects large tool results
+# should size this by expected spans per text, not by entry count. Zero
+# disables it.
 detection_cache_entries = 10000
