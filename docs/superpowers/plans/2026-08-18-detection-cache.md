@@ -838,7 +838,9 @@ Run each of these one at a time, restoring after each:
 2. In `insert`, replace `min_by_key(|(_, entry)| entry.used)` with `max_by_key(...)`: `saturation_evicts_the_least_recently_used` FAILS.
 3. In `get`, delete `entry.used = clock;`: `saturation_evicts_the_least_recently_used` FAILS.
 4. Replace the random salt with `[0u8; 32]`: `two_gateways_do_not_agree_on_a_key` FAILS.
-5. In `get`, replace `let version = inner.known_version?;` with a default of `[0u8; 32]`: `nothing_is_known_before_the_first_insert` FAILS.
+5. ~~In `get`, replace `let version = inner.known_version?;` with a default of `[0u8; 32]`.~~ **Struck: this mutation proves nothing and no test can be written that it would break.** `insert` is the only writer of `entries` and sets `known_version` before inserting, so `known_version.is_none()` implies `entries.is_empty()` — a `get` against an empty map misses whatever key it computes, and the guard's effect is fully shadowed. Keep the `?`: it is structurally required, because a `Key` cannot be built without a version, and it is the only honest expression of "no version, no key". Its unobservability is a property of the rest of the implementation, not a defect in the guard. The same applies to `get`'s `capacity == 0` guard, which `insert`'s guard makes equally unobservable. Both deserve a comment, not a test.
+
+Three further invariants are real, unproven by the four mutations above, and each needs a test — the poisoned-lock degradation in both `get` and `insert`, the `!contains_key` guard in the eviction condition, and the clock bump in `insert`. See Task 4's fix round in the ledger for the tests that close them.
 
 Record which mutation broke which test — it goes in the commit message.
 
