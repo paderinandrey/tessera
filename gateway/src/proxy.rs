@@ -978,6 +978,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_credential_is_asked_again_through_the_proxy() {
+        // `detector.rs`'s own tests prove `DetectorClient::detect` separates
+        // tenants; this proves the wiring between `handle` and `detect` does
+        // not drop that separation on the way down. `detector_returning`
+        // answers a partial run, which never caches anything, so this needs
+        // its own complete-run mock rather than that helper.
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": [], "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let body = json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber"}]});
+
+        let (status_a, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &[("authorization", "Bearer a")],
+        )
+        .await;
+        let (status_b, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            body,
+            &[("authorization", "Bearer b")],
+        )
+        .await;
+
+        assert_eq!(status_a, StatusCode::OK);
+        assert_eq!(status_b, StatusCode::OK);
+        // `expect(2)` is asserted when `detector` drops.
+    }
+
+    #[tokio::test]
     async fn headers_outside_the_allowlist_are_not_forwarded() {
         // A client's cookies are not the model provider's business.
         let detector = detector_returning(json!([])).await;

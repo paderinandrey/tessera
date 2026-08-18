@@ -51,8 +51,6 @@ pub struct Config {
     /// cache, which is a memory budget rather than a mistake: the gateway then
     /// calls the detector for every text, as it did before the cache existed.
     #[serde(default = "default_detection_cache_entries")]
-    // Unread until the cache (a later task) wires the cache store in.
-    #[allow(dead_code)]
     pub detection_cache_entries: usize,
 }
 

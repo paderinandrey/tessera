@@ -310,4 +310,50 @@ mod tests {
         assert!(client.detect("Weber", credential).await.is_err());
         assert!(client.detect("Weber", credential).await.is_err());
     }
+
+    #[tokio::test]
+    async fn another_credential_is_asked_again() {
+        // `detection_cache.rs::another_credential_does_not_see_the_entry` proves
+        // the store keys by credential; this proves `detect` actually hands it
+        // the caller's credential on both the read and the write, rather than,
+        // say, a normalized or truncated copy that collapses every tenant into
+        // one bucket.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [], "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let a: Option<&[u8]> = Some(b"Bearer a");
+        let b: Option<&[u8]> = Some(b"Bearer b");
+        client.detect("Weber", a).await.unwrap();
+        client.detect("Weber", b).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_different_text_is_asked_again() {
+        // The companion to `a_repeated_text_does_not_reach_the_detector_twice`:
+        // that test would still pass if `detect` keyed the cache on something
+        // constant instead of the text, because it only ever sends one text.
+        // This one sends two, so a constant key would wrongly answer the
+        // second from the first's entry — which `Mapping::mask` would then
+        // apply to the wrong text.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [], "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+        client.detect("Weber", credential).await.unwrap();
+        client.detect("Schmidt", credential).await.unwrap();
+    }
 }
