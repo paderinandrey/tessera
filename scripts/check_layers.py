@@ -22,7 +22,21 @@ QUOTED = re.compile(r'"([^"]*)"')
 
 
 def gateway_layers() -> set[str]:
-    match = GATEWAY.search(DETECTOR_RS.read_text(encoding="utf-8"))
+    source = DETECTOR_RS.read_text(encoding="utf-8")
+    # Rust defines this constant once. A second copy of the declaration is
+    # therefore either commented out or dead, and this script cannot tell which
+    # of the two the compiler reads — it reads the first. A commented-out copy
+    # carrying the names as they used to be would be read here in place of the
+    # array below it, and unlike a commented-out *entry* the length check cannot
+    # notice, because a copy brings its own length. Counting the definition is
+    # what closes that, and it needs no theory of comments either.
+    if source.count("pub const LAYERS") != 1:
+        sys.exit(
+            f"{DETECTOR_RS}: LAYERS is written "
+            f"{source.count('pub const LAYERS')} times. Only one of them "
+            "is the array the gateway compiles, and this check cannot tell which."
+        )
+    match = GATEWAY.search(source)
     if match is None:
         sys.exit(f"{DETECTOR_RS}: no LAYERS declaration found")
     declared, body = int(match.group(1)), match.group(2)
@@ -35,7 +49,21 @@ def gateway_layers() -> set[str]:
 
 
 def detector_layers() -> set[str]:
-    match = DETECTOR.search(API_PY.read_text(encoding="utf-8"))
+    source = API_PY.read_text(encoding="utf-8")
+    # Anchoring the alias to the start of a line already keeps a commented-out
+    # copy from being read here — `# Layer = Literal[...]` does not start with
+    # `Layer`. But Python raises no error for two live top-level assignments to
+    # the same name; the interpreter binds whichever one runs last, while a
+    # plain `.search()` still reads whichever one comes first in the file. A
+    # stale `Layer = Literal[...]` left above a rewritten one would be read
+    # here in place of the one the detector actually imports.
+    if source.count("Layer = Literal") != 1:
+        sys.exit(
+            f"{API_PY}: Layer is assigned "
+            f"{source.count('Layer = Literal')} times. Only one of them "
+            "is the alias the detector imports, and this check cannot tell which."
+        )
+    match = DETECTOR.search(source)
     if match is None:
         sys.exit(f"{API_PY}: no Layer alias found")
     return set(QUOTED.findall(match.group(1)))
@@ -54,7 +82,10 @@ def main() -> None:
     if extra:
         print(f"expected by the gateway, absent from the detector: {extra}")
         print("  no run can ever look complete, so nothing will be cached")
-    sys.exit(1)
+    sys.exit(
+        f"layers have drifted; reconcile LAYERS in {DETECTOR_RS} with Layer in "
+        f"{API_PY} and re-run `make check-layers`."
+    )
 
 
 if __name__ == "__main__":
