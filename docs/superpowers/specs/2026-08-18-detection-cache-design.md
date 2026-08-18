@@ -185,9 +185,25 @@ saturation here evicts.
 
 ## Configuration
 
-One key, `detection_cache_entries`, defaulting to 10 000 — single-digit
-megabytes at roughly 300 bytes an entry. Zero disables the cache; unlike
-`max_sessions`, zero is a meaningful setting rather than a validation error.
+One key, `detection_cache_entries`, defaulting to 10 000. Zero disables the
+cache; unlike `max_sessions`, zero is a meaningful setting rather than a
+validation error.
+
+**The key bounds entries, not bytes, and the two are not interchangeable.**
+Measured: an entry costs about 130 bytes fixed plus about 65 per span found in
+its text. Chat-shaped text with a name or two lands near 300 bytes, so the
+default is a few megabytes — which is the figure this design originally quoted,
+and it is only true for that shape. A 20 KB tool result with an entity every 25
+characters is some 800 spans, about 52 KB in a single entry, and ten thousand of
+those is hundreds of megabytes. Since this cache exists for agent traffic, that
+is not the tail case: a deployment handling large tool results must size by
+expected spans per text rather than by entry count.
+
+Bounding the inner dimension as well as the outer one is the structural answer,
+and the codebase already has the precedent — the session store ships
+`max_session_values` beside `max_sessions` for exactly this reason. It is a
+follow-up rather than part of this slice, and the config comment carries the
+scaling law in the meantime.
 
 It is on by default. The cache changes how fast the gateway answers and not what
 it sends, so an operator who never reads the documentation should get the fast
