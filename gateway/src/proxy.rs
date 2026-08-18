@@ -501,6 +501,23 @@ mod tests {
         server
     }
 
+    /// A detector whose runs are complete and identified, so its answers are
+    /// eligible for the cache. `detector_returning` deliberately is not: its
+    /// partial runs keep every other test in this file cache-free.
+    async fn complete_detector_returning(spans: Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": spans,
+                "layers_run": ["deterministic", "ner"],
+                "version": "test-version"
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
     async fn failing_detector() -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1019,6 +1036,35 @@ mod tests {
         assert_eq!(status_a, StatusCode::OK);
         assert_eq!(status_b, StatusCode::OK);
         // `expect(2)` is asserted when `detector` drops.
+    }
+
+    #[tokio::test]
+    async fn the_journal_says_the_same_for_a_cached_detection() {
+        // The evidence layer must not get weaker because an answer came from
+        // memory. Two identical requests, the second served from the cache:
+        // both masked lines must carry the same counts.
+        let detector = complete_detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let body = json!({"messages": [{"role": "user", "content": "Weber schreibt"}]});
+
+        let (first, _) = call(Arc::clone(&state), "/v1/chat/completions", body.clone()).await;
+        let (second, _) = call(Arc::clone(&state), "/v1/chat/completions", body).await;
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+
+        let lines = journal(&path);
+        let masked: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked.len(), 2, "two requests, two masked lines");
+        assert_eq!(masked[0]["types"], masked[1]["types"]);
+        assert_eq!(masked[0]["spans"], masked[1]["spans"]);
     }
 
     #[tokio::test]
