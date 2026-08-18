@@ -55,11 +55,17 @@
             },
             "title": "Spans",
             "type": "array"
+          },
+          "version": {
+            "description": "Digest of the weights and catalogs that produced these spans. A caller that caches spans must key them by this: it changes whenever the same text would detect differently.",
+            "title": "Version",
+            "type": "string"
           }
         },
         "required": [
           "spans",
-          "layers_run"
+          "layers_run",
+          "version"
         ],
         "title": "DetectResponse",
         "type": "object"

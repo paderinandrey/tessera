@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from tessera_detector.api import create_app
 from tessera_detector.spans import Span
+from tessera_detector.version import detector_version
 
 TEXT = "Contact: anna.keller@example.ch"
 OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.json"
@@ -239,3 +240,13 @@ def test_no_undeclared_routes_are_served(path: str) -> None:
     # The contract is two endpoints and a committed schema file. A docs UI on a
     # service that sees personal data is surface nobody asked for.
     assert client(FakeDetector()).get(path).status_code == 404
+
+
+def test_detect_reports_the_version_that_produced_the_spans() -> None:
+    # The gateway keys its span cache by this; without it every cached entry
+    # would outlive the model that justified it.
+    response = client(FakeDetector()).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic"]}
+    )
+    assert response.status_code == 200
+    assert response.json()["version"] == detector_version()
