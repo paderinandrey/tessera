@@ -488,33 +488,33 @@ mod tests {
                 "recognizer": "ner:fake", "tier": 2, "boosted": false}])
     }
 
+    /// A detector whose runs are complete and identified, so every answer is
+    /// eligible for the cache: a second call with the same text under the
+    /// same credential is served from memory and never reaches this mock. A
+    /// test that must observe the detector called twice for the same text
+    /// needs a different credential or text per call — or
+    /// `detector_returning_expecting`, to pin the count directly rather than
+    /// leaving it to whatever the cache happens to do.
     async fn detector_returning(spans: Value) -> MockServer {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"spans": spans, "layers_run": ["deterministic"]})),
-            )
-            .mount(&server)
-            .await;
-        server
+        detector_returning_expecting(spans, None).await
     }
 
-    /// A detector whose runs are complete and identified, so its answers are
-    /// eligible for the cache. `detector_returning` deliberately is not: its
-    /// partial runs keep every other test in this file cache-free.
-    async fn complete_detector_returning(spans: Value) -> MockServer {
+    /// As `detector_returning`, but pins how many times the mock may be
+    /// called. `None` asserts nothing, matching `detector_returning` itself.
+    async fn detector_returning_expecting(spans: Value, expect: Option<u64>) -> MockServer {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        let mock = Mock::given(method("POST"))
             .and(path("/detect"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "spans": spans,
                 "layers_run": ["deterministic", "ner"],
                 "version": "test-version"
-            })))
-            .mount(&server)
-            .await;
+            })));
+        let mock = match expect {
+            Some(count) => mock.expect(count),
+            None => mock,
+        };
+        mock.mount(&server).await;
         server
     }
 
@@ -998,18 +998,11 @@ mod tests {
     async fn a_second_credential_is_asked_again_through_the_proxy() {
         // `detector.rs`'s own tests prove `DetectorClient::detect` separates
         // tenants; this proves the wiring between `handle` and `detect` does
-        // not drop that separation on the way down. `detector_returning`
-        // answers a partial run, which never caches anything, so this needs
-        // its own complete-run mock rather than that helper.
-        let detector = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "spans": [], "layers_run": ["deterministic", "ner"], "version": "v1"
-            })))
-            .expect(2)
-            .mount(&detector)
-            .await;
+        // not drop that separation on the way down. Two different
+        // credentials are two different cache buckets, so both requests miss
+        // and the detector must be asked exactly twice — pinned directly
+        // rather than left to whatever the cache happens to do.
+        let detector = detector_returning_expecting(json!([]), Some(2)).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
             json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
@@ -1043,7 +1036,7 @@ mod tests {
         // The evidence layer must not get weaker because an answer came from
         // memory. Two identical requests, the second served from the cache:
         // both masked lines must carry the same counts.
-        let detector = complete_detector_returning(person_span()).await;
+        let detector = detector_returning(person_span()).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
             json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
@@ -1065,6 +1058,35 @@ mod tests {
         assert_eq!(masked.len(), 2, "two requests, two masked lines");
         assert_eq!(masked[0]["types"], masked[1]["types"]);
         assert_eq!(masked[0]["spans"], masked[1]["spans"]);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_forwards_the_same_body_as_the_miss() {
+        // Counts survive a cache hit that applies the wrong offsets just as
+        // well as a correct one: shifting every span by one character still
+        // masks one PERSON out of one span found, so
+        // `the_journal_says_the_same_for_a_cached_detection` would not
+        // notice. The body sent upstream is the assertion that would — a
+        // wrong offset masks a different slice of the same-length text, and
+        // the two requests stop being byte-identical.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let body = json!({"messages": [{"role": "user", "content": "Weber schreibt"}]});
+
+        call(Arc::clone(&state), "/v1/chat/completions", body.clone()).await;
+        call(Arc::clone(&state), "/v1/chat/completions", body).await;
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "two requests, two upstream calls");
+        assert_eq!(
+            received[0].body, received[1].body,
+            "a cache hit forwarded a body different from the miss that computed it"
+        );
     }
 
     #[tokio::test]
