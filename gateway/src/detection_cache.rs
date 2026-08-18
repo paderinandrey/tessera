@@ -6,15 +6,15 @@
 //! change, and the spans were already computed.
 //!
 //! Two properties make this safe to add to a gateway whose argument is that
-//! personal data lives in exactly one place. Nothing here holds submitted text
-//! — keys are digests, and a value is a type name and two offsets, with the
-//! same caveat `audit.rs` records about type names: `Span.entity_type` is an
-//! unrestricted string on the wire, and a detector that echoed found text into
-//! it would put that text here too. And a miss is never a refusal: every
-//! failure path below degrades to "call the detector", because losing an
-//! entry costs time, not correctness. That is the opposite of `SessionStore`,
-//! where losing an entry is a confidentiality problem and saturation
-//! therefore refuses.
+//! personal data lives in exactly one place. No key here holds submitted text
+//! — keys are digests — and a value holds only a type name and two offsets,
+//! with the same caveat `audit.rs` records about type names: `Span.entity_type`
+//! is an unrestricted string on the wire, and a detector that echoed found
+//! text into it would put that text here too. And a miss is never a refusal:
+//! every failure path below degrades to "call the detector", because losing
+//! an entry costs time, not correctness. That is the opposite of
+//! `SessionStore`, where losing an entry is a confidentiality problem and
+//! saturation therefore refuses.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -130,12 +130,27 @@ impl DetectionCache {
         // `known_version` first, and holding the lock across a hash whose
         // cost is proportional to text length would serialize every lookup
         // in the process behind whichever request is hashing the longest
-        // text — in the one feature whose entire purpose is throughput. If
-        // the version changes between the two acquisitions below, the key
-        // built from the first is already stale and the second lookup
-        // misses, which costs nothing under this module's own rule.
-        let version = self.inner.lock().ok()?.known_version?;
+        // text — in the one feature whose entire purpose is throughput. A
+        // version bump between the two acquisitions below does not make the
+        // key built from the first *wrong* — a `Key` matches only on all
+        // three digests, so a stale key can at worst produce a stale but
+        // exact hit for this same text, never someone else's.
+        //
+        // Scoped so the guard is dropped before the hashing below. A
+        // `let`-bound guard here would live to the end of the method, and
+        // the second acquisition would deadlock against it — `Mutex` is not
+        // reentrant.
+        let version = {
+            let inner = self.inner.lock().ok()?;
+            inner.known_version?
+        };
         let key = self.key(version, credential, text);
+        // A second poisoning, in the window between the two acquisitions
+        // above, is defence in depth rather than a proven path: no test
+        // reaches it, since a single thread cannot poison its own lock
+        // between two of its own acquisitions, and reaching it in
+        // production needs another thread to panic inside that same
+        // window.
         let mut inner = self.inner.lock().ok()?;
         inner.clock += 1;
         let clock = inner.clock;
