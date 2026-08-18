@@ -27,20 +27,15 @@ use crate::mapping::Span;
 /// text's offsets to another, and at equal length `Mapping::mask` accepts them
 /// — the wrong ranges are masked and a real value leaves the process. Sixteen
 /// more bytes per key is not a trade worth making against that.
-// Unread outside tests until the cache (a later task) wires `DetectionCache`
-// into `DetectorClient`.
-#[allow(dead_code)]
 type Digest32 = [u8; 32];
 
 #[derive(PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 struct Key {
     version: Digest32,
     tenant: Digest32,
     text: Digest32,
 }
 
-#[allow(dead_code)]
 struct Entry {
     spans: Vec<Span>,
     /// Monotonic, from the store's own counter rather than a clock: eviction
@@ -48,7 +43,6 @@ struct Entry {
     used: u64,
 }
 
-#[allow(dead_code)]
 struct Inner {
     entries: HashMap<Key, Entry>,
     clock: u64,
@@ -58,7 +52,6 @@ struct Inner {
     known_version: Option<Digest32>,
 }
 
-#[allow(dead_code)]
 pub struct DetectionCache {
     capacity: usize,
     /// Minted per process and never persisted. The cache must not survive a
@@ -70,7 +63,6 @@ pub struct DetectionCache {
     inner: Mutex<Inner>,
 }
 
-#[allow(dead_code)]
 impl DetectionCache {
     pub fn new(capacity: usize) -> Self {
         let mut salt = [0u8; 32];

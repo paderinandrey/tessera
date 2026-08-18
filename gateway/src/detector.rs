@@ -36,28 +36,48 @@ struct DetectResponse {
 /// that a cache hit is never worse than a fresh call.
 pub(crate) struct Detection {
     pub spans: Vec<Span>,
-    // Unread outside tests until the cache (a later task) wires `detect_full` in.
-    #[allow(dead_code)]
     pub version: Option<String>,
 }
 
 pub struct DetectorClient {
     base_url: String,
     client: reqwest::Client,
+    cache: crate::detection_cache::DetectionCache,
 }
 
 impl DetectorClient {
-    pub fn new(base_url: String, timeout: Duration) -> Self {
+    pub fn new(base_url: String, timeout: Duration, cache_entries: usize) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .expect("reqwest client builds with a timeout");
-        Self { base_url, client }
+        Self {
+            base_url,
+            client,
+            cache: crate::detection_cache::DetectionCache::new(cache_entries),
+        }
     }
 
     /// Every layer the detector has: the gateway does not narrow detection.
-    pub async fn detect(&self, text: &str) -> Result<Vec<Span>, DetectorError> {
-        Ok(self.detect_full(text).await?.spans)
+    ///
+    /// The credential is not used to authenticate anything — the gateway
+    /// authenticates nobody — only to keep one tenant's cached results from
+    /// answering another's request, which would report through response time
+    /// that the two sent the same text.
+    pub async fn detect(
+        &self,
+        text: &str,
+        credential: Option<&[u8]>,
+    ) -> Result<Vec<Span>, DetectorError> {
+        if let Some(spans) = self.cache.get(credential, text) {
+            return Ok(spans);
+        }
+        let detection = self.detect_full(text).await?;
+        if let Some(version) = &detection.version {
+            self.cache
+                .insert(version, credential, text, &detection.spans);
+        }
+        Ok(detection.spans)
     }
 
     pub(crate) async fn detect_full(&self, text: &str) -> Result<Detection, DetectorError> {
@@ -109,8 +129,8 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5));
-        let spans = client.detect("Weber schreibt").await.unwrap();
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let spans = client.detect("Weber schreibt", None).await.unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].entity_type, "PERSON");
     }
@@ -126,8 +146,8 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5));
-        assert!(client.detect("Weber").await.is_err());
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        assert!(client.detect("Weber", None).await.is_err());
     }
 
     #[tokio::test]
@@ -142,8 +162,8 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_millis(50));
-        assert!(client.detect("Weber").await.is_err());
+        let client = DetectorClient::new(server.uri(), Duration::from_millis(50), 16);
+        assert!(client.detect("Weber", None).await.is_err());
     }
 
     #[tokio::test]
@@ -157,8 +177,8 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5));
-        client.detect("Weber").await.unwrap();
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        client.detect("Weber", None).await.unwrap();
         let sent = &server.received_requests().await.unwrap()[0];
         let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
         assert_eq!(body["text"], "Weber");
@@ -180,7 +200,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5));
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
         let detection = client.detect_full("Weber").await.unwrap();
         assert_eq!(detection.version.as_deref(), Some("abc123"));
     }
@@ -199,7 +219,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5));
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
         let detection = client.detect_full("Weber").await.unwrap();
         assert!(detection.version.is_none());
     }
@@ -217,8 +237,77 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5));
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
         let detection = client.detect_full("Weber").await.unwrap();
         assert!(detection.version.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_repeated_text_does_not_reach_the_detector_twice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [], "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+        client.detect("Weber", credential).await.unwrap();
+        client.detect("Weber", credential).await.unwrap();
+        // `expect(1)` is asserted when the server drops.
+    }
+
+    #[tokio::test]
+    async fn a_partial_run_is_asked_again_every_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [], "layers_run": ["deterministic"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+        client.detect("Weber", credential).await.unwrap();
+        client.detect("Weber", credential).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_disabled_cache_asks_every_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [], "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 0);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+        client.detect("Weber", credential).await.unwrap();
+        client.detect("Weber", credential).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_detector_is_never_remembered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(
+                serde_json::json!({"detail": "layer(s) ner unavailable: no weights"}),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+        assert!(client.detect("Weber", credential).await.is_err());
+        assert!(client.detect("Weber", credential).await.is_err());
     }
 }

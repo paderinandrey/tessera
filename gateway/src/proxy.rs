@@ -135,6 +135,7 @@ impl AppState {
             detector: DetectorClient::new(
                 config.detector_url.clone(),
                 Duration::from_secs(config.detector_timeout_secs),
+                config.detection_cache_entries,
             ),
             upstream: reqwest::Client::new(),
             openai_base: config.openai_base.clone(),
@@ -169,13 +170,14 @@ async fn mask_all(
     body: &Value,
     pointers: &[String],
     mapping: &mut Mapping,
+    credential: Option<&[u8]>,
 ) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
     let mut distinct: HashSet<(String, String)> = HashSet::new();
     for pointer in pointers {
         let text = read_pointer(body, pointer)?;
-        let spans = detector.detect(&text).await?;
+        let spans = detector.detect(&text, credential).await?;
         total += spans.len();
         // The `Vec<char>` is a copy of the whole text, and a conversation
         // history is many texts: it is built only when there is a span to
@@ -266,7 +268,7 @@ async fn handle(
             };
             let mut work = guard.clone();
             let (masked, spans, types) =
-                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+                mask_all(&state.detector, &body, &pointers, &mut work, credential).await?;
             record.detected(pointers.len(), spans, types, work.redacted_count());
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
@@ -289,7 +291,7 @@ async fn handle(
         None => {
             let mut work = Mapping::new();
             let (masked, spans, types) =
-                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+                mask_all(&state.detector, &body, &pointers, &mut work, credential).await?;
             record.detected(pointers.len(), spans, types, work.redacted_count());
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
@@ -538,7 +540,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -1060,7 +1062,7 @@ mod tests {
         let audit =
             Arc::new(crate::audit::Audit::open(&dir.path().join("audit.jsonl")).expect("opens"));
         Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
             anthropic_base: upstream_base,
@@ -1660,7 +1662,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2061,7 +2063,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2117,7 +2119,7 @@ mod tests {
             .await;
 
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2153,7 +2155,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
             anthropic_base: base,
@@ -2635,7 +2637,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
             anthropic_base: base,
