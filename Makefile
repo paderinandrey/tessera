@@ -1,4 +1,4 @@
-.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke check-entity-types
+.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke check-entity-types check-layers
 
 # The host port the stack publishes. Overridable because 8080 is a popular
 # port; both compose and the smoke test read it from the environment.
@@ -39,6 +39,9 @@ lint:
 
 check-entity-types:
 	uv run --project detector python scripts/check_entity_types.py
+
+check-layers:
+	python3 scripts/check_layers.py
 
 # Brings the demo stack up, sends one request through it, and tears the stack
 # and its volumes down whether the check passed or failed — a smoke test that

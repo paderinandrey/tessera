@@ -37,6 +37,9 @@ jobs:
       # Through the Makefile so the target cannot rot unnoticed: it is what a
       # developer runs, and what the failure message tells them to re-run.
       - run: make -C .. check-entity-types
+      # Guards gateway/src/detector.rs, not the detector — so like the step
+      # above, this job must not grow a `paths:` filter.
+      - run: make -C .. check-layers
       # The committed corpus must regenerate byte-identical (seeded) — this
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
