@@ -17,7 +17,7 @@
 - Rust edits must pass `cargo fmt --check` and `cargo clippy --all-targets` with no warnings.
 - Python edits must pass `uv run ruff check .` and `uv run mypy src` from `detector/`.
 - Comments explain *why*, matching the surrounding code's density. Test names are declarative sentences, matching `mapping.rs` and `detector.rs`.
-- Each new test is proved by mutation: break the invariant it guards, watch that test fail, restore. Record the observed failure in the commit message.
+- Each **distinct invariant** is proved by mutation: break it, watch the test guarding it fail — and confirm the tests guarding other invariants still pass — then restore. Record the observed failure. Tests that approach one invariant from several angles share a mutation; tests guarding different properties each need their own. Where a task's steps list fewer mutations than it has invariants, the rule above governs and the implementer adds the missing ones.
 
 ## File Structure
 
