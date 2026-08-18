@@ -15,3 +15,6 @@ max_sessions = 1000
 max_session_values = 1000
 
 audit_path = "/var/lib/tessera/audit.jsonl"
+
+# Spans are remembered by digest so a resent conversation is not rescanned.
+detection_cache_entries = 10000

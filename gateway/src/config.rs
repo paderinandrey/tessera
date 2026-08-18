@@ -47,6 +47,11 @@ pub struct Config {
     /// masked and still restored — they are simply not remembered.
     #[serde(default = "default_max_session_values")]
     pub max_session_values: usize,
+    /// How many detection results may be remembered at once. Zero disables the
+    /// cache, which is a memory budget rather than a mistake: the gateway then
+    /// calls the detector for every text, as it did before the cache existed.
+    #[serde(default = "default_detection_cache_entries")]
+    pub detection_cache_entries: usize,
 }
 
 fn default_bind() -> String {
@@ -72,6 +77,9 @@ fn default_max_sessions() -> usize {
 }
 fn default_max_session_values() -> usize {
     1000
+}
+fn default_detection_cache_entries() -> usize {
+    10_000
 }
 
 impl Config {
@@ -194,5 +202,26 @@ mod tests {
         // Enabled and unable to hold anything is not a configuration, it is a typo.
         assert!(Config::from_toml(&with_audit("max_sessions = 0")).is_err());
         assert!(Config::from_toml(&with_audit("max_session_values = 0")).is_err());
+    }
+
+    #[test]
+    fn the_detection_cache_has_a_default() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(config.detection_cache_entries, 10_000);
+    }
+
+    #[test]
+    fn the_detection_cache_can_be_sized() {
+        let config = Config::from_toml(&with_audit("detection_cache_entries = 64")).unwrap();
+        assert_eq!(config.detection_cache_entries, 64);
+    }
+
+    #[test]
+    fn a_zero_detection_cache_is_a_setting_not_an_error() {
+        // Unlike max_sessions, where zero would mean "no conversation can be
+        // remembered": here it means "do not remember spans", which is exactly
+        // today's behaviour and a legitimate memory budget.
+        let config = Config::from_toml(&with_audit("detection_cache_entries = 0")).unwrap();
+        assert_eq!(config.detection_cache_entries, 0);
     }
 }

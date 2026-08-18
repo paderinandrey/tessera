@@ -34,3 +34,12 @@ max_session_values = 1000
 # This default is relative on purpose, so that following the quickstart writes
 # where you ran it. A deployment wants an absolute path on storage you back up.
 audit_path = "tessera-audit.jsonl"
+
+# How many detection results the gateway may remember at once. Detection runs
+# over every text on every request, and a client resends the whole conversation
+# each turn, so without this a ten-turn conversation pays for its first turn ten
+# times. Entries hold a digest of the text and the spans found in it — never the
+# text itself — and are invalidated automatically when the detector's weights or
+# catalogs change. Roughly 300 bytes each, so the default is single-digit
+# megabytes. Zero disables it.
+detection_cache_entries = 10000
