@@ -7,11 +7,14 @@
 //!
 //! Two properties make this safe to add to a gateway whose argument is that
 //! personal data lives in exactly one place. Nothing here holds submitted text
-//! — keys are digests, values are spans, and a span is a type and two offsets.
-//! And a miss is never a refusal: every failure path below degrades to "call
-//! the detector", because losing an entry costs time, not correctness. That is
-//! the opposite of `SessionStore`, where losing an entry is a confidentiality
-//! problem and saturation therefore refuses.
+//! — keys are digests, and a value is a type name and two offsets, with the
+//! same caveat `audit.rs` records about type names: `Span.entity_type` is an
+//! unrestricted string on the wire, and a detector that echoed found text into
+//! it would put that text here too. And a miss is never a refusal: every
+//! failure path below degrades to "call the detector", because losing an
+//! entry costs time, not correctness. That is the opposite of `SessionStore`,
+//! where losing an entry is a confidentiality problem and saturation
+//! therefore refuses.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -100,7 +103,11 @@ impl DetectionCache {
         Key {
             version,
             // A request with no credential is its own bucket rather than
-            // everyone's: an empty digest is a tenant like any other.
+            // everyone's: an empty digest is a tenant like any other. That
+            // makes `Some(b"")` and `None` collide here — unreachable today
+            // only because `session::credential_of` filters an empty header
+            // value before either ever reaches this file, a dependency this
+            // module otherwise does not record.
             tenant: self.digest(credential.unwrap_or(b"")),
             text: self.digest(text.as_bytes()),
         }
@@ -108,13 +115,28 @@ impl DetectionCache {
 
     pub fn get(&self, credential: Option<&[u8]>, text: &str) -> Option<Vec<Span>> {
         if self.capacity == 0 {
+            // Defence in depth, not the only thing keeping a disabled cache
+            // from answering: `insert`'s own guard below already keeps
+            // `known_version` at `None` forever when capacity is zero, so
+            // `entries` stays empty and a lookup would miss even without
+            // this check.
             return None;
         }
         // A poisoned lock means some other request panicked mid-update. That is
         // worth neither failing this request nor propagating: answer "miss".
-        let mut inner = self.inner.lock().ok()?;
-        let version = inner.known_version?;
+        //
+        // The two digests below run outside the lock, unlike the rest of this
+        // method: `insert` can hash before it ever locks, but `get` needs
+        // `known_version` first, and holding the lock across a hash whose
+        // cost is proportional to text length would serialize every lookup
+        // in the process behind whichever request is hashing the longest
+        // text — in the one feature whose entire purpose is throughput. If
+        // the version changes between the two acquisitions below, the key
+        // built from the first is already stale and the second lookup
+        // misses, which costs nothing under this module's own rule.
+        let version = self.inner.lock().ok()?.known_version?;
         let key = self.key(version, credential, text);
+        let mut inner = self.inner.lock().ok()?;
         inner.clock += 1;
         let clock = inner.clock;
         let entry = inner.entries.get_mut(&key)?;
@@ -140,8 +162,11 @@ impl DetectionCache {
         let clock = inner.clock;
         if inner.entries.len() >= self.capacity && !inner.entries.contains_key(&key) {
             // One ordered pass, the same shape the session store's eviction
-            // scan uses. It runs only when full, and at the default ceiling it
-            // is microseconds.
+            // scan uses, though ten times the length: this store's default
+            // ceiling is 10,000 entries against the session store's 1,000.
+            // It runs only when full, and at that size a linear scan still
+            // costs tens of microseconds, not the single microsecond a
+            // smaller structure might suggest.
             if let Some(oldest) = inner
                 .entries
                 .iter()
@@ -200,9 +225,13 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_known_before_the_first_insert() {
-        // The version is only ever learned from a response, so a cold cache
-        // has no version to look under and must miss.
+    fn a_cold_cache_misses_rather_than_guessing_a_version() {
+        // This cannot fail through the version guard alone: `insert` is the
+        // only writer of `entries` and sets `known_version` first, so a cold
+        // store misses on the empty map whatever key `get` computes. What it
+        // does pin is the coldest point of the miss-is-never-a-refusal rule —
+        // a `get` before any response answers `None` rather than panicking
+        // or inventing spans.
         let cache = DetectionCache::new(4);
         assert!(cache.get(A, "Weber").is_none());
     }
@@ -267,5 +296,46 @@ mod tests {
         cache.insert("v1", None, "Weber", &[span("PERSON", 0, 5)]);
         assert!(cache.get(None, "Weber").is_some());
         assert!(cache.get(A, "Weber").is_none());
+    }
+
+    #[test]
+    fn a_poisoned_lock_answers_a_miss_rather_than_a_panic() {
+        let cache = DetectionCache::new(4);
+        cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = cache.inner.lock().expect("not yet poisoned");
+            panic!("a request died mid-update");
+        }));
+        assert!(panicked.is_err(), "the panic is what poisons the lock");
+        assert!(cache.get(A, "Weber").is_none(), "a poisoned lock must miss");
+        cache.insert("v1", A, "Meier", &[span("PERSON", 0, 5)]); // must not panic
+    }
+
+    #[test]
+    fn reinserting_a_key_the_store_already_holds_evicts_nothing() {
+        // Capacity 3, not 2: at capacity 2 the least-recently-used entry
+        // would be the one being re-inserted, and this mutation would stay
+        // invisible — the eviction it would wrongly trigger and the
+        // overwrite that follows would remove the same key either way.
+        let cache = DetectionCache::new(3);
+        cache.insert("v1", A, "first", &[span("PERSON", 0, 5)]);
+        cache.insert("v1", A, "second", &[span("PERSON", 0, 6)]);
+        cache.insert("v1", A, "third", &[span("PERSON", 0, 5)]);
+        cache.insert("v1", A, "third", &[span("PERSON", 0, 5)]);
+        assert_eq!(cache.len(), 3);
+        assert!(
+            cache.get(A, "first").is_some(),
+            "an unrelated entry was taken"
+        );
+    }
+
+    #[test]
+    fn two_entries_stored_in_a_row_do_not_share_a_recency() {
+        let cache = DetectionCache::new(4);
+        cache.insert("v1", A, "first", &[span("PERSON", 0, 5)]);
+        cache.insert("v1", A, "second", &[span("PERSON", 0, 6)]);
+        let inner = cache.inner.lock().expect("not poisoned");
+        let used: Vec<u64> = inner.entries.values().map(|entry| entry.used).collect();
+        assert_ne!(used[0], used[1], "eviction would break the tie arbitrarily");
     }
 }
