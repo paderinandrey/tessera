@@ -219,8 +219,8 @@ spans per 1 000 characters, README prose 2.50, and Rust source 1.00. The
 evaluation corpus gives 28.67, but it is a detection benchmark of concatenated
 dense PII sentences and is a proxy for nothing.
 
-At 250 spans the cap admits prose to roughly 98 KB, logs to 183 KB and source to
-244 KB, so every realistic single tool result is cached and the pathological
+At 250 spans the cap admits prose to roughly 100 KB, logs to 188 KB and source
+to 250 KB, so every realistic single tool result is cached and the pathological
 shapes that motivated the bound are not. The number is chosen from that range
 rather than from the memory side alone, because the value of caching a text grows
 with its length: a cap trims the most valuable entries first, which is the wrong
