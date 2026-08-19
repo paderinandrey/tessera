@@ -115,7 +115,8 @@ The cost is honest and stated in **Known limits** below.
 Spans are determined by the weights *and* by `catalog/identifiers.yaml` and
 `catalog/ner.yaml` — a threshold edit changes what is detected without touching
 `HF_REVISION`. The version is therefore a digest over both catalogs, the weights
-themselves, and this package's own source.
+themselves, this package's own source, and the declared versions of the
+dependencies the inference path pulls in.
 
 Not over `HF_REVISION`, which was this design's first answer and was wrong.
 `TESSERA_NER_MODEL` is a supported override, so the pinned revision names the
@@ -136,7 +137,17 @@ the same weights is a real deployment rather than a hypothetical one. Its own
 boundary is stated where it is computed — a dependency upgrade changes spans too
 and no digest here sees it. Pinning the packages that participate in inference is
 the follow-up; hashing the whole lockfile is not, since it would invalidate every
-entry in the fleet on a `pytest` bump.
+entry in the fleet on a `pytest` bump. The dependency half is resolved from
+`importlib.metadata`, walking what the inference root declares rather than a list
+someone maintains — the fourth time in this slice that a hand-written list was
+the wrong answer. Its boundary is the mirror image of the source digest's: it
+covers what is declared, not what is merely imported.
+
+**All four halves fail loudly rather than digest less.** A weights file that
+cannot be read, or a dependency whose version cannot be resolved, fails the
+detector's startup. The alternative — a digest computed over what happened to be
+available — reports a version that claims coverage it does not have, which is the
+one outcome every part of this design is arranged to prevent.
 
 ### Why a degraded run is dropped rather than keyed
 
