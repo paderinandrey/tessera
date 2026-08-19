@@ -187,8 +187,9 @@ saturation here evicts.
 
 Two keys. `detection_cache_entries`, defaulting to 10 000, bounds how many
 detections are held; zero disables the cache, and unlike `max_sessions`, zero is
-a meaningful setting rather than a validation error. `max_spans_per_entry`
-bounds how large any one of them may be.
+a meaningful setting rather than a validation error. `max_spans_per_entry`,
+defaulting to 250, bounds how large any one of them may be; following
+`max_session_values`, zero is a validation error while the cache is enabled.
 
 **An entry count alone does not bound memory, because an entry has no fixed
 size.** Measured with a counting allocator against the real types: 264 bytes
@@ -206,7 +207,28 @@ So the design ships a second key, `max_spans_per_entry`. A detection with more
 spans than that is served normally and simply not stored — declining to cache is
 never a refusal, which is invariant 4 below. This is the inner bound the session
 store already has in `max_session_values` beside `max_sessions`, and the two
-pairs exist for the same reason.
+pairs exist for the same reason. The two defaults multiply out to
+`10 000 × (264 + 250 × 46)` ≈ 118 MB, which is the figure an operator gets
+without reading this document.
+
+**Where the default comes from, and where the 25-character assumption came
+from.** The density used above to argue the ceiling — an entity every 25
+characters — was assumed, not measured, and it is about twenty times real. Run
+against the detector over 6 000-character samples: a `git log --stat` gives 1.33
+spans per 1 000 characters, README prose 2.50, and Rust source 1.00. The
+evaluation corpus gives 28.67, but it is a detection benchmark of concatenated
+dense PII sentences and is a proxy for nothing.
+
+At 250 spans the cap admits prose to roughly 98 KB, logs to 183 KB and source to
+244 KB, so every realistic single tool result is cached and the pathological
+shapes that motivated the bound are not. The number is chosen from that range
+rather than from the memory side alone, because the value of caching a text grows
+with its length: a cap trims the most valuable entries first, which is the wrong
+end to trim on an arbitrary number.
+
+Four samples from one repository are not a survey of customer traffic. The
+measurement that would settle it is spans per 1 000 characters over a day of real
+gateway traffic, which the journal is one field away from being able to answer.
 
 **Why this is in the slice rather than after it.** An earlier draft of this
 document scoped the inner bound to a follow-up, on the grounds that the ceiling
@@ -272,6 +294,13 @@ the first miss reveals the new one. On agent traffic misses are continuous —
 every turn carries new text — so the window is one request. The pathological case
 is a deployment that, after a model upgrade, only ever replays byte-identical
 text.
+
+More precisely, the window closes on the first *cacheable* miss. A detection
+declined for exceeding `max_spans_per_entry` returns before the new version is
+recorded, so a run of oversized responses holds the window open. This is the
+price of deciding the cap before taking the lock, and it is worth paying: the
+alternative puts work in front of every decline to shorten a window that only a
+mid-process detector upgrade can open at all.
 
 Condition for revisiting: someone upgrades a detector on a live stand and
 observes stale spans. Then `/health` polling is added. This is cheaper to decide
