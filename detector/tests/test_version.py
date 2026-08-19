@@ -153,6 +153,21 @@ def test_interpreter_id_changes_with_the_python_version(
     assert interpreter_id() != before
 
 
+def test_interpreter_id_separates_a_prerelease_from_its_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A prerelease shares its first three fields with the final it
+    # precedes, so taking only those makes 3.15.0rc1, rc2 and 3.15.0 one
+    # identity — and a prerelease is exactly where `re` behaviour moves.
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0, "candidate", 1))
+    rc1 = interpreter_id()
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0, "candidate", 2))
+    rc2 = interpreter_id()
+    monkeypatch.setattr(sys, "version_info", (3, 15, 0, "final", 0))
+    final = interpreter_id()
+    assert len({rc1, rc2, final}) == 3, "a prerelease was not distinguished"
+
+
 def test_interpreter_id_changes_with_the_unicode_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

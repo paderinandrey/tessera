@@ -129,9 +129,13 @@ def interpreter_id() -> str:
     - `sys.implementation.name` — a different implementation entirely
       (PyPy, GraalPy) can carry its own `re` engine with its own matching
       semantics, unrelated to Unicode table version.
-    - `sys.version_info`, to the patch level — `re`'s own behaviour has
-      changed between CPython releases before, independent of the
-      Unicode Character Database version.
+    - `sys.version_info`, in full rather than to the patch level — a
+      prerelease carries the same first three fields as the final it
+      precedes, so 3.15.0rc1, 3.15.0rc2 and 3.15.0 are one identity
+      without `releaselevel` and `serial`, and `requires-python`'s open
+      bound permits all three. `re`'s own behaviour has changed between
+      CPython releases before, independent of the Unicode Character
+      Database version, and a prerelease is exactly where it changes.
     - `unicodedata.unidata_version` — the fact the paragraph above is
       really about: two interpreters reporting the same
       `sys.version_info` are not guaranteed to load the same Unicode
@@ -141,8 +145,9 @@ def interpreter_id() -> str:
     See `detector_version` for the criterion this satisfies and the
     boundary of what it does not extend to.
     """
-    major, minor, micro = sys.version_info[:3]
-    return f"{sys.implementation.name}-{major}.{minor}.{micro}-unicode{unicodedata.unidata_version}"
+    major, minor, micro, releaselevel, serial = sys.version_info
+    version = f"{major}.{minor}.{micro}.{releaselevel}.{serial}"
+    return f"{sys.implementation.name}-{version}-unicode{unicodedata.unidata_version}"
 
 
 def detector_version(model_id: str, catalog_text: str) -> str:
