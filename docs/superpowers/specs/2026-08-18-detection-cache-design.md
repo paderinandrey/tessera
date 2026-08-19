@@ -369,6 +369,18 @@ every turn carries new text — so the window is one request. The pathological c
 is a deployment that, after a model upgrade, only ever replays byte-identical
 text.
 
+The window is also wider than "one request" makes it sound. `mask_all` walks a
+conversation's texts in order, so on the first request after an upgrade the
+history hits the cache under the old version *before* the new turn misses and
+reveals the new one — a single request can straddle the change rather than
+merely the sequence of them. What the miss buys is that the request after it is
+clean.
+
+Polling `/health` would close this and stays out of scope, for the reason given
+under Out of scope rather than because the argument is weak. The condition for
+revisiting is unchanged and unmet: someone upgrades a detector on a live stand
+and observes stale spans.
+
 That reasoning assumed versions only move forward, which nothing guarantees: a
 digest carries no order, and a slow response from a not-yet-upgraded replica can
 arrive after a newer one. So a version change now sweeps every entry that does
