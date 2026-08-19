@@ -273,6 +273,16 @@ rather than refusing, and a poisoned lock degrades to calling the detector rathe
 failing the request. Set `detection_cache_entries = 0` to disable the cache entirely —
 the gateway then calls the detector for every text, with no cache in the loop at all.
 
+That coverage is measured against code, logs and prose — a coding agent's traffic — and
+it is not this product's core traffic. A contact list, an intake form or client
+correspondence runs 16 to 29 spans per 1 000 characters, and a document that dense
+crosses 250 spans somewhere between 9 and 16 KB, so a few pages of exactly the text this
+gateway exists to protect is declined and rescanned on every turn. This is a real limit
+rather than a number worth chasing with a bigger default: raising `max_spans_per_entry`
+is the deliberate lever for that traffic, priced by the arithmetic above, and a
+deployment whose traffic is dense documents rather than code should raise it and
+recompute the worst case against its own texts.
+
 A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or
 `session_idle_secs = 0` — is refused before the detector runs rather than served without
