@@ -102,18 +102,29 @@ The cost is honest and stated in **Known limits** below.
 
 Spans are determined by the weights *and* by `catalog/identifiers.yaml` and
 `catalog/ner.yaml` — a threshold edit changes what is detected without touching
-`HF_REVISION`. The version is therefore a digest over both catalogs and the
-weights themselves.
+`HF_REVISION`. The version is therefore a digest over both catalogs, the weights
+themselves, and this package's own source.
 
 Not over `HF_REVISION`, which was this design's first answer and was wrong.
 `TESSERA_NER_MODEL` is a supported override, so the pinned revision names the
 weights a detector *would* load rather than the ones it did: two replicas, one
 overridden, would report one version while returning different spans, and the
-gateway would key them together. The digest is taken over the bytes of the
-artifacts actually resolved, which also makes it independent of the path they
-were found at. It is computed once when the model is resolved, since hashing a
-1.15 GB weights file costs about 0.75 s and this value is read on every
-`/detect`.
+gateway would key them together. The digest is taken over the bytes of every
+artifact in the resolved directory rather than a named list, because the first
+attempt at this fix enumerated two files and missed the tokenizer — whose
+`return_offsets_mapping` produces the very offsets being cached. Walking the
+directory also makes the digest independent of the path the weights were found
+at. It is computed once when the model is resolved, since the graph is 1.15 GB
+and this value is read on every `/detect`.
+
+The source digest closes the third version of the same hole: chunking, the token
+window and conflict resolution all change spans with the weights and catalogs
+untouched, and weights are fetched separately from the image, so a new build on
+the same weights is a real deployment rather than a hypothetical one. Its own
+boundary is stated where it is computed — a dependency upgrade changes spans too
+and no digest here sees it. Pinning the packages that participate in inference is
+the follow-up; hashing the whole lockfile is not, since it would invalidate every
+entry in the fleet on a `pytest` bump.
 
 ### Why a degraded run is dropped rather than keyed
 
