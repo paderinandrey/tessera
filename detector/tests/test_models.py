@@ -1,5 +1,7 @@
+import hashlib
 import sys
 import types
+from importlib import metadata
 from pathlib import Path
 
 import pytest
@@ -229,11 +231,40 @@ def test_dependency_digest_changes_with_the_root() -> None:
     assert dependency_digest("pydantic") != dependency_digest("httpx")
 
 
-def test_dependency_digest_ignores_a_root_with_no_installed_distribution() -> None:
-    # Not every name resolves to an installed distribution. Contributing
-    # nothing is correct; raising would fail startup over a root that was
-    # never really "a version" to track.
-    assert dependency_digest("not-a-real-package-xyz") == dependency_digest("also-not-real-xyz")
+def test_dependency_digest_raises_for_a_missing_root() -> None:
+    # The finding this replaced a first attempt at: a missing root, a typo
+    # in the root name, and a genuinely dependency-free package used to
+    # produce the identical digest — sha256 of the empty set — because a
+    # PackageNotFoundError on the root was swallowed the same way an
+    # unresolvable transitive dependency was. "Could not determine the
+    # dependencies" must not read as "the dependencies are these: none".
+    with pytest.raises(metadata.PackageNotFoundError):
+        dependency_digest("not-a-real-package-xyz")
+
+
+def test_dependency_digest_of_a_dependency_free_package_is_a_real_digest() -> None:
+    # PyYAML declares no runtime dependencies at all (metadata.requires
+    # returns None for it) — the legitimate case the fix above must not
+    # collide with. It must not raise, and its digest must not be the
+    # empty-set value either, or it would still be indistinguishable from
+    # the failure case this fix exists to separate out.
+    empty = hashlib.sha256(b"").hexdigest()
+    digest = dependency_digest("PyYAML")
+    assert digest != empty
+    assert digest == dependency_digest("PyYAML")
+
+
+@pytest.mark.ner
+def test_dependency_digest_tolerates_platform_gated_requirements() -> None:
+    # torch declares its own CUDA-sibling packages behind platform markers
+    # (`; platform_system == "Linux"`, and similar) that are never
+    # satisfied by this project's own shipped configuration — the pinned
+    # torch build is CPU-only (see the CPU-index pin in pyproject.toml) —
+    # nor by this dev machine. Those requirements must be recognized as
+    # "correctly not part of this install" and skipped, not treated as
+    # unresolvable distributions that make the whole digest raise.
+    pytest.importorskip("torch")
+    assert dependency_digest("torch")
 
 
 def test_transitive_requirements_includes_a_real_dependency() -> None:

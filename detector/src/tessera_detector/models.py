@@ -10,6 +10,14 @@ import os
 import re
 from importlib import metadata
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only for the annotation below: the `ner` group is what actually
+    # installs `packaging` (see _transitive_requirements, which imports it
+    # lazily for the same reason gliner itself is imported lazily — the
+    # base install carries neither).
+    from packaging.requirements import Requirement
 
 MODEL_NAME = "gliner_multi-v2.1"
 # The upstream `urchade/gliner_multi-v2.1` repo publishes PyTorch weights only.
@@ -161,22 +169,6 @@ def weights_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-# A distribution name from the start of a PEP 508 requirement string —
-# "torch>=2.0.0" -> "torch", "onnxruntime-gpu; extra == \"gpu\"" ->
-# "onnxruntime-gpu". Deliberately not the `packaging` library's own
-# `Requirement` parser: that dependency is only ever present once the
-# `ner` group is installed, and this pattern is all `dependency_digest`
-# needs from the string — a name, not a validated specifier.
-_REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
-
-
-def _requirement_name(requirement: str) -> str:
-    match = _REQUIREMENT_NAME.match(requirement)
-    if match is None:
-        raise ValueError(f"cannot find a distribution name in requirement {requirement!r}")
-    return match.group(1)
-
-
 def _normalize_distribution_name(name: str) -> str:
     # PEP 503: distribution names compare case- and separator-insensitively
     # ("PyYAML" and "pyyaml", "typing_extensions" and "typing-extensions").
@@ -186,23 +178,41 @@ def _normalize_distribution_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _applies_here(requirement: Requirement) -> bool:
+    # No marker means unconditional. A marker decides two different
+    # questions with the same syntax: an *extra* ("; extra == \"gpu\"") is
+    # optional behaviour nothing here activates, and a *platform* marker
+    # ("; platform_system == \"Linux\"") is torch's own CUDA sibling
+    # packages, absent on the CPU-only build this project actually ships
+    # (see the CPU-index pin in pyproject.toml) and on this dev machine
+    # alike. `Marker.evaluate()` answers both against the real environment,
+    # with no activated extras — correctly false for either case, on
+    # whichever platform this happens to run on.
+    return requirement.marker is None or requirement.marker.evaluate()
+
+
 def _transitive_requirements(root: str) -> set[str]:
     """Every distribution `root` depends on, transitively, through its own
     declared requirements — not what happens to be imported in the current
     process, which depends on when in the process's life this runs (a
     second construction in one process finds everything already imported,
     so a diff against `sys.modules` reports nothing new for it — the
-    defect this function replaces).
+    defect this function replaced; see `dependency_digest`).
 
-    Requirements gated behind an extra (`; extra == "gpu"`) are skipped:
-    they describe optional features nothing here activates, not what a
-    plain `pip install gliner` — which is what this project's own
-    dependency group does — actually pulls in. Requirements gated behind
-    other markers (`; sys_platform == "..."`) are not evaluated and may
-    list a distribution this platform never installs; `dependency_digest`
-    below tolerates that by skipping anything with no resolvable version,
-    the same way it already tolerates a module with no distribution.
+    Raises `importlib.metadata.PackageNotFoundError` if `root`, or any
+    requirement in its tree whose marker says it belongs on this platform,
+    has no installed metadata — deliberately not caught here. See
+    `dependency_digest` for why.
+
+    A requirement gated behind a marker that evaluates false here — an
+    extra nothing activates, a platform variant this build does not ship —
+    is correctly never resolved at all: it was never going to be part of
+    this install, on any environment, and asking `importlib.metadata` to
+    resolve it would raise for a reason that has nothing to do with a
+    broken install.
     """
+    from packaging.requirements import Requirement
+
     seen: set[str] = set()
     frontier = [root]
     while frontier:
@@ -211,16 +221,12 @@ def _transitive_requirements(root: str) -> set[str]:
         if normalized in seen:
             continue
         seen.add(normalized)
-        try:
-            requirements = metadata.requires(name) or ()
-        except metadata.PackageNotFoundError:
-            continue
-        for requirement in requirements:
-            if "extra ==" in requirement:
+        for requirement_text in metadata.requires(name) or ():
+            requirement = Requirement(requirement_text)
+            if not _applies_here(requirement):
                 continue
-            dependency_name = _requirement_name(requirement)
-            if _normalize_distribution_name(dependency_name) not in seen:
-                frontier.append(dependency_name)
+            if _normalize_distribution_name(requirement.name) not in seen:
+                frontier.append(requirement.name)
     return seen
 
 
@@ -251,23 +257,22 @@ def dependency_digest(root: str) -> str:
     instead has no process to depend on: the same environment reports the
     same digest every time, which `test_models.py` pins directly.
 
+    Raises rather than reporting a partial answer, the same posture
+    `weights_digest` takes for a read it cannot complete: "the weights'
+    identity cannot be established, and reporting a version anyway would
+    silently reintroduce the bug this function exists to close." A missing
+    root or an unresolvable dependency used to be swallowed here and the
+    result was the digest of an empty set — indistinguishable from a
+    genuinely dependency-free package, and from a typo in `root`. Neither
+    should look like "these are the dependencies: none."
+
     Boundary, stated rather than left implicit: this covers what `root`'s
     distribution *declares*, transitively. A package imported at runtime
     but never declared as a dependency — by `root` or anything in its
     tree — would be missed, the mirror image of the gap the `sys.modules`
     approach had. Nothing in GLiNER's own dependency tree does that today.
     """
-    versions: dict[str, str] = {}
-    for name in _transitive_requirements(root):
-        try:
-            versions[name] = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            # Declared but not installed on this platform — a marker this
-            # function does not evaluate (`; sys_platform == "..."`) ruled
-            # it out, or an optional backend nothing here requires. Not a
-            # version to miss: there is no installed package here to have
-            # one.
-            continue
+    versions = {name: metadata.version(name) for name in _transitive_requirements(root)}
     digest = hashlib.sha256()
     for name in sorted(versions):
         digest.update(f"{name}=={versions[name]}".encode())
