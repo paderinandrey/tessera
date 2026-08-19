@@ -292,8 +292,23 @@ spans than that is served normally and simply not stored — declining to cache 
 never a refusal, which is invariant 4 below. This is the inner bound the session
 store already has in `max_session_values` beside `max_sessions`, and the two
 pairs exist for the same reason. The two defaults multiply out to
-`10 000 × (264 + 250 × 46)` ≈ 118 MB, which is the figure an operator gets
-without reading this document.
+`10 000 × (264 + 250 × 46)` ≈ 118 MB on the traffic that produced the 46, which
+is the figure an operator gets without reading this document.
+
+That 46 was measured, and it measured entity types of ordinary length. It is not
+a ceiling: `entity_type` is a string the detector supplies and the gateway
+already treats as untrusted, so the count gate alone let one span retain an
+arbitrarily large one. A span whose type exceeds `mapping::MAX_ENTITY_TYPE` is
+now declined, which puts the enforced ceiling nearer `10 000 × (264 + 250 × 80)`
+≈ 200 MB. That figure is arithmetic from the cap rather than a second allocator
+run, and is labelled as such wherever it appears.
+
+Declining is the right lever rather than normalising the type on the way in. The
+journal builds its counts from `entity_type` for a hit exactly as for a miss, and
+`is_entity_type`'s grammar check runs on the miss that populated the entry — so
+rewriting the type at insert time would make the same request report a named type
+on a hit where the miss recorded it as unvalidated. A memory bound must not
+change what the evidence says.
 
 **Where the default comes from, and where the 25-character assumption came
 from.** The density used above to argue the ceiling — an entity every 25
