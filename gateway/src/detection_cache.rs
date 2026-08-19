@@ -179,15 +179,35 @@ impl DetectionCache {
         // `known_version` first, and holding the lock across a hash whose
         // cost is proportional to text length would serialize every lookup
         // in the process behind whichever request is hashing the longest
-        // text — in the one feature whose entire purpose is throughput. A
-        // version bump between the two acquisitions below does not make the
-        // key built from the first *wrong* — a `Key` matches only on all
-        // three digests, so a stale key can at worst produce a stale but
-        // exact hit for this same text, never someone else's.
+        // text — in the one feature whose entire purpose is throughput.
+        //
+        // A version bump can land in the gap between the two acquisitions
+        // below. It could never resurrect someone else's spans — a `Key`
+        // matches on all three digests, so the key built from the stale
+        // `version` still only matches this exact text under that stale
+        // version — but serving it anyway would answer from a version the
+        // store has already moved past. Closed below, at the cost of one
+        // comparison the second lock was already going to pay for: recheck
+        // `known_version` under that lock and treat a mismatch as a miss.
         //
         // `known_version()` returns rather than lending its guard, so there
         // is no guard here for this method to hold across the hashing below.
         let version = self.known_version()?;
+        self.get_at_version(version, credential, text)
+    }
+
+    // Split out of `get` so a test can drive the race described above it
+    // explicitly: capture a version, let a concurrent `insert` move
+    // `known_version` past it, then call this directly with the
+    // now-stale version. That reaches the exact interleaving a real race
+    // would produce without racing actual threads and hoping the
+    // scheduler cooperates.
+    fn get_at_version(
+        &self,
+        version: Digest32,
+        credential: Option<&[u8]>,
+        text: &str,
+    ) -> Option<Vec<Span>> {
         let key = self.key(version, credential, text);
         // A second poisoning, in the window between the two acquisitions
         // above, is defence in depth rather than a proven path: no test
@@ -202,6 +222,13 @@ impl DetectionCache {
                 return None;
             }
         };
+        // The version this key was built from may already be stale — see
+        // above. A concurrent insert for a newer version between the two
+        // acquisitions would otherwise let this lookup serve a version the
+        // store has already left behind.
+        if inner.known_version != Some(version) {
+            return None;
+        }
         inner.clock += 1;
         let clock = inner.clock;
         let entry = inner.entries.get_mut(&key)?;
@@ -330,6 +357,35 @@ mod tests {
         cache.insert("v2", A, "Schmidt", &[span("PERSON", 0, 7)]);
         assert!(cache.get(A, "Weber").is_none());
         assert!(cache.get(A, "Schmidt").is_some());
+    }
+
+    #[test]
+    fn a_version_that_moved_between_gets_two_locks_is_a_miss() {
+        // Drives the interleaving `get`'s doc comment describes explicitly,
+        // rather than racing threads and hoping the scheduler cooperates:
+        // capture the version exactly as `get` would before its second
+        // lock, then let a concurrent insert move `known_version` past it
+        // — simulated here by simply calling `insert` in between, since
+        // this test *is* the thread that would otherwise be racing `get`.
+        let cache = DetectionCache::new(4, UNCAPPED);
+        cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
+        let stale_version = cache.known_version().expect("insert set it");
+
+        cache.insert("v2", A, "Meier", &[span("PERSON", 0, 5)]);
+        assert_ne!(
+            cache.known_version(),
+            Some(stale_version),
+            "the second insert did not actually move the version"
+        );
+
+        // `get_at_version` is exactly the second half of `get` — the half
+        // that runs after the version above would have been captured. A
+        // real race lands here with `stale_version` in hand and the store
+        // already past it.
+        assert!(
+            cache.get_at_version(stale_version, A, "Weber").is_none(),
+            "a lookup built from a version the store had already moved past was served anyway"
+        );
     }
 
     #[test]
