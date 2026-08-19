@@ -78,9 +78,21 @@ impl DetectorClient {
             return Ok(spans);
         }
         let detection = self.detect_full(text).await?;
+        // A malformed complete response — empty, inverted, out of range or
+        // overlapping spans — must be served (the caller already has what
+        // the detector returned) but never remembered: `crate::mapping::mask`
+        // would refuse every future request answered from this entry, and a
+        // cache hit refreshes the LRU clock, so one transient bad response
+        // would become a permanent per-text refusal rather than a single
+        // failed request. `check_spans` asks the exact question `mask` will
+        // ask later, over the same text and spans, so this can only decline
+        // to cache what `mask` would actually reject — never more, never
+        // less.
         if let Some(version) = &detection.version {
-            self.cache
-                .insert(version, credential, text, &detection.spans);
+            if crate::mapping::check_spans(text, &detection.spans).is_ok() {
+                self.cache
+                    .insert(version, credential, text, &detection.spans);
+            }
         }
         Ok(detection.spans)
     }
@@ -412,5 +424,78 @@ mod tests {
         assert_eq!(second.len(), 3);
         // `expect(2)` is asserted when `server` drops: a cached hit would
         // have answered the second call without reaching it at all.
+    }
+
+    #[tokio::test]
+    async fn a_malformed_complete_response_is_not_cached() {
+        // `Mapping::mask` (mapping.rs) refuses overlapping, empty/inverted or
+        // out-of-range spans. Before `check_spans` gated `insert`, `detect`
+        // cached a malformed complete response anyway: every later request
+        // for the same tenant and text answered from that entry, `mask`
+        // refused it again, and the hit refreshed the LRU clock so the
+        // entry was never evicted — one transient bad response became a
+        // permanent per-text refusal. The overlapping pair here
+        // (PERSON 0..5, IBAN 3..8 over "Weber schreibt") is the same shape
+        // `mapping::tests::an_overlapping_span_refuses` uses, so the two
+        // tests exercise one shared predicate rather than two that could
+        // disagree.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [
+                    {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 2, "boosted": false},
+                    {"entity_type": "IBAN", "start": 3, "end": 8, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 1, "boosted": false}
+                ],
+                "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+
+        let first = client.detect("Weber schreibt", credential).await.unwrap();
+        assert_eq!(
+            first.len(),
+            2,
+            "a malformed detection is still served in full"
+        );
+
+        let second = client.detect("Weber schreibt", credential).await.unwrap();
+        assert_eq!(second.len(), 2);
+        // `expect(2)` is asserted when `server` drops: a cached hit — good
+        // or bad — would have answered the second call without reaching it.
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_complete_response_still_caches() {
+        // The mirror of `a_malformed_complete_response_is_not_cached`: the
+        // new guard must decline exactly what `mask` would reject, not
+        // caching in general. Same text, spans that do not overlap.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [
+                    {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 2, "boosted": false},
+                    {"entity_type": "IBAN", "start": 6, "end": 14, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 1, "boosted": false}
+                ],
+                "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+
+        client.detect("Weber schreibt", credential).await.unwrap();
+        client.detect("Weber schreibt", credential).await.unwrap();
+        // `expect(1)` is asserted when `server` drops: a cache hit answered
+        // the second call.
     }
 }
