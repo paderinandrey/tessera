@@ -102,8 +102,18 @@ The cost is honest and stated in **Known limits** below.
 
 Spans are determined by the weights *and* by `catalog/identifiers.yaml` and
 `catalog/ner.yaml` — a threshold edit changes what is detected without touching
-`HF_REVISION`. The version is therefore a digest over the pinned revision and
-the contents of both catalogs.
+`HF_REVISION`. The version is therefore a digest over both catalogs and the
+weights themselves.
+
+Not over `HF_REVISION`, which was this design's first answer and was wrong.
+`TESSERA_NER_MODEL` is a supported override, so the pinned revision names the
+weights a detector *would* load rather than the ones it did: two replicas, one
+overridden, would report one version while returning different spans, and the
+gateway would key them together. The digest is taken over the bytes of the
+artifacts actually resolved, which also makes it independent of the path they
+were found at. It is computed once when the model is resolved, since hashing a
+1.15 GB weights file costs about 0.75 s and this value is read on every
+`/detect`.
 
 ### Why a degraded run is dropped rather than keyed
 
