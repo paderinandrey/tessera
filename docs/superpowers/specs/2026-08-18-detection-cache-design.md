@@ -110,6 +110,20 @@ no background task and no "before the first successful poll" state exist.
 
 The cost is honest and stated in **Known limits** below.
 
+### The rule this section keeps rediscovering
+
+Six times in this slice the version described what the package *ships* instead
+of what the process *holds*, and each was found the same way: the pinned
+revision rather than the loaded weights; two named artifacts rather than the
+directory the loader reads; the catalogs and weights but not this package's own
+source; the inference tree but not the validators'; and finally the packaged
+catalog while the detector held a caller's.
+
+The rule is one sentence — **derive the version from the object, never from the
+package** — and it is written into `detector_version`'s docstring rather than
+only here, because every one of those six was added by someone who had the
+design in front of them and still reached for the file on disk.
+
 ### Why the version is not just the model revision
 
 Spans are determined by the weights *and* by `catalog/identifiers.yaml` and
