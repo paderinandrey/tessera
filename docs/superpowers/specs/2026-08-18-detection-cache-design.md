@@ -185,29 +185,44 @@ saturation here evicts.
 
 ## Configuration
 
-One key, `detection_cache_entries`, defaulting to 10 000. Zero disables the
-cache; unlike `max_sessions`, zero is a meaningful setting rather than a
-validation error.
+Two keys. `detection_cache_entries`, defaulting to 10 000, bounds how many
+detections are held; zero disables the cache, and unlike `max_sessions`, zero is
+a meaningful setting rather than a validation error. `max_spans_per_entry`
+bounds how large any one of them may be.
 
-**The key bounds entries, not bytes, and the two are not interchangeable.**
-Measured: an entry costs about 130 bytes fixed plus about 65 per span found in
-its text. Chat-shaped text with a name or two lands near 300 bytes, so the
-default is a few megabytes — which is the figure this design originally quoted,
-and it is only true for that shape. A 20 KB tool result with an entity every 25
-characters is some 800 spans, about 52 KB in a single entry, and ten thousand of
-those is hundreds of megabytes. Since this cache exists for agent traffic, that
-is not the tail case: a deployment handling large tool results must size by
-expected spans per text rather than by entry count.
+**An entry count alone does not bound memory, because an entry has no fixed
+size.** Measured with a counting allocator against the real types: 264 bytes
+fixed plus 46 per span found in the text, and those are requested bytes, so they
+exclude malloc rounding and hash-table slack and are a floor rather than an
+estimate. Chat-shaped text with a name or two lands near 350 bytes and ten
+thousand of those is a few megabytes. A 20 KB tool result with an entity every
+25 characters is some 800 spans and about 37 KB in a single entry, and ten
+thousand of those is 352 MB. Nothing in the request path bounds it there either:
+axum's 2 MB body limit permits roughly 80 000 spans in one text, about 3.7 MB in
+a single entry. An entry count multiplied by an unbounded term is not a memory
+budget.
 
-Bounding the inner dimension as well as the outer one is the structural answer,
-and the codebase already has the precedent — the session store ships
-`max_session_values` beside `max_sessions` for exactly this reason. It is a
-follow-up rather than part of this slice, and the config comment carries the
-scaling law in the meantime.
+So the design ships a second key, `max_spans_per_entry`. A detection with more
+spans than that is served normally and simply not stored — declining to cache is
+never a refusal, which is invariant 4 below. This is the inner bound the session
+store already has in `max_session_values` beside `max_sessions`, and the two
+pairs exist for the same reason.
+
+**Why this is in the slice rather than after it.** An earlier draft of this
+document scoped the inner bound to a follow-up, on the grounds that the ceiling
+converges rather than leaks and the scaling law could be documented in the
+meantime. That reasoning missed the coupling that decides it: `SessionStore`
+lives in the same process, cache entries expire only by count and never by time,
+so the ceiling is reached rather than approached — and an OOM kill takes the
+session mappings with it. This cache is built on the principle that losing an
+entry costs time and not correctness. It must not be the component that destroys
+the one where correctness lives.
 
 It is on by default. The cache changes how fast the gateway answers and not what
 it sends, so an operator who never reads the documentation should get the fast
-behaviour; the reason to reach for the key is a memory budget, not a policy.
+behaviour — which is precisely why the product of the two defaults has to be a
+memory figure that operator would accept unread. The reason to reach for either
+key is a memory budget, not a policy.
 
 Added to `gateway/tessera.example.toml`, `deploy/tessera.container.toml` and
 `deploy/tessera.demo.toml`.
@@ -224,6 +239,8 @@ fail:
 5. `detection_cache_entries = 0` reproduces today's behaviour exactly.
 6. Saturation evicts the least recently used rather than refusing.
 7. The journal's `types` and `spans` counts are identical for a hit and a miss.
+8. A detection above `max_spans_per_entry` is served in full and not stored.
+9. A hit returns the offsets that were computed for that text, not another's.
 
 Store mechanics are unit tests in `detection_cache.rs`. Client behaviour goes
 through `wiremock`, already used in `detector.rs`: a miss reaches the server, a
@@ -233,6 +250,12 @@ catalog is edited.
 
 Invariant 7 is asserted rather than assumed. The evidence layer must not get
 weaker because an answer arrived from memory.
+
+Invariant 9 is the one this design argues hardest for and the easiest to leave
+untested, because every cheaper assertion passes without it: a hit that applies
+another text's offsets returns the right number of spans of the right types, and
+only the bytes forwarded upstream reveal it. It is pinned by comparing the body
+sent to the provider across a miss and a hit.
 
 ## Out of scope
 
