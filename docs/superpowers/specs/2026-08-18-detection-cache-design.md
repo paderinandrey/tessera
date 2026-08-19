@@ -234,8 +234,8 @@ gateway traffic, which the journal is one field away from being able to answer.
 a limit rather than a number to keep raising.** The densities above are code,
 logs and prose — the shapes a coding agent sends. A contact list or an intake
 form is not shaped like either. The only dense-PII sample in this repository is
-the evaluation corpus, which annotates 19.9 spans per 1 000 characters across the
-whole file and 30.0 across its eighty non-negative rows; a real contact row, at
+the evaluation corpus, which annotates about 20 spans per 1 000 characters across
+the whole file and about 30 across its eighty non-negative rows; a real contact row, at
 roughly five entities in eighty characters, exceeds both. It characterises
 nothing about a buyer's traffic and is not offered as doing so — it is an
 illustration of where the cap lands on text that is dense throughout.

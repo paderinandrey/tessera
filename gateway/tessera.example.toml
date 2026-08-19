@@ -71,12 +71,15 @@ detection_cache_entries = 10000
 # is a limit rather than a number to keep raising. The densities above are
 # code, logs and prose — the shapes a coding agent sends. A contact list or
 # an intake form is not shaped like either. The only dense-PII sample in
-# this repository is the evaluation corpus, which annotates 19.9 spans per
-# 1000 characters across the whole file and 30.0 across its eighty
+# this repository is the evaluation corpus, which annotates about 20 spans per
+# 1000 characters across the whole file and about 30 across its eighty
 # non-negative rows; a real contact row, at roughly five entities in eighty
 # characters, exceeds both. It characterises nothing about a buyer's
 # traffic and is not offered as doing so — it is an illustration of where
-# the cap lands on text that is dense throughout.
+# the cap lands on text that is dense throughout. It cannot be more than
+# that: every row of that corpus is a single rendered sentence under 126
+# characters, so nothing in this repository is shaped like a client
+# document. The figure is an illustration awaiting its measurement.
 #
 # At that density a single text crosses 250 spans somewhere between 8 and
 # 16 KB, so a uniformly dense document arriving as one message is declined
