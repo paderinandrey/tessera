@@ -23,6 +23,16 @@ jobs:
       - run: uv run pytest
       - run: uv run ruff check . ../evaluation
       - run: uv run mypy src
+      # `uv sync --group serve` above installs the dev group too (uv's
+      # default for a group literally named `dev`), so every step before
+      # this one runs with pytest, mypy and ruff's own dependencies sitting
+      # in the environment alongside detector's declared ones — exactly the
+      # gap that let an undeclared `packaging` import ship, since pytest
+      # pulled it in incidentally and nothing here noticed. This proves the
+      # runtime resolves with nothing but [project.dependencies] installed,
+      # in a scratch environment this target builds and tears down itself
+      # rather than the one every step above shares.
+      - run: make -C .. check-base-install
       # The gateway keeps its own copy of the entity-type vocabulary, because
       # asking the detector which types it emits would be worthless against a
       # detector that lies. The copy is only safe while something notices it

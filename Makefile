@@ -1,4 +1,4 @@
-.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke check-entity-types check-layers
+.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke check-entity-types check-layers check-base-install
 
 # The host port the stack publishes. Overridable because 8080 is a popular
 # port; both compose and the smoke test read it from the environment.
@@ -42,6 +42,29 @@ check-entity-types:
 
 check-layers:
 	python3 scripts/check_layers.py
+
+# Proves detector/'s runtime imports resolve with nothing but
+# [project.dependencies] installed — the exact gap that let a `packaging`
+# import ship undeclared, because every environment this repo's own
+# commands otherwise build includes the dev group (uv's default) or the
+# serve/ner groups, any of which can drag a dependency in incidentally. A
+# `pytest` run cannot substitute for this: pytest is itself a dev
+# dependency, so a suite run already proves the environment it happens to
+# run in, never the minimal one.
+#
+# Synced with UV_PROJECT_ENVIRONMENT pointed at a scratch directory rather
+# than detector/.venv, so this never touches the developer's own
+# environment — nothing here needs restoring, because nothing here is
+# shared. `mktemp -d` for the scratch path and a trap for its removal, one
+# shell for the whole recipe so the trap covers both the sync and the run:
+# the same reasons compose-smoke's own recipe already uses both.
+check-base-install:
+	@dir=$$(mktemp -d); \
+	trap 'rm -rf "$$dir"' EXIT INT TERM; \
+	UV_PROJECT_ENVIRONMENT="$$dir" uv run --project detector --no-default-groups --frozen python -c "\
+	from tessera_detector.pipeline import build_detector; \
+	build_detector(ner=False); \
+	print('base install: runtime imports resolve without dev, serve or ner')"
 
 # Brings the demo stack up, sends one request through it, and tears the stack
 # and its volumes down whether the check passed or failed — a smoke test that
