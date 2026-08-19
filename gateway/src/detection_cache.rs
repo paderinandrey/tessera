@@ -306,8 +306,29 @@ impl DetectionCache {
         // and wrong — and it costs nothing extra on the common path, where
         // the version matches and the sweep never runs.
         if inner.known_version != Some(version) {
+            let known_before = inner.known_version;
             inner.entries.retain(|stored, _| stored.version == version);
             inner.known_version = Some(version);
+            // The sweep alone isn't enough: this response is the one that
+            // revealed the disagreement, and storing it would let it look
+            // identical to a legitimate current entry from the moment it
+            // lands — matching `known_version`, so immune to every sweep
+            // after this one. That is how a late response would otherwise
+            // outlive the rollover it arrived during: cached once here, a
+            // request for the same text would hit it and never miss again,
+            // long after the rest of the fleet moved on. Declined instead,
+            // for exactly this call: the text stays a miss until an insert
+            // whose version agrees with what is *then* known arrives — in
+            // step with the entries already sitting around it, not ahead
+            // of them.
+            //
+            // `known_before` is `None` only when nothing has been recorded
+            // yet — the cache's first insert ever, not a disagreement with
+            // anything. That one still stores, or the cache could never
+            // hold a first entry.
+            if known_before.is_some() {
+                return;
+            }
         }
         inner.clock += 1;
         let clock = inner.clock;
@@ -403,6 +424,11 @@ mod tests {
     fn a_new_version_hides_everything_stored_under_the_old_one() {
         let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
+        // The transition itself is never stored (finding G) — it is the
+        // response that revealed the version changed, not one to trust.
+        // A second v2 insert, now agreeing with what is already known,
+        // is what actually lands.
+        cache.insert("v2", A, "Warm-up", &[span("PERSON", 0, 5)]);
         cache.insert("v2", A, "Schmidt", &[span("PERSON", 0, 7)]);
         assert!(cache.get(A, "Weber").is_none());
         assert!(cache.get(A, "Schmidt").is_some());
@@ -434,6 +460,56 @@ mod tests {
         assert!(
             cache.get(A, "TextA").is_none(),
             "a version rollback revived TextA's stale v1 entry, never re-verified under v2"
+        );
+    }
+
+    #[test]
+    fn a_converging_fleet_does_not_let_a_late_response_persist_as_current() {
+        // The gap the sweep alone left open (finding G): a late response is
+        // swept into place correctly, but if it is also *stored*, it looks
+        // exactly like a legitimate current entry from that moment on —
+        // matching `known_version`, so no later sweep ever touches it
+        // again. A text that keeps being asked for would hit that one
+        // stale answer forever, long after every replica actually
+        // converged on the newer version.
+        let cache = DetectionCache::new(4, UNCAPPED);
+        cache.insert("v1", A, "Setup", &[span("PERSON", 0, 5)]);
+        // A transition insert is never stored (this is finding G's own
+        // fix, exercised here to set the stage): known becomes v2, but
+        // nothing is written for this call.
+        cache.insert("v2", A, "Warm-up", &[span("PERSON", 0, 5)]);
+        // A second v2 insert, agreeing with what is already known, lands
+        // normally — this is "the fleet, steadily on v2" for this test.
+        cache.insert("v2", A, "TextB", &[span("PERSON", 0, 5)]);
+        assert!(
+            cache.get(A, "TextB").is_some(),
+            "setup: v2 traffic must cache normally"
+        );
+
+        // The late v1 response for "TextA", arriving after the fleet is on
+        // v2. It must not persist as if it were current.
+        cache.insert("v1", A, "TextA", &[span("PERSON", 0, 5)]);
+        assert!(
+            cache.get(A, "TextA").is_none(),
+            "the late v1 response was stored and served as though current"
+        );
+
+        // The fleet has converged: TextA is asked again, and this time a
+        // v2 replica answers. That response also disagrees with what was
+        // just adopted (known is v1, from the late arrival above) and so
+        // is itself declined — the text stays a miss for one more round.
+        cache.insert("v2", A, "TextA", &[span("PERSON", 0, 5)]);
+        assert!(
+            cache.get(A, "TextA").is_none(),
+            "a response arriving mid-transition was stored anyway"
+        );
+
+        // Only once a response's version agrees with what is *then*
+        // already known does it land — the fleet has fully converged.
+        cache.insert("v2", A, "TextA", &[span("PERSON", 0, 5)]);
+        assert!(
+            cache.get(A, "TextA").is_some(),
+            "a response that finally agreed with the converged version was not stored"
         );
     }
 
