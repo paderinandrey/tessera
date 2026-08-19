@@ -255,11 +255,37 @@ impl DetectionCache {
             self.warn_poisoned();
             return;
         };
-        // A version the store has not seen before makes every entry under the
-        // old one unreachable. They are not swept: they simply stop matching
-        // and age out through the ceiling, which costs nothing on the path a
-        // request is waiting on.
-        inner.known_version = Some(version);
+        // A version that differs from the one currently known is swept, not
+        // just left to stop matching. Digests carry no order, so a
+        // differing version cannot be assumed newer: a slow response for an
+        // older version can land after a faster one for a newer version —
+        // real with cacheable misses straddling a rolling upgrade, or with
+        // mixed-version replicas behind one gateway, both real deployments
+        // (see the version-honesty fix this cache already carries). Without
+        // the sweep, that late arrival would reassign `known_version` back
+        // to the older value, and every entry still sitting under it —
+        // never removed, only waiting to stop matching — would become
+        // reachable again through `get`'s own version recheck, which trusts
+        // `known_version` to mean "current" and has no way to know it just
+        // went backwards. Served that way, the answer is missing whatever
+        // the newer version's run added: a masking gap, not merely stale
+        // data.
+        //
+        // So every entry not stamped with the version about to become
+        // current is dropped right here, before it is adopted — an entry
+        // present in the map, at any instant, is now stamped with
+        // `known_version` by construction, whichever direction the version
+        // moved. In a fleet that is permanently mixed rather than mid-
+        // rollover, this costs the hit rate: every insert sees a different
+        // version than the last and sweeps the map on every call, thrashing
+        // toward zero. That is the correct trade for this cache, the same
+        // one this gateway makes everywhere else — slow and right over fast
+        // and wrong — and it costs nothing extra on the common path, where
+        // the version matches and the sweep never runs.
+        if inner.known_version != Some(version) {
+            inner.entries.retain(|stored, _| stored.version == version);
+            inner.known_version = Some(version);
+        }
         inner.clock += 1;
         let clock = inner.clock;
         if inner.entries.len() >= self.capacity && !inner.entries.contains_key(&key) {
@@ -357,6 +383,35 @@ mod tests {
         cache.insert("v2", A, "Schmidt", &[span("PERSON", 0, 7)]);
         assert!(cache.get(A, "Weber").is_none());
         assert!(cache.get(A, "Schmidt").is_some());
+    }
+
+    #[test]
+    fn a_version_rollback_does_not_revive_a_different_texts_stale_entry() {
+        // Digests carry no order, so a version rollback is not hypothetical:
+        // a slow response for an older version can land after a faster one
+        // for a newer version, whether from a cacheable miss straddling a
+        // rolling upgrade or from mixed-version replicas behind one
+        // gateway. "TextA" here stands for a text `insert` never touches
+        // again after the rollback — the entry the old, unswept design
+        // would have quietly left sitting under v1, waiting for
+        // `known_version` to come back around, never re-verified against
+        // whatever v2's run added for it.
+        let cache = DetectionCache::new(4, UNCAPPED);
+        cache.insert("v1", A, "TextA", &[span("PERSON", 0, 5)]);
+        cache.insert("v2", A, "TextB", &[span("PERSON", 0, 5)]);
+        assert!(
+            cache.get(A, "TextA").is_none(),
+            "TextA's v1 entry was reachable right after the move to v2"
+        );
+
+        // The late v1 response: a text v1 never scanned before now,
+        // arriving only after the fleet has already moved on to v2.
+        cache.insert("v1", A, "TextC", &[span("PERSON", 0, 5)]);
+
+        assert!(
+            cache.get(A, "TextA").is_none(),
+            "a version rollback revived TextA's stale v1 entry, never re-verified under v2"
+        );
     }
 
     #[test]
