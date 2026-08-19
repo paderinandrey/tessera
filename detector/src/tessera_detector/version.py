@@ -29,6 +29,8 @@ so it alone is still read from the package's own resources; see
 """
 
 import hashlib
+import sys
+import unicodedata
 from collections.abc import Iterable
 from importlib import resources
 from pathlib import Path
@@ -101,6 +103,48 @@ def source_digest(root: Path | None = None) -> str:
     return digest.hexdigest()
 
 
+def interpreter_id() -> str:
+    """The Python runtime's own identity: implementation, version, and the
+    Unicode database it loaded.
+
+    `normalize.py` calls `unicodedata.normalize("NFKC", ...)`, and
+    `deterministic.py`'s rules match through the stdlib `re` engine over
+    that normalized text — both against the same interpreter's own
+    Unicode tables, sourced from neither the source tree (`source_digest`)
+    nor any declared dependency (`models.dependency_digest`). A runtime
+    whose Unicode database differs can change normalized text, matches and
+    offsets with no source, catalog, model or distribution version moving.
+    Real, not hypothetical, for this package specifically:
+    `requires-python = ">=3.14"` is an open lower bound that permits any
+    later interpreter, and neither of `Dockerfile`'s two base images
+    (`ghcr.io/astral-sh/uv:python3.14-trixie-slim`,
+    `python:3.14-slim-trixie`) is pinned to a digest — a rebuild can land
+    on a different point release, or the same point release rebuilt
+    against a newer Debian trixie image, with no change to this
+    package's own files at all.
+
+    Three fields, not one, because each protects a different mechanism
+    that could vary independently:
+
+    - `sys.implementation.name` — a different implementation entirely
+      (PyPy, GraalPy) can carry its own `re` engine with its own matching
+      semantics, unrelated to Unicode table version.
+    - `sys.version_info`, to the patch level — `re`'s own behaviour has
+      changed between CPython releases before, independent of the
+      Unicode Character Database version.
+    - `unicodedata.unidata_version` — the fact the paragraph above is
+      really about: two interpreters reporting the same
+      `sys.version_info` are not guaranteed to load the same Unicode
+      Character Database revision, and this is what `NFKC` actually
+      normalizes against.
+
+    See `detector_version` for the criterion this satisfies and the
+    boundary of what it does not extend to.
+    """
+    major, minor, micro = sys.version_info[:3]
+    return f"{sys.implementation.name}-{major}.{minor}.{micro}-unicode{unicodedata.unidata_version}"
+
+
 def detector_version(model_id: str, catalog_text: str) -> str:
     """Neither argument has a default, deliberately: a forgotten argument
     here is exactly the bug this signature exists to make impossible to
@@ -115,14 +159,78 @@ def detector_version(model_id: str, catalog_text: str) -> str:
     value, the same way `model_id` already does for the weights, is what
     makes a caller-supplied catalog visible here at all: an application
     that overrides `catalog_text` gets detection from those rules, and this
-    has to see that they changed. Six inputs now follow this rule, one
+    has to see that they changed. Seven inputs now follow this rule, one
     after another as each was found missing it: the pinned weights
     (`model_id`), the NER runtime's own dependencies, the deterministic
     layer's own dependencies (both folded into `model_id` by
-    `pipeline.build_detector`), this package's own source (`source_digest`
-    below), and now the identifiers catalog. Whatever the next input turns
-    out to be, the rule already stated for all of them is the one to keep:
-    read what the object holds, never re-read the package's own copy of it.
+    `pipeline.build_detector`), this package's own source (`source_digest`),
+    the identifiers catalog, and now the interpreter itself
+    (`interpreter_id`). Read what the object or the process holds, never
+    re-read the package's own copy of it — the rule every one of them
+    follows.
+
+    That rule answers *how* an input gets in once it qualifies. It does
+    not say what qualifies, and nine rounds of finding one more thing this
+    digest did not cover is what happens without an answer to that
+    question too — the interpreter is not the last thing a rebuild can
+    change. The criterion, checked against every input above and below
+    rather than declared from nothing: an input belongs in this digest
+    when (1) it can actually change what a text detects to, and (2) that
+    identity is available cheaply, deterministically and from inside this
+    process — no shelling out, no parsing another program's output, no
+    dependence on the machine's own state beyond what the process already
+    loaded.
+
+    Both conditions matter, not just the first. `sys.platform` fails
+    condition (1) outright: this package touches nothing platform-specific
+    in the paths that produce spans (grep the source — `normalize.py` and
+    `deterministic.py` use only `unicodedata` and `re`, both of which ship
+    their own tables rather than reading the OS's), so recording it would
+    never actually distinguish two builds that detect differently.
+
+    Three things that were considered and left out, because at least one
+    condition fails for each — named here rather than left to the next
+    reviewer to wonder whether they were missed:
+
+    - The host C library. `unicodedata` and `re` use CPython's own
+      bundled Unicode tables, not libc's — condition (1) is unverified at
+      best for the operations this package actually performs, and no
+      onnxruntime internals were audited to be sure a compiled dependency
+      never touches it. Moot regardless: there is no portable stdlib way
+      to name "the libc version" from inside a Python process across the
+      platforms this package runs on, so condition (2) fails on its own.
+    - The CPU features onnxruntime's kernels dispatch on (AVX2 vs
+      AVX-512, say). Real: different dispatch can mean different
+      floating-point paths through the same model. But the dispatch
+      decision is internal to onnxruntime's own C++ runtime and is not
+      exposed through a public API this process can read; querying the
+      CPU's own advertised feature flags would only say what the hardware
+      *could* dispatch to, not what a given kernel call actually did.
+      Fails condition (2): not cheap, not from inside this process.
+    - The ONNX execution provider a session actually loads with.
+      Unlike the two above, this one is genuinely cheap, deterministic
+      and in-process — `InferenceSession.get_providers()` answers it
+      directly, so it does not fail either condition on its own terms.
+      Left out because, today, it carries no information: this package's
+      own `pyproject.toml` pins onnxruntime to a CPU build and never
+      installs a GPU provider, so every session that loads at all reports
+      the same one. The day a GPU provider becomes installable, that
+      stops being true, and this is the input to add then — not a
+      boundary that holds by definition, one that holds by this
+      deployment's own present architecture, and the trigger for
+      revisiting it is that architecture changing.
+
+    What staying outside the boundary means, plainly: a difference this
+    digest cannot see is a difference the gateway's cache cannot see
+    either. A deployment whose fleet runs mixed libc versions, or whose
+    hardware mix spans CPU generations old enough for kernel dispatch to
+    differ, can serve spans from one host's cache to a request a
+    different host's detector would have answered slightly differently.
+    That is not a bug this digest failed to catch; it is the edge of what
+    an in-process digest can ever see, stated so a deployment that cares
+    can decide — pin the fleet to one image and one CPU baseline, or
+    accept the gap — rather than discover it by noticing drift nobody
+    can explain.
     """
     catalog_dir = resources.files("tessera_detector") / "catalog"
     ner_catalog_bytes = (catalog_dir / NER_CATALOG).read_bytes()
@@ -135,8 +243,9 @@ def detector_version(model_id: str, catalog_text: str) -> str:
         catalog_text.encode("utf-8"),
         ner_catalog_bytes,
         source_digest().encode("utf-8"),
+        interpreter_id().encode("utf-8"),
     ]
     return version_from(model_id, blobs)
 
 
-__all__ = ["NER_CATALOG", "detector_version", "source_digest", "version_from"]
+__all__ = ["NER_CATALOG", "detector_version", "interpreter_id", "source_digest", "version_from"]

@@ -1,12 +1,14 @@
 """The version is what the gateway keys its span cache by, so it must change
 whenever the same text would produce different spans."""
 
+import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
 
 from tessera_detector.deterministic import DeterministicDetector
-from tessera_detector.version import detector_version, source_digest, version_from
+from tessera_detector.version import detector_version, interpreter_id, source_digest, version_from
 
 
 def test_the_same_inputs_give_the_same_version():
@@ -114,5 +116,69 @@ def test_detector_version_changes_when_the_source_tree_does(
     monkeypatch.setattr(version_module, "source_digest", lambda: "source-a")
     first = detector_version("m", "cat")
     monkeypatch.setattr(version_module, "source_digest", lambda: "source-b")
+    second = detector_version("m", "cat")
+    assert first != second
+
+
+def test_interpreter_id_is_stable_within_a_process() -> None:
+    assert interpreter_id() == interpreter_id()
+
+
+def test_interpreter_id_reflects_the_running_interpreter() -> None:
+    # Not a stub: the real implementation name and Unicode database version
+    # actually appear in it, so a reader can tell what it is reporting
+    # without trusting the function's own docstring.
+    identity = interpreter_id()
+    assert sys.implementation.name in identity
+    assert unicodedata.unidata_version in identity
+
+
+def test_interpreter_id_changes_with_the_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A different implementation (PyPy, GraalPy) can carry its own `re`
+    # engine, unrelated to Unicode table version.
+    before = interpreter_id()
+    monkeypatch.setattr(sys.implementation, "name", "not-cpython")
+    assert interpreter_id() != before
+
+
+def test_interpreter_id_changes_with_the_python_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `re`'s own behaviour has changed between CPython releases before,
+    # independent of the Unicode Character Database version.
+    before = interpreter_id()
+    monkeypatch.setattr(sys, "version_info", (9, 9, 9, "final", 0))
+    assert interpreter_id() != before
+
+
+def test_interpreter_id_changes_with_the_unicode_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fact `interpreter_id` ultimately exists to catch: two
+    # interpreters reporting the same sys.version_info are not guaranteed
+    # to load the same Unicode Character Database revision, which is what
+    # normalize.py's NFKC call actually normalizes against.
+    before = interpreter_id()
+    monkeypatch.setattr(unicodedata, "unidata_version", "0.0.0")
+    assert interpreter_id() != before
+
+
+def test_detector_version_changes_when_the_interpreter_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding: the version used to cover the pinned weights, both
+    # dependency digests, both catalogs and this package's own source, but
+    # not the interpreter that runs all of it. A rebuild landing on a
+    # different Python — the container base images are tag-pinned, not
+    # digest-pinned, and requires-python is an open lower bound — could
+    # change NFKC normalization and regex matching with none of those
+    # other five inputs moving.
+    import tessera_detector.version as version_module
+
+    monkeypatch.setattr(version_module, "interpreter_id", lambda: "interpreter-a")
+    first = detector_version("m", "cat")
+    monkeypatch.setattr(version_module, "interpreter_id", lambda: "interpreter-b")
     second = detector_version("m", "cat")
     assert first != second
