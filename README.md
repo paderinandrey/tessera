@@ -278,7 +278,10 @@ uniformly dense text — a contact list or an intake form, not ordinary correspo
 which is prose-shaped at nearer 2.5 spans per 1 000 characters and is not affected —
 crosses the cap at single-digit kilobytes: 8 to 16 KB at the density this repository's
 own evaluation corpus annotates, offered here only as an illustration of where the cap
-lands on text that is dense throughout, not as a claim about a buyer's traffic. Because
+lands on text that is dense throughout, not as a claim about a buyer's traffic — every
+row of that corpus is a single rendered sentence under 126 characters, and nothing else
+here is shaped like a client document either, so the figure awaits its real measurement:
+spans per 1,000 characters over actual gateway traffic. Because
 the cache keys per text rather than per document, this bites a dense message arriving as
 one text — a conversation *about* a dense file is many short turns that all cache
 normally, and a long document is rarely uniform, the way a contract is prose everywhere

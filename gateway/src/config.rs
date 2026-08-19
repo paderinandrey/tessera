@@ -108,13 +108,17 @@ fn default_detection_cache_entries() -> usize {
 // prose-shaped at nearer 2.5/1 000 and unaffected — crosses the cap at
 // single-digit kilobytes (8-16 KB at the evaluation corpus's measured
 // density, offered only as an illustration of a uniformly dense text, never
-// as a characterisation of real traffic). The cache keys per text, so this
-// bites a dense message arriving as one text, not a conversation about a
-// dense file (many short turns, all cached normally) or a document that is
-// merely dense in places. A real limit, not a number to keep raising by
-// default, because the same number multiplies against the entry ceiling
-// below. Raising it is the deliberate lever for that traffic; see
-// tessera.example.toml for the arithmetic that prices it.
+// as a characterisation of real traffic — every row of that corpus is a
+// single rendered sentence under 126 characters, so nothing in this
+// repository is actually shaped like a client document; the figure awaits
+// its measurement, which is spans per 1 000 characters over real gateway
+// traffic). The cache keys per text, so this bites a dense message arriving
+// as one text, not a conversation about a dense file (many short turns, all
+// cached normally) or a document that is merely dense in places. A real
+// limit, not a number to keep raising by default, because the same number
+// multiplies against the entry ceiling below. Raising it is the deliberate
+// lever for that traffic; see tessera.example.toml for the arithmetic that
+// prices it.
 //
 // At 264 B fixed + 46 B/span (measured, a floor): the worst-case entry is
 // 264 + 250 * 46 = 11 764 B, and at the default 10 000 entries the worst-case
