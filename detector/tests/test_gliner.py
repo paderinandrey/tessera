@@ -59,6 +59,11 @@ def test_scores_below_the_threshold_are_dropped(recognizer: GlinerRecognizer) ->
         type(t)(t.entity_type, t.label, 1.0, t.tier, t.specificity) for t in load_ner_types()
     ))
     assert strict.detect("Le dossier de Madame Amélie Rousseau est complet.") == []
+    # This is also the real second construction in this process finding F's
+    # fix has to survive: a sys.modules-diff dependency digest reports
+    # nothing new here (everything is already imported) and would disagree
+    # with `recognizer`'s own — the exact defect the fix replaced.
+    assert strict.dependency_digest == recognizer.dependency_digest
 
 
 def test_token_dense_text_is_still_inferred_to_its_end(recognizer: GlinerRecognizer) -> None:

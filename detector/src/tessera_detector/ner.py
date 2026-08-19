@@ -4,7 +4,6 @@ Types are data: entity type, the label handed to the model, its threshold, tier 
 specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
-import sys
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib import resources
@@ -163,16 +162,6 @@ class GlinerRecognizer:
     def __init__(self, model_path: Path, types: tuple[NerType, ...] | None = None) -> None:
         # Imported lazily: the base install does not carry the ner group, and
         # `import tessera_detector.ner` must keep working without it.
-        #
-        # Bracketed here rather than resolved from the whole process's
-        # import table: everything that becomes importable between these
-        # two snapshots is what loading the model itself pulled in —
-        # gliner, onnxruntime, transformers, tokenizers, numpy, and
-        # whatever they in turn depend on — not fastapi, pytest, or
-        # anything else a dev checkout's extra dependency groups already
-        # had loaded before this constructor ran (see
-        # models.dependency_digest).
-        modules_before = set(sys.modules)
         from gliner import GLiNER
 
         self.model_path = model_path
@@ -189,10 +178,13 @@ class GlinerRecognizer:
         self._model = GLiNER.from_pretrained(
             str(model_path), load_onnx_model=True, onnx_model_file=ONNX_MODEL_FILE
         )
-        # What actually loaded, named the same way weights_digest names the
-        # graph: by what changed, not by a hand-written guess at which
-        # packages matter.
-        self.dependency_digest = dependency_digest(set(sys.modules) - modules_before)
+        # "gliner" here is the PyPI distribution name (unrelated to
+        # MODEL_NAME, which names the weights), the root `dependency_digest`
+        # walks transitively through installed package metadata — not a
+        # snapshot of what this process happened to import, which a second
+        # construction here would find already loaded. See its own
+        # docstring for what that distinction fixes.
+        self.dependency_digest = dependency_digest("gliner")
         self._tokenizer = self._model.data_processor.transformer_tokenizer
         self._token_budget = int(self._model.config.max_len) - PROMPT_TOKEN_RESERVE
         # One inference pass per tier. GLiNER gives a span a single label, so

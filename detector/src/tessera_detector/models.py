@@ -7,7 +7,7 @@ deterministic layer alone.
 
 import hashlib
 import os
-from collections.abc import Iterable
+import re
 from importlib import metadata
 from pathlib import Path
 
@@ -161,10 +161,73 @@ def weights_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def dependency_digest(new_modules: Iterable[str]) -> str:
-    """A digest over the installed distributions behind `new_modules` — the
-    modules that became importable only once the inference path actually
-    ran, not a maintained list of package names.
+# A distribution name from the start of a PEP 508 requirement string —
+# "torch>=2.0.0" -> "torch", "onnxruntime-gpu; extra == \"gpu\"" ->
+# "onnxruntime-gpu". Deliberately not the `packaging` library's own
+# `Requirement` parser: that dependency is only ever present once the
+# `ner` group is installed, and this pattern is all `dependency_digest`
+# needs from the string — a name, not a validated specifier.
+_REQUIREMENT_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _requirement_name(requirement: str) -> str:
+    match = _REQUIREMENT_NAME.match(requirement)
+    if match is None:
+        raise ValueError(f"cannot find a distribution name in requirement {requirement!r}")
+    return match.group(1)
+
+
+def _normalize_distribution_name(name: str) -> str:
+    # PEP 503: distribution names compare case- and separator-insensitively
+    # ("PyYAML" and "pyyaml", "typing_extensions" and "typing-extensions").
+    # Without this, the same distribution reached by two different spellings
+    # would be walked and hashed twice, and could each recurse into the
+    # other's requirements as if they were unrelated.
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _transitive_requirements(root: str) -> set[str]:
+    """Every distribution `root` depends on, transitively, through its own
+    declared requirements — not what happens to be imported in the current
+    process, which depends on when in the process's life this runs (a
+    second construction in one process finds everything already imported,
+    so a diff against `sys.modules` reports nothing new for it — the
+    defect this function replaces).
+
+    Requirements gated behind an extra (`; extra == "gpu"`) are skipped:
+    they describe optional features nothing here activates, not what a
+    plain `pip install gliner` — which is what this project's own
+    dependency group does — actually pulls in. Requirements gated behind
+    other markers (`; sys_platform == "..."`) are not evaluated and may
+    list a distribution this platform never installs; `dependency_digest`
+    below tolerates that by skipping anything with no resolvable version,
+    the same way it already tolerates a module with no distribution.
+    """
+    seen: set[str] = set()
+    frontier = [root]
+    while frontier:
+        name = frontier.pop()
+        normalized = _normalize_distribution_name(name)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            requirements = metadata.requires(name) or ()
+        except metadata.PackageNotFoundError:
+            continue
+        for requirement in requirements:
+            if "extra ==" in requirement:
+                continue
+            dependency_name = _requirement_name(requirement)
+            if _normalize_distribution_name(dependency_name) not in seen:
+                frontier.append(dependency_name)
+    return seen
+
+
+def dependency_digest(root: str) -> str:
+    """A digest over the installed versions of `root` and everything it
+    depends on, transitively — declared in package metadata, not read from
+    which modules this process happened to import.
 
     A rebuild that moves GLiNER, onnxruntime or the tokenizer library to a
     different release — weights, catalogs and this package's own sources
@@ -173,44 +236,38 @@ def dependency_digest(new_modules: Iterable[str]) -> str:
     Naming the packages by hand here would repeat the exact mistake
     `REQUIRED_ARTIFACTS` already made once in this file: correct today,
     silently under-covering the day someone adds a dependency GLiNER pulls
-    in transitively. Reading the distributions actually imported instead
-    means a new one is picked up the next time the model loads, with
-    nothing here to update.
+    in transitively. Walking the declared dependency tree instead means a
+    new one is picked up the next time it appears in `gliner`'s own
+    metadata (or that of anything it depends on), with nothing here to
+    update by hand.
 
-    `new_modules` is deliberately a caller-supplied set rather than
-    something this function derives from `sys.modules` on its own:
-    `GlinerRecognizer.__init__` is the one place that knows the load's
-    boundary, snapshotting `sys.modules` immediately before and after
-    `GLiNER.from_pretrained` runs and diffing the two. Diffing there,
-    rather than reading the whole process's import table, is what keeps
-    this from also digesting fastapi, pytest, or whatever else a dev
-    checkout with extra dependency groups installed happens to have
-    imported before the model ever loads: none of that is new between the
-    two snapshots, so none of it appears here, regardless of how many
-    extra groups are merely *installed* alongside the inference path —
-    only what the load itself actually imports counts.
+    This replaced an earlier version keyed on a `sys.modules` diff around
+    the model load. That was a fact about process history, not about what
+    is installed: a second `GlinerRecognizer` built in the same process —
+    real in this suite, at `test_gliner.py`'s `strict = GlinerRecognizer(...)`
+    — finds everything already imported, so the diff for it is empty and
+    the two constructions report different identities for identical
+    weights, code and dependencies. Reading `importlib.metadata.requires()`
+    instead has no process to depend on: the same environment reports the
+    same digest every time, which `test_models.py` pins directly.
 
-    One gap, stated rather than hidden: a dependency already imported by
-    something else before the model loads would be invisible here, the
-    same way it would be invisible to any snapshot-diff approach. Nothing
-    in this project's own dependency tree imports GLiNER's own packages
-    (torch, onnxruntime, transformers, tokenizers) ahead of `ner.py`
-    itself, so this does not bite today; there is no "read every installed
-    distribution" fallback that would not trade this gap for the opposite
-    one — describing dev-only tooling as part of the model's identity.
+    Boundary, stated rather than left implicit: this covers what `root`'s
+    distribution *declares*, transitively. A package imported at runtime
+    but never declared as a dependency — by `root` or anything in its
+    tree — would be missed, the mirror image of the gap the `sys.modules`
+    approach had. Nothing in GLiNER's own dependency tree does that today.
     """
-    distributions = metadata.packages_distributions()
     versions: dict[str, str] = {}
-    for module_name in new_modules:
-        top_level = module_name.split(".", 1)[0]
-        for distribution_name in distributions.get(top_level, ()):
-            try:
-                versions[distribution_name] = metadata.version(distribution_name)
-            except metadata.PackageNotFoundError:
-                # An imported module with no resolvable distribution — a
-                # vendored or namespace module. Not a version to miss:
-                # there is no installed package here to have one.
-                continue
+    for name in _transitive_requirements(root):
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            # Declared but not installed on this platform — a marker this
+            # function does not evaluate (`; sys_platform == "..."`) ruled
+            # it out, or an optional backend nothing here requires. Not a
+            # version to miss: there is no installed package here to have
+            # one.
+            continue
     digest = hashlib.sha256()
     for name in sorted(versions):
         digest.update(f"{name}=={versions[name]}".encode())

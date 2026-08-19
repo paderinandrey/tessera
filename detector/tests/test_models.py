@@ -1,3 +1,5 @@
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -5,6 +7,8 @@ import pytest
 from tessera_detector.models import (
     HF_REVISION,
     MODEL_NAME,
+    _normalize_distribution_name,
+    _transitive_requirements,
     _weighed_files,
     dependency_digest,
     find_model,
@@ -194,35 +198,65 @@ def test_weighed_files_walks_beyond_required_artifacts(tmp_path: Path) -> None:
     assert "brand_new_artifact.bin" in names
 
 
-def test_dependency_digest_is_stable_for_the_same_modules() -> None:
-    # "yaml" is PyYAML, a base dependency (pyproject.toml's pyyaml), so it
-    # is always resolvable to an installed distribution in this suite.
-    assert dependency_digest({"yaml"}) == dependency_digest({"yaml"})
+def test_dependency_digest_is_stable_for_the_same_root() -> None:
+    # "pydantic" is a base dependency (pyproject.toml), always installed.
+    assert dependency_digest("pydantic") == dependency_digest("pydantic")
 
 
-def test_dependency_digest_changes_with_the_module_set() -> None:
-    # "pytest" has to be installed for this test to be running at all.
-    assert dependency_digest({"yaml"}) != dependency_digest({"pytest"})
+def test_dependency_digest_does_not_depend_on_process_history() -> None:
+    # The defect this replaced: a `sys.modules` diff around the load found
+    # a different answer depending on what the process had already
+    # imported by the time it ran — a second construction in one process
+    # found everything already imported and reported nothing new. Reading
+    # installed package metadata instead has no process state to depend
+    # on. Simulated directly rather than by importing something and hoping
+    # it was not already loaded: stuff a name into `sys.modules` between
+    # the two calls, standing in for whatever the process happens to
+    # import between two constructions in real life.
+    first = dependency_digest("pydantic")
+    marker = "a_module_dependency_digest_must_not_notice"
+    sys.modules[marker] = types.ModuleType(marker)
+    try:
+        second = dependency_digest("pydantic")
+    finally:
+        del sys.modules[marker]
+    assert first == second
 
 
-def test_dependency_digest_folds_in_every_module_given() -> None:
-    both = dependency_digest({"yaml", "pytest"})
-    assert both != dependency_digest({"yaml"})
-    assert both != dependency_digest({"pytest"})
+def test_dependency_digest_changes_with_the_root() -> None:
+    # "httpx" is a base dependency of the serve group, always installed
+    # alongside pydantic in this suite's environment.
+    assert dependency_digest("pydantic") != dependency_digest("httpx")
 
 
-def test_dependency_digest_resolves_only_the_top_level_package() -> None:
-    # sys.modules holds submodules too ("yaml.loader", not just "yaml").
-    # Only the top-level name maps to an installed distribution, so a
-    # deeper path must fold to the same identity as the bare name.
-    assert dependency_digest({"yaml.loader"}) == dependency_digest({"yaml"})
+def test_dependency_digest_ignores_a_root_with_no_installed_distribution() -> None:
+    # Not every name resolves to an installed distribution. Contributing
+    # nothing is correct; raising would fail startup over a root that was
+    # never really "a version" to track.
+    assert dependency_digest("not-a-real-package-xyz") == dependency_digest("also-not-real-xyz")
 
 
-def test_dependency_digest_ignores_a_module_with_no_installed_distribution() -> None:
-    # Not every importable name resolves to a distribution (a vendored or
-    # namespace module, or — as here — one that plain does not exist).
-    # Contributing nothing is correct; raising would fail startup over a
-    # module that was never really "a version" to track.
-    assert dependency_digest({"not_a_real_module_xyz"}) == dependency_digest(set())
+def test_transitive_requirements_includes_a_real_dependency() -> None:
+    # pydantic-core is a real, non-optional dependency of pydantic —
+    # walking one level deep is the whole point of "transitive".
+    assert "pydantic-core" in _transitive_requirements("pydantic")
+
+
+def test_transitive_requirements_excludes_extras() -> None:
+    # pydantic declares `email-validator` only behind `extra == "email"`,
+    # which nothing in this project activates — a plain install never
+    # pulls it in, and this must not either.
+    assert "email-validator" not in _transitive_requirements("pydantic")
+
+
+def test_normalize_distribution_name_folds_case_and_separators() -> None:
+    # PEP 503: "PyYAML", "pyyaml" and "py_yaml" all name the same
+    # distribution. Without this, the same package reached under two
+    # spellings would be walked (and hashed) as if it were two different
+    # ones.
+    assert _normalize_distribution_name("PyYAML") == _normalize_distribution_name("pyyaml")
+    assert _normalize_distribution_name("typing_extensions") == _normalize_distribution_name(
+        "typing-extensions"
+    )
 
 
