@@ -247,6 +247,21 @@ The cache is an optimisation, and that governs every failure path: **it may not
 fail a request.** A poisoned mutex degrades to "no cache" and the call proceeds
 to the detector. Saturation evicts. Detector errors are never stored.
 
+That sentence was first written thinking only about misses, and a miss is the
+easy half. A *hit* can fail a request too, and worse: a complete response whose
+spans `mask` will refuse — empty, past the end of the text, overlapping — was
+cached before anything looked at them, so every retry for that text was refused
+from memory without ever reaching a detector that may have recovered. Each hit
+also refreshed the entry's recency, so eviction would never reclaim it. One
+transient bad response became a permanent refusal for one text.
+
+So nothing is cached that `mask` would refuse. The check is the same predicate
+`mask` itself uses rather than a second copy of its conditions: a validator that
+disagreed with `mask` would be worse than none, caching what masking rejects or
+rejecting what it accepts. Those three conditions are the whole of `mask`'s
+failure surface — `placeholder_for` has no `Err` path — so passing the predicate
+and masking successfully are the same statement.
+
 The asymmetry with `SessionStore` is deliberate and worth stating, because the
 two look alike. Losing a session entry is a confidentiality problem, so
 saturation there refuses the request. Losing a cache entry costs time, so
@@ -357,6 +372,8 @@ fail:
 2. A different detector version invalidates every entry.
 3. The same text under a different credential misses.
 4. A miss is never a refusal, under any cache state including a poisoned lock.
+   Neither is a hit: spans `mask` would refuse are never stored in the first
+   place.
 5. `detection_cache_entries = 0` reproduces today's behaviour exactly.
 6. Saturation evicts the least recently used rather than refusing.
 7. The journal's `types` and `spans` counts are identical for a hit and a miss.
