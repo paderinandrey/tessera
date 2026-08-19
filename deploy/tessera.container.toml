@@ -22,4 +22,8 @@ max_session_values = 1000
 audit_path = "/var/lib/tessera/audit.jsonl"
 
 # Spans are remembered by digest so a resent conversation is not rescanned.
+# max_spans_per_entry bounds the other dimension: how large one remembered
+# text's detection may be, so a single span-dense text cannot dominate the
+# cache's memory the way an unbounded entry count alone would allow.
 detection_cache_entries = 10000
+max_spans_per_entry = 100

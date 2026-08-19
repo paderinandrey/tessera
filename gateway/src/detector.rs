@@ -46,7 +46,12 @@ pub struct DetectorClient {
 }
 
 impl DetectorClient {
-    pub fn new(base_url: String, timeout: Duration, cache_entries: usize) -> Self {
+    pub fn new(
+        base_url: String,
+        timeout: Duration,
+        cache_entries: usize,
+        max_spans_per_entry: usize,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -54,7 +59,7 @@ impl DetectorClient {
         Self {
             base_url,
             client,
-            cache: crate::detection_cache::DetectionCache::new(cache_entries),
+            cache: crate::detection_cache::DetectionCache::new(cache_entries, max_spans_per_entry),
         }
     }
 
@@ -116,6 +121,10 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// The span cap tests that are not about the cap itself pass this, so a
+    /// handful of spans never accidentally brushes against it.
+    const UNCAPPED: usize = usize::MAX;
+
     #[tokio::test]
     async fn spans_come_back_from_the_service() {
         let server = MockServer::start().await;
@@ -129,7 +138,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let spans = client.detect("Weber schreibt", None).await.unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].entity_type, "PERSON");
@@ -146,7 +155,7 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         assert!(client.detect("Weber", None).await.is_err());
     }
 
@@ -162,7 +171,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_millis(50), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_millis(50), 16, UNCAPPED);
         assert!(client.detect("Weber", None).await.is_err());
     }
 
@@ -177,7 +186,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         client.detect("Weber", None).await.unwrap();
         let sent = &server.received_requests().await.unwrap()[0];
         let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
@@ -200,7 +209,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let detection = client.detect_full("Weber").await.unwrap();
         assert_eq!(detection.version.as_deref(), Some("abc123"));
     }
@@ -219,7 +228,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let detection = client.detect_full("Weber").await.unwrap();
         assert!(detection.version.is_none());
     }
@@ -237,7 +246,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let detection = client.detect_full("Weber").await.unwrap();
         assert!(detection.version.is_none());
     }
@@ -253,7 +262,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let credential: Option<&[u8]> = Some(b"Bearer a");
         client.detect("Weber", credential).await.unwrap();
         client.detect("Weber", credential).await.unwrap();
@@ -271,7 +280,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let credential: Option<&[u8]> = Some(b"Bearer a");
         client.detect("Weber", credential).await.unwrap();
         client.detect("Weber", credential).await.unwrap();
@@ -288,7 +297,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 0);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 0, UNCAPPED);
         let credential: Option<&[u8]> = Some(b"Bearer a");
         client.detect("Weber", credential).await.unwrap();
         client.detect("Weber", credential).await.unwrap();
@@ -305,7 +314,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let credential: Option<&[u8]> = Some(b"Bearer a");
         assert!(client.detect("Weber", credential).await.is_err());
         assert!(client.detect("Weber", credential).await.is_err());
@@ -327,7 +336,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let a: Option<&[u8]> = Some(b"Bearer a");
         let b: Option<&[u8]> = Some(b"Bearer b");
         client.detect("Weber", a).await.unwrap();
@@ -351,9 +360,57 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16);
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
         let credential: Option<&[u8]> = Some(b"Bearer a");
         client.detect("Weber", credential).await.unwrap();
         client.detect("Schmidt", credential).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_detection_is_served_in_full_but_never_cached() {
+        // Declining to cache must never mean declining to serve: the caller
+        // already has the spans this call found and gets every one of them
+        // back, whether or not the cache remembers them for next time. A
+        // test that only checked "not cached" would pass just as well
+        // against a broken implementation that refused the request instead
+        // of serving it — this checks both halves in one place.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "spans": [
+                    {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 2, "boosted": false},
+                    {"entity_type": "PERSON", "start": 6, "end": 11, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 2, "boosted": false},
+                    {"entity_type": "PERSON", "start": 12, "end": 19, "confidence": 1.0,
+                     "recognizer": "ner:fake", "tier": 2, "boosted": false}
+                ],
+                "layers_run": ["deterministic", "ner"], "version": "v1"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        // Three spans, capped at two: this detection is over the limit.
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, 2);
+        let credential: Option<&[u8]> = Some(b"Bearer a");
+
+        let first = client
+            .detect("Weber Meier Schmidt", credential)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            3,
+            "an oversized detection was truncated rather than served in full"
+        );
+
+        let second = client
+            .detect("Weber Meier Schmidt", credential)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 3);
+        // `expect(2)` is asserted when `server` drops: a cached hit would
+        // have answered the second call without reaching it at all.
     }
 }

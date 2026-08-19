@@ -254,16 +254,21 @@ itself — so a hit never reveals, even through timing, that one tenant sent wha
 tenant sent before it. The session stabilises a placeholder that detection produced,
 cached or not; it is never asked to find personal data on its own.
 
-The cache is bounded by `detection_cache_entries` (default 10 000), which counts entries
-rather than bytes: a large tool result can carry hundreds of spans in one entry, so a
-deployment expecting that shape of traffic should watch memory rather than trust the
-count alone. Unlike the session table, it has no idle TTL — an entry outlives its
+The cache is bounded on two dimensions, the same relationship `max_sessions` and
+`max_session_values` have to each other: `detection_cache_entries` (default 10 000)
+bounds how many texts it remembers, and `max_spans_per_entry` (default 100) bounds how
+many spans one remembered text's detection may carry — without the second, a single
+span-dense text, such as a large tool result with an entity every few characters, could
+outweigh thousands of ordinary ones. A detection over the cap is masked, restored and
+returned exactly like any other; it is simply not stored, so an oversized result never
+becomes a refusal, only a permanent miss. At the shipped defaults the worst case is about
+46 MB. Unlike the session table, the cache has no idle TTL — an entry outlives its
 conversation and stays reachable for as long as the process runs, until the detector's
 version changes or the cache fills and something else is used more recently. And unlike
 the session table, losing an entry costs time, not protection: a full cache evicts
 rather than refusing, and a poisoned lock degrades to calling the detector rather than
-failing the request. Set `detection_cache_entries = 0` to disable it — the gateway then
-calls the detector for every text, with no cache in the loop at all.
+failing the request. Set `detection_cache_entries = 0` to disable the cache entirely —
+the gateway then calls the detector for every text, with no cache in the loop at all.
 
 A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or

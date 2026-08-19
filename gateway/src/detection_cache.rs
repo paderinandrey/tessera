@@ -15,6 +15,15 @@
 //! an entry costs time, not correctness. That is the opposite of
 //! `SessionStore`, where losing an entry is a confidentiality problem and
 //! saturation therefore refuses.
+//!
+//! Memory is bounded on two dimensions, not one: `capacity` caps how many
+//! texts are remembered, and `max_spans_per_entry` caps how large one
+//! remembered text's detection may be. Without the second, the first is not
+//! actually a memory bound — a single text with enough spans can outweigh
+//! thousands of ordinary ones. Declining an oversized detection is not a
+//! third failure path with its own rule: it is the same "a miss is never a
+//! refusal" property, since the caller already has the spans it asked for
+//! and serves them exactly as it would if the cache did not exist.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +64,15 @@ struct Inner {
 
 pub struct DetectionCache {
     capacity: usize,
+    /// The other dimension `capacity` does not bound: how many spans one
+    /// remembered detection may carry. `capacity` bounds how many texts the
+    /// cache remembers; this bounds how large one remembered text's
+    /// detection may be, the same relationship `SessionStore` has between
+    /// `max_sessions` and `max_session_values`. A detection over this cap is
+    /// declined rather than stored — the caller already has its spans from
+    /// this call and serves them exactly as it would anyway; only whether
+    /// they are remembered for next time is affected.
+    max_spans_per_entry: usize,
     /// Minted per process and never persisted. The cache must not survive a
     /// restart, so its keys never need to be comparable across runs — and a
     /// per-process salt keeps them from becoming a second stable identifier
@@ -71,11 +89,12 @@ pub struct DetectionCache {
 }
 
 impl DetectionCache {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, max_spans_per_entry: usize) -> Self {
         let mut salt = [0u8; 32];
         getrandom::getrandom(&mut salt).expect("the OS provides randomness");
         Self {
             capacity,
+            max_spans_per_entry,
             salt,
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
@@ -194,6 +213,15 @@ impl DetectionCache {
         if self.capacity == 0 {
             return;
         }
+        // Declined, not refused: the caller already has `spans` from this
+        // call and serves them exactly as it would if the cache did not
+        // exist. A single oversized detection is the failure mode
+        // `capacity` alone cannot prevent — it bounds entry count, not the
+        // size of one entry, and a 20 KB tool result can carry hundreds of
+        // spans in a single text.
+        if spans.len() > self.max_spans_per_entry {
+            return;
+        }
         let version = self.digest(version.as_bytes());
         let key = self.key(version, credential, text);
         let Ok(mut inner) = self.inner.lock() else {
@@ -259,10 +287,13 @@ mod tests {
 
     const A: Option<&[u8]> = Some(b"Bearer a");
     const B: Option<&[u8]> = Some(b"Bearer b");
+    /// The span cap tests that are not about the cap itself pass this, so a
+    /// handful of `PERSON` spans never accidentally brushes against it.
+    const UNCAPPED: usize = usize::MAX;
 
     #[test]
     fn a_stored_result_comes_back() {
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         let found = cache
             .get(A, "Weber")
@@ -279,7 +310,7 @@ mod tests {
         // does pin is the coldest point of the miss-is-never-a-refusal rule —
         // a `get` before any response answers `None` rather than panicking
         // or inventing spans.
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         assert!(cache.get(A, "Weber").is_none());
     }
 
@@ -287,14 +318,14 @@ mod tests {
     fn another_credential_does_not_see_the_entry() {
         // Not because the spans would leak — B already has the text it sent —
         // but because the response time would say that A sent it first.
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         assert!(cache.get(B, "Weber").is_none());
     }
 
     #[test]
     fn a_new_version_hides_everything_stored_under_the_old_one() {
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         cache.insert("v2", A, "Schmidt", &[span("PERSON", 0, 7)]);
         assert!(cache.get(A, "Weber").is_none());
@@ -303,7 +334,7 @@ mod tests {
 
     #[test]
     fn saturation_evicts_the_least_recently_used() {
-        let cache = DetectionCache::new(2);
+        let cache = DetectionCache::new(2, UNCAPPED);
         cache.insert("v1", A, "first", &[span("PERSON", 0, 5)]);
         cache.insert("v1", A, "second", &[span("PERSON", 0, 6)]);
         // Touching "first" makes "second" the oldest.
@@ -317,18 +348,53 @@ mod tests {
 
     #[test]
     fn a_disabled_cache_stores_nothing_and_answers_nothing() {
-        let cache = DetectionCache::new(0);
+        let cache = DetectionCache::new(0, UNCAPPED);
         cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         assert_eq!(cache.len(), 0);
         assert!(cache.get(A, "Weber").is_none());
     }
 
     #[test]
+    fn a_detection_over_the_span_cap_is_declined() {
+        let cache = DetectionCache::new(4, 2);
+        cache.insert(
+            "v1",
+            A,
+            "Weber Meier Schmidt",
+            &[
+                span("PERSON", 0, 5),
+                span("PERSON", 6, 11),
+                span("PERSON", 12, 19),
+            ],
+        );
+        assert!(
+            cache.get(A, "Weber Meier Schmidt").is_none(),
+            "a detection over the span cap was stored anyway"
+        );
+        assert_eq!(cache.len(), 0, "an oversized detection took a slot");
+    }
+
+    #[test]
+    fn a_detection_at_the_span_cap_is_stored() {
+        // The boundary: strictly over the cap is declined, so exactly at it
+        // must still be an ordinary hit — the cap is not off by one in
+        // either direction.
+        let cache = DetectionCache::new(4, 2);
+        cache.insert(
+            "v1",
+            A,
+            "Weber Meier",
+            &[span("PERSON", 0, 5), span("PERSON", 6, 11)],
+        );
+        assert!(cache.get(A, "Weber Meier").is_some());
+    }
+
+    #[test]
     fn two_gateways_do_not_agree_on_a_key() {
         // The salt is per process and never persisted, so a digest here names
         // nothing anywhere else — including in a second gateway's memory.
-        let first = DetectionCache::new(4);
-        let second = DetectionCache::new(4);
+        let first = DetectionCache::new(4, UNCAPPED);
+        let second = DetectionCache::new(4, UNCAPPED);
         first.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         second.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         assert_ne!(
@@ -339,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_request_without_a_credential_is_its_own_bucket() {
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", None, "Weber", &[span("PERSON", 0, 5)]);
         assert!(cache.get(None, "Weber").is_some());
         assert!(cache.get(A, "Weber").is_none());
@@ -347,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_poisoned_lock_answers_a_miss_rather_than_a_panic() {
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = cache.inner.lock().expect("not yet poisoned");
@@ -374,7 +440,7 @@ mod tests {
         // requests actually run in. This is the guarantee the field exists
         // for, checked directly rather than through the `tracing` output the
         // real call site produces.
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         assert!(!cache.poisoned_warned.swap(true, Ordering::Relaxed));
         assert!(cache.poisoned_warned.swap(true, Ordering::Relaxed));
         assert!(cache.poisoned_warned.swap(true, Ordering::Relaxed));
@@ -386,7 +452,7 @@ mod tests {
         // would be the one being re-inserted, and this mutation would stay
         // invisible — the eviction it would wrongly trigger and the
         // overwrite that follows would remove the same key either way.
-        let cache = DetectionCache::new(3);
+        let cache = DetectionCache::new(3, UNCAPPED);
         cache.insert("v1", A, "first", &[span("PERSON", 0, 5)]);
         cache.insert("v1", A, "second", &[span("PERSON", 0, 6)]);
         cache.insert("v1", A, "third", &[span("PERSON", 0, 5)]);
@@ -400,7 +466,7 @@ mod tests {
 
     #[test]
     fn two_entries_stored_in_a_row_do_not_share_a_recency() {
-        let cache = DetectionCache::new(4);
+        let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", A, "first", &[span("PERSON", 0, 5)]);
         cache.insert("v1", A, "second", &[span("PERSON", 0, 6)]);
         let inner = cache.inner.lock().expect("not poisoned");

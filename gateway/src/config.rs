@@ -10,6 +10,10 @@ pub enum ConfigError {
     ZeroSessionLimit,
     #[error("max_session_values must be greater than zero unless session_idle_secs is zero")]
     ZeroSessionValues,
+    #[error(
+        "max_spans_per_entry must be greater than zero unless detection_cache_entries is zero"
+    )]
+    ZeroSpansPerEntry,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +56,15 @@ pub struct Config {
     /// calls the detector for every text, as it did before the cache existed.
     #[serde(default = "default_detection_cache_entries")]
     pub detection_cache_entries: usize,
+    /// The cache's other dimension: how many spans a single detection may
+    /// carry and still be remembered. `detection_cache_entries` bounds how
+    /// many texts the cache holds, not how large one text's detection may
+    /// be — the same relationship `max_session_values` has to `max_sessions`.
+    /// A detection over the cap is served exactly as any other: masked,
+    /// restored, returned. It is simply not stored, so the cache never turns
+    /// a large result into a refusal.
+    #[serde(default = "default_max_spans_per_entry")]
+    pub max_spans_per_entry: usize,
 }
 
 fn default_bind() -> String {
@@ -81,6 +94,17 @@ fn default_max_session_values() -> usize {
 fn default_detection_cache_entries() -> usize {
     10_000
 }
+// 100 spans, at 264 B fixed + 46 B/span (measured, a floor): the worst-case
+// entry is 264 + 100 * 46 = 4 864 B. At the default 10 000 entries, the
+// worst-case cache is 10 000 * 4 864 B ≈ 46.4 MB — small enough that an
+// operator who never reads the documentation is not exposed to more than
+// tens of megabytes, regardless of what a client sends. A text with more
+// entities than that is real (agent tool results can carry hundreds) and is
+// still served correctly; it is simply not remembered, the same trade
+// `max_session_values` already makes for a session with too many values.
+fn default_max_spans_per_entry() -> usize {
+    100
+}
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -95,6 +119,9 @@ impl Config {
             if config.max_session_values == 0 {
                 return Err(ConfigError::ZeroSessionValues);
             }
+        }
+        if config.detection_cache_entries > 0 && config.max_spans_per_entry == 0 {
+            return Err(ConfigError::ZeroSpansPerEntry);
         }
         Ok(config)
     }
@@ -223,5 +250,38 @@ mod tests {
         // today's behaviour and a legitimate memory budget.
         let config = Config::from_toml(&with_audit("detection_cache_entries = 0")).unwrap();
         assert_eq!(config.detection_cache_entries, 0);
+    }
+
+    #[test]
+    fn the_span_cap_has_a_default() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(config.max_spans_per_entry, 100);
+    }
+
+    #[test]
+    fn the_span_cap_can_be_sized() {
+        let config = Config::from_toml(&with_audit("max_spans_per_entry = 8")).unwrap();
+        assert_eq!(config.max_spans_per_entry, 8);
+    }
+
+    #[test]
+    fn a_zero_span_cap_with_the_cache_enabled_is_rejected() {
+        // The same mistake `a_zero_limit_with_sessions_enabled_is_rejected`
+        // guards against, one level down: an entry cap with nothing an
+        // entry may hold is a typo, not a configuration.
+        let error = Config::from_toml(&with_audit("max_spans_per_entry = 0")).unwrap_err();
+        assert!(error.to_string().contains("max_spans_per_entry"));
+    }
+
+    #[test]
+    fn a_zero_span_cap_is_permitted_once_the_cache_is_disabled() {
+        let config = Config::from_toml(&with_audit(
+            r#"
+            detection_cache_entries = 0
+            max_spans_per_entry = 0
+            "#,
+        ))
+        .expect("a disabled cache does not care what its dead setting says");
+        assert_eq!(config.max_spans_per_entry, 0);
     }
 }

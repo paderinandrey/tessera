@@ -43,14 +43,29 @@ audit_path = "tessera-audit.jsonl"
 # catalogs change.
 #
 # This key bounds how many entries the cache holds, not how much memory it
-# uses: measured with a counting allocator, an entry costs 264 bytes fixed
-# plus 46 per span found in the text — a floor, since that counts only
-# requested bytes and neither malloc rounding nor HashMap slack — and nothing
-# here bounds span count. For chat-shaped text — a turn with a name or two —
-# that is a few hundred bytes an entry, so the default costs a few megabytes.
-# A span-dense text does not fit that shape: a 20 KB tool result with an
-# entity every 25 characters is around 800 spans, on the order of 37 KB in
-# that one entry alone, and the default ceiling of it would be hundreds of
-# megabytes. A deployment that expects large tool results should size this by
-# expected spans per text, not by entry count. Zero disables it.
+# uses — that also depends on max_spans_per_entry below, since an entry's
+# size is not fixed. Measured with a counting allocator: an entry costs 264
+# bytes fixed plus 46 per span found in the text, a floor, since that counts
+# only requested bytes and neither malloc rounding nor HashMap slack. Zero
+# disables the cache: the gateway then calls the detector for every text, as
+# it did before the cache existed.
 detection_cache_entries = 10000
+
+# The cache's other dimension: how many spans a single detection may carry
+# and still be remembered. Without this, one span-dense text could dominate
+# the cache's memory on its own — a 20 KB tool result with an entity every 25
+# characters is around 800 spans, some 37 KB in that one entry alone, and
+# nothing above bounds how many spans one text may have. A detection over
+# this cap is masked, restored and returned exactly like any other; it is
+# simply not stored, so an oversized result never becomes a refusal.
+#
+# At the shipped defaults, the worst case is entries * (264 + spans * 46) =
+# 10000 * (264 + 100 * 46) ≈ 46.4 MB — small enough that an operator who
+# never reads this file is not exposed to more than tens of megabytes. The
+# default favors chat-shaped traffic, where a name or two per turn is the
+# common case; a deployment expecting large tool results and wanting them
+# cached should raise this figure and recompute the worst case above. Zero
+# is rejected while the cache is enabled — an entry cap of zero would remember
+# nothing, which is what detection_cache_entries = 0 already says more
+# directly.
+max_spans_per_entry = 100

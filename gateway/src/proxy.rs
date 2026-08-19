@@ -136,6 +136,7 @@ impl AppState {
                 config.detector_url.clone(),
                 Duration::from_secs(config.detector_timeout_secs),
                 config.detection_cache_entries,
+                config.max_spans_per_entry,
             ),
             upstream: reqwest::Client::new(),
             openai_base: config.openai_base.clone(),
@@ -482,6 +483,9 @@ mod tests {
     use crate::session::{SessionKey, SESSION_HEADER};
 
     const SECRET: &str = "Weber";
+    /// The span cap tests that are not about the cap itself pass this, so a
+    /// handful of spans never accidentally brushes against it.
+    const UNCAPPED: usize = usize::MAX;
 
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
@@ -557,7 +561,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -1174,7 +1178,7 @@ mod tests {
         let audit =
             Arc::new(crate::audit::Audit::open(&dir.path().join("audit.jsonl")).expect("opens"));
         Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
             anthropic_base: upstream_base,
@@ -1774,7 +1778,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2175,7 +2179,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2231,7 +2235,7 @@ mod tests {
             .await;
 
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2267,7 +2271,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
             anthropic_base: base,
@@ -2749,7 +2753,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
             anthropic_base: base,
