@@ -127,7 +127,11 @@ impl DetectionCache {
 
     #[cfg(test)]
     fn key_for(&self, version: &str, credential: Option<&[u8]>, text: &str) -> Digest32 {
-        let key = self.key(self.digest(version.as_bytes()), credential, text);
+        let key = self.key(
+            self.digest(version.as_bytes()),
+            credential.expect("key_for is only ever called with a credential in tests"),
+            text,
+        );
         self.digest(&[key.version, key.tenant, key.text].concat())
     }
 
@@ -148,16 +152,10 @@ impl DetectionCache {
         }
     }
 
-    fn key(&self, version: Digest32, credential: Option<&[u8]>, text: &str) -> Key {
+    fn key(&self, version: Digest32, credential: &[u8], text: &str) -> Key {
         Key {
             version,
-            // A request with no credential is its own bucket rather than
-            // everyone's: an empty digest is a tenant like any other. That
-            // makes `Some(b"")` and `None` collide here — unreachable today
-            // only because `session::credential_of` filters an empty header
-            // value before either ever reaches this file, a dependency this
-            // module otherwise does not record.
-            tenant: self.digest(credential.unwrap_or(b"")),
+            tenant: self.digest(credential),
             text: self.digest(text.as_bytes()),
         }
     }
@@ -171,6 +169,24 @@ impl DetectionCache {
             // this check.
             return None;
         }
+        // No credential, no cache. `key` used to fold `None` down to an
+        // empty tenant digest — "its own bucket rather than everyone's,"
+        // the same as any other tenant — which is true only when there is
+        // exactly one credential-less caller. There is not: a demo stand
+        // with no API key, or any closed-perimeter deployment in front of
+        // a self-hosted model, puts every distinct caller in that one
+        // bucket together, and a cache hit is a second-long response time
+        // away from a miss. That is the timing oracle the credential
+        // digest in the key exists to prevent (see the design's "why the
+        // key carries a digest of the credential") — reached here through
+        // the absent-header route instead of the guessed-credential one.
+        // `session::credential_of`'s own test already says as much about
+        // an empty value; an absent one is the same hole, reached more
+        // directly. A deployment that wants this cache has to give its
+        // callers distinguishable credentials; one that cannot is served
+        // fresh every time rather than sharing a bucket that leaks through
+        // timing.
+        let credential = credential?;
         // A poisoned lock means some other request panicked mid-update. That is
         // worth neither failing this request nor propagating: answer "miss".
         //
@@ -205,7 +221,7 @@ impl DetectionCache {
     fn get_at_version(
         &self,
         version: Digest32,
-        credential: Option<&[u8]>,
+        credential: &[u8],
         text: &str,
     ) -> Option<Vec<Span>> {
         let key = self.key(version, credential, text);
@@ -240,6 +256,13 @@ impl DetectionCache {
         if self.capacity == 0 {
             return;
         }
+        // No credential, no cache — see `get`'s matching guard for why. A
+        // credential-less detection is declined here for the same reason an
+        // oversized one is below: the caller already has `spans` and serves
+        // them exactly as it would without this cache existing at all.
+        let Some(credential) = credential else {
+            return;
+        };
         // Declined, not refused: the caller already has `spans` from this
         // call and serves them exactly as it would if the cache did not
         // exist. A single oversized detection is the failure mode
@@ -438,7 +461,9 @@ mod tests {
         // real race lands here with `stale_version` in hand and the store
         // already past it.
         assert!(
-            cache.get_at_version(stale_version, A, "Weber").is_none(),
+            cache
+                .get_at_version(stale_version, A.expect("A is Some"), "Weber")
+                .is_none(),
             "a lookup built from a version the store had already moved past was served anyway"
         );
     }
@@ -515,11 +540,28 @@ mod tests {
     }
 
     #[test]
-    fn a_request_without_a_credential_is_its_own_bucket() {
+    fn two_anonymous_callers_never_share_a_cached_hit() {
+        // A `None` credential used to fold down to one shared bucket, "its
+        // own" only in the sense that every credential-less caller got the
+        // same one. Nothing here can tell two such callers apart, so that
+        // bucket was the exact cross-tenant timing oracle the credential
+        // digest in the key exists to prevent (see the design's "why the
+        // key carries a digest of the credential") — reached through the
+        // absent-header route rather than the guessed-credential one.
+        // Closed by declining to cache credential-less detections at all:
+        // insert is a no-op, so there is nothing left for a second
+        // "caller" — indistinguishable from the first — to hit.
         let cache = DetectionCache::new(4, UNCAPPED);
         cache.insert("v1", None, "Weber", &[span("PERSON", 0, 5)]);
-        assert!(cache.get(None, "Weber").is_some());
-        assert!(cache.get(A, "Weber").is_none());
+        assert!(
+            cache.get(None, "Weber").is_none(),
+            "a second anonymous caller hit the first anonymous caller's entry"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "a credential-less detection took a slot anyway"
+        );
     }
 
     #[test]

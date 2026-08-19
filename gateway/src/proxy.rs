@@ -1040,7 +1040,15 @@ mod tests {
         // The evidence layer must not get weaker because an answer came from
         // memory. Two identical requests, the second served from the cache:
         // both masked lines must carry the same counts.
-        let detector = detector_returning(person_span()).await;
+        //
+        // `Some(1)` and a real credential, not `detector_returning` and
+        // `call`'s headerless default: a credential-less request is never
+        // cached at all (detection_cache.rs's
+        // `two_anonymous_callers_never_share_a_cached_hit`), so without
+        // both this test would see two misses — which would still pass,
+        // since two identical misses report identical counts too, but
+        // would no longer be testing what its name says it tests.
+        let detector = detector_returning_expecting(person_span(), Some(1)).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
             json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
@@ -1048,9 +1056,17 @@ mod tests {
         .await;
         let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
         let body = json!({"messages": [{"role": "user", "content": "Weber schreibt"}]});
+        let headers = [("authorization", "Bearer k1")];
 
-        let (first, _) = call(Arc::clone(&state), "/v1/chat/completions", body.clone()).await;
-        let (second, _) = call(Arc::clone(&state), "/v1/chat/completions", body).await;
+        let (first, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &headers,
+        )
+        .await;
+        let (second, _) =
+            call_with_headers(Arc::clone(&state), "/v1/chat/completions", body, &headers).await;
         assert_eq!(first, StatusCode::OK);
         assert_eq!(second, StatusCode::OK);
 
@@ -1082,6 +1098,12 @@ mod tests {
         // green, including this one — the offset mutation only bites
         // because a hit happens to occur, not because this test requires
         // one.
+        //
+        // A real credential, not `call`'s headerless default: a
+        // credential-less request is never cached at all (see
+        // detection_cache.rs's `two_anonymous_callers_never_share_a_cached_hit`),
+        // so without one this test would see two misses and `Some(1)`
+        // above would fail for an unrelated reason.
         let detector = detector_returning_expecting(person_span(), Some(1)).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
@@ -1090,9 +1112,16 @@ mod tests {
         .await;
         let state = state(&detector, &upstream);
         let body = json!({"messages": [{"role": "user", "content": "Weber schreibt"}]});
+        let headers = [("authorization", "Bearer k1")];
 
-        call(Arc::clone(&state), "/v1/chat/completions", body.clone()).await;
-        call(Arc::clone(&state), "/v1/chat/completions", body).await;
+        call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &headers,
+        )
+        .await;
+        call_with_headers(Arc::clone(&state), "/v1/chat/completions", body, &headers).await;
 
         let received = upstream.received_requests().await.unwrap();
         assert_eq!(received.len(), 2, "two requests, two upstream calls");
