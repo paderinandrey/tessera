@@ -5,6 +5,7 @@ import pytest
 from tessera_detector.models import (
     HF_REVISION,
     MODEL_NAME,
+    _weighed_files,
     find_model,
     model_cache_dir,
     weights_digest,
@@ -131,3 +132,62 @@ def test_weights_digest_does_not_depend_on_path(tmp_path: Path) -> None:
     a = _weights(tmp_path / "nested" / "a", b"graph-bytes")
     b = _weights(tmp_path / "elsewhere" / "b", b"graph-bytes")
     assert weights_digest(a) == weights_digest(b)
+
+
+def test_weights_digest_changes_with_a_tokenizer_file_alone(tmp_path: Path) -> None:
+    # Follow-up finding: REQUIRED_ARTIFACTS names only the graph and
+    # config.json, but GLiNER.from_pretrained loads the whole directory —
+    # the tokenizer's offset mapping is what the gateway's caches spans
+    # come out of. A digest that only covered REQUIRED_ARTIFACTS would
+    # report the same identity for two directories whose tokenizer differs,
+    # exactly the failure class P1 closed for the graph alone.
+    a = _weights(tmp_path / "a", b"graph-bytes")
+    (a / "tokenizer.json").write_bytes(b"tokenizer-v1")
+    b = _weights(tmp_path / "b", b"graph-bytes")
+    (b / "tokenizer.json").write_bytes(b"tokenizer-v2")
+    assert weights_digest(a) != weights_digest(b)
+
+
+def test_weights_digest_ignores_download_bookkeeping(tmp_path: Path) -> None:
+    # huggingface_hub's own `.cache/huggingface/download/*.metadata` sidecars
+    # carry a download timestamp and are never read by the loader; including
+    # them would make two downloads of byte-identical weights report
+    # different identities depending on when they happened to be fetched.
+    a = _weights(tmp_path / "a", b"graph-bytes")
+    (a / ".cache" / "huggingface" / "download").mkdir(parents=True)
+    (a / ".cache" / "huggingface" / "download" / "config.json.metadata").write_text(
+        "1111111111.111111"
+    )
+    b = _weights(tmp_path / "b", b"graph-bytes")
+    (b / ".cache" / "huggingface" / "download").mkdir(parents=True)
+    (b / ".cache" / "huggingface" / "download" / "config.json.metadata").write_text(
+        "9999999999.999999"
+    )
+    assert weights_digest(a) == weights_digest(b)
+
+
+def test_weights_digest_ignores_unused_onnx_quantizations(tmp_path: Path) -> None:
+    # The mirror ships fp16 and int8 graphs alongside the fp32 one ner.py
+    # actually loads (ONNX_MODEL_FILE). Hashing them would nearly double
+    # weights_digest's dominant cost for a change that cannot affect a
+    # single span, since ner.py never opens them.
+    a = _weights(tmp_path / "a", b"graph-bytes")
+    (a / "onnx" / "model_int8.onnx").write_bytes(b"int8-v1")
+    b = _weights(tmp_path / "b", b"graph-bytes")
+    (b / "onnx" / "model_int8.onnx").write_bytes(b"int8-v2")
+    assert weights_digest(a) == weights_digest(b)
+
+
+def test_weighed_files_walks_beyond_required_artifacts(tmp_path: Path) -> None:
+    # Direct check on the walk itself, named for the root cause the finding
+    # called out: REQUIRED_ARTIFACTS answers "did the download finish", not
+    # "what determines the output", and a digest built from the former
+    # under-covers the latter. Adding a file the walk was never told about
+    # must still be picked up — the whole point of walking instead of
+    # enumerating a second list that can drift from the first.
+    weights = _weights(tmp_path / "weights", b"graph-bytes")
+    (weights / "tokenizer.json").write_bytes(b"tok")
+    (weights / "brand_new_artifact.bin").write_bytes(b"surprise")
+    names = {f.relative_to(weights).as_posix() for f in _weighed_files(weights)}
+    assert "tokenizer.json" in names
+    assert "brand_new_artifact.bin" in names
