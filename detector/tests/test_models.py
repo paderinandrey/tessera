@@ -6,6 +6,7 @@ from tessera_detector.models import (
     HF_REVISION,
     MODEL_NAME,
     _weighed_files,
+    dependency_digest,
     find_model,
     model_cache_dir,
     weights_digest,
@@ -191,3 +192,37 @@ def test_weighed_files_walks_beyond_required_artifacts(tmp_path: Path) -> None:
     names = {f.relative_to(weights).as_posix() for f in _weighed_files(weights)}
     assert "tokenizer.json" in names
     assert "brand_new_artifact.bin" in names
+
+
+def test_dependency_digest_is_stable_for_the_same_modules() -> None:
+    # "yaml" is PyYAML, a base dependency (pyproject.toml's pyyaml), so it
+    # is always resolvable to an installed distribution in this suite.
+    assert dependency_digest({"yaml"}) == dependency_digest({"yaml"})
+
+
+def test_dependency_digest_changes_with_the_module_set() -> None:
+    # "pytest" has to be installed for this test to be running at all.
+    assert dependency_digest({"yaml"}) != dependency_digest({"pytest"})
+
+
+def test_dependency_digest_folds_in_every_module_given() -> None:
+    both = dependency_digest({"yaml", "pytest"})
+    assert both != dependency_digest({"yaml"})
+    assert both != dependency_digest({"pytest"})
+
+
+def test_dependency_digest_resolves_only_the_top_level_package() -> None:
+    # sys.modules holds submodules too ("yaml.loader", not just "yaml").
+    # Only the top-level name maps to an installed distribution, so a
+    # deeper path must fold to the same identity as the bare name.
+    assert dependency_digest({"yaml.loader"}) == dependency_digest({"yaml"})
+
+
+def test_dependency_digest_ignores_a_module_with_no_installed_distribution() -> None:
+    # Not every importable name resolves to a distribution (a vendored or
+    # namespace module, or — as here — one that plain does not exist).
+    # Contributing nothing is correct; raising would fail startup over a
+    # module that was never really "a version" to track.
+    assert dependency_digest({"not_a_real_module_xyz"}) == dependency_digest(set())
+
+

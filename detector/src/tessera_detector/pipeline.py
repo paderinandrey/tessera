@@ -115,10 +115,19 @@ def build_detector(
     # `path` may be the cache or an operator's `TESSERA_NER_MODEL` override,
     # and the same path can hold different bytes across a redeploy. Hashed
     # once, here, rather than per request — see `weights_digest`.
+    #
+    # `#` separates the two digests unambiguously: both are hex, so neither
+    # can ever contain the character the other side of the split looks for
+    # — no anti-concatenation hashing needed the way `version_from` needs
+    # it for arbitrary-length catalog bytes. `recognizer.dependency_digest`
+    # covers a third thing weights and catalogs do not: a rebuild that
+    # moves GLiNER, onnxruntime or the tokenizer library to a different
+    # release can change spans with the weights and catalogs both
+    # untouched (see its own docstring in models.py).
     return Detector(
         catalog_text=catalog_text,
         recognizer=recognizer,
-        model_id=f"{MODEL_NAME}@{weights_digest(path)}",
+        model_id=f"{MODEL_NAME}@{weights_digest(path)}#{recognizer.dependency_digest}",
     )
 
 

@@ -7,6 +7,8 @@ deterministic layer alone.
 
 import hashlib
 import os
+from collections.abc import Iterable
+from importlib import metadata
 from pathlib import Path
 
 MODEL_NAME = "gliner_multi-v2.1"
@@ -159,6 +161,62 @@ def weights_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def dependency_digest(new_modules: Iterable[str]) -> str:
+    """A digest over the installed distributions behind `new_modules` — the
+    modules that became importable only once the inference path actually
+    ran, not a maintained list of package names.
+
+    A rebuild that moves GLiNER, onnxruntime or the tokenizer library to a
+    different release — weights, catalogs and this package's own sources
+    all unchanged — can still change what a text detects to, and neither
+    `weights_digest` nor the source digest in `version.py` would see it.
+    Naming the packages by hand here would repeat the exact mistake
+    `REQUIRED_ARTIFACTS` already made once in this file: correct today,
+    silently under-covering the day someone adds a dependency GLiNER pulls
+    in transitively. Reading the distributions actually imported instead
+    means a new one is picked up the next time the model loads, with
+    nothing here to update.
+
+    `new_modules` is deliberately a caller-supplied set rather than
+    something this function derives from `sys.modules` on its own:
+    `GlinerRecognizer.__init__` is the one place that knows the load's
+    boundary, snapshotting `sys.modules` immediately before and after
+    `GLiNER.from_pretrained` runs and diffing the two. Diffing there,
+    rather than reading the whole process's import table, is what keeps
+    this from also digesting fastapi, pytest, or whatever else a dev
+    checkout with extra dependency groups installed happens to have
+    imported before the model ever loads: none of that is new between the
+    two snapshots, so none of it appears here, regardless of how many
+    extra groups are merely *installed* alongside the inference path —
+    only what the load itself actually imports counts.
+
+    One gap, stated rather than hidden: a dependency already imported by
+    something else before the model loads would be invisible here, the
+    same way it would be invisible to any snapshot-diff approach. Nothing
+    in this project's own dependency tree imports GLiNER's own packages
+    (torch, onnxruntime, transformers, tokenizers) ahead of `ner.py`
+    itself, so this does not bite today; there is no "read every installed
+    distribution" fallback that would not trade this gap for the opposite
+    one — describing dev-only tooling as part of the model's identity.
+    """
+    distributions = metadata.packages_distributions()
+    versions: dict[str, str] = {}
+    for module_name in new_modules:
+        top_level = module_name.split(".", 1)[0]
+        for distribution_name in distributions.get(top_level, ()):
+            try:
+                versions[distribution_name] = metadata.version(distribution_name)
+            except metadata.PackageNotFoundError:
+                # An imported module with no resolvable distribution — a
+                # vendored or namespace module. Not a version to miss:
+                # there is no installed package here to have one.
+                continue
+    digest = hashlib.sha256()
+    for name in sorted(versions):
+        digest.update(f"{name}=={versions[name]}".encode())
+    return digest.hexdigest()
+
+
 __all__ = [
     "HF_REPO_ID",
     "HF_REVISION",
@@ -166,6 +224,7 @@ __all__ = [
     "ONNX_MODEL_FILE",
     "REQUIRED_ARTIFACTS",
     "ModelUnavailable",
+    "dependency_digest",
     "find_model",
     "model_cache_dir",
     "weights_digest",

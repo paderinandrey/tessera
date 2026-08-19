@@ -1,3 +1,4 @@
+import functools
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -95,8 +96,9 @@ class FakeGlinerRecognizer:
 
     specificity: Mapping[str, int] = {}
 
-    def __init__(self, model_path: Path) -> None:
+    def __init__(self, model_path: Path, dependency_digest: str = "fake-deps") -> None:
         self.model_path = model_path
+        self.dependency_digest = dependency_digest
 
     def detect(self, text: str) -> list[Span]:
         return []
@@ -127,7 +129,7 @@ def test_build_detector_names_the_weights_actually_loaded(
     detector = build_detector()
 
     assert detector.ner_available is True
-    assert detector.model_id == f"{MODEL_NAME}@{weights_digest(weights)}"
+    assert detector.model_id == f"{MODEL_NAME}@{weights_digest(weights)}#fake-deps"
     assert detector.model_id != DEFAULT_MODEL_ID
 
 
@@ -168,6 +170,47 @@ def test_the_same_weight_bytes_report_the_same_model_id_from_a_different_path(
     detector_b = build_detector()
 
     assert detector_a.model_id == detector_b.model_id
+
+
+def test_build_detector_folds_the_dependency_digest_into_the_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights = _weights(tmp_path / "weights", b"weights-v1")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(weights))
+    monkeypatch.setattr(
+        "tessera_detector.ner.GlinerRecognizer",
+        functools.partial(FakeGlinerRecognizer, dependency_digest="deps-v1"),
+    )
+
+    detector = build_detector()
+
+    assert detector.model_id.endswith("#deps-v1")
+
+
+def test_a_different_dependency_digest_changes_the_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding F: weights and catalogs unchanged, but the inference
+    # dependencies moved — GLiNER, onnxruntime, or the tokenizer library
+    # released a new version. The weight bytes are identical here on
+    # purpose; only the dependency digest differs, which is what a real
+    # rebuild against the same pinned weights would produce.
+    weights = _weights(tmp_path / "weights", b"weights-v1")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(weights))
+
+    monkeypatch.setattr(
+        "tessera_detector.ner.GlinerRecognizer",
+        functools.partial(FakeGlinerRecognizer, dependency_digest="deps-v1"),
+    )
+    detector_a = build_detector()
+
+    monkeypatch.setattr(
+        "tessera_detector.ner.GlinerRecognizer",
+        functools.partial(FakeGlinerRecognizer, dependency_digest="deps-v2"),
+    )
+    detector_b = build_detector()
+
+    assert detector_a.model_id != detector_b.model_id
 
 
 def test_auto_mode_falls_back_when_the_ner_runtime_is_absent(
