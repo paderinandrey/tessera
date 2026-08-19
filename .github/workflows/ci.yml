@@ -23,6 +23,16 @@ jobs:
       - run: uv run pytest
       - run: uv run ruff check . ../evaluation
       - run: uv run mypy src
+      # `uv sync --group serve` above installs the dev group too (uv's
+      # default for a group literally named `dev`), so every step before
+      # this one runs with pytest, mypy and ruff's own dependencies sitting
+      # in the environment alongside detector's declared ones — exactly the
+      # gap that let an undeclared `packaging` import ship, since pytest
+      # pulled it in incidentally and nothing here noticed. This proves the
+      # runtime resolves with nothing but [project.dependencies] installed,
+      # in a scratch environment this target builds and tears down itself
+      # rather than the one every step above shares.
+      - run: make -C .. check-base-install
       # The gateway keeps its own copy of the entity-type vocabulary, because
       # asking the detector which types it emits would be worthless against a
       # detector that lies. The copy is only safe while something notices it
@@ -37,6 +47,9 @@ jobs:
       # Through the Makefile so the target cannot rot unnoticed: it is what a
       # developer runs, and what the failure message tells them to re-run.
       - run: make -C .. check-entity-types
+      # Guards gateway/src/detector.rs, not the detector — so like the step
+      # above, this job must not grow a `paths:` filter.
+      - run: make -C .. check-layers
       # The committed corpus must regenerate byte-identical (seeded) — this
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
@@ -95,7 +108,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      # --all-targets so test code is linted too: without it a stale
+      # suppression in a test module survives every run, which is how one
+      # lived from Task 3 to Task 5 on the detection-cache branch.
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   compose:

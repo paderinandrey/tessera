@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from tessera_detector.api import create_app
 from tessera_detector.spans import Span
+from tessera_detector.version import detector_version
 
 TEXT = "Contact: anna.keller@example.ch"
 OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.json"
@@ -19,9 +20,18 @@ OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.json"
 class FakeDetector:
     """Stands in for Detector: the API contract is what is under test here."""
 
-    def __init__(self, *, ner_available: bool = True, ner_off_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        ner_available: bool = True,
+        ner_off_reason: str | None = None,
+        model_id: str = "test-model@0",
+        catalog_text: str = "test-catalog",
+    ) -> None:
         self.ner_available = ner_available
         self.ner_off_reason = ner_off_reason
+        self.model_id = model_id
+        self.catalog_text = catalog_text
         self.seen: list[str] = []
 
     def _span(self) -> Span:
@@ -239,3 +249,40 @@ def test_no_undeclared_routes_are_served(path: str) -> None:
     # The contract is two endpoints and a committed schema file. A docs UI on a
     # service that sees personal data is surface nobody asked for.
     assert client(FakeDetector()).get(path).status_code == 404
+
+
+def test_detect_reports_the_version_that_produced_the_spans() -> None:
+    # The gateway keys its span cache by this; without it every cached entry
+    # would outlive the model that justified it.
+    fake = FakeDetector()
+    response = client(fake).post("/detect", json={"text": TEXT, "layers": ["deterministic"]})
+    assert response.status_code == 200
+    assert response.json()["version"] == detector_version(fake.model_id, fake.catalog_text)
+
+
+def test_two_detectors_with_different_model_ids_report_different_versions() -> None:
+    # The API-level companion to version.py's own test of the same fact: the
+    # route must actually pass the detector's model_id through rather than a
+    # constant, or two detectors loading different weights would both report
+    # the version of whichever one the process happened to pin.
+    first = client(FakeDetector(model_id="gliner@aaa")).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic"]}
+    )
+    second = client(FakeDetector(model_id="gliner@bbb")).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic"]}
+    )
+    assert first.json()["version"] != second.json()["version"]
+
+
+def test_two_detectors_with_different_catalog_text_report_different_versions() -> None:
+    # Finding I: the route must pass the detector's own catalog_text
+    # through too, not just model_id, or an application supplying its own
+    # identifiers.yaml would get detection from those rules and a version
+    # computed from the packaged ones.
+    first = client(FakeDetector(catalog_text="catalog-a")).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic"]}
+    )
+    second = client(FakeDetector(catalog_text="catalog-b")).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic"]}
+    )
+    assert first.json()["version"] != second.json()["version"]

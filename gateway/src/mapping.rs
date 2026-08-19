@@ -116,6 +116,11 @@ impl Mapping {
     }
 
     pub fn mask(&mut self, text: &str, spans: &[Span]) -> Result<String, MappingError> {
+        // Bail out before touching any state: `placeholder_for` never fails
+        // (see its own body), so this is the only way `mask` can return
+        // `Err`, and checking it up front means the loop below never has to.
+        check_spans(text, spans)?;
+
         // Character indices, because that is what the detector reports.
         let chars: Vec<char> = text.chars().collect();
         let mut ordered: Vec<&Span> = spans.iter().collect();
@@ -129,18 +134,6 @@ impl Mapping {
         let mut result = String::with_capacity(text.len());
         let mut cursor = 0usize;
         for span in ordered {
-            // A span we cannot apply means the value stays in the text, and the
-            // text is about to leave the process. Refuse instead: skipping here
-            // would turn a detector contract bug into raw egress.
-            if span.start >= span.end {
-                return Err(MappingError::BadSpan("empty or inverted"));
-            }
-            if span.end > chars.len() {
-                return Err(MappingError::BadSpan("past the end of the text"));
-            }
-            if span.start < cursor {
-                return Err(MappingError::BadSpan("overlapping"));
-            }
             result.extend(&chars[cursor..span.start]);
             let value: String = chars[span.start..span.end].iter().collect();
             result.push_str(&self.placeholder_for(&span.entity_type, value)?);
@@ -279,6 +272,45 @@ impl Mapping {
         result.push_str(rest);
         Ok(result)
     }
+}
+
+/// Whether `spans` can be applied to `text` at all: every span non-empty,
+/// in range, and non-overlapping once ordered by start. This is `mask`'s
+/// own well-formedness check, pulled out so a caller deciding whether a
+/// detection is safe to *remember* can ask the exact question `mask` will
+/// ask when it is later asked to *apply* the same spans to the same text —
+/// one copy of the three conditions rather than two that could drift and
+/// disagree about which spans are usable.
+///
+/// Order-dependent — the conditions run over spans sorted by `start`, with
+/// a `cursor` tracking how far a preceding span reached — and the bound is
+/// `text.chars().count()`, a character count, because that is what the
+/// detector's offsets are in. A caller that sorted differently or bounded
+/// by byte length would not be asking the same question `mask` asks, and
+/// could cache a response `mask` would reject, or refuse one `mask` would
+/// have accepted.
+pub fn check_spans(text: &str, spans: &[Span]) -> Result<(), MappingError> {
+    let char_count = text.chars().count();
+    let mut ordered: Vec<&Span> = spans.iter().collect();
+    ordered.sort_by_key(|span| span.start);
+    let mut cursor = 0usize;
+    for span in ordered {
+        // A span that fails here means the value would stay in the text,
+        // and the text is about to leave the process. Refuse instead:
+        // passing it through would turn a detector contract bug into raw
+        // egress.
+        if span.start >= span.end {
+            return Err(MappingError::BadSpan("empty or inverted"));
+        }
+        if span.end > char_count {
+            return Err(MappingError::BadSpan("past the end of the text"));
+        }
+        if span.start < cursor {
+            return Err(MappingError::BadSpan("overlapping"));
+        }
+        cursor = span.end;
+    }
+    Ok(())
 }
 
 /// `[TYPE_N]`: upper-case type, underscore, digits.

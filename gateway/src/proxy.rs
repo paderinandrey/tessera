@@ -135,6 +135,8 @@ impl AppState {
             detector: DetectorClient::new(
                 config.detector_url.clone(),
                 Duration::from_secs(config.detector_timeout_secs),
+                config.detection_cache_entries,
+                config.max_spans_per_entry,
             ),
             upstream: reqwest::Client::new(),
             openai_base: config.openai_base.clone(),
@@ -169,13 +171,14 @@ async fn mask_all(
     body: &Value,
     pointers: &[String],
     mapping: &mut Mapping,
+    credential: Option<&[u8]>,
 ) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
     let mut distinct: HashSet<(String, String)> = HashSet::new();
     for pointer in pointers {
         let text = read_pointer(body, pointer)?;
-        let spans = detector.detect(&text).await?;
+        let spans = detector.detect(&text, credential).await?;
         total += spans.len();
         // The `Vec<char>` is a copy of the whole text, and a conversation
         // history is many texts: it is built only when there is a span to
@@ -266,7 +269,7 @@ async fn handle(
             };
             let mut work = guard.clone();
             let (masked, spans, types) =
-                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+                mask_all(&state.detector, &body, &pointers, &mut work, credential).await?;
             record.detected(pointers.len(), spans, types, work.redacted_count());
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
@@ -289,7 +292,7 @@ async fn handle(
         None => {
             let mut work = Mapping::new();
             let (masked, spans, types) =
-                mask_all(&state.detector, &body, &pointers, &mut work).await?;
+                mask_all(&state.detector, &body, &pointers, &mut work, credential).await?;
             record.detected(pointers.len(), spans, types, work.redacted_count());
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
@@ -480,22 +483,42 @@ mod tests {
     use crate::session::{SessionKey, SESSION_HEADER};
 
     const SECRET: &str = "Weber";
+    /// The span cap tests that are not about the cap itself pass this, so a
+    /// handful of spans never accidentally brushes against it.
+    const UNCAPPED: usize = usize::MAX;
 
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
                 "recognizer": "ner:fake", "tier": 2, "boosted": false}])
     }
 
+    /// A detector whose runs are complete and identified, so every answer is
+    /// eligible for the cache: a second call with the same text under the
+    /// same credential is served from memory and never reaches this mock. A
+    /// test that must observe the detector called twice for the same text
+    /// needs a different credential or text per call — or
+    /// `detector_returning_expecting`, to pin the count directly rather than
+    /// leaving it to whatever the cache happens to do.
     async fn detector_returning(spans: Value) -> MockServer {
+        detector_returning_expecting(spans, None).await
+    }
+
+    /// As `detector_returning`, but pins how many times the mock may be
+    /// called. `None` asserts nothing, matching `detector_returning` itself.
+    async fn detector_returning_expecting(spans: Value, expect: Option<u64>) -> MockServer {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        let mock = Mock::given(method("POST"))
             .and(path("/detect"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"spans": spans, "layers_run": ["deterministic"]})),
-            )
-            .mount(&server)
-            .await;
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": spans,
+                "layers_run": ["deterministic", "ner"],
+                "version": "test-version"
+            })));
+        let mock = match expect {
+            Some(count) => mock.expect(count),
+            None => mock,
+        };
+        mock.mount(&server).await;
         server
     }
 
@@ -538,7 +561,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -976,6 +999,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_credential_is_asked_again_through_the_proxy() {
+        // `detector.rs`'s own tests prove `DetectorClient::detect` separates
+        // tenants; this proves the wiring between `handle` and `detect` does
+        // not drop that separation on the way down. Two different
+        // credentials are two different cache buckets, so both requests miss
+        // and the detector must be asked exactly twice — pinned directly
+        // rather than left to whatever the cache happens to do.
+        let detector = detector_returning_expecting(json!([]), Some(2)).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let body = json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber"}]});
+
+        let (status_a, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &[("authorization", "Bearer a")],
+        )
+        .await;
+        let (status_b, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            body,
+            &[("authorization", "Bearer b")],
+        )
+        .await;
+
+        assert_eq!(status_a, StatusCode::OK);
+        assert_eq!(status_b, StatusCode::OK);
+        // `expect(2)` is asserted when `detector` drops.
+    }
+
+    #[tokio::test]
+    async fn the_journal_says_the_same_for_a_cached_detection() {
+        // The evidence layer must not get weaker because an answer came from
+        // memory. Two identical requests, the second served from the cache:
+        // both masked lines must carry the same counts.
+        //
+        // `Some(1)` and a real credential, not `detector_returning` and
+        // `call`'s headerless default: a credential-less request is never
+        // cached at all (detection_cache.rs's
+        // `two_anonymous_callers_never_share_a_cached_hit`), so without
+        // both this test would see two misses — which would still pass,
+        // since two identical misses report identical counts too, but
+        // would no longer be testing what its name says it tests.
+        let detector = detector_returning_expecting(person_span(), Some(1)).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let body = json!({"messages": [{"role": "user", "content": "Weber schreibt"}]});
+        let headers = [("authorization", "Bearer k1")];
+
+        let (first, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &headers,
+        )
+        .await;
+        let (second, _) =
+            call_with_headers(Arc::clone(&state), "/v1/chat/completions", body, &headers).await;
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+
+        let lines = journal(&path);
+        let masked: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked.len(), 2, "two requests, two masked lines");
+        assert_eq!(masked[0]["types"], masked[1]["types"]);
+        assert_eq!(masked[0]["spans"], masked[1]["spans"]);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_forwards_the_same_body_as_the_miss() {
+        // Counts survive a cache hit that applies the wrong offsets just as
+        // well as a correct one: shifting every span by one character still
+        // masks one PERSON out of one span found, so
+        // `the_journal_says_the_same_for_a_cached_detection` would not
+        // notice. The body sent upstream is the assertion that would — a
+        // wrong offset masks a different slice of the same-length text, and
+        // the two requests stop being byte-identical.
+        //
+        // `Some(1)` is the other half of that: two identical bodies would
+        // agree whether the second came from the cache or from a second,
+        // equally correct miss, so nothing above pins that a hit actually
+        // happened. Without it, turning the cache off everywhere in this
+        // suite (`detection_cache_entries = 0`) leaves every test here
+        // green, including this one — the offset mutation only bites
+        // because a hit happens to occur, not because this test requires
+        // one.
+        //
+        // A real credential, not `call`'s headerless default: a
+        // credential-less request is never cached at all (see
+        // detection_cache.rs's `two_anonymous_callers_never_share_a_cached_hit`),
+        // so without one this test would see two misses and `Some(1)`
+        // above would fail for an unrelated reason.
+        let detector = detector_returning_expecting(person_span(), Some(1)).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let body = json!({"messages": [{"role": "user", "content": "Weber schreibt"}]});
+        let headers = [("authorization", "Bearer k1")];
+
+        call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &headers,
+        )
+        .await;
+        call_with_headers(Arc::clone(&state), "/v1/chat/completions", body, &headers).await;
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "two requests, two upstream calls");
+        assert_eq!(
+            received[0].body, received[1].body,
+            "a cache hit forwarded a body different from the miss that computed it"
+        );
+        // `Some(1)` above is asserted when `detector` drops: two requests,
+        // one detector call, is what this test's name already claims.
+    }
+
+    #[tokio::test]
     async fn headers_outside_the_allowlist_are_not_forwarded() {
         // A client's cookies are not the model provider's business.
         let detector = detector_returning(json!([])).await;
@@ -1060,7 +1218,7 @@ mod tests {
         let audit =
             Arc::new(crate::audit::Audit::open(&dir.path().join("audit.jsonl")).expect("opens"));
         Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
             anthropic_base: upstream_base,
@@ -1660,7 +1818,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2061,7 +2219,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2117,7 +2275,7 @@ mod tests {
             .await;
 
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
             anthropic_base: upstream.uri(),
@@ -2153,7 +2311,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
             anthropic_base: base,
@@ -2635,7 +2793,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
-            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5)),
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
             anthropic_base: base,

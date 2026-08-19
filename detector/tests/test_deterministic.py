@@ -1,12 +1,14 @@
+from importlib import resources
+
 import pytest
 
 from tessera_detector.deterministic import DeterministicDetector
-from tessera_detector.pipeline import Detector
+from tessera_detector.pipeline import DEFAULT_MODEL_ID, Detector
 from tessera_detector.spans import Span
 
 
 def detect(text: str) -> list[Span]:
-    return Detector().detect(text)
+    return Detector(model_id=DEFAULT_MODEL_ID).detect(text)
 
 
 def spans_of_type(spans: list[Span], entity_type: str) -> list[Span]:
@@ -72,6 +74,30 @@ def test_catalog_drives_entity_types() -> None:
     detector = DeterministicDetector()
     types = {rule.entity_type for rule in detector.rules}
     assert {"IBAN", "CREDIT_CARD", "CH_AVS", "FR_NIR", "DE_STEUER_ID", "FR_NIF", "EMAIL"} <= types
+
+
+def test_default_catalog_text_is_the_packaged_file() -> None:
+    # Finding I: detector_version needs the text that actually produced
+    # `self.rules`, not a second, independent read of the package's own
+    # copy — proved here at the source, before pipeline.Detector and
+    # version.detector_version both come to depend on it.
+    packaged = (resources.files("tessera_detector") / "catalog" / "identifiers.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert DeterministicDetector().catalog_text == packaged
+
+
+def test_custom_catalog_text_is_reported_back_unchanged() -> None:
+    catalog = """
+version: 1
+identifiers:
+  - id: naked
+    entity_type: NAKED
+    tier: 2
+    confidence: 0.5
+    pattern: 'x+'
+"""
+    assert DeterministicDetector(catalog).catalog_text == catalog
 
 
 def test_corsican_nir_detected() -> None:

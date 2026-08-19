@@ -8,6 +8,7 @@
 
 mod audit;
 mod config;
+mod detection_cache;
 mod detector;
 mod mapping;
 mod provider;

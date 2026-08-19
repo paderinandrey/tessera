@@ -11,6 +11,7 @@ from pathlib import Path
 
 import yaml
 
+from .models import ONNX_MODEL_FILE, dependency_digest
 from .spans import Span
 
 _DEFAULT_CONFIG = resources.files("tessera_detector") / "catalog" / "ner.yaml"
@@ -171,9 +172,19 @@ class GlinerRecognizer:
         # the upstream urchade repo ships PyTorch weights only. The mirror's ONNX
         # graph lives under onnx/model.onnx rather than at the repo root, so the
         # default onnx_model_file="model.onnx" must be overridden to match.
+        # ONNX_MODEL_FILE is the same name models.weights_digest hashes as
+        # "the one graph actually loaded" — one constant, not two lists that
+        # can drift.
         self._model = GLiNER.from_pretrained(
-            str(model_path), load_onnx_model=True, onnx_model_file="onnx/model.onnx"
+            str(model_path), load_onnx_model=True, onnx_model_file=ONNX_MODEL_FILE
         )
+        # "gliner" here is the PyPI distribution name (unrelated to
+        # MODEL_NAME, which names the weights), the root `dependency_digest`
+        # walks transitively through installed package metadata — not a
+        # snapshot of what this process happened to import, which a second
+        # construction here would find already loaded. See its own
+        # docstring for what that distinction fixes.
+        self.dependency_digest = dependency_digest("gliner")
         self._tokenizer = self._model.data_processor.transformer_tokenizer
         self._token_budget = int(self._model.config.max_len) - PROMPT_TOKEN_RESERVE
         # One inference pass per tier. GLiNER gives a span a single label, so

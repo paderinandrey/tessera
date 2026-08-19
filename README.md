@@ -221,9 +221,11 @@ is the credential, not the id: callers who share one API key share one namespace
 within it any id is reachable by anyone holding that key. The raw id
 never reaches a log either — a client may well name its session after the person in it.
 
-The table holds real values in memory between requests, which nothing else in the gateway
-does, so it is bounded three ways: `session_idle_secs`, `max_sessions` and
-`max_session_values`. Reaching `max_session_values` or the idle TTL costs coreference,
+The table holds real values in memory between requests. It is the only place in the
+gateway where that is true — the detection cache below retains data across requests too,
+but never a value, only a span's type and offsets — so the session table is bounded
+three ways: `session_idle_secs`, `max_sessions` and `max_session_values`. Reaching
+`max_session_values` or the idle TTL costs coreference,
 never protection. The client holds restored text and sends the history again, so a
 session that was evicted is rebuilt from scratch by the next request — `[PERSON_3]`
 becomes `[PERSON_1]` and nothing else changes. Past `max_session_values` a value is
@@ -241,9 +243,53 @@ A request for a session the store already holds is never refused.
 Values are never evicted from within a live session: one that came back from the model
 would end a request with nothing to restore to.
 
-Detection still runs over every text in every request. The session stabilises a
-placeholder that detection produced; it is never asked to find personal data on its own,
-because personal data does not arrive in the same form twice.
+Detection itself is cached, separately from the session table above and whether or not
+a session is attached: a text is scanned once per detector version and credential, and
+every repeat after that — the whole history a client resends on each turn — is served
+from memory instead of calling the detector, which is what turns a conversation's cost
+from growing with the square of its length back to growing with it linearly. What is
+remembered is a span's type and two offsets, never the text or the value, keyed on
+digests of the detector's version, a salted fingerprint of the credential, and the text
+itself — so a hit never reveals, even through timing, that one tenant sent what another
+tenant sent before it. The session stabilises a placeholder that detection produced,
+cached or not; it is never asked to find personal data on its own.
+
+The cache is bounded on two dimensions, the same relationship `max_sessions` and
+`max_session_values` have to each other: `detection_cache_entries` (default 10 000)
+bounds how many texts it remembers, and `max_spans_per_entry` (default 250) bounds how
+many spans one remembered text's detection may carry — without the second, a single
+span-dense text could outweigh thousands of ordinary ones. 250 is sized against measured
+density rather than assumed: real text runs roughly 1.0 to 2.5 spans per 1 000
+characters, so the default covers prose to about 100 KB, logs to about 188 KB and source
+to 250 KB — every realistic single tool result. A detection over the cap is masked,
+restored and returned exactly like any other; it is simply not stored, so an oversized
+result never becomes a refusal, only a permanent miss. At the shipped defaults the worst
+case is about 118 MB. Unlike the session table, the cache has no idle TTL — an entry
+outlives its conversation and stays reachable for as long as the process runs, until the
+detector's
+version changes or the cache fills and something else is used more recently. And unlike
+the session table, losing an entry costs time, not protection: a full cache evicts
+rather than refusing, and a poisoned lock degrades to calling the detector rather than
+failing the request. Set `detection_cache_entries = 0` to disable the cache entirely —
+the gateway then calls the detector for every text, with no cache in the loop at all.
+
+That coverage is measured against code, logs and prose — a coding agent's traffic. A
+uniformly dense text — a contact list or an intake form, not ordinary correspondence,
+which is prose-shaped at nearer 2.5 spans per 1 000 characters and is not affected —
+crosses the cap at single-digit kilobytes: 8 to 16 KB at the density this repository's
+own evaluation corpus annotates, offered here only as an illustration of where the cap
+lands on text that is dense throughout, not as a claim about a buyer's traffic — every
+row of that corpus is a single rendered sentence under 126 characters, and nothing else
+here is shaped like a client document either, so the figure awaits its real measurement:
+spans per 1,000 characters over actual gateway traffic. Because
+the cache keys per text rather than per document, this bites a dense message arriving as
+one text — a conversation *about* a dense file is many short turns that all cache
+normally, and a long document is rarely uniform, the way a contract is prose everywhere
+but its header and signature block. This is a real limit rather than a number worth
+chasing with a bigger default: raising `max_spans_per_entry` is the deliberate lever for
+a deployment whose texts really are dense throughout, priced by the formula in
+`gateway/tessera.example.toml` (`entries × (264 + spans × 46)`), and recomputed there
+against the deployment's own texts.
 
 A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or
@@ -277,9 +323,10 @@ because the connection broke or because a token could not be restored. It was sa
 moment earlier, and the failure does not change that; what stays behind is the hold-back
 buffer, which may hold the token that failed.
 
-The gateway asks the detector for every layer it has, so a request costs what the
-[latency](#latency) section reports; `detector_timeout_secs` defaults to 30 seconds
-because a tight timeout would turn protection into a denial of service. Configuration is
+On a cache miss the gateway asks the detector for every layer it has, so that request
+costs what the [latency](#latency) section reports; a hit costs a lookup instead.
+`detector_timeout_secs` defaults to 30 seconds because a tight timeout would turn
+protection into a denial of service. Configuration is
 TOML and rejects unknown keys — a typo in a security control should fail loudly rather
 than leave a default in place.
 

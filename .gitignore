@@ -22,3 +22,7 @@ tessera-audit.jsonl*
 .idea/
 .vscode/
 gateway/target/
+
+# Scratch for subagent-driven execution: ledgers, briefs, review packages.
+# Never part of the record — git history is.
+.superpowers/

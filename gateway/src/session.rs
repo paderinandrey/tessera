@@ -369,6 +369,27 @@ mod tests {
     }
 
     #[test]
+    fn credential_of_treats_an_empty_header_as_no_credential() {
+        // `credential_of`'s output is what the detection cache digests into
+        // a tenant bucket, and what the audit journal digests for
+        // attribution. Without this filter `Some(b"")` and `None` digest
+        // identically, so every credential-less caller would share one
+        // cache bucket, and a refusal recorded before masking would name a
+        // digest of `b""` as though it were a tenant.
+        let empty = headers(&[("authorization", "")]);
+        assert!(
+            credential_of(&empty, &OpenAi).is_none(),
+            "an empty header value was treated as a credential"
+        );
+
+        let absent = headers(&[]);
+        assert!(credential_of(&absent, &OpenAi).is_none());
+
+        let present = headers(&[("authorization", "Bearer k")]);
+        assert!(credential_of(&present, &OpenAi).is_some());
+    }
+
+    #[test]
     fn no_header_asks_for_no_session() {
         let asked = key_from(&headers(&[("authorization", "Bearer k")]), &OpenAi, true);
         assert!(matches!(asked, Ok(None)));

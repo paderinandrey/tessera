@@ -34,3 +34,82 @@ max_session_values = 1000
 # This default is relative on purpose, so that following the quickstart writes
 # where you ran it. A deployment wants an absolute path on storage you back up.
 audit_path = "tessera-audit.jsonl"
+
+# How many detection results the gateway may remember at once. Detection runs
+# over every text on every request, and a client resends the whole conversation
+# each turn, so without this a ten-turn conversation pays for its first turn ten
+# times. Entries hold a digest of the text and the spans found in it — never the
+# text itself — and are invalidated automatically when the detector's weights or
+# catalogs change.
+#
+# This key bounds how many entries the cache holds, not how much memory it
+# uses — that also depends on max_spans_per_entry below, since an entry's
+# size is not fixed. Measured with a counting allocator: an entry costs 264
+# bytes fixed plus 46 per span found in the text, a floor, since that counts
+# only requested bytes and neither malloc rounding nor HashMap slack. Zero
+# disables the cache: the gateway then calls the detector for every text, as
+# it did before the cache existed.
+detection_cache_entries = 10000
+
+# The cache's other dimension: how many spans a single detection may carry
+# and still be remembered. Without this, one span-dense text could dominate
+# the cache's memory on its own, and nothing above bounds how many spans one
+# text may have. A detection over this cap is masked, restored and returned
+# exactly like any other; it is simply not stored, so an oversized result
+# never becomes a refusal, only a permanent miss.
+#
+# 250, chosen from measured density rather than assumed: real text runs
+# roughly 1.0 to 2.5 spans per 1000 characters (git log --stat 1.33, README
+# prose 2.50, Rust source 1.00 — a synthetic dense-PII detection corpus
+# measured 28.67, but that corpus is a proxy for nothing outside itself). 250
+# spans covers prose to about 100 KB, logs to about 188 KB and source to
+# 250 KB — every realistic single tool result — while a lower cap would trim
+# the longest, most expensive-to-recompute texts first, the wrong end to trim
+# on a number that would otherwise be arbitrary.
+#
+# A uniformly dense text crosses the cap at single-digit kilobytes, and that
+# is a limit rather than a number to keep raising. The densities above are
+# code, logs and prose — the shapes a coding agent sends. A contact list or
+# an intake form is not shaped like either. The only dense-PII sample in
+# this repository is the evaluation corpus, which annotates about 20 spans per
+# 1000 characters across the whole file and about 30 across its eighty
+# non-negative rows; a real contact row, at roughly five entities in eighty
+# characters, exceeds both. It characterises nothing about a buyer's
+# traffic and is not offered as doing so — it is an illustration of where
+# the cap lands on text that is dense throughout. It cannot be more than
+# that: every row of that corpus is a single rendered sentence under 126
+# characters, so nothing in this repository is shaped like a client
+# document. The figure is an illustration awaiting its measurement.
+#
+# At that density a single text crosses 250 spans somewhere between 8 and
+# 16 KB, so a uniformly dense document arriving as one message is declined
+# and rescanned on every turn. Two things bound how often that bites: the
+# cache keys per text rather than per document, so a conversation about a
+# dense file is many short turns that all cache normally; and a long
+# document is rarely uniform — a contract with personal data in its header
+# and signature block is prose in between. Ordinary correspondence is
+# prose-shaped at nearer 2.5 spans per 1000 and is not affected.
+#
+# Raising the cap for a deployment whose texts really are dense throughout
+# is a deliberate lever with a priced cost — the formula is in front of the
+# operator — but it cannot be the default, because the same number
+# multiplies against ten thousand entries.
+#
+# At the shipped defaults, the worst case is entries * (264 + spans * 46) =
+# 10000 * (264 + 250 * 46) = 117640000 B ≈ 118 MB — three times below the
+# figure that would have blocked this cache from shipping, and reachable
+# only with ten thousand simultaneously resident maximum-size entries. A
+# deployment whose texts really are dense throughout should raise this
+# figure and recompute the worst case above against its own texts. Zero is
+# rejected while the cache is enabled — an entry cap of zero would remember
+# nothing, which is what detection_cache_entries = 0 already says more
+# directly.
+#
+# The 46 B/span above measured real detector output; it bounded no single
+# span's type on its own, so one span with a very large type still passed
+# this count cap and was retained in full. The gateway now declines any
+# entry containing a span whose type is longer than the placeholder grammar
+# allows (40 bytes), so a span's true worst-case weight is nearer 80 B and
+# the figure above holds as a typical case rather than an assumed ceiling —
+# the true ceiling is nearer 200 MB at these defaults.
+max_spans_per_entry = 250

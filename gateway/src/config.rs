@@ -10,6 +10,10 @@ pub enum ConfigError {
     ZeroSessionLimit,
     #[error("max_session_values must be greater than zero unless session_idle_secs is zero")]
     ZeroSessionValues,
+    #[error(
+        "max_spans_per_entry must be greater than zero unless detection_cache_entries is zero"
+    )]
+    ZeroSpansPerEntry,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +51,20 @@ pub struct Config {
     /// masked and still restored — they are simply not remembered.
     #[serde(default = "default_max_session_values")]
     pub max_session_values: usize,
+    /// How many detection results may be remembered at once. Zero disables the
+    /// cache, which is a memory budget rather than a mistake: the gateway then
+    /// calls the detector for every text, as it did before the cache existed.
+    #[serde(default = "default_detection_cache_entries")]
+    pub detection_cache_entries: usize,
+    /// The cache's other dimension: how many spans a single detection may
+    /// carry and still be remembered. `detection_cache_entries` bounds how
+    /// many texts the cache holds, not how large one text's detection may
+    /// be — the same relationship `max_session_values` has to `max_sessions`.
+    /// A detection over the cap is served exactly as any other: masked,
+    /// restored, returned. It is simply not stored, so the cache never turns
+    /// a large result into a refusal.
+    #[serde(default = "default_max_spans_per_entry")]
+    pub max_spans_per_entry: usize,
 }
 
 fn default_bind() -> String {
@@ -73,6 +91,57 @@ fn default_max_sessions() -> usize {
 fn default_max_session_values() -> usize {
     1000
 }
+fn default_detection_cache_entries() -> usize {
+    10_000
+}
+// Chosen from measured density, not from the memory side alone: real text
+// runs roughly 1.0 to 2.5 spans per 1 000 characters (git log --stat 1.33,
+// README prose 2.50, Rust source 1.00 — the evaluation corpus's 28.67 is a
+// dense-PII detection benchmark, not a proxy for real traffic). 250 spans
+// covers prose to about 100 KB, logs to about 188 KB and source to 250 KB —
+// every realistic single tool result — while a lower cap would trim the
+// longest, most expensive-to-recompute texts first, which is the wrong end
+// to trim on a number that is otherwise arbitrary.
+//
+// That coverage is a coding agent's traffic. A uniformly dense text — a
+// contact list or an intake form, not ordinary correspondence, which is
+// prose-shaped at nearer 2.5/1 000 and unaffected — crosses the cap at
+// single-digit kilobytes (8-16 KB at the evaluation corpus's measured
+// density, offered only as an illustration of a uniformly dense text, never
+// as a characterisation of real traffic — every row of that corpus is a
+// single rendered sentence under 126 characters, so nothing in this
+// repository is actually shaped like a client document; the figure awaits
+// its measurement, which is spans per 1 000 characters over real gateway
+// traffic). The cache keys per text, so this bites a dense message arriving
+// as one text, not a conversation about a dense file (many short turns, all
+// cached normally) or a document that is merely dense in places. A real
+// limit, not a number to keep raising by default, because the same number
+// multiplies against the entry ceiling below. Raising it is the deliberate
+// lever for that traffic; see tessera.example.toml for the arithmetic that
+// prices it.
+//
+// At 264 B fixed + 46 B/span (measured, a floor): the worst-case entry is
+// 264 + 250 * 46 = 11 764 B, and at the default 10 000 entries the worst-case
+// cache is 10 000 * 11 764 B = 117 640 000 B ≈ 118 MB. A text with more
+// spans than that is real and is still served correctly; it is simply not
+// remembered, the same trade `max_session_values` already makes for a
+// session with too many values.
+//
+// The 46 B/span figure measured real detector output, where `Span.entity_type`
+// runs a handful of characters (`PERSON`, `IBAN`). It was never a ceiling on
+// that string's length, only an average over what a real detector actually
+// sends — a single span with a large type passed this cap on count exactly
+// as easily as an ordinary one and was retained in full. `DetectionCache::insert`
+// now declines an entry with any span past `mapping::MAX_ENTITY_TYPE` (40
+// bytes), closing that gap the same way this cap closes span count. That
+// makes the true worst case per span roughly 80 B (a `String`'s own ~24 B
+// plus up to 40 B of characters plus two `usize` offsets) rather than 46,
+// so the 118 MB figure above is now a typical case again, not an assumed
+// ceiling — the actual ceiling is nearer 200 MB. Analytical, from struct
+// layout, not re-measured with a counting allocator the way 46 B was.
+fn default_max_spans_per_entry() -> usize {
+    250
+}
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -87,6 +156,9 @@ impl Config {
             if config.max_session_values == 0 {
                 return Err(ConfigError::ZeroSessionValues);
             }
+        }
+        if config.detection_cache_entries > 0 && config.max_spans_per_entry == 0 {
+            return Err(ConfigError::ZeroSpansPerEntry);
         }
         Ok(config)
     }
@@ -194,5 +266,59 @@ mod tests {
         // Enabled and unable to hold anything is not a configuration, it is a typo.
         assert!(Config::from_toml(&with_audit("max_sessions = 0")).is_err());
         assert!(Config::from_toml(&with_audit("max_session_values = 0")).is_err());
+    }
+
+    #[test]
+    fn the_detection_cache_has_a_default() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(config.detection_cache_entries, 10_000);
+    }
+
+    #[test]
+    fn the_detection_cache_can_be_sized() {
+        let config = Config::from_toml(&with_audit("detection_cache_entries = 64")).unwrap();
+        assert_eq!(config.detection_cache_entries, 64);
+    }
+
+    #[test]
+    fn a_zero_detection_cache_is_a_setting_not_an_error() {
+        // Unlike max_sessions, where zero would mean "no conversation can be
+        // remembered": here it means "do not remember spans", which is exactly
+        // today's behaviour and a legitimate memory budget.
+        let config = Config::from_toml(&with_audit("detection_cache_entries = 0")).unwrap();
+        assert_eq!(config.detection_cache_entries, 0);
+    }
+
+    #[test]
+    fn the_span_cap_has_a_default() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(config.max_spans_per_entry, 250);
+    }
+
+    #[test]
+    fn the_span_cap_can_be_sized() {
+        let config = Config::from_toml(&with_audit("max_spans_per_entry = 8")).unwrap();
+        assert_eq!(config.max_spans_per_entry, 8);
+    }
+
+    #[test]
+    fn a_zero_span_cap_with_the_cache_enabled_is_rejected() {
+        // The same mistake `a_zero_limit_with_sessions_enabled_is_rejected`
+        // guards against, one level down: an entry cap with nothing an
+        // entry may hold is a typo, not a configuration.
+        let error = Config::from_toml(&with_audit("max_spans_per_entry = 0")).unwrap_err();
+        assert!(error.to_string().contains("max_spans_per_entry"));
+    }
+
+    #[test]
+    fn a_zero_span_cap_is_permitted_once_the_cache_is_disabled() {
+        let config = Config::from_toml(&with_audit(
+            r#"
+            detection_cache_entries = 0
+            max_spans_per_entry = 0
+            "#,
+        ))
+        .expect("a disabled cache does not care what its dead setting says");
+        assert_eq!(config.max_spans_per_entry, 0);
     }
 }

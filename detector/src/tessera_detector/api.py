@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .pipeline import Detector, build_detector
 from .spans import Span
+from .version import detector_version
 
 Layer = Literal["deterministic", "ner"]
 
@@ -54,6 +55,13 @@ class DetectRequest(BaseModel):
 class DetectResponse(BaseModel):
     spans: list[Span]
     layers_run: list[Layer] = Field(description="Layers that actually ran for this request")
+    version: str = Field(
+        description=(
+            "Digest of the weights and catalogs that produced these spans. A caller "
+            "that caches spans must key them by this: it changes whenever the same "
+            "text would detect differently."
+        )
+    )
 
 
 class ErrorDetail(BaseModel):
@@ -139,7 +147,11 @@ def create_app(detector: Detector | None = None) -> FastAPI:
             if "ner" in requested
             else detector.deterministic_only(body.text)
         )
-        return DetectResponse(spans=spans, layers_run=list(requested))
+        return DetectResponse(
+            spans=spans,
+            layers_run=list(requested),
+            version=detector_version(detector.model_id, detector.catalog_text),
+        )
 
     @app.get("/health", response_model=HealthResponse)
     def health(detector: Annotated[Detector, Depends(get_detector)]) -> HealthResponse:
