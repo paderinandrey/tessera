@@ -230,16 +230,28 @@ Four samples from one repository are not a survey of customer traffic. The
 measurement that would settle it is spans per 1 000 characters over a day of real
 gateway traffic, which the journal is one field away from being able to answer.
 
-**The cap declines dense documents at any tolerable default, and that is a
-limit rather than a number to keep raising.** The densities above are code,
-logs and prose — the shapes a coding agent sends. The shapes this product is
-bought for are not those: a contact list, an intake form or client
-correspondence is closer to the evaluation corpus, at 16 to 29 spans per 1 000
-characters. At that density a document crosses 250 spans somewhere between 9 and
-16 KB, so a genuinely PII-dense document of a few pages is served fresh every
-time. Raising the cap to cover it is a deliberate lever with a priced cost — the
-formula is in front of the operator — but it cannot be the default, because the
-same number multiplies against ten thousand entries.
+**A uniformly dense text crosses the cap at single-digit kilobytes, and that is
+a limit rather than a number to keep raising.** The densities above are code,
+logs and prose — the shapes a coding agent sends. A contact list or an intake
+form is not shaped like either. The only dense-PII sample in this repository is
+the evaluation corpus, which annotates 19.9 spans per 1 000 characters across the
+whole file and 30.0 across its eighty non-negative rows; a real contact row, at
+roughly five entities in eighty characters, exceeds both. It characterises
+nothing about a buyer's traffic and is not offered as doing so — it is an
+illustration of where the cap lands on text that is dense throughout.
+
+At that density a single text crosses 250 spans somewhere between 8 and 16 KB, so
+a uniformly dense document arriving as one message is declined and rescanned on
+every turn. Two things bound how often that bites: the cache keys per text rather
+than per document, so a conversation *about* a dense file is many short turns
+that all cache normally; and a long document is rarely uniform — a contract with
+personal data in its header and signature block is prose in between. Ordinary
+correspondence is prose-shaped at nearer 2.5 spans per 1 000 and is not affected.
+
+Raising the cap for a deployment whose texts really are dense throughout is a
+deliberate lever with a priced cost — the formula is in front of the operator —
+but it cannot be the default, because the same number multiplies against ten
+thousand entries.
 
 **Why this is in the slice rather than after it.** An earlier draft of this
 document scoped the inner bound to a follow-up, on the grounds that the ceiling
