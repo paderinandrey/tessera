@@ -14,6 +14,7 @@ from .models import (
     HF_REVISION,
     MODEL_NAME,
     ModelUnavailable,
+    dependency_digest,
     find_model,
     model_cache_dir,
     weights_digest,
@@ -27,6 +28,19 @@ from .spans import Span
 # (`layers_run` cannot include "ner"), so this string is never a cache key —
 # only a label in a response nobody caches against.
 DEFAULT_MODEL_ID = f"{MODEL_NAME}@{HF_REVISION}"
+
+# This package's own installed distribution name — the root whose declared
+# `[project.dependencies]` (pydantic, python-stdnum, schwifty, pyyaml)
+# `dependency_digest` walks to cover the deterministic layer's own
+# third-party validators. Naming schwifty and stdnum here by hand would
+# repeat, a fifth time in this slice, the exact mistake REQUIRED_ARTIFACTS,
+# the quantization filenames and the earlier inference-package list already
+# made once each (see models.py): correct today, silently under-covering
+# the day someone adds a validator dependency. Naming the package instead
+# means whatever `[project.dependencies]` declares is picked up
+# automatically, the same way `_weighed_files` replaced a hand-maintained
+# artifact list with a directory walk.
+PACKAGE_NAME = "tessera-detector"
 
 
 class NerRecognizer(Protocol):
@@ -87,8 +101,23 @@ def build_detector(
     *, ner: bool | None = None, catalog_text: str | None = None
 ) -> Detector:
     """ner=None auto-enables when weights exist, True requires them, False disables."""
+    # The deterministic layer runs on every request this function can ever
+    # produce a Detector for — ner=False, no weights, and no runtime alike —
+    # so its own dependency digest belongs in every branch below, not only
+    # the one where NER is active. A rebuild that moves schwifty or
+    # python-stdnum to a different release changes which IBANs and tax
+    # numbers validate, with weights, catalogs and this package's own
+    # source all untouched; the version has to see that regardless of
+    # whether NER happens to be running too. Computed once, here, the same
+    # reasoning weights_digest and recognizer.dependency_digest already
+    # apply to their own inputs: metadata reads, not per-request work.
+    deterministic_deps = dependency_digest(PACKAGE_NAME)
     if ner is False:
-        return Detector(catalog_text=catalog_text, ner_off_reason=DISABLED)
+        return Detector(
+            catalog_text=catalog_text,
+            ner_off_reason=DISABLED,
+            model_id=f"{DEFAULT_MODEL_ID}#{deterministic_deps}",
+        )
     path = find_model()
     if path is None:
         if ner is True:
@@ -96,7 +125,11 @@ def build_detector(
                 f"no NER weights found; run `make model` or set TESSERA_NER_MODEL "
                 f"(looked in {model_cache_dir()})"
             )
-        return Detector(catalog_text=catalog_text, ner_off_reason=NO_WEIGHTS)
+        return Detector(
+            catalog_text=catalog_text,
+            ner_off_reason=NO_WEIGHTS,
+            model_id=f"{DEFAULT_MODEL_ID}#{deterministic_deps}",
+        )
     # Imported lazily: this path only runs once weights exist, and the ner
     # dependency group (gliner) need not be installed until it does. Weights
     # outlive virtualenvs — a base-synced environment with a populated cache
@@ -133,24 +166,33 @@ def build_detector(
                 f"NER weights are installed but the ner dependency group is not "
                 f"(`uv sync --group ner`): {error}"
             ) from error
-        return Detector(catalog_text=catalog_text, ner_off_reason=NO_RUNTIME)
+        return Detector(
+            catalog_text=catalog_text,
+            ner_off_reason=NO_RUNTIME,
+            model_id=f"{DEFAULT_MODEL_ID}#{deterministic_deps}",
+        )
     # Named by what is actually loaded, not by the pinned snapshot's constant:
     # `path` may be the cache or an operator's `TESSERA_NER_MODEL` override,
     # and the same path can hold different bytes across a redeploy. Hashed
     # once, here, rather than per request — see `weights_digest`.
     #
-    # `#` separates the two digests unambiguously: both are hex, so neither
-    # can ever contain the character the other side of the split looks for
-    # — no anti-concatenation hashing needed the way `version_from` needs
-    # it for arbitrary-length catalog bytes. `recognizer.dependency_digest`
-    # covers a third thing weights and catalogs do not: a rebuild that
-    # moves GLiNER, onnxruntime or the tokenizer library to a different
-    # release can change spans with the weights and catalogs both
-    # untouched (see its own docstring in models.py).
+    # `#` separates all three digests unambiguously: each is hex, so none
+    # can ever contain the character its neighbours split on — no
+    # anti-concatenation hashing needed the way `version_from` needs it for
+    # arbitrary-length catalog bytes. `deterministic_deps` covers what
+    # `[project.dependencies]` names (schwifty, python-stdnum and friends,
+    # see `PACKAGE_NAME`); `recognizer.dependency_digest` covers a fourth
+    # thing none of weights, catalogs or that list do: a rebuild that moves
+    # GLiNER, onnxruntime or the tokenizer library to a different release
+    # can change spans with everything else untouched (see its own
+    # docstring in models.py).
     return Detector(
         catalog_text=catalog_text,
         recognizer=recognizer,
-        model_id=f"{MODEL_NAME}@{weights_digest(path)}#{recognizer.dependency_digest}",
+        model_id=(
+            f"{MODEL_NAME}@{weights_digest(path)}#{deterministic_deps}"
+            f"#{recognizer.dependency_digest}"
+        ),
     )
 
 
@@ -159,6 +201,7 @@ __all__ = [
     "DISABLED",
     "NO_RUNTIME",
     "NO_WEIGHTS",
+    "PACKAGE_NAME",
     "Detector",
     "NerRecognizer",
     "build_detector",

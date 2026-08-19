@@ -6,8 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from tessera_detector.models import MODEL_NAME, ModelUnavailable, weights_digest
-from tessera_detector.pipeline import DEFAULT_MODEL_ID, Detector, build_detector
+from tessera_detector.models import (
+    MODEL_NAME,
+    ModelUnavailable,
+    _transitive_requirements,
+    dependency_digest,
+    weights_digest,
+)
+from tessera_detector.pipeline import DEFAULT_MODEL_ID, PACKAGE_NAME, Detector, build_detector
 from tessera_detector.spans import Span
 
 
@@ -116,8 +122,65 @@ def test_a_detector_without_ner_reports_the_pinned_constant() -> None:
     # No weights are loaded, so there is nothing to digest instead — the
     # pinned snapshot's own name is the honest answer here, and it is also
     # never a cache key: a deterministic-only run can't satisfy the
-    # gateway's "complete run" check.
+    # gateway's "complete run" check. This constructs Detector directly, not
+    # through build_detector, so PACKAGE_NAME's dependency digest (Finding
+    # I) never enters into it — see the build_detector tests below for that.
     assert Detector().model_id == DEFAULT_MODEL_ID
+
+
+def test_the_deterministic_root_actually_covers_the_validator_libraries() -> None:
+    # Finding I: PACKAGE_NAME has to be the right root, not merely produce
+    # *a* digest. validators.py imports schwifty and stdnum (the import
+    # name for the python-stdnum distribution); proving both are reachable
+    # from PACKAGE_NAME's own declared dependency tree is what tells a
+    # correct root apart from a typo or the wrong package that would still
+    # look plausible without this.
+    tree = _transitive_requirements(PACKAGE_NAME)
+    assert "schwifty" in tree
+    assert "python-stdnum" in tree
+
+
+def test_build_detector_folds_the_deterministic_dependency_digest_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding I: the version used to omit the deterministic layer's own
+    # dependencies entirely — a rebuild moving schwifty or python-stdnum to
+    # a different release changes which IBANs and tax numbers validate,
+    # with the reported version unchanged. This must hold even when NER is
+    # explicitly turned off: the deterministic layer still runs.
+    monkeypatch.setattr("tessera_detector.pipeline.dependency_digest", lambda root: "det-deps-v1")
+    detector = build_detector(ner=False)
+    assert detector.model_id == f"{DEFAULT_MODEL_ID}#det-deps-v1"
+
+
+def test_build_detector_folds_the_deterministic_dependency_digest_without_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TESSERA_NER_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("tessera_detector.pipeline.dependency_digest", lambda root: "det-deps-v1")
+    detector = build_detector()
+    assert detector.model_id == f"{DEFAULT_MODEL_ID}#det-deps-v1"
+
+
+def test_build_detector_folds_the_deterministic_dependency_digest_without_the_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "gliner", None)
+    monkeypatch.setattr("tessera_detector.pipeline.dependency_digest", lambda root: "det-deps-v1")
+    detector = build_detector()
+    assert detector.model_id == f"{DEFAULT_MODEL_ID}#det-deps-v1"
+
+
+def test_a_different_deterministic_dependency_digest_changes_the_model_id_when_ner_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tessera_detector.pipeline.dependency_digest", lambda root: "det-deps-v1")
+    off_a = build_detector(ner=False)
+    monkeypatch.setattr("tessera_detector.pipeline.dependency_digest", lambda root: "det-deps-v2")
+    off_b = build_detector(ner=False)
+    assert off_a.model_id != off_b.model_id
 
 
 def test_build_detector_names_the_weights_actually_loaded(
@@ -130,7 +193,9 @@ def test_build_detector_names_the_weights_actually_loaded(
     detector = build_detector()
 
     assert detector.ner_available is True
-    assert detector.model_id == f"{MODEL_NAME}@{weights_digest(weights)}#fake-deps"
+    assert detector.model_id == (
+        f"{MODEL_NAME}@{weights_digest(weights)}#{dependency_digest(PACKAGE_NAME)}#fake-deps"
+    )
     assert detector.model_id != DEFAULT_MODEL_ID
 
 
