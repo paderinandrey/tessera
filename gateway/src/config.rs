@@ -94,16 +94,23 @@ fn default_max_session_values() -> usize {
 fn default_detection_cache_entries() -> usize {
     10_000
 }
-// 100 spans, at 264 B fixed + 46 B/span (measured, a floor): the worst-case
-// entry is 264 + 100 * 46 = 4 864 B. At the default 10 000 entries, the
-// worst-case cache is 10 000 * 4 864 B ≈ 46.4 MB — small enough that an
-// operator who never reads the documentation is not exposed to more than
-// tens of megabytes, regardless of what a client sends. A text with more
-// entities than that is real (agent tool results can carry hundreds) and is
-// still served correctly; it is simply not remembered, the same trade
-// `max_session_values` already makes for a session with too many values.
+// Chosen from measured density, not from the memory side alone: real text
+// runs roughly 1.0 to 2.5 spans per 1 000 characters (git log --stat 1.33,
+// README prose 2.50, Rust source 1.00 — the evaluation corpus's 28.67 is a
+// dense-PII detection benchmark, not a proxy for real traffic). 250 spans
+// covers prose to about 100 KB, logs to about 188 KB and source to 250 KB —
+// every realistic single tool result — while a lower cap would trim the
+// longest, most expensive-to-recompute texts first, which is the wrong end
+// to trim on a number that is otherwise arbitrary.
+//
+// At 264 B fixed + 46 B/span (measured, a floor): the worst-case entry is
+// 264 + 250 * 46 = 11 764 B, and at the default 10 000 entries the worst-case
+// cache is 10 000 * 11 764 B = 117 640 000 B ≈ 118 MB. A text with more
+// spans than that is real and is still served correctly; it is simply not
+// remembered, the same trade `max_session_values` already makes for a
+// session with too many values.
 fn default_max_spans_per_entry() -> usize {
-    100
+    250
 }
 
 impl Config {
@@ -255,7 +262,7 @@ mod tests {
     #[test]
     fn the_span_cap_has_a_default() {
         let config = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(config.max_spans_per_entry, 100);
+        assert_eq!(config.max_spans_per_entry, 250);
     }
 
     #[test]

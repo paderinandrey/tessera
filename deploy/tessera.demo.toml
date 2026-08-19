@@ -21,4 +21,4 @@ audit_path = "/var/lib/tessera/audit.jsonl"
 # text's detection may be, so a single span-dense text cannot dominate the
 # cache's memory the way an unbounded entry count alone would allow.
 detection_cache_entries = 10000
-max_spans_per_entry = 100
+max_spans_per_entry = 250

@@ -256,14 +256,17 @@ cached or not; it is never asked to find personal data on its own.
 
 The cache is bounded on two dimensions, the same relationship `max_sessions` and
 `max_session_values` have to each other: `detection_cache_entries` (default 10 000)
-bounds how many texts it remembers, and `max_spans_per_entry` (default 100) bounds how
+bounds how many texts it remembers, and `max_spans_per_entry` (default 250) bounds how
 many spans one remembered text's detection may carry — without the second, a single
-span-dense text, such as a large tool result with an entity every few characters, could
-outweigh thousands of ordinary ones. A detection over the cap is masked, restored and
-returned exactly like any other; it is simply not stored, so an oversized result never
-becomes a refusal, only a permanent miss. At the shipped defaults the worst case is about
-46 MB. Unlike the session table, the cache has no idle TTL — an entry outlives its
-conversation and stays reachable for as long as the process runs, until the detector's
+span-dense text could outweigh thousands of ordinary ones. 250 is sized against measured
+density rather than assumed: real text runs roughly 1.0 to 2.5 spans per 1 000
+characters, so the default covers prose to about 100 KB, logs to about 188 KB and source
+to 250 KB — every realistic single tool result. A detection over the cap is masked,
+restored and returned exactly like any other; it is simply not stored, so an oversized
+result never becomes a refusal, only a permanent miss. At the shipped defaults the worst
+case is about 118 MB. Unlike the session table, the cache has no idle TTL — an entry
+outlives its conversation and stays reachable for as long as the process runs, until the
+detector's
 version changes or the cache fills and something else is used more recently. And unlike
 the session table, losing an entry costs time, not protection: a full cache evicts
 rather than refusing, and a poisoned lock degrades to calling the detector rather than
