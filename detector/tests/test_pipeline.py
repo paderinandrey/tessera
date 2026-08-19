@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from tessera_detector.models import ModelUnavailable
-from tessera_detector.pipeline import Detector, build_detector
+from tessera_detector.models import MODEL_NAME, ModelUnavailable, weights_digest
+from tessera_detector.pipeline import DEFAULT_MODEL_ID, Detector, build_detector
 from tessera_detector.spans import Span
 
 
@@ -83,6 +83,91 @@ def test_build_detector_required_raises_without_weights(
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     with pytest.raises(ModelUnavailable):
         build_detector(ner=True)
+
+
+class FakeGlinerRecognizer:
+    """Stands in for the real GLiNER model: constructing the real one needs
+    gigabytes of ONNX weights this suite does not carry. Patched onto
+    `tessera_detector.ner.GlinerRecognizer`, which `build_detector` only
+    imports lazily — importing the `.ner` module itself needs no `gliner`
+    install, only instantiating the real class does, so this works without
+    the optional `ner` dependency group."""
+
+    specificity: Mapping[str, int] = {}
+
+    def __init__(self, model_path: Path) -> None:
+        self.model_path = model_path
+
+    def detect(self, text: str) -> list[Span]:
+        return []
+
+
+def _weights(path: Path, onnx_bytes: bytes) -> Path:
+    (path / "onnx").mkdir(parents=True)
+    (path / "onnx" / "model.onnx").write_bytes(onnx_bytes)
+    (path / "config.json").write_bytes(b"{}")
+    return path
+
+
+def test_a_detector_without_ner_reports_the_pinned_constant() -> None:
+    # No weights are loaded, so there is nothing to digest instead — the
+    # pinned snapshot's own name is the honest answer here, and it is also
+    # never a cache key: a deterministic-only run can't satisfy the
+    # gateway's "complete run" check.
+    assert Detector().model_id == DEFAULT_MODEL_ID
+
+
+def test_build_detector_names_the_weights_actually_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights = _weights(tmp_path / "weights", b"weights-v1")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(weights))
+    monkeypatch.setattr("tessera_detector.ner.GlinerRecognizer", FakeGlinerRecognizer)
+
+    detector = build_detector()
+
+    assert detector.ner_available is True
+    assert detector.model_id == f"{MODEL_NAME}@{weights_digest(weights)}"
+    assert detector.model_id != DEFAULT_MODEL_ID
+
+
+def test_an_override_pointing_at_different_weights_changes_the_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The P1 fix, proved directly: two overrides, two sets of bytes, must
+    # produce two different identities — the failure mode was that both
+    # reported the same one regardless.
+    monkeypatch.setattr("tessera_detector.ner.GlinerRecognizer", FakeGlinerRecognizer)
+
+    a = _weights(tmp_path / "a", b"weights-v1")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(a))
+    detector_a = build_detector()
+
+    b = _weights(tmp_path / "b", b"weights-v2")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(b))
+    detector_b = build_detector()
+
+    assert detector_a.model_id != detector_b.model_id
+
+
+def test_the_same_weight_bytes_report_the_same_model_id_from_a_different_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The companion the first mutation alone would miss: identity has to
+    # track the bytes, not the path they happen to sit at, or a redeploy to
+    # a new directory with byte-identical weights would look like a version
+    # change with nothing behind it.
+    monkeypatch.setattr("tessera_detector.ner.GlinerRecognizer", FakeGlinerRecognizer)
+
+    a = _weights(tmp_path / "a", b"weights-v1")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(a))
+    detector_a = build_detector()
+
+    b = _weights(tmp_path / "elsewhere", b"weights-v1")
+    monkeypatch.setenv("TESSERA_NER_MODEL", str(b))
+    detector_b = build_detector()
+
+    assert detector_a.model_id == detector_b.model_id
 
 
 def test_auto_mode_falls_back_when_the_ner_runtime_is_absent(

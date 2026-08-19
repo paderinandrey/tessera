@@ -20,9 +20,16 @@ OPENAPI = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.json"
 class FakeDetector:
     """Stands in for Detector: the API contract is what is under test here."""
 
-    def __init__(self, *, ner_available: bool = True, ner_off_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        ner_available: bool = True,
+        ner_off_reason: str | None = None,
+        model_id: str = "test-model@0",
+    ) -> None:
         self.ner_available = ner_available
         self.ner_off_reason = ner_off_reason
+        self.model_id = model_id
         self.seen: list[str] = []
 
     def _span(self) -> Span:
@@ -245,8 +252,21 @@ def test_no_undeclared_routes_are_served(path: str) -> None:
 def test_detect_reports_the_version_that_produced_the_spans() -> None:
     # The gateway keys its span cache by this; without it every cached entry
     # would outlive the model that justified it.
-    response = client(FakeDetector()).post(
+    fake = FakeDetector()
+    response = client(fake).post("/detect", json={"text": TEXT, "layers": ["deterministic"]})
+    assert response.status_code == 200
+    assert response.json()["version"] == detector_version(fake.model_id)
+
+
+def test_two_detectors_with_different_model_ids_report_different_versions() -> None:
+    # The API-level companion to version.py's own test of the same fact: the
+    # route must actually pass the detector's model_id through rather than a
+    # constant, or two detectors loading different weights would both report
+    # the version of whichever one the process happened to pin.
+    first = client(FakeDetector(model_id="gliner@aaa")).post(
         "/detect", json={"text": TEXT, "layers": ["deterministic"]}
     )
-    assert response.status_code == 200
-    assert response.json()["version"] == detector_version()
+    second = client(FakeDetector(model_id="gliner@bbb")).post(
+        "/detect", json={"text": TEXT, "layers": ["deterministic"]}
+    )
+    assert first.json()["version"] != second.json()["version"]

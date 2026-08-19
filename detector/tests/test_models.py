@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from tessera_detector.models import HF_REVISION, MODEL_NAME, find_model, model_cache_dir
+from tessera_detector.models import (
+    HF_REVISION,
+    MODEL_NAME,
+    find_model,
+    model_cache_dir,
+    weights_digest,
+)
 
 
 def test_cache_dir_is_under_the_user_cache(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,3 +93,41 @@ def test_a_revision_bump_invalidates_the_old_cache(
     (stale / "onnx" / "model.onnx").write_bytes(b"old graph")
     (stale / "config.json").write_text("{}", encoding="utf-8")
     assert find_model() is None
+
+
+def _weights(path: Path, onnx_bytes: bytes, config_bytes: bytes = b"{}") -> Path:
+    (path / "onnx").mkdir(parents=True)
+    (path / "onnx" / "model.onnx").write_bytes(onnx_bytes)
+    (path / "config.json").write_bytes(config_bytes)
+    return path
+
+
+def test_weights_digest_is_stable_for_the_same_bytes(tmp_path: Path) -> None:
+    a = _weights(tmp_path / "a", b"graph-bytes")
+    b = _weights(tmp_path / "b", b"graph-bytes")
+    assert weights_digest(a) == weights_digest(b)
+
+
+def test_weights_digest_changes_with_the_onnx_graph(tmp_path: Path) -> None:
+    a = _weights(tmp_path / "a", b"graph-v1")
+    b = _weights(tmp_path / "b", b"graph-v2")
+    assert weights_digest(a) != weights_digest(b)
+
+
+def test_weights_digest_changes_with_config_alone(tmp_path: Path) -> None:
+    # The graph can be byte-identical while config.json's label map or
+    # thresholds differ; identity has to track every required artifact, not
+    # just the largest one.
+    a = _weights(tmp_path / "a", b"graph-bytes", config_bytes=b'{"v": 1}')
+    b = _weights(tmp_path / "b", b"graph-bytes", config_bytes=b'{"v": 2}')
+    assert weights_digest(a) != weights_digest(b)
+
+
+def test_weights_digest_does_not_depend_on_path(tmp_path: Path) -> None:
+    # Named for what the reviewer's finding calls out directly: a path alone
+    # is a weak identifier, since the same path can hold different bytes
+    # across a redeploy. This is the converse check — different paths,
+    # same bytes, same identity — which a path-based identifier would fail.
+    a = _weights(tmp_path / "nested" / "a", b"graph-bytes")
+    b = _weights(tmp_path / "elsewhere" / "b", b"graph-bytes")
+    assert weights_digest(a) == weights_digest(b)

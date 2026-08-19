@@ -5,13 +5,20 @@ whenever the same text would produce different spans. That is the pinned
 weights *and* both catalogs: a threshold edit in `ner.yaml` changes what is
 detected without touching `HF_REVISION`, and a cache that missed it would keep
 serving the old thresholds.
+
+`model_id` is a caller-supplied argument rather than a constant computed in
+here on purpose: `HF_REVISION` names the pinned snapshot, not what is
+necessarily loaded. `TESSERA_NER_MODEL` can override the weights at start-up,
+and building `model_id` from the constant regardless would report the pinned
+snapshot's identity for weights that are not it. `pipeline.build_detector`
+is what decides the honest value — the pinned constant when no NER weights
+are loaded, a digest of the actually-loaded weight bytes when they are — and
+hands it down through `Detector.model_id`.
 """
 
 import hashlib
 from collections.abc import Iterable
 from importlib import resources
-
-from .models import HF_REVISION, MODEL_NAME
 
 CATALOGS = ("identifiers.yaml", "ner.yaml")
 
@@ -29,10 +36,14 @@ def version_from(model_id: str, catalogs: Iterable[bytes]) -> str:
     return digest.hexdigest()[:32]
 
 
-def detector_version() -> str:
+def detector_version(model_id: str) -> str:
+    """`model_id` has no default deliberately: a forgotten argument here is
+    exactly the bug this signature exists to make impossible to write by
+    accident — silently falling back to the pinned constant regardless of
+    what is actually loaded."""
     catalog_dir = resources.files("tessera_detector") / "catalog"
     return version_from(
-        f"{MODEL_NAME}@{HF_REVISION}",
+        model_id,
         [(catalog_dir / name).read_bytes() for name in CATALOGS],
     )
 

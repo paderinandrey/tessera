@@ -34,6 +34,13 @@ def test_catalog_order_is_not_a_concatenation_accident():
     assert version_from("m", [b"ab", b"c"]) != version_from("m", [b"a", b"bc"])
 
 
-def test_the_real_detector_reports_a_stable_version():
-    assert detector_version() == detector_version()
-    assert len(detector_version()) == 32
+def test_the_real_catalogs_report_a_stable_version():
+    assert detector_version("m") == detector_version("m")
+    assert len(detector_version("m")) == 32
+
+
+def test_a_different_model_id_changes_the_version():
+    # `model_id` has no default: this is what a caller who forgets it would
+    # have silently lost — two different loaded weights folding into the
+    # same version.
+    assert detector_version("gliner@abc123") != detector_version("gliner@def456")

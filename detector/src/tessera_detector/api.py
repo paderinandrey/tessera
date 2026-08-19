@@ -147,7 +147,9 @@ def create_app(detector: Detector | None = None) -> FastAPI:
             if "ner" in requested
             else detector.deterministic_only(body.text)
         )
-        return DetectResponse(spans=spans, layers_run=list(requested), version=detector_version())
+        return DetectResponse(
+            spans=spans, layers_run=list(requested), version=detector_version(detector.model_id)
+        )
 
     @app.get("/health", response_model=HealthResponse)
     def health(detector: Annotated[Detector, Depends(get_detector)]) -> HealthResponse:

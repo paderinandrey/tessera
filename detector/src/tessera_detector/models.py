@@ -5,6 +5,7 @@ missing path is an error: a typo must not quietly downgrade the pipeline to the
 deterministic layer alone.
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -56,6 +57,34 @@ def find_model() -> Path | None:
     return cached
 
 
+def weights_digest(path: Path) -> str:
+    """A digest over the artifact bytes actually found at `path` — not the
+    path itself, which `TESSERA_NER_MODEL` can point anywhere, and the same
+    path can hold different bytes across a redeploy. This is what the
+    version the gateway caches by has to name honestly: two detectors that
+    both call themselves the pinned snapshot but load different weights
+    (one overridden, one not) must not report the same version.
+
+    Called once, when the model is resolved — not per request. `onnx/model.onnx`
+    alone runs over a gigabyte; hashing it on every `/detect` call would add
+    real latency to the one feature (the gateway's cache) whose entire point
+    is to avoid work on the common path. Measured warm-cache: ~0.75 s for the
+    full graph, paid once at startup alongside the model load itself, which
+    already costs "seconds" (see the top-level README).
+
+    Raises whatever the read raises if a required artifact cannot be read —
+    deliberately not caught here. `find_model` has already confirmed these
+    paths exist by the time this runs; a read failure past that point means
+    the weights' identity cannot be established, and reporting a version
+    anyway would silently reintroduce the bug this function exists to close.
+    Fail the startup instead of guessing.
+    """
+    digest = hashlib.sha256()
+    for name in REQUIRED_ARTIFACTS:
+        digest.update(hashlib.sha256((path / name).read_bytes()).digest())
+    return digest.hexdigest()
+
+
 __all__ = [
     "HF_REPO_ID",
     "HF_REVISION",
@@ -64,4 +93,5 @@ __all__ = [
     "ModelUnavailable",
     "find_model",
     "model_cache_dir",
+    "weights_digest",
 ]
