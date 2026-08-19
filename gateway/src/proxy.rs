@@ -1073,7 +1073,16 @@ mod tests {
         // notice. The body sent upstream is the assertion that would — a
         // wrong offset masks a different slice of the same-length text, and
         // the two requests stop being byte-identical.
-        let detector = detector_returning(person_span()).await;
+        //
+        // `Some(1)` is the other half of that: two identical bodies would
+        // agree whether the second came from the cache or from a second,
+        // equally correct miss, so nothing above pins that a hit actually
+        // happened. Without it, turning the cache off everywhere in this
+        // suite (`detection_cache_entries = 0`) leaves every test here
+        // green, including this one — the offset mutation only bites
+        // because a hit happens to occur, not because this test requires
+        // one.
+        let detector = detector_returning_expecting(person_span(), Some(1)).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
             json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
@@ -1091,6 +1100,8 @@ mod tests {
             received[0].body, received[1].body,
             "a cache hit forwarded a body different from the miss that computed it"
         );
+        // `Some(1)` above is asserted when `detector` drops: two requests,
+        // one detector call, is what this test's name already claims.
     }
 
     #[tokio::test]
