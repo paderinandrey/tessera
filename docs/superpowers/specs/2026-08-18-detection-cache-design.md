@@ -240,6 +240,13 @@ roughly five entities in eighty characters, exceeds both. It characterises
 nothing about a buyer's traffic and is not offered as doing so — it is an
 illustration of where the cap lands on text that is dense throughout.
 
+It cannot be more than that, and the reason is worth stating rather than
+implying: every row of that corpus is a single rendered sentence under 126
+characters. `generate.py` calls them documents; nothing in this repository is
+shaped like one. The density figure below is therefore an illustration awaiting
+its measurement, and the measurement is the one named above — spans per 1 000
+characters over real gateway traffic.
+
 At that density a single text crosses 250 spans somewhere between 8 and 16 KB, so
 a uniformly dense document arriving as one message is declined and rescanned on
 every turn. Two things bound how often that bites: the cache keys per text rather
