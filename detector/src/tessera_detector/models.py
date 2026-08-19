@@ -22,6 +22,7 @@ HF_REVISION = "6ddaeb9413b0e71ad8457da1aab378a165b24058"
 # download masquerade as installed weights and crash the loader instead of
 # falling back to the deterministic layer.
 REQUIRED_ARTIFACTS = ("onnx/model.onnx", "config.json")
+_HASH_CHUNK_SIZE = 1024 * 1024
 
 
 class ModelUnavailable(Exception):
@@ -57,6 +58,21 @@ def find_model() -> Path | None:
     return cached
 
 
+def _hash_file(path: Path) -> bytes:
+    # Chunked rather than `path.read_bytes()`: the largest artifact here is
+    # over a gigabyte, `GlinerRecognizer` has usually already loaded it into
+    # the ONNX runtime by the time this runs, and materializing the whole
+    # file again as one `bytes` object would carry the graph twice in
+    # memory at once — a container sized for the model alone can OOM on
+    # that second copy. A fixed-size read loop never holds more than one
+    # chunk.
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
 def weights_digest(path: Path) -> str:
     """A digest over the artifact bytes actually found at `path` — not the
     path itself, which `TESSERA_NER_MODEL` can point anywhere, and the same
@@ -81,7 +97,7 @@ def weights_digest(path: Path) -> str:
     """
     digest = hashlib.sha256()
     for name in REQUIRED_ARTIFACTS:
-        digest.update(hashlib.sha256((path / name).read_bytes()).digest())
+        digest.update(_hash_file(path / name))
     return digest.hexdigest()
 
 
