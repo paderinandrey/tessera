@@ -116,7 +116,9 @@ Spans are determined by the weights *and* by `catalog/identifiers.yaml` and
 `catalog/ner.yaml` — a threshold edit changes what is detected without touching
 `HF_REVISION`. The version is therefore a digest over both catalogs, the weights
 themselves, this package's own source, and the declared versions of the
-dependencies the inference path pulls in.
+dependencies both layers pull in — `schwifty` and `python-stdnum` decide which
+IBANs and tax numbers validate, as surely as the weights decide which names are
+found.
 
 Not over `HF_REVISION`, which was this design's first answer and was wrong.
 `TESSERA_NER_MODEL` is a supported override, so the pinned revision names the
@@ -142,6 +144,15 @@ entry in the fleet on a `pytest` bump. The dependency half is resolved from
 someone maintains — the fourth time in this slice that a hand-written list was
 the wrong answer. Its boundary is the mirror image of the source digest's: it
 covers what is declared, not what is merely imported.
+
+There are two roots rather than one, and the distinction is structural rather
+than a list creeping back. This package's own distribution metadata names the
+deterministic layer's dependencies, which is where `schwifty` and
+`python-stdnum` arrive. It cannot name the NER group's: a PEP 735 dependency
+group is not part of installed distribution metadata the way `[project
+.dependencies]` is, so the inference tree has to be reached from its own root.
+A third root would be a list again; these two are the two places the metadata
+actually is.
 
 **All four halves fail loudly rather than digest less.** A weights file that
 cannot be read, or a dependency whose version cannot be resolved, fails the
