@@ -17,6 +17,7 @@
 //! saturation therefore refuses.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
@@ -61,6 +62,12 @@ pub struct DetectionCache {
     /// which is on disk precisely so its digests do persist.
     salt: [u8; 32],
     inner: Mutex<Inner>,
+    /// Set the first time a poisoned lock is observed, so a run of requests
+    /// against a permanently degraded cache logs the operator's signal once
+    /// rather than once per request: without this, a poisoned cache would
+    /// fail silently forever, and an operator would see only a throughput
+    /// collapse with nothing in the logs to explain it.
+    poisoned_warned: AtomicBool,
 }
 
 impl DetectionCache {
@@ -75,6 +82,7 @@ impl DetectionCache {
                 clock: 0,
                 known_version: None,
             }),
+            poisoned_warned: AtomicBool::new(false),
         }
     }
 
@@ -83,6 +91,19 @@ impl DetectionCache {
         hasher.update(self.salt);
         hasher.update(bytes);
         hasher.finalize().into()
+    }
+
+    /// The `warn!` a poisoned lock earns, logged at most once per process.
+    /// `swap` rather than `load`-then-`store`: two requests racing to be the
+    /// first to notice the poisoning would otherwise both see `false` and
+    /// both log, which is exactly the spam this guards against.
+    fn warn_poisoned(&self) {
+        if !self.poisoned_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "the detection cache's lock is poisoned; caching is disabled for the rest of \
+                 this process and every request now calls the detector directly"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -99,7 +120,13 @@ impl DetectionCache {
     // `Mutex` is not reentrant, and doing so would deadlock the very next
     // acquisition it makes.
     fn known_version(&self) -> Option<Digest32> {
-        self.inner.lock().ok()?.known_version
+        match self.inner.lock() {
+            Ok(inner) => inner.known_version,
+            Err(_) => {
+                self.warn_poisoned();
+                None
+            }
+        }
     }
 
     fn key(&self, version: Digest32, credential: Option<&[u8]>, text: &str) -> Key {
@@ -149,7 +176,13 @@ impl DetectionCache {
         // between two of its own acquisitions, and reaching it in
         // production needs another thread to panic inside that same
         // window.
-        let mut inner = self.inner.lock().ok()?;
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.warn_poisoned();
+                return None;
+            }
+        };
         inner.clock += 1;
         let clock = inner.clock;
         let entry = inner.entries.get_mut(&key)?;
@@ -164,6 +197,7 @@ impl DetectionCache {
         let version = self.digest(version.as_bytes());
         let key = self.key(version, credential, text);
         let Ok(mut inner) = self.inner.lock() else {
+            self.warn_poisoned();
             return;
         };
         // A version the store has not seen before makes every entry under the
@@ -320,8 +354,30 @@ mod tests {
             panic!("a request died mid-update");
         }));
         assert!(panicked.is_err(), "the panic is what poisons the lock");
+        assert!(
+            !cache.poisoned_warned.load(Ordering::Relaxed),
+            "warned about a poisoning nothing has observed yet"
+        );
         assert!(cache.get(A, "Weber").is_none(), "a poisoned lock must miss");
+        assert!(
+            cache.poisoned_warned.load(Ordering::Relaxed),
+            "an operator gets no signal that the cache degraded"
+        );
         cache.insert("v1", A, "Meier", &[span("PERSON", 0, 5)]); // must not panic
+    }
+
+    #[test]
+    fn a_poisoning_is_warned_about_once_not_once_per_request() {
+        // Not a race: `swap` returns the *old* value, and only the call that
+        // observes `false` there ever logs — every later call observes
+        // `true` and skips unconditionally, whatever order concurrent
+        // requests actually run in. This is the guarantee the field exists
+        // for, checked directly rather than through the `tracing` output the
+        // real call site produces.
+        let cache = DetectionCache::new(4);
+        assert!(!cache.poisoned_warned.swap(true, Ordering::Relaxed));
+        assert!(cache.poisoned_warned.swap(true, Ordering::Relaxed));
+        assert!(cache.poisoned_warned.swap(true, Ordering::Relaxed));
     }
 
     #[test]

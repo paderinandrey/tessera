@@ -43,13 +43,14 @@ audit_path = "tessera-audit.jsonl"
 # catalogs change.
 #
 # This key bounds how many entries the cache holds, not how much memory it
-# uses: an entry costs about 130 bytes fixed plus about 65 per span found in
-# the text, and nothing here bounds span count. For chat-shaped text — a turn
-# with a name or two — that is roughly 300 bytes an entry, so the default
-# costs a few megabytes. A span-dense text does not fit that shape: a 20 KB
-# tool result with an entity every 25 characters is around 800 spans, on the
-# order of 50 KB in that one entry alone, and the default ceiling of it would
-# be hundreds of megabytes. A deployment that expects large tool results
-# should size this by expected spans per text, not by entry count. Zero
-# disables it.
+# uses: measured with a counting allocator, an entry costs 264 bytes fixed
+# plus 46 per span found in the text — a floor, since that counts only
+# requested bytes and neither malloc rounding nor HashMap slack — and nothing
+# here bounds span count. For chat-shaped text — a turn with a name or two —
+# that is a few hundred bytes an entry, so the default costs a few megabytes.
+# A span-dense text does not fit that shape: a 20 KB tool result with an
+# entity every 25 characters is around 800 spans, on the order of 37 KB in
+# that one entry alone, and the default ceiling of it would be hundreds of
+# megabytes. A deployment that expects large tool results should size this by
+# expected spans per text, not by entry count. Zero disables it.
 detection_cache_entries = 10000
