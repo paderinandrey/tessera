@@ -148,7 +148,9 @@ def create_app(detector: Detector | None = None) -> FastAPI:
             else detector.deterministic_only(body.text)
         )
         return DetectResponse(
-            spans=spans, layers_run=list(requested), version=detector_version(detector.model_id)
+            spans=spans,
+            layers_run=list(requested),
+            version=detector_version(detector.model_id, detector.catalog_text),
         )
 
     @app.get("/health", response_model=HealthResponse)

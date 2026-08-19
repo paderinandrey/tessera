@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tessera_detector.deterministic import DeterministicDetector
 from tessera_detector.version import detector_version, source_digest, version_from
 
 
@@ -39,15 +40,29 @@ def test_catalog_order_is_not_a_concatenation_accident():
 
 
 def test_the_real_catalogs_report_a_stable_version():
-    assert detector_version("m") == detector_version("m")
-    assert len(detector_version("m")) == 32
+    catalog_text = DeterministicDetector().catalog_text
+    assert detector_version("m", catalog_text) == detector_version("m", catalog_text)
+    assert len(detector_version("m", catalog_text)) == 32
 
 
 def test_a_different_model_id_changes_the_version():
     # `model_id` has no default: this is what a caller who forgets it would
     # have silently lost — two different loaded weights folding into the
     # same version.
-    assert detector_version("gliner@abc123") != detector_version("gliner@def456")
+    assert detector_version("gliner@abc123", "cat") != detector_version("gliner@def456", "cat")
+
+
+def test_a_different_catalog_text_changes_the_version():
+    # Finding I: `catalog_text` has no default either, for the same reason
+    # `model_id` doesn't. Before this, `detector_version` re-read the
+    # packaged identifiers.yaml regardless of what a `Detector` actually
+    # loaded, so an application's own catalog changed what was detected
+    # while the version stayed put.
+    assert detector_version("m", "catalog-a") != detector_version("m", "catalog-b")
+
+
+def test_the_same_catalog_text_gives_the_same_version():
+    assert detector_version("m", "catalog-a") == detector_version("m", "catalog-a")
 
 
 def test_source_digest_is_stable_for_the_same_tree(tmp_path: Path) -> None:
@@ -97,7 +112,7 @@ def test_detector_version_changes_when_the_source_tree_does(
     import tessera_detector.version as version_module
 
     monkeypatch.setattr(version_module, "source_digest", lambda: "source-a")
-    first = detector_version("m")
+    first = detector_version("m", "cat")
     monkeypatch.setattr(version_module, "source_digest", lambda: "source-b")
-    second = detector_version("m")
+    second = detector_version("m", "cat")
     assert first != second

@@ -17,6 +17,15 @@ snapshot's identity for weights that are not it. `pipeline.build_detector`
 is what decides the honest value — the pinned constant when no NER weights
 are loaded, a digest of the actually-loaded weight bytes when they are — and
 hands it down through `Detector.model_id`.
+
+`catalog_text` is caller-supplied for the identical reason: `Detector`'s own
+`catalog_text=` argument can replace identifiers.yaml with an application's
+own rules, and this module has to digest the rules `DeterministicDetector`
+actually parsed, not the package's packaged copy — `Detector.catalog_text`
+is the honest value, the same relationship `Detector.model_id` already has
+to the weights. `ner.yaml` has no such override anywhere in this codebase,
+so it alone is still read from the package's own resources; see
+`detector_version`'s own docstring for the boundary that leaves.
 """
 
 import hashlib
@@ -24,7 +33,13 @@ from collections.abc import Iterable
 from importlib import resources
 from pathlib import Path
 
-CATALOGS = ("identifiers.yaml", "ner.yaml")
+# ner.yaml has no equivalent of Detector's `catalog_text=`: nothing in this
+# codebase lets a caller replace it, so `detector_version` reads it from the
+# package's own resources unconditionally — honest today because there is no
+# other copy of it to be honest about. The day something adds an override
+# for it too, it has to follow `catalog_text`'s path below rather than keep
+# reading this file directly.
+NER_CATALOG = "ner.yaml"
 
 
 def version_from(model_id: str, catalogs: Iterable[bytes]) -> str:
@@ -86,20 +101,42 @@ def source_digest(root: Path | None = None) -> str:
     return digest.hexdigest()
 
 
-def detector_version(model_id: str) -> str:
-    """`model_id` has no default deliberately: a forgotten argument here is
-    exactly the bug this signature exists to make impossible to write by
-    accident — silently falling back to the pinned constant regardless of
-    what is actually loaded."""
+def detector_version(model_id: str, catalog_text: str) -> str:
+    """Neither argument has a default, deliberately: a forgotten argument
+    here is exactly the bug this signature exists to make impossible to
+    write by accident — silently falling back to the pinned constant, or to
+    the package's own packaged catalog, regardless of what a `Detector`
+    actually loaded.
+
+    `catalog_text` is `Detector.catalog_text` — the identifiers.yaml text
+    `DeterministicDetector` actually parsed, a caller's own catalog or the
+    packaged default already resolved when none was given — not a second,
+    independent read of the package's own copy. Passing the object's own
+    value, the same way `model_id` already does for the weights, is what
+    makes a caller-supplied catalog visible here at all: an application
+    that overrides `catalog_text` gets detection from those rules, and this
+    has to see that they changed. Six inputs now follow this rule, one
+    after another as each was found missing it: the pinned weights
+    (`model_id`), the NER runtime's own dependencies, the deterministic
+    layer's own dependencies (both folded into `model_id` by
+    `pipeline.build_detector`), this package's own source (`source_digest`
+    below), and now the identifiers catalog. Whatever the next input turns
+    out to be, the rule already stated for all of them is the one to keep:
+    read what the object holds, never re-read the package's own copy of it.
+    """
     catalog_dir = resources.files("tessera_detector") / "catalog"
-    blobs = [(catalog_dir / name).read_bytes() for name in CATALOGS]
-    # Folded in as one more blob rather than string-concatenated onto
-    # `model_id`: `version_from` already hashes each blob before folding it
-    # in for exactly this reason (see its own comment) — appending the
-    # digest as a string would reopen the same concatenation-boundary
-    # question it exists to close.
-    blobs.append(source_digest().encode("utf-8"))
+    ner_catalog_bytes = (catalog_dir / NER_CATALOG).read_bytes()
+    # Folded in as blobs rather than string-concatenated onto `model_id`:
+    # `version_from` already hashes each blob before folding it in for
+    # exactly this reason (see its own comment) — appending anything as a
+    # plain string would reopen the same concatenation-boundary question it
+    # exists to close.
+    blobs = [
+        catalog_text.encode("utf-8"),
+        ner_catalog_bytes,
+        source_digest().encode("utf-8"),
+    ]
     return version_from(model_id, blobs)
 
 
-__all__ = ["CATALOGS", "detector_version", "source_digest", "version_from"]
+__all__ = ["NER_CATALOG", "detector_version", "source_digest", "version_from"]

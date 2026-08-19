@@ -79,6 +79,20 @@ class Detector:
     def ner_available(self) -> bool:
         return self.recognizer is not None
 
+    @property
+    def catalog_text(self) -> str:
+        """The identifiers.yaml text `self.deterministic` actually parsed —
+        a caller's own catalog, or the packaged default `DeterministicDetector`
+        already resolved when none was given. `detector_version` needs this,
+        not the package's own copy: an application supplying `catalog_text`
+        gets detection from those rules, and the version has to change when
+        that external file does, the same way it already changes for the
+        weights, the source and both dependency digests. Delegated rather
+        than duplicated, so there is exactly one place this can drift from
+        `self.rules`.
+        """
+        return self.deterministic.catalog_text
+
     def deterministic_only(self, text: str) -> list[Span]:
         """Resolved spans from the catalog layer alone.
 

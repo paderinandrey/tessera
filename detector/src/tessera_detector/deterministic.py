@@ -183,6 +183,13 @@ class DeterministicDetector:
     def __init__(self, catalog_text: str | None = None) -> None:
         if catalog_text is None:
             catalog_text = _DEFAULT_CATALOG.read_text(encoding="utf-8")
+        # What actually determines `self.rules`, kept rather than discarded
+        # once parsed: a custom catalog resolves to bytes this object holds
+        # but the package itself never shipped, and `detector_version` has
+        # to see those bytes rather than re-reading its own copy of
+        # identifiers.yaml — see `Detector.catalog_text` and
+        # `detector_version`'s own docstring.
+        self.catalog_text = catalog_text
         self.rules = _load_rules(catalog_text)
 
     @property

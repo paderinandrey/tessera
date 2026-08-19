@@ -44,6 +44,26 @@ def test_without_recognizer_only_deterministic_spans() -> None:
     assert [s.entity_type for s in spans] == ["EMAIL"]
 
 
+def test_detector_catalog_text_is_the_deterministic_layers_own() -> None:
+    # Finding I: version.detector_version needs this, not a second read of
+    # the packaged identifiers.yaml — delegated to the object that actually
+    # parsed it rather than duplicated onto Detector itself.
+    assert Detector().catalog_text == Detector().deterministic.catalog_text
+
+
+def test_detector_catalog_text_reflects_a_custom_catalog() -> None:
+    catalog = """
+version: 1
+identifiers:
+  - id: naked
+    entity_type: NAKED
+    tier: 2
+    confidence: 0.5
+    pattern: 'x+'
+"""
+    assert Detector(catalog_text=catalog).catalog_text == catalog
+
+
 def test_ner_spans_join_the_result() -> None:
     detector = Detector(recognizer=FakeRecognizer([person(0, 5)]))
     spans = detector.detect("Keller a écrit à anna.keller@example.ch")
