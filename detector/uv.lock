@@ -845,6 +845,7 @@ name = "tessera-detector"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "python-stdnum" },
     { name = "pyyaml" },
@@ -876,6 +877,7 @@ serve = [
 
 [package.metadata]
 requires-dist = [
+    { name = "packaging", specifier = ">=26.2" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-stdnum", specifier = ">=2.2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
