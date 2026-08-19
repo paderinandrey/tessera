@@ -108,7 +108,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      # --all-targets so test code is linted too: without it a stale
+      # suppression in a test module survives every run, which is how one
+      # lived from Task 3 to Task 5 on the detection-cache branch.
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   compose:

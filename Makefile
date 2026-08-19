@@ -29,7 +29,7 @@ gateway-test:
 	cd gateway && cargo test
 
 gateway-lint:
-	cd gateway && cargo fmt --check && cargo clippy -- -D warnings
+	cd gateway && cargo fmt --check && cargo clippy --all-targets -- -D warnings
 
 test:
 	cd detector && uv run --group serve pytest
