@@ -103,14 +103,18 @@ fn default_detection_cache_entries() -> usize {
 // longest, most expensive-to-recompute texts first, which is the wrong end
 // to trim on a number that is otherwise arbitrary.
 //
-// That coverage is a coding agent's traffic, not this product's core
-// traffic: a contact list, an intake form or client correspondence runs 16
-// to 29 spans per 1 000 characters, and a document that dense crosses 250
-// spans between 9 and 16 KB. That text is declined and rescanned every
-// turn — a real limit, not a number to keep raising by default, because the
-// same number multiplies against the entry ceiling below. Raising it is the
-// deliberate lever for that traffic; see tessera.example.toml for the
-// arithmetic that prices it.
+// That coverage is a coding agent's traffic. A uniformly dense text — a
+// contact list or an intake form, not ordinary correspondence, which is
+// prose-shaped at nearer 2.5/1 000 and unaffected — crosses the cap at
+// single-digit kilobytes (8-16 KB at the evaluation corpus's measured
+// density, offered only as an illustration of a uniformly dense text, never
+// as a characterisation of real traffic). The cache keys per text, so this
+// bites a dense message arriving as one text, not a conversation about a
+// dense file (many short turns, all cached normally) or a document that is
+// merely dense in places. A real limit, not a number to keep raising by
+// default, because the same number multiplies against the entry ceiling
+// below. Raising it is the deliberate lever for that traffic; see
+// tessera.example.toml for the arithmetic that prices it.
 //
 // At 264 B fixed + 46 B/span (measured, a floor): the worst-case entry is
 // 264 + 250 * 46 = 11 764 B, and at the default 10 000 entries the worst-case

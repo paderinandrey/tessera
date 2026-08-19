@@ -67,24 +67,38 @@ detection_cache_entries = 10000
 # the longest, most expensive-to-recompute texts first, the wrong end to trim
 # on a number that would otherwise be arbitrary.
 #
-# That coverage is code, logs and prose — a coding agent's traffic. It is not
-# this product's core traffic: a contact list, an intake form or client
-# correspondence runs 16 to 29 spans per 1000 characters (this repository's
-# own PII-dense evaluation corpus is that shape), and a document that dense
-# crosses 250 spans somewhere between 9 and 16 KB. A few pages of exactly the
-# text this gateway exists to protect is therefore declined and rescanned on
-# every turn. This is a real limit, not a number to keep raising: raising the
-# cap is the deliberate lever for that traffic, priced by the arithmetic
-# below, but it cannot be the default, because the same number multiplies
-# against ten thousand entries.
+# A uniformly dense text crosses the cap at single-digit kilobytes, and that
+# is a limit rather than a number to keep raising. The densities above are
+# code, logs and prose — the shapes a coding agent sends. A contact list or
+# an intake form is not shaped like either. The only dense-PII sample in
+# this repository is the evaluation corpus, which annotates 19.9 spans per
+# 1000 characters across the whole file and 30.0 across its eighty
+# non-negative rows; a real contact row, at roughly five entities in eighty
+# characters, exceeds both. It characterises nothing about a buyer's
+# traffic and is not offered as doing so — it is an illustration of where
+# the cap lands on text that is dense throughout.
+#
+# At that density a single text crosses 250 spans somewhere between 8 and
+# 16 KB, so a uniformly dense document arriving as one message is declined
+# and rescanned on every turn. Two things bound how often that bites: the
+# cache keys per text rather than per document, so a conversation about a
+# dense file is many short turns that all cache normally; and a long
+# document is rarely uniform — a contract with personal data in its header
+# and signature block is prose in between. Ordinary correspondence is
+# prose-shaped at nearer 2.5 spans per 1000 and is not affected.
+#
+# Raising the cap for a deployment whose texts really are dense throughout
+# is a deliberate lever with a priced cost — the formula is in front of the
+# operator — but it cannot be the default, because the same number
+# multiplies against ten thousand entries.
 #
 # At the shipped defaults, the worst case is entries * (264 + spans * 46) =
 # 10000 * (264 + 250 * 46) = 117640000 B ≈ 118 MB — three times below the
 # figure that would have blocked this cache from shipping, and reachable
 # only with ten thousand simultaneously resident maximum-size entries. A
-# deployment whose traffic is dense documents rather than code should raise
-# this figure and recompute the worst case above against its own texts.
-# Zero is rejected while the cache is enabled — an entry cap of zero would
-# remember nothing, which is what detection_cache_entries = 0 already says
-# more directly.
+# deployment whose texts really are dense throughout should raise this
+# figure and recompute the worst case above against its own texts. Zero is
+# rejected while the cache is enabled — an entry cap of zero would remember
+# nothing, which is what detection_cache_entries = 0 already says more
+# directly.
 max_spans_per_entry = 250
