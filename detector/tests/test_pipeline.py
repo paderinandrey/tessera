@@ -1,6 +1,7 @@
 import functools
 import sys
 from collections.abc import Mapping
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 import pytest
@@ -235,6 +236,41 @@ def test_required_mode_reports_a_missing_ner_runtime(
     )
     monkeypatch.setitem(sys.modules, "gliner", None)
     with pytest.raises(ModelUnavailable, match="ner"):
+        build_detector(ner=True)
+
+
+def _raise_package_not_found(model_path: Path) -> None:
+    # Stands in for `GlinerRecognizer.__init__` failing inside
+    # `dependency_digest`, after `gliner` itself has already imported and
+    # loaded successfully — a stripped or corrupted `.dist-info`, not a
+    # missing runtime.
+    raise PackageNotFoundError("stripped-dist-info")
+
+
+def test_auto_mode_does_not_swallow_a_metadata_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding J: PackageNotFoundError subclasses ModuleNotFoundError, which
+    # subclasses ImportError. Before this fix, the bare `except ImportError`
+    # around GlinerRecognizer's construction caught this too and reported
+    # NO_RUNTIME — the default, auto ner=None case silently started a
+    # deterministic-only detector, a masking gap presented as a normal
+    # startup. It must instead escape.
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setattr("tessera_detector.ner.GlinerRecognizer", _raise_package_not_found)
+    with pytest.raises(PackageNotFoundError):
+        build_detector()
+
+
+def test_required_mode_also_does_not_swallow_a_metadata_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same failure must escape under ner=True too, rather than being
+    # reworded into ModelUnavailable's "the ner group is not installed" —
+    # that message would be actively misleading for a metadata bug.
+    monkeypatch.setattr("tessera_detector.pipeline.find_model", lambda: tmp_path)
+    monkeypatch.setattr("tessera_detector.ner.GlinerRecognizer", _raise_package_not_found)
+    with pytest.raises(PackageNotFoundError):
         build_detector(ner=True)
 
 

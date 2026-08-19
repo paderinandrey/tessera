@@ -6,6 +6,7 @@ neither layer resolves on its own (REQ-1, REQ-8).
 """
 
 from collections.abc import Mapping
+from importlib.metadata import PackageNotFoundError
 from typing import Protocol
 
 from .deterministic import DeterministicDetector
@@ -104,6 +105,28 @@ def build_detector(
         from .ner import GlinerRecognizer
 
         recognizer = GlinerRecognizer(path)
+    except PackageNotFoundError:
+        # `PackageNotFoundError` subclasses `ModuleNotFoundError`, which
+        # subclasses `ImportError` — so the broader `except ImportError`
+        # below would catch it too, and report NO_RUNTIME: "the ner
+        # dependency group is not installed." That is not what this is.
+        # `GlinerRecognizer.__init__` reaches this deep into `dependency_digest`
+        # only after `from gliner import GLiNER` and `GLiNER.from_pretrained`
+        # have both already succeeded — the runtime is genuinely present.
+        # A `PackageNotFoundError` here means a distribution in its
+        # dependency tree has unreadable metadata (stripped `.dist-info` in
+        # a slim image, a renamed root), which is `dependency_digest`'s own
+        # fail-loud posture, not a missing-runtime signal. Narrowing the
+        # `try` to just the `from .ner import GlinerRecognizer` line cannot
+        # fix this: the genuine "ner group absent" case this handler exists
+        # for is `GLiNER.from_pretrained`'s own `ImportError`, raised from
+        # inside `GlinerRecognizer.__init__` on the very next line, not from
+        # the module import — narrowing the `try` there would silently stop
+        # catching that case too. Distinguishing by exception type rather
+        # than by code position is what lets both live in the same `try`:
+        # listed first, so Python's first-match-wins ordering peels this
+        # off before the `except ImportError` below ever sees it.
+        raise
     except ImportError as error:
         if ner is True:
             raise ModelUnavailable(
