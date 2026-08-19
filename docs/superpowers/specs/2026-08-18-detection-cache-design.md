@@ -124,6 +124,39 @@ package** — and it is written into `detector_version`'s docstring rather than
 only here, because every one of those six was added by someone who had the
 design in front of them and still reached for the file on disk.
 
+The seventh was the sharpest: the fix for the first put the pinned constant back
+as a default parameter value. A default is a hand-written claim about what is
+loaded, made in the one place that cannot know it, so the requirement is carried
+by the signature now — no default — rather than by convention.
+
+And the eighth was the interpreter, whose Unicode tables decide what `NFKC`
+normalisation and the regex engine produce. That one is folded in; more
+importantly, it is where the sequence stops, because a list of things the version
+does not yet cover has no natural end and each round of finding one more only
+buys the next.
+
+**The criterion, so the next candidate can be answered without another round.**
+Two gates, in order. First: can it change what a span is? Second: can it be
+identified cheaply, deterministically, and from inside the process? The first
+gate rejects on its own — `sys.platform` passes the second trivially and fails
+the first, since normalisation and matching use CPython's own bundled tables and
+never the host's.
+
+By that criterion the host C library is out (no portable way to name it), and so
+is the CPU feature set ONNX Runtime dispatches on: the dispatch decision lives in
+its C++ internals with no public API, and reading the available flags reports
+what the machine *has* rather than what the kernel *used*. The execution provider
+is the interesting case, because `get_providers()` answers it cheaply and
+in-process and so passes both gates. It stays out for a different reason — this
+deployment pins onnxruntime to CPU and installs no GPU provider, so every session
+reports the same value and it would discriminate nothing. That one is bounded by
+the architecture rather than by the criterion, and the day a GPU provider becomes
+installable it should be revisited.
+
+What remains outside is the honest cost of an in-process digest: a fleet whose
+images and CPU baseline are not pinned can still produce different spans under
+one version. Pin them, or accept the gap knowingly.
+
 ### Why the version is not just the model revision
 
 Spans are determined by the weights *and* by `catalog/identifiers.yaml` and
