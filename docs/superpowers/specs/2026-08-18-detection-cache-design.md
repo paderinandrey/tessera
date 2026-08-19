@@ -66,6 +66,18 @@ byte-identical document. The spans themselves leak nothing — B already has the
 text it sent — but the timing does, across a tenant boundary, which is the one
 boundary this product sells.
 
+### Why a caller with no credential is not cached
+
+The section above argues the credential into the key to stop one tenant learning,
+from response time alone, that another submitted a byte-identical text. Where the
+provider needs no credential — the demo stack, or a closed perimeter in front of
+a self-hosted model — every caller presents none, they all digest alike, and that
+timing oracle is exactly what the shared bucket restores.
+
+So a request with no credential is served and never cached, the same way an
+oversized detection is. The cost is real and worth naming: such a deployment gets
+no cache at all until its callers carry distinguishable credentials.
+
 ### Why the digests are not truncated
 
 A collision on the text digest applies one text's offsets to another. When the
@@ -345,6 +357,18 @@ the first miss reveals the new one. On agent traffic misses are continuous —
 every turn carries new text — so the window is one request. The pathological case
 is a deployment that, after a model upgrade, only ever replays byte-identical
 text.
+
+That reasoning assumed versions only move forward, which nothing guarantees: a
+digest carries no order, and a slow response from a not-yet-upgraded replica can
+arrive after a newer one. So a version change now sweeps every entry that does
+not match it, in either direction, under the same lock that records it. The
+invariant is that every entry present matches the known version, rather than the
+weaker one it replaced — that stale entries merely fail to match and age out.
+
+The honest cost: a fleet left permanently mixed sweeps on every insert and its
+hit rate goes to nothing. That is this cache being correct and slow rather than
+fast and wrong, which is the same choice it makes on saturation and on a poisoned
+lock.
 
 More precisely, the window closes on the first *cacheable* miss. A detection
 declined for exceeding `max_spans_per_entry` returns before the new version is
