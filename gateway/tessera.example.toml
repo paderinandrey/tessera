@@ -104,4 +104,12 @@ detection_cache_entries = 10000
 # rejected while the cache is enabled — an entry cap of zero would remember
 # nothing, which is what detection_cache_entries = 0 already says more
 # directly.
+#
+# The 46 B/span above measured real detector output; it bounded no single
+# span's type on its own, so one span with a very large type still passed
+# this count cap and was retained in full. The gateway now declines any
+# entry containing a span whose type is longer than the placeholder grammar
+# allows (40 bytes), so a span's true worst-case weight is nearer 80 B and
+# the figure above holds as a typical case rather than an assumed ceiling —
+# the true ceiling is nearer 200 MB at these defaults.
 max_spans_per_entry = 250

@@ -24,6 +24,14 @@
 //! third failure path with its own rule: it is the same "a miss is never a
 //! refusal" property, since the caller already has the spans it asked for
 //! and serves them exactly as it would if the cache did not exist.
+//!
+//! `max_spans_per_entry` bounds span *count*, not what one span weighs:
+//! `Span.entity_type`, named above as the thing this module already treats
+//! as untrusted, has no length limit of its own, and a single span with a
+//! very large type would pass the count gate and be retained in full.
+//! `insert` declines that too, against `mapping::MAX_ENTITY_TYPE` — the
+//! bound already established for what a type may mean anywhere downstream
+//! — for the same reason and by the same rule as an oversized span count.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -270,6 +278,43 @@ impl DetectionCache {
         // size of one entry, and a 20 KB tool result can carry hundreds of
         // spans in a single text.
         if spans.len() > self.max_spans_per_entry {
+            return;
+        }
+        // The dimension `max_spans_per_entry` alone still leaves open:
+        // `Span.entity_type` is a detector-supplied string with no length
+        // limit of its own, cloned in full below. A count gate does not see
+        // it — one span with a very large type passes count as easily as
+        // one with a short type, and would be retained in full, the exact
+        // "one dimension bounded, another left open" shape the count gate
+        // itself was added to close for span count.
+        //
+        // `mapping::MAX_ENTITY_TYPE` is the bound already established for
+        // what a type may be to mean anything downstream — the longest
+        // name `Mapping::mask` can ever place in a stream-safe placeholder
+        // — so a span past it could never be used for its name by the rest
+        // of the gateway anyway; nothing a real detector response needs is
+        // lost by declining to remember it.
+        //
+        // Declined whole, not truncated or replaced: either would store
+        // different bytes than a fresh call would have produced, and a
+        // cache hit is required to be indistinguishable from a miss in
+        // everything downstream sees — including the audit journal, which
+        // reads `entity_type` directly off whatever spans this call
+        // returns. Truncating a span to `MAX_ENTITY_TYPE` characters could
+        // turn a name the journal would grammar-reject at full length
+        // (`audit::is_entity_type`, bounded by the same constant) into one
+        // it accepts and reports by that shortened name; replacing it with
+        // a fixed stand-in has the mirror problem, reported as that
+        // stand-in's own name instead of "unvalidated". Either way, the
+        // same request would journal differently depending on whether this
+        // text happened to be a cache hit — a behaviour change the memory
+        // fix has no business making. Declining leaves every stored byte
+        // identical to what the detector returned, so a hit always reads
+        // back exactly what a miss would have journaled.
+        if spans
+            .iter()
+            .any(|span| span.entity_type.len() > crate::mapping::MAX_ENTITY_TYPE)
+        {
             return;
         }
         let version = self.digest(version.as_bytes());
@@ -599,6 +644,34 @@ mod tests {
             &[span("PERSON", 0, 5), span("PERSON", 6, 11)],
         );
         assert!(cache.get(A, "Weber Meier").is_some());
+    }
+
+    #[test]
+    fn a_detection_with_an_oversized_type_is_declined() {
+        // Finding M: `max_spans_per_entry` bounds span count, not what one
+        // span weighs. A single span whose type is one character past
+        // `MAX_ENTITY_TYPE` passes the count gate easily and, before this
+        // guard, was retained in full regardless of how large that string
+        // was.
+        let cache = DetectionCache::new(4, UNCAPPED);
+        let huge_type = "A".repeat(crate::mapping::MAX_ENTITY_TYPE + 1);
+        cache.insert("v1", A, "Weber", &[span(&huge_type, 0, 5)]);
+        assert!(
+            cache.get(A, "Weber").is_none(),
+            "a detection with an oversized type was stored anyway"
+        );
+        assert_eq!(cache.len(), 0, "an oversized type took a slot");
+    }
+
+    #[test]
+    fn a_detection_with_a_type_at_the_length_cap_is_stored() {
+        // The boundary, matching `a_detection_at_the_span_cap_is_stored`:
+        // strictly over `MAX_ENTITY_TYPE` is declined, so exactly at it
+        // must still be an ordinary hit.
+        let cache = DetectionCache::new(4, UNCAPPED);
+        let longest_type = "A".repeat(crate::mapping::MAX_ENTITY_TYPE);
+        cache.insert("v1", A, "Weber", &[span(&longest_type, 0, 5)]);
+        assert!(cache.get(A, "Weber").is_some());
     }
 
     #[test]

@@ -126,6 +126,19 @@ fn default_detection_cache_entries() -> usize {
 // spans than that is real and is still served correctly; it is simply not
 // remembered, the same trade `max_session_values` already makes for a
 // session with too many values.
+//
+// The 46 B/span figure measured real detector output, where `Span.entity_type`
+// runs a handful of characters (`PERSON`, `IBAN`). It was never a ceiling on
+// that string's length, only an average over what a real detector actually
+// sends — a single span with a large type passed this cap on count exactly
+// as easily as an ordinary one and was retained in full. `DetectionCache::insert`
+// now declines an entry with any span past `mapping::MAX_ENTITY_TYPE` (40
+// bytes), closing that gap the same way this cap closes span count. That
+// makes the true worst case per span roughly 80 B (a `String`'s own ~24 B
+// plus up to 40 B of characters plus two `usize` offsets) rather than 46,
+// so the 118 MB figure above is now a typical case again, not an assumed
+// ceiling — the actual ceiling is nearer 200 MB. Analytical, from struct
+// layout, not re-measured with a counting allocator the way 46 B was.
 fn default_max_spans_per_entry() -> usize {
     250
 }
