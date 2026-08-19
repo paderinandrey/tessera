@@ -3,12 +3,12 @@ from importlib import resources
 import pytest
 
 from tessera_detector.deterministic import DeterministicDetector
-from tessera_detector.pipeline import Detector
+from tessera_detector.pipeline import DEFAULT_MODEL_ID, Detector
 from tessera_detector.spans import Span
 
 
 def detect(text: str) -> list[Span]:
-    return Detector().detect(text)
+    return Detector(model_id=DEFAULT_MODEL_ID).detect(text)
 
 
 def spans_of_type(spans: list[Span], entity_type: str) -> list[Span]:

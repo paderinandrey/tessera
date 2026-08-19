@@ -18,7 +18,7 @@ from functools import partial
 from pathlib import Path
 
 from tessera_detector.ner import GlinerRecognizer, InferencePass
-from tessera_detector.pipeline import Detector, build_detector
+from tessera_detector.pipeline import DEFAULT_MODEL_ID, Detector, build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TARGET_P95_MS = 80.0
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         json.loads(line)["text"] for line in CORPUS.read_text(encoding="utf-8").splitlines()
     ]
     sizes = build_sizes(documents)
-    deterministic = Detector()
+    deterministic = Detector(model_id=DEFAULT_MODEL_ID)
     full = build_detector()
 
     timings: list[Timing] = []

@@ -23,10 +23,25 @@ from .resolution import resolve
 from .spans import Span
 
 # What a detector reports when no NER weights are loaded at all: the pinned
-# snapshot's own name, since no loaded weights exist to digest instead. A
-# deterministic-only run never satisfies the gateway's "complete run" check
-# (`layers_run` cannot include "ner"), so this string is never a cache key —
-# only a label in a response nobody caches against.
+# snapshot's own name, since no loaded weights exist to digest instead. Read
+# literally against `DetectResponse.version`'s own words — "the weights ...
+# that produced these spans" — this over-claims: no weights ran, so naming
+# a specific pinned revision names something that contributed nothing.
+#
+# Harmless rather than fixed, and the reason has to hold structurally, not
+# by convention: a deterministic-only run's `layers_run` can never include
+# "ner" (no recognizer ran to put it there), and the gateway's own
+# completeness check — `LAYERS.iter().all(|layer| layers_run.contains(layer))`
+# in `detector.rs` — requires every entry in `LAYERS` before it will treat
+# `version` as a cache key at all. So this string can be embedded, changed,
+# or left as a constant with no way for the gateway to ever cache under it;
+# the property Finding L's own defect broke (an injected recognizer's real
+# output cached under an unrelated version) cannot arise here because there
+# is no recognizer, and therefore no NER layer, and therefore no path to
+# `layers_run` ever calling this run complete. Kept as the pinned name
+# rather than a bare sentinel because it is still real, useful information
+# — which snapshot this build would load if weights existed — and nothing
+# about that claim is exposed to a cache that could act on it being wrong.
 DEFAULT_MODEL_ID = f"{MODEL_NAME}@{HF_REVISION}"
 
 # This package's own installed distribution name — the root whose declared
@@ -63,16 +78,27 @@ class Detector:
         catalog_text: str | None = None,
         recognizer: NerRecognizer | None = None,
         ner_off_reason: str = NO_WEIGHTS,
-        model_id: str = DEFAULT_MODEL_ID,
+        *,
+        model_id: str,
     ) -> None:
         self.deterministic = DeterministicDetector(catalog_text)
         self.recognizer = recognizer
         self.ner_off_reason = None if recognizer is not None else ner_off_reason
         # What `detector_version()` digests as the model half of its input.
-        # The pinned constant by default; `build_detector` overrides this to
-        # the actual loaded weights' digest whenever NER is running, so an
-        # operator's `TESSERA_NER_MODEL` override is named honestly rather
-        # than reported as the snapshot it replaced.
+        # No default, deliberately, and keyword-only so a positional call
+        # cannot land here by accident either — the seventh instance of the
+        # same mistake was the *previous* fix: `DEFAULT_MODEL_ID` didn't go
+        # away when `build_detector` learned to pass a real digest, it
+        # became this parameter's default, and `Detector(recognizer=...)` —
+        # a public constructor `build_detector` does not gate — silently
+        # reported the pinned snapshot's identity for whatever recognizer
+        # was actually injected. A default here is a hand-written claim
+        # about what is loaded, made in the one place (`__init__`) that
+        # cannot know; every real caller already knows the honest value —
+        # `build_detector`'s four branches compute one, and a caller
+        # constructing `Detector` directly for anything else (tests,
+        # embedding this package as a library) has to decide instead of
+        # inheriting a claim about weights it may not be using.
         self.model_id = model_id
 
     @property

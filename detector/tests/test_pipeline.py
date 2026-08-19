@@ -38,17 +38,37 @@ def person(start: int, end: int, confidence: float = 0.9) -> Span:
 
 
 def test_without_recognizer_only_deterministic_spans() -> None:
-    detector = Detector()
+    detector = Detector(model_id=DEFAULT_MODEL_ID)
     spans = detector.detect("mail: anna.keller@example.ch")
     assert detector.ner_available is False
     assert [s.entity_type for s in spans] == ["EMAIL"]
+
+
+def test_detector_requires_a_model_id() -> None:
+    with pytest.raises(TypeError, match="model_id"):
+        Detector()  # type: ignore[call-arg]
+
+
+def test_an_injected_recognizer_cannot_report_the_pinned_version() -> None:
+    # Finding L, the seventh instance of the same rule, and the sharpest:
+    # the fix for the first instance is what created this one.
+    # DEFAULT_MODEL_ID as model_id's default meant Detector(recognizer=...)
+    # — a public constructor build_detector does not gate — silently
+    # reported the pinned snapshot's identity for whatever recognizer was
+    # actually injected. Swap the recognizer, keep the version, and a live
+    # gateway replays offsets that miss what the new one finds. No default
+    # at all makes this impossible to construct rather than merely wrong to
+    # construct.
+    with pytest.raises(TypeError, match="model_id"):
+        Detector(recognizer=FakeRecognizer([person(0, 5)]))  # type: ignore[call-arg]
 
 
 def test_detector_catalog_text_is_the_deterministic_layers_own() -> None:
     # Finding I: version.detector_version needs this, not a second read of
     # the packaged identifiers.yaml — delegated to the object that actually
     # parsed it rather than duplicated onto Detector itself.
-    assert Detector().catalog_text == Detector().deterministic.catalog_text
+    detector = Detector(model_id=DEFAULT_MODEL_ID)
+    assert detector.catalog_text == detector.deterministic.catalog_text
 
 
 def test_detector_catalog_text_reflects_a_custom_catalog() -> None:
@@ -61,11 +81,11 @@ identifiers:
     confidence: 0.5
     pattern: 'x+'
 """
-    assert Detector(catalog_text=catalog).catalog_text == catalog
+    assert Detector(catalog_text=catalog, model_id=DEFAULT_MODEL_ID).catalog_text == catalog
 
 
 def test_ner_spans_join_the_result() -> None:
-    detector = Detector(recognizer=FakeRecognizer([person(0, 5)]))
+    detector = Detector(recognizer=FakeRecognizer([person(0, 5)]), model_id="test-ner@0")
     spans = detector.detect("Keller a écrit à anna.keller@example.ch")
     assert detector.ner_available is True
     assert sorted(s.entity_type for s in spans) == ["EMAIL", "PERSON"]
@@ -75,7 +95,9 @@ def test_checksum_span_survives_an_overlapping_ner_span() -> None:
     # The e-mail is a catalog span; a PERSON claiming the same range must not
     # displace it — cross-layer conflicts are resolved once, over the union.
     text = "mail: anna.keller@example.ch"
-    detector = Detector(recognizer=FakeRecognizer([person(6, 28, confidence=0.99)]))
+    detector = Detector(
+        recognizer=FakeRecognizer([person(6, 28, confidence=0.99)]), model_id="test-ner@0"
+    )
     spans = detector.detect(text)
     assert [(s.entity_type, s.start, s.end) for s in spans] == [("EMAIL", 6, 28)]
 
@@ -136,16 +158,6 @@ def _weights(path: Path, onnx_bytes: bytes) -> Path:
     (path / "onnx" / "model.onnx").write_bytes(onnx_bytes)
     (path / "config.json").write_bytes(b"{}")
     return path
-
-
-def test_a_detector_without_ner_reports_the_pinned_constant() -> None:
-    # No weights are loaded, so there is nothing to digest instead — the
-    # pinned snapshot's own name is the honest answer here, and it is also
-    # never a cache key: a deterministic-only run can't satisfy the
-    # gateway's "complete run" check. This constructs Detector directly, not
-    # through build_detector, so PACKAGE_NAME's dependency digest (Finding
-    # I) never enters into it — see the build_detector tests below for that.
-    assert Detector().model_id == DEFAULT_MODEL_ID
 
 
 def test_the_deterministic_root_actually_covers_the_validator_libraries() -> None:
@@ -389,7 +401,7 @@ def test_article_9_span_outranks_an_overlapping_org() -> None:
         [org(4, 23), article_9(4, 23)],
         specificity={"ORG": 10, "TRADE_UNION": 35},
     )
-    spans = Detector(recognizer=recognizer).detect(text)
+    spans = Detector(recognizer=recognizer, model_id="test-ner@0").detect(text)
     assert [s.entity_type for s in spans] == ["TRADE_UNION"]
 
 
@@ -398,11 +410,11 @@ def test_checksum_identifier_still_outranks_an_article_9_span() -> None:
     recognizer = FakeRecognizer(
         [article_9(6, 28, confidence=0.9)], specificity={"TRADE_UNION": 35}
     )
-    spans = Detector(recognizer=recognizer).detect(text)
+    spans = Detector(recognizer=recognizer, model_id="test-ner@0").detect(text)
     assert [(s.entity_type, s.start, s.end) for s in spans] == [("EMAIL", 6, 28)]
 
 
 def test_deterministic_only_still_resolves_conflicts() -> None:
-    detector = Detector(recognizer=FakeRecognizer([person(0, 5)]))
+    detector = Detector(recognizer=FakeRecognizer([person(0, 5)]), model_id="test-ner@0")
     spans = detector.deterministic_only("Keller a écrit à anna.keller@example.ch")
     assert [s.entity_type for s in spans] == ["EMAIL"], "the NER span must not appear"
