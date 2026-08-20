@@ -20,6 +20,15 @@ pub enum MappingError {
              forwarded with the value still in it"
     )]
     BadSpan(&'static str),
+    #[error("a tool document is nested deeper than this gateway will walk")]
+    TooDeep,
+    #[error("a tool document carries more values than this gateway will walk")]
+    TooLarge,
+    #[error(
+        "masked strings do not correspond to a document's text leaves ({0}); the request is \
+             refused rather than served with a value misplaced or left in"
+    )]
+    MaskCountMismatch(&'static str),
 }
 
 /// The longest entity type that can be written as a placeholder.
@@ -274,6 +283,127 @@ impl Mapping {
     }
 }
 
+/// How deep a client's document may nest, and how many values it may hold.
+/// `restore_value` needs neither: it walks a provider's own response envelope,
+/// whose shape is the provider's business. This walk is reachable from a
+/// client's tool arguments, which are untrusted input — a document nested ten
+/// thousand deep would end the process by exhausting the stack, and the
+/// recursion below is the one that would do it.
+pub const MAX_JSON_DEPTH: usize = 64;
+pub const MAX_JSON_NODES: usize = 10_000;
+
+/// A value a document carries, in the order the walk finds it. Keys are absent
+/// by construction: this walk descends into values and never yields a name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Leaf {
+    Text(String),
+    /// Rendered as the client wrote it. A card number, a German tax ID and a
+    /// French NIR are digits alone, so a number has to be looked at — but it is
+    /// never replaced, because a schema that declared a number may reject a
+    /// string.
+    Number(String),
+}
+
+// Constructed by task 4's detection call; nothing in this task builds one yet.
+#[allow(dead_code)]
+pub fn json_leaves(value: &Value) -> Result<Vec<Leaf>, MappingError> {
+    let mut leaves = Vec::new();
+    let mut nodes = 0usize;
+    walk(value, 0, &mut nodes, &mut leaves)?;
+    Ok(leaves)
+}
+
+fn walk(
+    value: &Value,
+    depth: usize,
+    nodes: &mut usize,
+    leaves: &mut Vec<Leaf>,
+) -> Result<(), MappingError> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(MappingError::TooDeep);
+    }
+    *nodes += 1;
+    if *nodes > MAX_JSON_NODES {
+        return Err(MappingError::TooLarge);
+    }
+    match value {
+        Value::String(text) => leaves.push(Leaf::Text(text.clone())),
+        Value::Number(number) => leaves.push(Leaf::Number(number.to_string())),
+        Value::Array(items) => {
+            for item in items {
+                walk(item, depth + 1, nodes, leaves)?;
+            }
+        }
+        Value::Object(fields) => {
+            // `fields` is iterated, never yielded: a key is the client's
+            // dispatch, and masking one would break the call it dispatches.
+            for (_key, item) in fields {
+                walk(item, depth + 1, nodes, leaves)?;
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+    Ok(())
+}
+
+/// The mirror of `restore_value`, and the second half of masking: the walk
+/// above collected the leaves, `mask_all` detected them, and this puts the
+/// masked strings back where they came from. Order is the only correspondence,
+/// which is why both walks are the same function shape.
+// Constructed by task 4's detection call; nothing in this task builds one yet.
+#[allow(dead_code)]
+pub fn replace_text_leaves(value: &Value, masked: &[String]) -> Result<Value, MappingError> {
+    let mut next = 0usize;
+    let mut nodes = 0usize;
+    let result = replace(value, 0, &mut nodes, masked, &mut next)?;
+    if next != masked.len() {
+        return Err(MappingError::MaskCountMismatch(
+            "more masked strings than text leaves",
+        ));
+    }
+    Ok(result)
+}
+
+fn replace(
+    value: &Value,
+    depth: usize,
+    nodes: &mut usize,
+    masked: &[String],
+    next: &mut usize,
+) -> Result<Value, MappingError> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(MappingError::TooDeep);
+    }
+    *nodes += 1;
+    if *nodes > MAX_JSON_NODES {
+        return Err(MappingError::TooLarge);
+    }
+    Ok(match value {
+        Value::String(_) => {
+            let replacement = masked.get(*next).ok_or(MappingError::MaskCountMismatch(
+                "fewer masked strings than text leaves",
+            ))?;
+            *next += 1;
+            Value::String(replacement.clone())
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| replace(item, depth + 1, nodes, masked, next))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, item)| {
+                    Ok((key.clone(), replace(item, depth + 1, nodes, masked, next)?))
+                })
+                .collect::<Result<serde_json::Map<_, _>, MappingError>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
 /// Whether `spans` can be applied to `text` at all: every span non-empty,
 /// in range, and non-overlapping once ordered by start. This is `mask`'s
 /// own well-formedness check, pulled out so a caller deciding whether a
@@ -330,6 +460,7 @@ fn is_placeholder(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn span(entity_type: &str, start: usize, end: usize) -> Span {
         Span {
@@ -748,5 +879,105 @@ mod tests {
                 "{entity_type} is too long to survive a stream"
             );
         }
+    }
+
+    #[test]
+    fn a_walk_reports_string_leaves_in_order_and_ignores_keys() {
+        let document = json!({
+            "b_second": "Weber",
+            "a_first": {"nested": "Meier"},
+            "list": ["Schmidt", 7, true, null]
+        });
+        let leaves = json_leaves(&document).unwrap();
+        assert_eq!(
+            leaves,
+            vec![
+                Leaf::Text("Meier".to_owned()),
+                Leaf::Text("Weber".to_owned()),
+                Leaf::Text("Schmidt".to_owned()),
+                Leaf::Number("7".to_owned()),
+            ],
+            "keys are not leaves, and booleans and null carry no personal data"
+        );
+    }
+
+    #[test]
+    fn replacement_puts_masked_text_back_in_walk_order() {
+        // This crate does not enable serde_json's `preserve_order` feature, so
+        // `Value::Object` is backed by a `BTreeMap` and the walk visits keys
+        // alphabetically: "n", "where", "who" — not the order they were
+        // written in. "where" (Bern) is therefore the first text leaf and
+        // takes the first masked string; "who" (Weber) is the second. The two
+        // masked strings are deliberately distinguishable so a swap between
+        // them shows up here rather than being absorbed. If this crate ever
+        // gains `preserve_order`, the walk order changes and this expectation
+        // must be revisited — see `json_leaves_and_replace_text_leaves_agree_on_position`
+        // below for the invariant that holds regardless of which order rule
+        // is in force.
+        let document = json!({"who": "Weber", "n": 7, "where": "Bern"});
+        let masked = vec!["[PERSON_1]".to_owned(), "[LOCATION_2]".to_owned()];
+        let result = replace_text_leaves(&document, &masked).unwrap();
+        assert_eq!(
+            result,
+            json!({"who": "[LOCATION_2]", "n": 7, "where": "[PERSON_1]"}),
+            "numbers keep their type and their value; keys visit alphabetically, \
+             so \"where\" is masked before \"who\""
+        );
+    }
+
+    #[test]
+    fn json_leaves_and_replace_text_leaves_agree_on_position() {
+        // The invariant the rest of the slice actually rests on is not "the
+        // walk visits keys in this particular order" — it is that
+        // `json_leaves` and `replace_text_leaves` visit leaves in the *same*
+        // order as each other, whatever that order is. This test pins that
+        // correspondence directly, and unlike the test above, survives a
+        // change to the ordering rule.
+        let document = json!({
+            "who": "Weber",
+            "location": {"city": "Bern", "notes": ["Schmidt", 7]},
+            "count": 3
+        });
+        let text_leaf_count = json_leaves(&document)
+            .unwrap()
+            .into_iter()
+            .filter(|leaf| matches!(leaf, Leaf::Text(_)))
+            .count();
+        // Each replacement encodes the position it should land in.
+        let masked: Vec<String> = (0..text_leaf_count).map(|i| format!("leaf-{i}")).collect();
+        let replaced = replace_text_leaves(&document, &masked).unwrap();
+        let text_leaves_after: Vec<String> = json_leaves(&replaced)
+            .unwrap()
+            .into_iter()
+            .filter_map(|leaf| match leaf {
+                Leaf::Text(text) => Some(text),
+                Leaf::Number(_) => None,
+            })
+            .collect();
+        for (index, text) in text_leaves_after.iter().enumerate() {
+            assert_eq!(
+                *text,
+                format!("leaf-{index}"),
+                "leaf at walk position {index} did not receive the replacement built for it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_past_the_depth_bound_is_refused() {
+        let mut document = json!("Weber");
+        for _ in 0..(MAX_JSON_DEPTH + 1) {
+            document = json!([document]);
+        }
+        assert!(matches!(json_leaves(&document), Err(MappingError::TooDeep)));
+    }
+
+    #[test]
+    fn a_document_past_the_node_bound_is_refused() {
+        let wide: Vec<Value> = (0..=MAX_JSON_NODES).map(|n| json!(n)).collect();
+        assert!(matches!(
+            json_leaves(&Value::Array(wide)),
+            Err(MappingError::TooLarge)
+        ));
     }
 }
