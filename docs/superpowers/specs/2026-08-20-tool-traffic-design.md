@@ -233,10 +233,19 @@ never issued.
 **The detection cache does not help the first time a text is seen**, and a tool
 result is usually seen once.
 
-Measured: 59 characters per CPU-second, and the detector already parallelises
-across cores — 50 KB costs roughly 850 CPU-seconds, about 92 seconds of
-wall-clock on nine cores. `detector_timeout_secs` defaults to 30. So a `Read` of
-a 1500-line file is a 503, and no amount of tool-field support changes that.
+Two measurements exist and they are not the same measurement, which is worth
+saying before either is used. The README's latency table is wall-clock on a
+named machine — an Apple M3 Pro, 11 cores, CPU only — and reports 1 200
+characters at 950 ms and 6 000 at 5 524 ms. The detection-cache design reports
+20.3 CPU-seconds per 1 200 characters on the compose stack, which on the same 11
+cores is about 1.85 wall-seconds for that text. Native against containerised,
+roughly twofold apart, and neither figure carries its setup where a reader would
+look for it.
+
+Either way the conclusion is the same and does not depend on choosing between
+them: 50 KB costs somewhere between 46 and 77 seconds of wall clock, against a
+`detector_timeout_secs` that defaults to 30. So a `Read` of a 1500-line file is a
+503, and no amount of tool-field support changes that.
 
 This slice answers it by bounding rather than by accelerating: the tool
 structures newly scanned in a request are refused past a configured size, in
@@ -284,11 +293,11 @@ because the client would execute it.
 ## Configuration
 
 One key, `max_tool_bytes`, defaulting to **10 000**, applied to the sum of the
-tool structures a request newly scans rather than to any one of them. The arithmetic is
-the point rather than the number: at 59 characters per CPU-second across nine
-cores, roughly 530 characters clear per wall-clock second, so 10 000 characters
-is about 19 seconds against a 30-second `detector_timeout_secs` — inside it with
-room for a slower machine.
+tool structures a request newly scans rather than to any one of them. The
+relationship is the point rather than the number: 10 000 characters is about nine
+seconds on the machine the README's table names and about fifteen on the
+containerised stack, both inside a 30-second `detector_timeout_secs` with
+headroom. Slower hardware, or a lowered timeout, has to lower this with it.
 
 The two keys are one constraint written twice, and the config comment says so:
 an operator who raises the timeout to serve larger results has to raise this as
