@@ -992,6 +992,38 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_part_is_understood_rather_than_refused() {
+        // The positive half of the test above: `tool_result` moved from the
+        // refused side to the described side, and both halves say so together.
+        // `content_pointers` is shared, so it moved for both providers at once.
+        //
+        // The result recurses through `content_pointers` itself, so a bare
+        // string and a list of blocks are one case, and an image inside a
+        // result inherits the policy images already have — asserted here rather
+        // than argued, since it is the reason the recursion exists.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "Martina Weber"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": [
+                {"type": "text", "text": "Weber"},
+                {"type": "image", "source": {"type": "base64", "data": "..."}}
+            ]}
+        ]}]});
+        for described in [
+            slot_pointers(OpenAi.request_pointers(&body)),
+            slot_pointers(Anthropic.request_pointers(&body)),
+        ] {
+            assert_eq!(
+                described,
+                vec![
+                    "/messages/0/content/0/content",
+                    "/messages/0/content/1/content/0/text",
+                ],
+                "the image is unscanned and the tool_use_id is dispatch"
+            );
+        }
+    }
+
+    #[test]
     fn media_parts_are_allowed_through_unscanned() {
         let body = json!({"messages": [{"role": "user", "content": [
             {"type": "text", "text": "Weber"},

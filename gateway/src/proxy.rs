@@ -595,11 +595,23 @@ mod tests {
                 "recognizer": "ner:fake", "tier": 2, "boosted": false}])
     }
 
-    // Direct construction, not a request through the router: nothing on the
-    // request path constructs `MappingError::TooDeep`, `TooLarge`, or
-    // `MaskCountMismatch` yet — Task 4 wires `json_leaves` and
-    // `replace_text_leaves` into a request handler. These pin `status()` in
-    // isolation ahead of that wiring.
+    // Direct construction, not a request through the router. `json_leaves` and
+    // `replace_text_leaves` are wired into the request handler now, and
+    // `a_tool_document_nested_past_the_walks_bound_is_refused` reaches `TooDeep`
+    // the whole way through — but the other two are still not reachable that
+    // way, for different reasons worth knowing:
+    //
+    // `TooLarge` cannot fire first at any sane configuration. Its bound is
+    // 10 000 nodes, and the cheapest node an array can hold costs two bytes
+    // (`0,`), so a document reaching it is upwards of 20 000 bytes and
+    // `max_tool_bytes` — 10 000 by default — has already refused it. It stays
+    // as depth behind the byte bound rather than as a check that fires.
+    //
+    // `MaskCountMismatch` fires only if this gateway's two walks disagree with
+    // each other, which no input can arrange; it is reachable by mutating one
+    // walk, and doing so is how the keys invariant was proved.
+    //
+    // These pin `status()` for all three regardless.
 
     #[test]
     fn a_too_deep_or_too_large_document_is_the_callers_mistake_not_the_upstreams() {
@@ -1029,6 +1041,45 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the refusal must cost the caller nothing upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_document_nested_past_the_walks_bound_is_refused() {
+        // `mapping.rs`'s depth bound stops a client's document from exhausting
+        // the stack in the walk. Until this task there was no request path that
+        // could reach it, so it was pinned only by constructing the error; this
+        // drives it through the router.
+        //
+        // 70 is past the walk's 64 and inside serde_json's own parser limit of
+        // 128 — measured, not assumed — so the request parses and is refused by
+        // the bound that exists to refuse it, rather than by the parser.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let mut nested = json!("x");
+        for _ in 0..70 {
+            nested = json!({ "a": nested });
+        }
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file", "input": nested}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("nested deeper"),
+            "refused by the depth bound rather than something else: {body}"
+        );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),
             "the refusal must cost the caller nothing upstream"

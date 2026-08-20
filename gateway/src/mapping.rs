@@ -232,7 +232,15 @@ impl Mapping {
     }
 
     /// Restore every string in a value. Used for upstream envelopes, whose shape
-    /// is the provider's business but which may quote the masked text back.
+    /// is the provider's business but which may quote the masked text back —
+    /// and, since tool traffic, for a `tool_use` block's arguments, whose shape
+    /// is the *client's* schema and whose content the model wrote.
+    ///
+    /// Unbounded recursion, unlike `walk` below, and safe for a reason that is
+    /// worth stating because it is not local: every value reaching here came
+    /// out of `serde_json`, whose parser refuses to nest past 128 (measured, not
+    /// assumed). A caller that ever hands this a value built in memory rather
+    /// than parsed loses that bound and needs its own.
     pub fn restore_value(&self, value: &Value) -> Result<Value, MappingError> {
         Ok(match value {
             Value::String(text) => Value::String(self.restore(text)?),
