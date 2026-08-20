@@ -539,6 +539,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Unwraps `stream_slots`' `TextSlot` results, for the streamed-event tests.
     fn pointers(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
         slots
             .unwrap()
@@ -547,9 +548,9 @@ mod tests {
             .collect()
     }
 
-    // `request_pointers`/`response_pointers` return `Vec<Slot>`, a different
-    // type from `stream_slots`' `Vec<TextSlot>` above — Rust does not overload
-    // free functions, so this is a second helper rather than a shared one.
+    // Unwraps `request_pointers`/`response_pointers`' `Slot` results — a
+    // different type from `TextSlot` above, so a second helper rather than a
+    // shared one; Rust does not overload free functions by parameter type.
     fn slot_pointers(slots: Result<Vec<Slot>, ShapeError>) -> Vec<String> {
         slots
             .unwrap()
