@@ -37,9 +37,14 @@ impl ProxyError {
         match self {
             // A body we cannot read is the client's to fix, and it is refused
             // rather than forwarded unmasked. So is a session the gateway
-            // cannot honour as asked.
+            // cannot honour as asked. So is a tool document nested or sized
+            // past what this gateway will walk: retrying will not help, and
+            // 502 would tell the caller the upstream got it wrong, which is
+            // false — they need to send something smaller instead.
             ProxyError::Shape(ShapeError::Request(_))
             | ProxyError::Shape(ShapeError::Unsupported(_, _))
+            | ProxyError::Mapping(MappingError::TooDeep)
+            | ProxyError::Mapping(MappingError::TooLarge)
             | ProxyError::Session(SessionError::BadId)
             | ProxyError::Session(SessionError::Disabled)
             | ProxyError::Session(SessionError::NoCredential(_)) => StatusCode::BAD_REQUEST,
@@ -52,15 +57,21 @@ impl ProxyError {
             ProxyError::Session(SessionError::Saturated) | ProxyError::Audit(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            // Everything the upstream or the detector got wrong, and every
-            // shape failure on the way back. Written out rather than left to a
-            // wildcard so that a new variant has to be given a status here, as
-            // `audit_class` already makes it be given a class: a wildcard
-            // turns a variant somebody forgot into a silent 502.
+            // Everything the upstream or the detector got wrong, every shape
+            // failure on the way back, and this gateway's own internal
+            // mapping defects: an unresolvable placeholder, a detector span
+            // that cannot be applied, or the two document walks disagreeing
+            // with each other about how many leaves a document has. Written
+            // out rather than left to a wildcard so that a new variant has to
+            // be given a status here, as `audit_class` already makes it be
+            // given a class: a wildcard turns a variant somebody forgot into
+            // a silent 502.
             ProxyError::Shape(ShapeError::Response(_))
             | ProxyError::Shape(ShapeError::Pointer(_))
             | ProxyError::Detector(_)
-            | ProxyError::Mapping(_)
+            | ProxyError::Mapping(MappingError::Unknown(_))
+            | ProxyError::Mapping(MappingError::BadSpan(_))
+            | ProxyError::Mapping(MappingError::MaskCountMismatch(_))
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -521,6 +532,39 @@ mod tests {
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
                 "recognizer": "ner:fake", "tier": 2, "boosted": false}])
+    }
+
+    // Direct construction, not a request through the router: nothing on the
+    // request path constructs `MappingError::TooDeep`, `TooLarge`, or
+    // `MaskCountMismatch` yet — Task 4 wires `json_leaves` and
+    // `replace_text_leaves` into a request handler. These pin `status()` in
+    // isolation ahead of that wiring.
+
+    #[test]
+    fn a_too_deep_or_too_large_document_is_the_callers_mistake_not_the_upstreams() {
+        assert_eq!(
+            ProxyError::Mapping(MappingError::TooDeep).status(),
+            StatusCode::BAD_REQUEST,
+            "retrying will not help; the caller needs to send something smaller"
+        );
+        assert_eq!(
+            ProxyError::Mapping(MappingError::TooLarge).status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn a_mask_count_mismatch_is_this_gateways_own_defect() {
+        // Unlike TooDeep/TooLarge, this fires when json_leaves and
+        // replace_text_leaves disagree with each other about a document
+        // this gateway already accepted — its own fault, not the caller's.
+        assert_eq!(
+            ProxyError::Mapping(MappingError::MaskCountMismatch(
+                "fewer masked strings than text leaves"
+            ))
+            .status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     /// A detector whose runs are complete and identified, so every answer is
