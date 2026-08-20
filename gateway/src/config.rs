@@ -71,10 +71,15 @@ pub struct Config {
     /// across every tool definition, argument and result in it.
     ///
     /// This key and `detector_timeout_secs` are one constraint written twice.
-    /// The detector clears roughly 530 characters per wall-clock second, so
-    /// 10 000 characters is about 19 seconds against a 30-second timeout, with
-    /// room for a slower machine. Raise the timeout to serve larger results and
-    /// this has to rise with it; lower the timeout and this has to fall.
+    /// Cost scales with text length; the README's latency table is the
+    /// measured source. On the machine that table names (Apple M3 Pro, 11
+    /// cores), 10 000 characters is roughly eight to nine seconds; on the
+    /// containerised stack the detection-cache design measured (20.3
+    /// CPU-seconds per 1 200 characters), closer to fifteen. Either sits
+    /// inside the 30-second default with headroom, which is why 10 000 is
+    /// the default here too. Slower hardware, or a lower timeout, has to
+    /// lower this to match — the relationship is the thing to carry, not
+    /// the number.
     ///
     /// It is not derived from the timeout automatically on purpose: a derived
     /// default changes behaviour silently when an unrelated key moves.
