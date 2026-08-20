@@ -710,10 +710,22 @@ carrying `tools` reaches the provider with its descriptions and schemas
 unmasked, which is raw egress and is not redeemed by a later task closing it.
 
 Make `reject_tool_fields` take its list as a parameter instead. OpenAI keeps all
-five fields until Task 5 removes its own; Anthropic keeps `functions` and
-`function_call`, which are OpenAI-shaped fields it should never see. Delete the
-`reject_tool_fields(message, "anthropic")` call for messages, and give each list
-a doc comment saying what it still refuses and why.
+five fields until Task 5 removes its own.
+
+Anthropic keeps three: `functions`, `function_call` and **`tool_calls`**. The
+first two are OpenAI-shaped fields it should never see. `tool_calls` is the one
+worth explaining, because Anthropic defines no such field — which is exactly why
+it is refused rather than ignored. Nothing describes it, so nothing masks it,
+and a client that sends an OpenAI-shaped message to this endpoint would have its
+arguments forwarded verbatim. An undescribed field carrying values is refused;
+that rule does not bend for a field the provider will reject anyway.
+
+**Keep the per-message `reject_tool_fields` call**, which is what catches
+`tool_calls` at message level rather than only at the top of the body. An earlier
+draft of this plan deleted it, which would have left the top-level check as the
+only guard.
+
+Give each list a doc comment saying what it still refuses and why.
 
 - [ ] **Step 5: Teach `mask_all` the Json kind**
 
