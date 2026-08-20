@@ -13,7 +13,7 @@ use crate::audit::Record;
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping::{Mapping, MappingError};
-use crate::provider::{read_pointer, write_pointer, Anthropic, OpenAi, Provider, ShapeError};
+use crate::provider::{read_pointer, write_pointer, Anthropic, OpenAi, Provider, ShapeError, Slot};
 use crate::session::{key_from, Limits, SessionError, SessionStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -167,16 +167,25 @@ impl AppState {
 /// stop describing the request. The values themselves live in the local set
 /// only long enough to be counted and never leave this function.
 async fn mask_all(
+    provider: &'static dyn Provider,
     detector: &DetectorClient,
     body: &Value,
-    pointers: &[String],
+    slots: &[Slot],
     mapping: &mut Mapping,
     credential: Option<&[u8]>,
 ) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
     let mut distinct: HashSet<(String, String)> = HashSet::new();
-    for pointer in pointers {
+    for slot in slots {
+        let pointer = match slot {
+            Slot::Text(pointer) => pointer,
+            // No provider emits this until Task 4. Refused rather than
+            // `unreachable!`: a panic in a request handler takes the process
+            // and every live session's mapping with it, and "this cannot
+            // happen" is the claim a refusal costs nothing to stop trusting.
+            Slot::Json { .. } => return Err(ShapeError::Request(provider.name()).into()),
+        };
         let text = read_pointer(body, pointer)?;
         let spans = detector.detect(&text, credential).await?;
         total += spans.len();
@@ -241,7 +250,7 @@ async fn handle(
     }
 
     // Where is the text? A shape we do not recognize is refused, not forwarded.
-    let pointers = provider.request_pointers(&body)?;
+    let slots = provider.request_pointers(&body)?;
 
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         record.streaming();
@@ -268,9 +277,16 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
-            let (masked, spans, types) =
-                mask_all(&state.detector, &body, &pointers, &mut work, credential).await?;
-            record.detected(pointers.len(), spans, types, work.redacted_count());
+            let (masked, spans, types) = mask_all(
+                provider,
+                &state.detector,
+                &body,
+                &slots,
+                &mut work,
+                credential,
+            )
+            .await?;
+            record.detected(slots.len(), spans, types, work.redacted_count());
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
             // request, and a request that never left must leave the session
@@ -291,9 +307,16 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
-            let (masked, spans, types) =
-                mask_all(&state.detector, &body, &pointers, &mut work, credential).await?;
-            record.detected(pointers.len(), spans, types, work.redacted_count());
+            let (masked, spans, types) = mask_all(
+                provider,
+                &state.detector,
+                &body,
+                &slots,
+                &mut work,
+                credential,
+            )
+            .await?;
+            record.detected(slots.len(), spans, types, work.redacted_count());
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
             record.masked().await?;
@@ -388,9 +411,14 @@ async fn handle(
 
     // Restore, and refuse rather than hand a placeholder to the client.
     let mut restored = upstream.clone();
-    for pointer in provider.response_pointers(&upstream)? {
-        let text = read_pointer(&upstream, &pointer)?;
-        write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
+    for slot in provider.response_pointers(&upstream)? {
+        match slot {
+            Slot::Text(pointer) => {
+                let text = read_pointer(&upstream, &pointer)?;
+                write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
+            }
+            Slot::Json { .. } => return Err(ShapeError::Response(provider.name()).into()),
+        }
     }
     // The same quota headers matter on a 200: a client that only learns its
     // remaining budget from errors learns it too late.

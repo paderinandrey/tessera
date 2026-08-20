@@ -17,8 +17,8 @@ pub enum ShapeError {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn upstream_path(&self) -> &'static str;
-    fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
-    fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
+    fn request_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError>;
+    fn response_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError>;
     /// Where the text lives inside one streamed event. An event type we do not
     /// know carries no slots and is forwarded as it came: both protocols add
     /// event types over time, and `ping` must not break a stream.
@@ -54,6 +54,35 @@ pub enum Terminates {
     Nothing,
     Runs(Vec<String>),
     All,
+}
+
+/// Where a maskable value lives, and what kind of value it is. `Text` is a
+/// string masked as it stands. `Json` is a document whose string leaves are
+/// masked and whose keys are not — `embedded` distinguishes a document from a
+/// string holding one, which is the only difference between Anthropic's
+/// `input` object and OpenAI's `arguments`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Slot {
+    Text(String),
+    // No provider constructs this until Task 4 wires a document-shaped
+    // location to it; both the variant and the method below are exercised
+    // by tests today and by `proxy.rs`'s match arms, but neither is built
+    // from production code yet, which reads as dead code to the bin target.
+    #[allow(dead_code)]
+    Json {
+        pointer: String,
+        embedded: bool,
+    },
+}
+
+impl Slot {
+    #[allow(dead_code)]
+    pub fn pointer(&self) -> &str {
+        match self {
+            Slot::Text(pointer) => pointer,
+            Slot::Json { pointer, .. } => pointer,
+        }
+    }
 }
 
 pub struct OpenAi;
@@ -103,12 +132,12 @@ fn identifier_pointer(
     lookup: &str,
     output: String,
     provider: &'static str,
-    out: &mut Vec<String>,
+    out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
     match body.pointer(lookup) {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(_)) => {
-            out.push(output);
+            out.push(Slot::Text(output));
             Ok(())
         }
         Some(_) => Err(ShapeError::Request(provider)),
@@ -140,14 +169,14 @@ fn content_pointers(
     prefix: &str,
     content: &Value,
     provider: &'static str,
-    out: &mut Vec<String>,
+    out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
     match content {
-        Value::String(_) => out.push(prefix.to_owned()),
+        Value::String(_) => out.push(Slot::Text(prefix.to_owned())),
         Value::Array(parts) => {
             for (index, part) in parts.iter().enumerate() {
                 if part.get("text").and_then(Value::as_str).is_some() {
-                    out.push(format!("{prefix}/{index}/text"));
+                    out.push(Slot::Text(format!("{prefix}/{index}/text")));
                     continue;
                 }
                 let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
@@ -172,7 +201,7 @@ impl Provider for OpenAi {
         "/v1/chat/completions"
     }
 
-    fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn request_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
@@ -245,7 +274,7 @@ impl Provider for OpenAi {
         Ok(pointers)
     }
 
-    fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn response_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let choices = body
             .get("choices")
             .and_then(Value::as_array)
@@ -361,7 +390,7 @@ impl Provider for Anthropic {
         "/v1/messages"
     }
 
-    fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn request_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
@@ -409,7 +438,7 @@ impl Provider for Anthropic {
         Ok(pointers)
     }
 
-    fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn response_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let blocks = body
             .get("content")
             .and_then(Value::as_array)
@@ -417,7 +446,7 @@ impl Provider for Anthropic {
         let mut pointers = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
             if block.get("text").and_then(Value::as_str).is_some() {
-                pointers.push(format!("/content/{index}/text"));
+                pointers.push(Slot::Text(format!("/content/{index}/text")));
                 continue;
             }
             // A tool_use block's arguments can carry placeholders we issued.
@@ -518,6 +547,38 @@ mod tests {
             .collect()
     }
 
+    // `request_pointers`/`response_pointers` return `Vec<Slot>`, a different
+    // type from `stream_slots`' `Vec<TextSlot>` above — Rust does not overload
+    // free functions, so this is a second helper rather than a shared one.
+    fn slot_pointers(slots: Result<Vec<Slot>, ShapeError>) -> Vec<String> {
+        slots
+            .unwrap()
+            .into_iter()
+            .map(|slot| slot.pointer().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_text_slot_names_the_pointer_it_wraps() {
+        let slot = Slot::Text("/messages/0/content".to_owned());
+        assert_eq!(slot.pointer(), "/messages/0/content");
+    }
+
+    #[test]
+    fn a_json_slot_remembers_whether_the_document_is_embedded() {
+        let plain = Slot::Json {
+            pointer: "/messages/0/content/0/input".to_owned(),
+            embedded: false,
+        };
+        let embedded = Slot::Json {
+            pointer: "/messages/0/tool_calls/0/function/arguments".to_owned(),
+            embedded: true,
+        };
+        assert_eq!(plain.pointer(), "/messages/0/content/0/input");
+        assert!(!matches!(plain, Slot::Json { embedded: true, .. }));
+        assert!(matches!(embedded, Slot::Json { embedded: true, .. }));
+    }
+
     fn keys(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
         slots.unwrap().into_iter().map(|slot| slot.key).collect()
     }
@@ -568,7 +629,7 @@ mod tests {
     fn openai_finds_string_content() {
         let body = json!({"messages": [{"role": "user", "content": "Weber"}]});
         assert_eq!(
-            OpenAi.request_pointers(&body).unwrap(),
+            slot_pointers(OpenAi.request_pointers(&body)),
             vec!["/messages/0/content"]
         );
     }
@@ -580,7 +641,7 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "http://x"}}
         ]}]});
         assert_eq!(
-            OpenAi.request_pointers(&body).unwrap(),
+            slot_pointers(OpenAi.request_pointers(&body)),
             vec!["/messages/0/content/0/text"]
         );
     }
@@ -592,7 +653,7 @@ mod tests {
             "messages": [{"role": "user", "name": "Weber", "content": "Hallo"}]
         });
         assert_eq!(
-            OpenAi.request_pointers(&body).unwrap(),
+            slot_pointers(OpenAi.request_pointers(&body)),
             vec!["/user", "/messages/0/name", "/messages/0/content"]
         );
     }
@@ -604,7 +665,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Hallo"}]
         });
         assert_eq!(
-            Anthropic.request_pointers(&body).unwrap(),
+            slot_pointers(Anthropic.request_pointers(&body)),
             vec!["/metadata/user_id", "/messages/0/content"]
         );
     }
@@ -613,7 +674,7 @@ mod tests {
     fn openai_reads_the_response_content() {
         let body = json!({"choices": [{"message": {"role": "assistant", "content": "Hallo"}}]});
         assert_eq!(
-            OpenAi.response_pointers(&body).unwrap(),
+            slot_pointers(OpenAi.response_pointers(&body)),
             vec!["/choices/0/message/content"]
         );
     }
@@ -625,7 +686,7 @@ mod tests {
             "messages": [{"role": "user", "content": [{"type": "text", "text": "Weber"}]}]
         });
         assert_eq!(
-            Anthropic.request_pointers(&body).unwrap(),
+            slot_pointers(Anthropic.request_pointers(&body)),
             vec!["/system", "/messages/0/content/0/text"]
         );
     }
@@ -634,7 +695,7 @@ mod tests {
     fn anthropic_reads_the_response_blocks() {
         let body = json!({"content": [{"type": "text", "text": "Hallo"}]});
         assert_eq!(
-            Anthropic.response_pointers(&body).unwrap(),
+            slot_pointers(Anthropic.response_pointers(&body)),
             vec!["/content/0/text"]
         );
     }
@@ -670,7 +731,7 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "http://x"}}
         ]}]});
         assert_eq!(
-            OpenAi.request_pointers(&body).unwrap(),
+            slot_pointers(OpenAi.request_pointers(&body)),
             vec!["/messages/0/content/0/text"]
         );
     }
