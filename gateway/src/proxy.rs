@@ -12,8 +12,12 @@ use serde_json::{json, Value};
 use crate::audit::Record;
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
-use crate::mapping::{Mapping, MappingError};
-use crate::provider::{read_pointer, write_pointer, Anthropic, OpenAi, Provider, ShapeError, Slot};
+use crate::mapping;
+use crate::mapping::{Mapping, MappingError, Span};
+use crate::provider::{
+    read_document, read_pointer, write_document, write_pointer, Anthropic, OpenAi, Provider,
+    ShapeError, Slot,
+};
 use crate::session::{key_from, Limits, SessionError, SessionStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +34,11 @@ pub enum ProxyError {
     Session(#[from] crate::session::SessionError),
     #[error("{0}")]
     Audit(#[from] crate::audit::AuditError),
+    #[error(
+        "this request's tool structures are larger than this gateway will detect over within \
+         its detector timeout; it is refused rather than forwarded"
+    )]
+    ToolTooLarge,
 }
 
 impl ProxyError {
@@ -47,7 +56,8 @@ impl ProxyError {
             | ProxyError::Mapping(MappingError::TooLarge)
             | ProxyError::Session(SessionError::BadId)
             | ProxyError::Session(SessionError::Disabled)
-            | ProxyError::Session(SessionError::NoCredential(_)) => StatusCode::BAD_REQUEST,
+            | ProxyError::Session(SessionError::NoCredential(_))
+            | ProxyError::ToolTooLarge => StatusCode::BAD_REQUEST,
             // Saturation is this gateway's own capacity rather than anything
             // the caller got wrong, and the same request may well succeed a
             // moment later. No `Retry-After`: the wait is another request's
@@ -97,6 +107,7 @@ impl ProxyError {
             ProxyError::Session(SessionError::NoCredential(_)) => "session_no_credential",
             ProxyError::Session(SessionError::Saturated) => "session_saturated",
             ProxyError::Audit(_) => "audit_write_failed",
+            ProxyError::ToolTooLarge => "tool_too_large",
         }
     }
 }
@@ -141,6 +152,12 @@ pub struct AppState {
     pub anthropic_base: String,
     pub sessions: SessionStore,
     pub audit: Arc<crate::audit::Audit>,
+    /// How much tool structure one request may carry. Not a session limit and
+    /// not a mapping limit: `mapping.rs`'s bounds stop a single document from
+    /// exhausting the stack, and this one stops a request whose detection would
+    /// outlast the detector timeout — a different failure, so a different
+    /// number, and it lives here because `handle` is where it is asked.
+    pub max_tool_bytes: usize,
 }
 
 impl AppState {
@@ -161,6 +178,7 @@ impl AppState {
                 max_values: config.max_session_values,
             }),
             audit,
+            max_tool_bytes: config.max_tool_bytes,
         }
     }
 
@@ -180,8 +198,28 @@ impl AppState {
 /// would report a session's running total on every turn, and the record would
 /// stop describing the request. The values themselves live in the local set
 /// only long enough to be counted and never leave this function.
+/// The distinct values one text contributed, folded into the caller's set.
+///
+/// A free function so both slot kinds count the same way: inlined twice they
+/// would drift, and the counts are what the journal reports about the request.
+fn count_distinct(text: &str, spans: &[Span], distinct: &mut HashSet<(String, String)>) {
+    // The `Vec<char>` is a copy of the whole text, and a conversation
+    // history is many texts: it is built only when there is a span to
+    // address into it.
+    if spans.is_empty() {
+        return;
+    }
+    let characters: Vec<char> = text.chars().collect();
+    for span in spans {
+        // Offsets are in characters, and a span the mapping would
+        // reject is counted only if it addresses real text.
+        if let Some(value) = characters.get(span.start..span.end) {
+            distinct.insert((span.entity_type.clone(), value.iter().collect()));
+        }
+    }
+}
+
 async fn mask_all(
-    provider: &'static dyn Provider,
     detector: &DetectorClient,
     body: &Value,
     slots: &[Slot],
@@ -192,31 +230,41 @@ async fn mask_all(
     let mut total = 0usize;
     let mut distinct: HashSet<(String, String)> = HashSet::new();
     for slot in slots {
-        let pointer = match slot {
-            Slot::Text(pointer) => pointer,
-            // No provider emits this until Task 4. Refused rather than
-            // `unreachable!`: a panic in a request handler takes the process
-            // and every live session's mapping with it, and "this cannot
-            // happen" is the claim a refusal costs nothing to stop trusting.
-            Slot::Json { .. } => return Err(ShapeError::Request(provider.name()).into()),
-        };
-        let text = read_pointer(body, pointer)?;
-        let spans = detector.detect(&text, credential).await?;
-        total += spans.len();
-        // The `Vec<char>` is a copy of the whole text, and a conversation
-        // history is many texts: it is built only when there is a span to
-        // address into it.
-        if !spans.is_empty() {
-            let characters: Vec<char> = text.chars().collect();
-            for span in &spans {
-                // Offsets are in characters, and a span the mapping would
-                // reject is counted only if it addresses real text.
-                if let Some(value) = characters.get(span.start..span.end) {
-                    distinct.insert((span.entity_type.clone(), value.iter().collect()));
+        match slot {
+            Slot::Text(pointer) => {
+                let text = read_pointer(body, pointer)?;
+                let spans = detector.detect(&text, credential).await?;
+                total += spans.len();
+                count_distinct(&text, &spans, &mut distinct);
+                write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
+            }
+            // A document's string leaves are detected one at a time and put
+            // back by position: `json_leaves` and `replace_text_leaves` walk
+            // the same shape in the same order, and neither yields a key, so
+            // a tool name or a schema's property name cannot be reached from
+            // here at all.
+            Slot::Json { pointer, embedded } => {
+                let document = read_document(body, pointer, *embedded)?;
+                let leaves = mapping::json_leaves(&document)?;
+                let mut replacements = Vec::new();
+                for leaf in &leaves {
+                    match leaf {
+                        mapping::Leaf::Text(text) => {
+                            let spans = detector.detect(text, credential).await?;
+                            total += spans.len();
+                            count_distinct(text, &spans, &mut distinct);
+                            replacements.push(mapping.mask(text, &spans)?);
+                        }
+                        // Task 6 refuses this when it carries a span. Until
+                        // then a number is looked at by nobody, which is the
+                        // behaviour that task exists to change.
+                        mapping::Leaf::Number(_) => {}
+                    }
                 }
+                let rebuilt = mapping::replace_text_leaves(&document, &replacements)?;
+                write_document(&mut masked, pointer, &rebuilt, *embedded)?;
             }
         }
-        write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
     }
     let mut types: BTreeMap<String, usize> = BTreeMap::new();
     for (entity_type, _) in distinct {
@@ -266,6 +314,23 @@ async fn handle(
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let slots = provider.request_pointers(&body)?;
 
+    // Every tool structure this request newly scans, summed. Arguments count,
+    // not only results: `Write` and `Edit` carry whole files in arguments, and
+    // a tool call the model produced is restored to real values and echoed back
+    // in the next turn's history — text the cache has never seen, because the
+    // cache holds the masked request rather than the restored response.
+    let tool_bytes: usize = slots
+        .iter()
+        .filter_map(|slot| match slot {
+            Slot::Json { pointer, .. } => body.pointer(pointer),
+            Slot::Text(_) => None,
+        })
+        .map(|value| value.to_string().len())
+        .sum();
+    if tool_bytes > state.max_tool_bytes {
+        return Err(ProxyError::ToolTooLarge);
+    }
+
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         record.streaming();
     }
@@ -291,15 +356,8 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
-            let (masked, spans, types) = mask_all(
-                provider,
-                &state.detector,
-                &body,
-                &slots,
-                &mut work,
-                credential,
-            )
-            .await?;
+            let (masked, spans, types) =
+                mask_all(&state.detector, &body, &slots, &mut work, credential).await?;
             record.detected(slots.len(), spans, types, work.redacted_count());
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
@@ -321,15 +379,8 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
-            let (masked, spans, types) = mask_all(
-                provider,
-                &state.detector,
-                &body,
-                &slots,
-                &mut work,
-                credential,
-            )
-            .await?;
+            let (masked, spans, types) =
+                mask_all(&state.detector, &body, &slots, &mut work, credential).await?;
             record.detected(slots.len(), spans, types, work.redacted_count());
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
@@ -431,7 +482,14 @@ async fn handle(
                 let text = read_pointer(&upstream, &pointer)?;
                 write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
             }
-            Slot::Json { .. } => return Err(ShapeError::Response(provider.name()).into()),
+            // Restored whole rather than leaf by leaf: nothing here has to
+            // agree with a detector about positions, so the walk that already
+            // knows how to replace placeholders inside a value does the job.
+            Slot::Json { pointer, embedded } => {
+                let document = read_document(&upstream, &pointer, embedded)?;
+                let restored_document = mapping.restore_value(&document)?;
+                write_document(&mut restored, &pointer, &restored_document, embedded)?;
+            }
         }
     }
     // The same quota headers matter on a 200: a client that only learns its
@@ -528,6 +586,9 @@ mod tests {
     /// The span cap tests that are not about the cap itself pass this, so a
     /// handful of spans never accidentally brushes against it.
     const UNCAPPED: usize = usize::MAX;
+    /// The production default, so tests exercise the bound callers get rather
+    /// than one chosen to make a test convenient.
+    const TEST_MAX_TOOL_BYTES: usize = 10_000;
 
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
@@ -642,6 +703,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(limits),
             audit,
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         });
         (state, dir, path)
     }
@@ -819,6 +881,180 @@ mod tests {
             "the line names a type no placeholder carried and does not say so: {}",
             lines[0]
         );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_is_masked_going_up_and_restored_coming_back() {
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [
+                {"type": "tool_use", "id": "t1", "name": "read_file",
+                 "input": {"path": "[PERSON_1]"}}
+            ]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "read_file",
+                 "input": {"path": "Weber"}}
+            ]}]
+        });
+        let (status, returned) = call(state, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::OK);
+        let returned: Value = serde_json::from_str(&returned).expect("a JSON body");
+        assert_eq!(
+            returned["content"][0]["input"]["path"], "Weber",
+            "the client executes this, so it has to be the real value"
+        );
+        assert_eq!(
+            returned["content"][0]["name"], "read_file",
+            "the tool name is dispatch and is never touched"
+        );
+        let sent = String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone())
+            .expect("utf-8");
+        assert!(
+            !sent.contains(SECRET),
+            "the original reached the upstream: {sent}"
+        );
+        assert!(
+            sent.contains("read_file"),
+            "the tool name must survive masking: {sent}"
+        );
+    }
+
+    /// The upstream's view of a request, parsed. What actually left the
+    /// process, which is the only thing the masking invariants are about.
+    async fn sent_to(upstream: &MockServer) -> Value {
+        let received = upstream.received_requests().await.expect("a request");
+        serde_json::from_slice(&received[0].body).expect("a JSON body")
+    }
+
+    #[tokio::test]
+    async fn a_tool_arguments_key_is_never_masked_even_when_it_looks_like_a_value() {
+        // Key and value are the same string, so nothing but the rule itself
+        // can tell them apart — a detector cannot, and neither can a walk that
+        // yields both. The key is where the tool reads its argument from:
+        // masked, the call arrives without the argument at all, and the client
+        // has no way to learn why.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"Weber": "Weber"}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sent = sent_to(&upstream).await;
+        let input = &sent["messages"][0]["content"][0]["input"];
+        assert_eq!(
+            input["Weber"], "[PERSON_1]",
+            "the value must be masked: {input}"
+        );
+        assert!(
+            input.get("Weber").is_some(),
+            "the key must reach the upstream verbatim: {input}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_schemas_nested_prose_is_masked_and_its_property_names_are_not() {
+        // The schema goes in whole, so a string the gateway was never told to
+        // look for — a `default`, here — is reached anyway. Its property name
+        // sits one level up in the same object and is not.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "tools": [{
+                    "name": "read_file",
+                    "description": "Weber wrote this file",
+                    "input_schema": {"type": "object", "properties": {
+                        "Weber": {"type": "string", "default": "Weber"}
+                    }}
+                }],
+                "messages": [{"role": "user", "content": "hallo"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tool = &sent_to(&upstream).await["tools"][0];
+        assert_eq!(
+            tool["name"], "read_file",
+            "the tool name is dispatch: {tool}"
+        );
+        assert_eq!(
+            tool["description"], "[PERSON_1] wrote this file",
+            "a definition's prose is masked: {tool}"
+        );
+        assert_eq!(
+            tool["input_schema"]["properties"]["Weber"]["default"], "[PERSON_1]",
+            "a string nested in the schema is reached, and its property name is not: {tool}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_document_past_the_byte_bound_is_refused_before_the_upstream_call() {
+        // Detection runs at roughly a thousand characters a second, so a
+        // document past the bound would outlast the detector timeout and cost
+        // the caller the wait before failing. Refused here instead, and
+        // refused before the call rather than after it.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "write_file",
+                     "input": {"text": "x".repeat(TEST_MAX_TOOL_BYTES + 1)}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the refusal must cost the caller nothing upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_document_within_the_byte_bound_is_served() {
+        // The other side of the same bound: a refusal that fired on everything
+        // would satisfy the test above and serve nobody.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "write_file",
+                     "input": {"text": "x".repeat(TEST_MAX_TOOL_BYTES - 100)}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]
@@ -1299,6 +1535,7 @@ mod tests {
             anthropic_base: upstream_base,
             sessions: SessionStore::new(test_limits()),
             audit,
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         })
     }
 
@@ -1899,6 +2136,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(test_limits()),
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         });
 
         let (status, _) = call_with_headers(
@@ -2300,6 +2538,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(test_limits()),
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         });
 
         let (status, body) = call(
@@ -2356,6 +2595,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(test_limits()),
             audit,
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         });
         call(
             state,
@@ -2392,6 +2632,7 @@ mod tests {
             anthropic_base: base,
             sessions: SessionStore::new(test_limits()),
             audit,
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         });
         (state, dir, path)
     }
@@ -2874,6 +3115,7 @@ mod tests {
             anthropic_base: base,
             sessions: SessionStore::new(test_limits()),
             audit,
+            max_tool_bytes: TEST_MAX_TOOL_BYTES,
         });
 
         let response = streamed_response(state).await;

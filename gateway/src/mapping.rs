@@ -304,8 +304,6 @@ pub enum Leaf {
     Number(String),
 }
 
-// Constructed by task 4's detection call; nothing in this task builds one yet.
-#[allow(dead_code)]
 pub fn json_leaves(value: &Value) -> Result<Vec<Leaf>, MappingError> {
     let mut leaves = Vec::new();
     let mut nodes = 0usize;
@@ -350,8 +348,6 @@ fn walk(
 /// above collected the leaves, `mask_all` detected them, and this puts the
 /// masked strings back where they came from. Order is the only correspondence,
 /// which is why both walks are the same function shape.
-// Constructed by task 4's detection call; nothing in this task builds one yet.
-#[allow(dead_code)]
 pub fn replace_text_leaves(value: &Value, masked: &[String]) -> Result<Value, MappingError> {
     let mut next = 0usize;
     let mut nodes = 0usize;

@@ -64,19 +64,17 @@ pub enum Terminates {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Slot {
     Text(String),
-    // No provider constructs this until Task 4 wires a document-shaped
-    // location to it; both the variant and the method below are exercised
-    // by tests today and by `proxy.rs`'s match arms, but neither is built
-    // from production code yet, which reads as dead code to the bin target.
-    #[allow(dead_code)]
-    Json {
-        pointer: String,
-        embedded: bool,
-    },
+    Json { pointer: String, embedded: bool },
 }
 
 impl Slot {
-    #[allow(dead_code)]
+    /// Test-only, and marked so rather than suppressed. Every production site
+    /// has to know *which* kind it holds — masking reads a string or a
+    /// document, the size bound counts documents alone — so each destructures
+    /// its own arm and none of them wants an accessor that erases the kind.
+    /// The tests want exactly that, to assert a list of locations without
+    /// restating how each one is read.
+    #[cfg(test)]
     pub fn pointer(&self) -> &str {
         match self {
             Slot::Text(pointer) => pointer,
@@ -90,21 +88,37 @@ pub struct Anthropic;
 
 /// Content parts we deliberately do not scan. Anything else without a `text`
 /// string is refused rather than forwarded: a shape we do not understand may
-/// carry personal data we would pass through untouched. Tool blocks are on this
-/// list by absence — masking their arguments is a later slice, and until then
-/// a request carrying them is refused rather than silently leaked.
+/// carry personal data we would pass through untouched. Tool blocks are not on
+/// this list and are not refused either — `content_pointers` describes them,
+/// because their arguments and results are exactly the text this gateway
+/// exists to mask.
 const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "audio"];
 
-/// Fields carrying tool definitions or tool traffic. Masking their arguments is
-/// a later slice, so a request that uses them is refused: forwarding it would
-/// send arbitrary strings past the masker.
-const TOOL_FIELDS: [&str; 5] = [
+/// Tool fields a provider still has no slots for. A request that uses one is
+/// refused rather than forwarded, because forwarding it would send arbitrary
+/// strings past the masker — the same silence-is-a-leak shape as an
+/// unrecognized content part.
+///
+/// Per provider, because the two are relaxed one slice at a time. OpenAI's is
+/// still the whole set until its own slice describes them; sharing one list
+/// would have relaxed OpenAI's refusal here, where nothing yet produces a slot
+/// to replace it.
+///
+/// Anthropic's tool traffic is described now, so what is left on its list is
+/// the three fields Anthropic's API does not define at all. They are still
+/// refused rather than ignored: a field no slot addresses is forwarded exactly
+/// as it came, so `tool_calls` smuggled into an Anthropic body would carry its
+/// arguments past the masker. `tool_choice` is deliberately absent — Anthropic
+/// does define it, and it holds a tool's name, which is dispatch and is
+/// therefore left alone rather than masked or refused.
+const OPENAI_TOOL_FIELDS: [&str; 5] = [
     "tools",
     "tool_choice",
     "functions",
     "function_call",
     "tool_calls",
 ];
+const ANTHROPIC_TOOL_FIELDS: [&str; 3] = ["functions", "function_call", "tool_calls"];
 
 /// Every message must be an object carrying `content`. A bare string entry, or
 /// an object without content, produced no pointer and was forwarded untouched —
@@ -116,13 +130,61 @@ fn require_scannable_message(message: &Value, provider: &'static str) -> Result<
     Ok(())
 }
 
-fn reject_tool_fields(body: &Value, provider: &'static str) -> Result<(), ShapeError> {
-    for field in TOOL_FIELDS {
+fn reject_tool_fields(
+    body: &Value,
+    fields: &[&'static str],
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    for field in fields {
         if body.get(field).is_some_and(|value| !value.is_null()) {
             return Err(ShapeError::Unsupported(provider, field));
         }
     }
     Ok(())
+}
+
+/// `proxy.rs` calls `request_pointers` before it looks at `stream`, so relaxing
+/// the tool refusal admits streamed tool requests as readily as buffered ones —
+/// and `stream_slots`, which this slice does not touch, would then reject the
+/// tool events *after* the upstream call, spending the caller's tokens to
+/// return a broken stream. The streaming slice deletes this function; nothing
+/// else should.
+fn reject_streamed_tools(
+    body: &Value,
+    carries_tools: bool,
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if streaming && carries_tools {
+        return Err(ShapeError::Unsupported(provider, "streamed tool traffic"));
+    }
+    Ok(())
+}
+
+/// A tool definition's prose and its schema. The schema goes in whole rather
+/// than by naming the keywords that carry text: `description` is not the only
+/// one — `default`, `const`, `enum`, `examples`, `title` and `$comment` are all
+/// client-controlled strings — and a list of what to scan is wrong the day
+/// someone adds to it. Property names are keys, which the walk never yields.
+fn tool_definition_slots(
+    prefix: &str,
+    definition: &Value,
+    schema_field: &str,
+    out: &mut Vec<Slot>,
+) {
+    if definition
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        out.push(Slot::Text(format!("{prefix}/description")));
+    }
+    if definition.get(schema_field).is_some() {
+        out.push(Slot::Json {
+            pointer: format!("{prefix}/{schema_field}"),
+            embedded: false,
+        });
+    }
 }
 
 /// A field that should hold a maskable string. Absent is fine; present but not
@@ -179,9 +241,36 @@ fn content_pointers(
                     out.push(Slot::Text(format!("{prefix}/{index}/text")));
                     continue;
                 }
-                let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
-                if !UNSCANNED_PART_TYPES.contains(&kind) {
-                    return Err(ShapeError::Request(provider));
+                match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                    // `id` and `name` are the client's dispatch and are never
+                    // described; only the arguments are.
+                    "tool_use" => {
+                        if part.get("input").is_some() {
+                            out.push(Slot::Json {
+                                pointer: format!("{prefix}/{index}/input"),
+                                embedded: false,
+                            });
+                        }
+                        continue;
+                    }
+                    // A result recurses through this same function, which is
+                    // what makes a string result and a list of blocks one case
+                    // rather than two — and what makes an image inside a result
+                    // inherit the policy images already have. `tool_use_id`
+                    // is dispatch and is left alone.
+                    "tool_result" => {
+                        if let Some(content) = part.get("content") {
+                            content_pointers(
+                                &format!("{prefix}/{index}/content"),
+                                content,
+                                provider,
+                                out,
+                            )?;
+                        }
+                        continue;
+                    }
+                    kind if UNSCANNED_PART_TYPES.contains(&kind) => continue,
+                    _ => return Err(ShapeError::Request(provider)),
                 }
             }
         }
@@ -206,7 +295,7 @@ impl Provider for OpenAi {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
-        reject_tool_fields(body, "openai")?;
+        reject_tool_fields(body, &OPENAI_TOOL_FIELDS, "openai")?;
         // With logprobs on, every choice carries the model's output again as
         // token strings under `logprobs`. Those are the masked tokens: joined
         // back together they spell the placeholder, and their probabilities
@@ -251,7 +340,7 @@ impl Provider for OpenAi {
         identifier_pointer(body, "/user", "/user".to_owned(), "openai", &mut pointers)?;
         for (index, message) in messages.iter().enumerate() {
             require_scannable_message(message, "openai")?;
-            reject_tool_fields(message, "openai")?;
+            reject_tool_fields(message, &OPENAI_TOOL_FIELDS, "openai")?;
             if message.get("tool_call_id").is_some() {
                 return Err(ShapeError::Unsupported("openai", "tool_call_id"));
             }
@@ -395,7 +484,23 @@ impl Provider for Anthropic {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
-        reject_tool_fields(body, "anthropic")?;
+        reject_tool_fields(body, &ANTHROPIC_TOOL_FIELDS, "anthropic")?;
+        let mut pointers = Vec::new();
+        let carries_tools = body.get("tools").is_some_and(|value| !value.is_null());
+        reject_streamed_tools(body, carries_tools, "anthropic")?;
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use tools — the same reading `thinking` and `logprobs` already get.
+        if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
+            let tools = tools.as_array().ok_or(ShapeError::Request("anthropic"))?;
+            for (index, definition) in tools.iter().enumerate() {
+                tool_definition_slots(
+                    &format!("/tools/{index}"),
+                    definition,
+                    "input_schema",
+                    &mut pointers,
+                );
+            }
+        }
         // Extended thinking opens the stream with a `thinking` block whose text
         // this gateway neither masks nor restores, and whose signature is
         // computed over the text the provider saw — restoring it would break
@@ -411,7 +516,6 @@ impl Provider for Anthropic {
                 _ => return Err(ShapeError::Unsupported("anthropic", "thinking")),
             },
         }
-        let mut pointers = Vec::new();
         // Anthropic carries a caller-supplied identifier here.
         identifier_pointer(
             body,
@@ -425,7 +529,7 @@ impl Provider for Anthropic {
         }
         for (index, message) in messages.iter().enumerate() {
             require_scannable_message(message, "anthropic")?;
-            reject_tool_fields(message, "anthropic")?;
+            reject_tool_fields(message, &ANTHROPIC_TOOL_FIELDS, "anthropic")?;
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
@@ -449,9 +553,22 @@ impl Provider for Anthropic {
                 pointers.push(Slot::Text(format!("/content/{index}/text")));
                 continue;
             }
-            // A tool_use block's arguments can carry placeholders we issued.
-            // Handing them to the client unrestored is the failure restoration
-            // exists to prevent, so an unreadable block refuses the response.
+            // A tool_use block's arguments carry the placeholders we issued,
+            // and the client executes them: unrestored, it would open
+            // `/home/[PERSON_1]/notes.txt`. Its `id` and `name` are dispatch
+            // and are left exactly as the model wrote them.
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                if block.get("input").is_some() {
+                    pointers.push(Slot::Json {
+                        pointer: format!("/content/{index}/input"),
+                        embedded: false,
+                    });
+                }
+                continue;
+            }
+            // Any other block is one we cannot read. Handing a placeholder to
+            // the client is the failure restoration exists to prevent, so an
+            // unreadable block refuses the response.
             return Err(ShapeError::Response("anthropic"));
         }
         Ok(pointers)
@@ -531,6 +648,39 @@ pub fn write_pointer(body: &mut Value, pointer: &str, text: &str) -> Result<(), 
         .pointer_mut(pointer)
         .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
     *slot = Value::String(text.to_owned());
+    Ok(())
+}
+
+/// A `Json` slot's document. `embedded` means the pointer addresses a string
+/// holding a document rather than the document itself — OpenAI's `arguments`
+/// against Anthropic's `input`.
+pub fn read_document(body: &Value, pointer: &str, embedded: bool) -> Result<Value, ShapeError> {
+    let at = body
+        .pointer(pointer)
+        .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
+    if !embedded {
+        return Ok(at.clone());
+    }
+    let text = at
+        .as_str()
+        .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
+    serde_json::from_str(text).map_err(|_| ShapeError::Pointer(pointer.to_owned()))
+}
+
+pub fn write_document(
+    body: &mut Value,
+    pointer: &str,
+    document: &Value,
+    embedded: bool,
+) -> Result<(), ShapeError> {
+    let slot = body
+        .pointer_mut(pointer)
+        .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
+    *slot = if embedded {
+        Value::String(serde_json::to_string(document).map_err(|_| ShapeError::Response("json"))?)
+    } else {
+        document.clone()
+    };
     Ok(())
 }
 
@@ -702,6 +852,117 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_describes_tool_definitions_and_calls_and_results() {
+        let body = json!({
+            "model": "claude",
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file for Dr. Weber",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"path": "/home/weber/notes.txt"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Martina Weber"}
+                ]}
+            ]
+        });
+        assert_eq!(
+            slot_pointers(Anthropic.request_pointers(&body)),
+            vec![
+                "/tools/0/description",
+                "/tools/0/input_schema",
+                "/messages/0/content/0/input",
+                "/messages/1/content/0/content",
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_never_describes_a_tool_name_or_a_result_id() {
+        let body = json!({
+            "model": "claude",
+            "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x"}
+            ]}]
+        });
+        let described = slot_pointers(Anthropic.request_pointers(&body));
+        assert!(
+            !described
+                .iter()
+                .any(|p| p.ends_with("/name") || p.ends_with("/tool_use_id")),
+            "a tool name and a result id are the client's dispatch: {described:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_still_refuses_the_openai_shaped_tool_fields() {
+        // Anthropic's API defines none of these, so nothing here produces a
+        // slot for them and nothing would mask them. A field no slot addresses
+        // is forwarded exactly as it came, which is how `tool_calls` smuggled
+        // into an Anthropic body would carry its arguments past the masker.
+        for field in ["functions", "function_call", "tool_calls"] {
+            let at_body = json!({
+                "model": "claude",
+                field: [{"name": "read_file", "arguments": "{\"n\":\"Weber\"}"}],
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                Anthropic.request_pointers(&at_body).is_err(),
+                "{field} was allowed at the top level"
+            );
+            let at_message = json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": "Hi",
+                              field: [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}]
+            });
+            assert!(
+                Anthropic.request_pointers(&at_message).is_err(),
+                "{field} was allowed on a message"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_choice_is_neither_masked_nor_refused() {
+        // It selects a tool by name. The name is the client's dispatch: masking
+        // it would break the call it dispatches, and refusing it would close
+        // forced tool use for no reason.
+        let body = json!({
+            "model": "claude",
+            "tools": [{"name": "read_file", "input_schema": {}}],
+            "tool_choice": {"type": "tool", "name": "read_file"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert_eq!(
+            slot_pointers(Anthropic.request_pointers(&body)),
+            vec!["/tools/0/input_schema", "/messages/0/content"],
+            "tool_choice must not appear here"
+        );
+    }
+
+    #[test]
+    fn anthropic_refuses_tool_traffic_on_a_streamed_request() {
+        let body = json!({
+            "model": "claude",
+            "stream": true,
+            "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&body),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "streamed tool traffic"
+            ))
+        ));
+    }
+
+    #[test]
     fn a_body_without_messages_is_a_shape_error() {
         // Fail closed: an unparsed body must not be forwarded unmasked.
         assert!(OpenAi.request_pointers(&json!({"model": "gpt"})).is_err());
@@ -719,10 +980,15 @@ mod tests {
 
     #[test]
     fn an_unrecognized_content_part_is_refused() {
+        // A part type nobody has taught this gateway to read. `tool_result`
+        // used to stand here and no longer can: `content_pointers` describes
+        // it now, for both providers, since a result's text is text wherever
+        // it turns up.
         let body = json!({"messages": [{"role": "user", "content": [
-            {"type": "tool_result", "content": "Weber"}
+            {"type": "video_url", "video_url": {"url": "http://x"}}
         ]}]});
         assert!(OpenAi.request_pointers(&body).is_err());
+        assert!(Anthropic.request_pointers(&body).is_err());
     }
 
     #[test]
@@ -738,13 +1004,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_bearing_requests_are_refused() {
-        // Masking tool arguments is a later slice; until then a request that
-        // uses them is refused rather than forwarded past the masker.
+    fn openai_tool_bearing_requests_are_refused() {
+        // Masking OpenAI's tool arguments is a later slice, and nothing here
+        // produces a slot for them yet; until then a request that uses them is
+        // refused rather than forwarded past the masker. Anthropic is
+        // deliberately absent — its tool traffic is described now, and the
+        // tests above assert where.
         let with_tools = json!({"messages": [{"role": "user", "content": "Hi"}],
                                 "tools": [{"type": "function"}]});
         assert!(OpenAi.request_pointers(&with_tools).is_err());
-        assert!(Anthropic.request_pointers(&with_tools).is_err());
 
         let with_calls = json!({"messages": [
             {"role": "assistant", "tool_calls": [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}
@@ -784,10 +1052,35 @@ mod tests {
 
     #[test]
     fn an_unreadable_anthropic_response_block_is_refused() {
-        // A tool_use block can carry placeholders we issued; handing them to
-        // the client unrestored is the failure restoration exists to prevent.
-        let body = json!({"content": [{"type": "tool_use", "input": {"n": "[PERSON_1]"}}]});
+        // A block that can carry placeholders we issued and that nothing here
+        // knows how to read. Handing them to the client unrestored is the
+        // failure restoration exists to prevent. `tool_use` used to stand
+        // here; it is read now, and the test below says so.
+        let body = json!({"content": [{"type": "thinking", "thinking": "[PERSON_1] again"}]});
         assert!(Anthropic.response_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn anthropic_reads_a_tool_use_block_out_of_the_response() {
+        // The client executes these arguments. A placeholder left in one is a
+        // call against a path that does not exist.
+        let body = json!({"content": [
+            {"type": "text", "text": "Reading it now"},
+            {"type": "tool_use", "id": "t1", "name": "read_file",
+             "input": {"path": "/home/[PERSON_1]/notes.txt"}}
+        ]});
+        let slots = Anthropic.response_pointers(&body).unwrap();
+        assert_eq!(
+            slots,
+            vec![
+                Slot::Text("/content/0/text".to_owned()),
+                Slot::Json {
+                    pointer: "/content/1/input".to_owned(),
+                    embedded: false,
+                },
+            ],
+            "the id and the name are dispatch and are not described"
+        );
     }
 
     #[test]
