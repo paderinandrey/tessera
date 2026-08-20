@@ -108,8 +108,11 @@ Then change every `out: &mut Vec<String>` helper — `content_pointers`, `identi
     for slot in slots {
         let pointer = match slot {
             Slot::Text(pointer) => pointer,
-            // No provider emits this yet; Task 4 is the first that does.
-            Slot::Json { .. } => unreachable!("no Json slot exists before Task 4"),
+            // No provider emits this until Task 4. Refused rather than
+            // `unreachable!`: a panic in a request handler takes the process
+            // and every live session's mapping with it, and "this cannot
+            // happen" is the claim a refusal costs nothing to stop trusting.
+            Slot::Json { .. } => return Err(ShapeError::Request(provider.name()).into()),
         };
         let text = read_pointer(body, pointer)?;
 ```
@@ -123,7 +126,7 @@ Then change every `out: &mut Vec<String>` helper — `content_pointers`, `identi
                 let text = read_pointer(&upstream, &pointer)?;
                 write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
             }
-            Slot::Json { .. } => unreachable!("no Json slot exists before Task 4"),
+            Slot::Json { .. } => return Err(ShapeError::Response(provider.name()).into()),
         }
     }
 ```
@@ -164,8 +167,8 @@ git commit -m "refactor(gateway): a described location gains a kind
 Providers name where maskable values live, and masking is written once
 against those names. Tool arguments are not a string, so a name alone can
 no longer say what to do with what it points at. Behaviour is unchanged:
-every location is still Text, and the Json arm is unreachable until the
-task that emits one."
+every location is still Text, and the Json arm refuses until the task
+that emits one."
 ```
 
 ---
@@ -704,7 +707,7 @@ Finally, remove `"tools"`, `"tool_choice"` and `"tool_calls"` from `TOOL_FIELDS`
 
 - [ ] **Step 5: Teach `mask_all` the Json kind**
 
-In `proxy.rs`, replace the `unreachable!` from Task 1:
+In `proxy.rs`, replace the Task 1 refusal arm in `mask_all`:
 
 ```rust
         match slot {
@@ -780,7 +783,7 @@ pub fn write_document(
 
 - [ ] **Step 6: Teach the response loop the Json kind**
 
-In `proxy.rs`'s buffered response loop, replace that `unreachable!`:
+In `proxy.rs`'s buffered response loop, replace its Task 1 refusal arm:
 
 ```rust
             Slot::Json { pointer, embedded } => {
