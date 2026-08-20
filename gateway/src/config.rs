@@ -14,6 +14,8 @@ pub enum ConfigError {
         "max_spans_per_entry must be greater than zero unless detection_cache_entries is zero"
     )]
     ZeroSpansPerEntry,
+    #[error("max_tool_bytes must be greater than zero")]
+    ZeroToolBytes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +67,23 @@ pub struct Config {
     /// a large result into a refusal.
     #[serde(default = "default_max_spans_per_entry")]
     pub max_spans_per_entry: usize,
+    /// How many bytes of tool structure one request may newly scan, summed
+    /// across every tool definition, argument and result in it.
+    ///
+    /// This key and `detector_timeout_secs` are one constraint written twice.
+    /// The detector clears roughly 530 characters per wall-clock second, so
+    /// 10 000 characters is about 19 seconds against a 30-second timeout, with
+    /// room for a slower machine. Raise the timeout to serve larger results and
+    /// this has to rise with it; lower the timeout and this has to fall.
+    ///
+    /// It is not derived from the timeout automatically on purpose: a derived
+    /// default changes behaviour silently when an unrelated key moves.
+    ///
+    /// The ceiling exists because the detection cache does not help the first
+    /// time a text is seen, and a tool result is usually seen once. Issue #28
+    /// carries the work that lifts it.
+    #[serde(default = "default_max_tool_bytes")]
+    pub max_tool_bytes: usize,
 }
 
 fn default_bind() -> String {
@@ -142,6 +161,9 @@ fn default_detection_cache_entries() -> usize {
 fn default_max_spans_per_entry() -> usize {
     250
 }
+fn default_max_tool_bytes() -> usize {
+    10_000
+}
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -159,6 +181,9 @@ impl Config {
         }
         if config.detection_cache_entries > 0 && config.max_spans_per_entry == 0 {
             return Err(ConfigError::ZeroSpansPerEntry);
+        }
+        if config.max_tool_bytes == 0 {
+            return Err(ConfigError::ZeroToolBytes);
         }
         Ok(config)
     }
@@ -320,5 +345,20 @@ mod tests {
         ))
         .expect("a disabled cache does not care what its dead setting says");
         assert_eq!(config.max_spans_per_entry, 0);
+    }
+
+    #[test]
+    fn the_tool_bound_has_a_default() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(config.max_tool_bytes, 10_000);
+    }
+
+    #[test]
+    fn a_zero_tool_bound_is_rejected() {
+        let text = with_audit("max_tool_bytes = 0");
+        assert!(matches!(
+            Config::from_toml(&text),
+            Err(ConfigError::ZeroToolBytes)
+        ));
     }
 }

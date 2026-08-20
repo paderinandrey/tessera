@@ -27,3 +27,12 @@ audit_path = "/var/lib/tessera/audit.jsonl"
 # cache's memory the way an unbounded entry count alone would allow.
 detection_cache_entries = 10000
 max_spans_per_entry = 250
+
+# How many bytes of tool structure (definitions, arguments and results,
+# summed across one request) the gateway will newly scan. Tied to
+# detector_timeout_secs above: the detector clears roughly 530 characters per
+# second, so 10 000 characters is about 19 seconds against the 30-second
+# timeout. A larger tool result is refused, not served slowly; raise the
+# timeout and this has to rise with it. See gateway/tessera.example.toml for
+# the full arithmetic.
+max_tool_bytes = 10000
