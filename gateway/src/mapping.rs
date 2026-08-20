@@ -980,4 +980,11 @@ mod tests {
             Err(MappingError::TooLarge)
         ));
     }
+
+    #[test]
+    fn a_number_survives_replacement_with_its_type_intact() {
+        let document = json!({"count": 7, "nested": {"ratio": 1.5}});
+        let result = replace_text_leaves(&document, &[]).unwrap();
+        assert_eq!(result, document, "a number is looked at, never rewritten");
+    }
 }
