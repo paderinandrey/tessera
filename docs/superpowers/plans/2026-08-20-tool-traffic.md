@@ -703,7 +703,17 @@ Then, in `content_pointers`, teach the array arm the two tool block types before
 
 `tool_result.content` recurses through `content_pointers` itself, which is what makes a string result and a list of blocks one case rather than two — and what makes an image inside a result inherit the policy images already have.
 
-Finally, remove `"tools"`, `"tool_choice"` and `"tool_calls"` from `TOOL_FIELDS`, and delete the `reject_tool_fields(message, "anthropic")` call for messages. Update `TOOL_FIELDS`'s doc comment: it now lists what is still refused and why, which is OpenAI's `functions` and `function_call` until Task 5.
+Finally, the refusal list. **`TOOL_FIELDS` is shared by both providers**, so
+removing entries from it relaxes the refusal for OpenAI too — and OpenAI grows no
+slots until Task 5. That would leave an interval in which an OpenAI request
+carrying `tools` reaches the provider with its descriptions and schemas
+unmasked, which is raw egress and is not redeemed by a later task closing it.
+
+Make `reject_tool_fields` take its list as a parameter instead. OpenAI keeps all
+five fields until Task 5 removes its own; Anthropic keeps `functions` and
+`function_call`, which are OpenAI-shaped fields it should never see. Delete the
+`reject_tool_fields(message, "anthropic")` call for messages, and give each list
+a doc comment saying what it still refuses and why.
 
 - [ ] **Step 5: Teach `mask_all` the Json kind**
 
@@ -813,12 +823,19 @@ In `proxy.rs`, before the masking loop:
         })
         .map(|value| value.to_string().len())
         .sum();
-    if tool_bytes > limits.max_tool_bytes {
+    if tool_bytes > state.max_tool_bytes {
         return Err(ProxyError::ToolTooLarge);
     }
 ```
 
-Add `ToolTooLarge` to `ProxyError` with the same 4xx/5xx treatment its neighbours get — read how `ShapeError::Unsupported` is turned into a response and match it.
+`max_tool_bytes` reaches here through `AppState`, threaded from `Config` in
+`from_config` the way `max_spans_per_entry` reaches `DetectorClient` — it does
+not belong in `session::Limits`, which the session store owns.
+
+Add `ToolTooLarge` to `ProxyError` with the same 4xx/5xx treatment its
+neighbours get. It describes the client's own request, so it belongs with
+`ShapeError::Request` rather than with the gateway's own failures — and note
+that `status()` names every variant explicitly, so the compiler will ask.
 
 - [ ] **Step 8: Write the proxy round-trip test**
 
@@ -959,7 +976,10 @@ Expected: FAIL — tool fields still refused for OpenAI.
 
 In `OpenAi::request_pointers`: move `let mut pointers = Vec::new();` above the checks as Task 4 did for Anthropic, call `reject_streamed_tools`, walk `tools` with `tool_definition_slots(&format!("/tools/{index}/function"), function, "parameters", &mut pointers)`, and per message: describe `tool_calls[].function.arguments` as `Slot::Json { embedded: true }`, and treat a `role: "tool"` message's `content` through `content_pointers` exactly as any other message's.
 
-Delete the `tool_call_id` refusal — the id is dispatch and is now simply not described. Empty `TOOL_FIELDS` if nothing remains in it, and delete `reject_tool_fields` with it rather than leaving a function no caller uses.
+Delete the `tool_call_id` refusal — the id is dispatch and is now simply not
+described. Then remove OpenAI's own entries from its refusal list, which Task 4
+made per-provider; if that leaves a list with nothing in it, delete the list and
+its call rather than leaving an empty one that reads as deliberate.
 
 - [ ] **Step 4: Describe them in the response too**
 
