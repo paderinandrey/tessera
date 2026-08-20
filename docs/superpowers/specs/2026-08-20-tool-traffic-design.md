@@ -254,7 +254,8 @@ At the default timeout the ceiling lands near 10 KB, which passes ordinary agent
 traffic — a 200-line file read, `grep` output, a small edit, short `bash` output
 — and refuses a large file read or a whole-file write honestly.
 
-Making large results fast is its own work, with its own measurements: chunking
+Making large results fast is its own work, filed as issue #28, with its own
+measurements: chunking
 across replicas with overlap and offset arithmetic, where a span missed at a
 seam is raw egress; or the int8 and fp16 graphs that already sit beside the fp32
 one in the model directory, whose accuracy cost the evaluation gates can
@@ -348,4 +349,5 @@ telephone entity, so nothing detects it — in tool arguments or in ordinary tex
 See the numeric-leaf section; closing it is detection-quality work, like issue
 #20.
 
-**A large tool result is refused, not served slowly.** See **Latency**.
+**A large tool result is refused, not served slowly.** See **Latency**, and
+issue #28, which exists to raise this ceiling.
