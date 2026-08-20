@@ -29,6 +29,14 @@ half: `input_json_delta` can split a placeholder across deltas *and* land it
 inside a partially written JSON value, so the hold-back buffer cannot know the
 document is well formed until the block closes.
 
+**The cut has to be enforced, not merely intended.** `request_pointers` runs
+before `proxy.rs` looks at `stream`, so relaxing `TOOL_FIELDS` admits streamed
+tool requests as readily as buffered ones — and `stream_slots`, unchanged, would
+then reject the tool events *after* the upstream call, spending the caller's
+tokens to return a broken stream. So `stream: true` together with tool traffic
+is refused before the upstream call, explicitly, and that refusal is deleted by
+the second slice rather than by accident.
+
 Being honest about what this opens: an agent whose results are small works end
 to end after this slice, and one that reads a large file does not (see
 **Latency**). The category opens properly when this and the latency work have
@@ -68,15 +76,22 @@ masking code for Anthropic. It was rejected because OpenAI cannot be expressed
 that way at all, so the two providers would get two different mechanisms for
 one idea. Two places describing the same thing is how they drift.
 
-### Why masking needs a new function and restoration does not
+### Why restoration needs no new primitive, but does need the same seam
 
 `Mapping::restore_value` already walks a JSON document and restores every string
-leaf, leaving keys and structure alone. It was written for upstream envelopes.
-This slice adds its mirror, `mask_value`, and nothing else on that side.
+leaf, leaving keys and structure alone. It was written for upstream envelopes,
+so `Mapping` gains only `mask_value`, its mirror, and nothing else.
 
-Restoration needs no new code even for OpenAI: a placeholder inside a string
-holding a document is ordinary text, and `restore` finds it there without
-parsing anything.
+The interface around it is a different question, and an earlier draft of this
+document got it wrong by checking only `Mapping`. The buffered response loop
+iterates `response_pointers` and calls `read_pointer`, which accepts a JSON
+string and nothing else — `tool_use.input` is an object and would fail there.
+So `response_pointers` returns `Slot` exactly as `request_pointers` does, and
+the loop dispatches on the kind: `Text` through `restore`, `Json` through
+`restore_value`.
+
+OpenAI needs no parsing on this side even so: a placeholder inside a string
+holding a document is ordinary text, and `restore` finds it there.
 
 ### Why the walk needs a depth bound now, when it never did before
 
@@ -92,19 +107,31 @@ is a document whose values were not examined.
 
 ### Why a number that looks like a phone number is refused rather than masked
 
-A JSON leaf can be a number, and a phone number, an insurance number or an IBAN
-without separators is a plausible number. The leaf walk masks strings, so those
-would pass untouched.
+A JSON leaf can be a number, and a credit card, a German tax ID or a French NIR
+is digits alone. The leaf walk masks strings, so those would pass untouched.
 
-Replacing one with `[PHONE_1]` changes the leaf's type, and a tool schema that
-declared a number may reject a string — or the model, seeing a string where the
-schema promised a number, answers with one, and restoration then hands the
+Replacing one with `[CREDIT_CARD_1]` changes the leaf's type, and a tool schema
+that declared a number may reject a string — or the model, seeing a string where
+the schema promised a number, answers with one, and restoration then hands the
 client the wrong type.
 
 Numeric leaves are therefore rendered as text, detected, and the request is
-refused when a span is found. Types stay as the client wrote them, nothing
-unmasked leaves, and the cost is stated plainly: an agent sending personal data
-as a JSON number gets a refusal with no way around it.
+refused when a span is found. Types stay as the client wrote them, and the cost
+is stated plainly: an agent sending a card number as a JSON number gets a
+refusal with no way around it.
+
+**What this does not cover, since an earlier draft of this document claimed
+otherwise.** The refusal is only as wide as the vocabulary, and `ENTITY_TYPES`
+has no telephone entity — neither catalog defines one. A phone number as a JSON
+number is not detected and is forwarded, exactly as a phone number in ordinary
+chat text is today. That is a gap in detection coverage rather than in this
+slice, and it is not closed here.
+
+Refusing every numeric leaf above some digit length was considered and rejected:
+a Unix timestamp is ten digits and a byte offset can be any length, so an agent's
+ordinary arguments would be refused constantly. Refusing by key name — `phone`,
+`ssn` — was rejected for the reason this codebase has learned four times over: a
+hand-written list of what matters is wrong the day someone adds to it.
 
 ### Why tool definitions are masked like anything else
 
@@ -159,16 +186,28 @@ loses the fields this slice masks; what remains refused stays refused.
 
 ### What is masked, by provider
 
-**Anthropic.** `tools[].description` and every `description` inside
-`input_schema`; `tool_use.input` as `Json`; `tool_result.content` as text when it
-is a string and as content blocks when it is a list.
+A schema is walked as a `Json` slot like everything else, rather than by naming
+the keywords that carry prose. An earlier draft named `description` alone, which
+would have forwarded `default`, `const`, `enum`, `examples`, `title` and
+`$comment` untouched — every one of them a client-controlled string. Naming what
+to scan is the mistake this codebase has now made four times; the walk scans
+every string value and the exclusions are named instead.
 
-**OpenAI.** `tools[].function.description` and every `description` inside
-`parameters`; `tool_calls[].function.arguments` as `Json { embedded: true }`;
-messages with role `tool` as ordinary text.
+**Anthropic.** `tools[].description` and `input_schema` as a whole;
+`tool_use.input` as `Json`; `tool_result.content` as text when it is a string and
+as content blocks when it is a list.
 
-Untouched on both: tool names, schema property names, `tool_call_id`,
-`tool_choice`'s selector.
+**OpenAI.** `tools[].function.description` and `parameters` as a whole;
+`tool_calls[].function.arguments` as `Json { embedded: true }`; messages with
+role `tool` as ordinary text.
+
+**Excluded, each because it is dispatch rather than prose:** tool names, schema
+property names, `tool_call_id`, and `tool_choice`'s selector. Keys are never
+masked by construction — the walk touches values only — so property names need
+no special handling; the others are values and are excluded by name, which is a
+list, and is therefore written next to the reason it is allowed to be one: these
+four are matched by the *client* against strings it authored, so masking one
+breaks dispatch rather than protecting anything.
 
 ### Restoration
 
@@ -176,10 +215,18 @@ Untouched on both: tool names, schema property names, `tool_call_id`,
 response reaches the client, because the client *executes* them. This is the
 one place in the gateway where a restoration failure is not a display problem.
 
-A placeholder the model invented, which the mapping never issued, is left as
-written — `restore`'s existing behaviour. The client receives a literal
-`[PERSON_9]` and its tool most likely errors. That is a wrong action rather than
-a leak, and it is recorded under **Known limits** rather than defended against.
+A placeholder the model invented, which the mapping never issued, does **not**
+reach the client: `Mapping::restore` returns `MappingError::Unknown` for a
+placeholder-shaped token it cannot resolve, and the response is refused. An
+earlier draft of this document asserted the opposite without reading the
+function, and the truth is the better behaviour — a literal `[PERSON_9]` handed
+to a client's tool would be a wrong action taken on the gateway's authority.
+
+The cost is real and belongs in **Known limits**: a model that hallucinates a
+placeholder costs the caller the whole response, after the upstream tokens are
+spent. Tool arguments make that more likely than prose does, because a model
+copying an identifier between fields can copy a placeholder into one the mapping
+never issued.
 
 ## Latency
 
@@ -191,10 +238,21 @@ across cores — 50 KB costs roughly 850 CPU-seconds, about 92 seconds of
 wall-clock on nine cores. `detector_timeout_secs` defaults to 30. So a `Read` of
 a 1500-line file is a 503, and no amount of tool-field support changes that.
 
-This slice answers it by bounding rather than by accelerating: a tool result
-above a configured size is refused. At the default timeout the ceiling lands
-near 10 KB, which passes ordinary agent traffic — a 200-line file read, `grep`
-output, an edit, short `bash` output — and refuses a large file read honestly.
+This slice answers it by bounding rather than by accelerating: the tool
+structures newly scanned in a request are refused past a configured size, in
+aggregate. **Arguments count, not only results** — `Write` and `Edit` carry
+whole file contents in their arguments, and an earlier draft bounded results
+alone, which would have left the larger half open.
+
+Arguments are the sharper case for a reason worth stating: a tool call the model
+produced is restored to real values and echoed back by the client in the next
+turn's history, and that text has never been detected — the cache holds the
+masked request text, not the restored response. So a large generated argument is
+first-seen on the following request, which is exactly when the timeout bites.
+
+At the default timeout the ceiling lands near 10 KB, which passes ordinary agent
+traffic — a 200-line file read, `grep` output, a small edit, short `bash` output
+— and refuses a large file read or a whole-file write honestly.
 
 Making large results fast is its own work, with its own measurements: chunking
 across replicas with overlap and offset arithmetic, where a span missed at a
@@ -211,15 +269,21 @@ already in place.
 
 Every failure is a refusal, and the vocabulary is the existing one. A document
 past the depth or node bound, a numeric leaf carrying a detected span, a content
-block whose shape this gateway does not understand, and a tool result over the
-size bound are all refused before the upstream call.
+block whose shape this gateway does not understand, tool structures summing past
+the size bound, and tool traffic arriving with `stream: true` are all refused
+before the upstream call.
+
+Refusing *before* it is the whole point in each case: every one of these is
+knowable from the request alone, and a refusal issued after the upstream call
+costs the caller tokens for an answer they will not receive.
 
 Nothing here degrades. A partially masked argument is worse than no answer,
 because the client would execute it.
 
 ## Configuration
 
-One key, `max_tool_result_bytes`, defaulting to **10 000**. The arithmetic is
+One key, `max_tool_bytes`, defaulting to **10 000**, applied to the sum of the
+tool structures a request newly scans rather than to any one of them. The arithmetic is
 the point rather than the number: at 59 characters per CPU-second across nine
 cores, roughly 530 characters clear per wall-clock second, so 10 000 characters
 is about 19 seconds against a 30-second `detector_timeout_secs` — inside it with
@@ -250,9 +314,14 @@ fail:
 5. A document past the depth bound refuses rather than recursing.
 6. A tool call restored for the client carries the original values, not
    placeholders.
-7. A tool result over the size bound refuses before the upstream call.
-8. The journal's counts include spans found in tool traffic, and record no key
+7. A tool result over the size bound refuses before the upstream call, and so
+   does a tool argument, and so does the two of them summing past it.
+8. A request carrying both `stream: true` and tool traffic refuses before the
+   upstream call.
+9. The journal's counts include spans found in tool traffic, and record no key
    name and no argument value.
+10. A schema keyword that is not `description` — `enum`, `default`, `title` —
+    has its values masked like any other string.
 
 Store mechanics are unit tests in `mapping.rs`; provider shapes are unit tests
 in `provider.rs`; the round trip goes through `wiremock` in `proxy.rs` against a
@@ -272,6 +341,11 @@ Claude Code uses extended thinking routinely, so an agent with it enabled is
 refused after this slice as before it. That is a separate problem with its own
 hard trade-off, and folding it in here would hide it.
 
-**A hallucinated placeholder reaches the client's tool.** See **Restoration**.
+**A hallucinated placeholder costs the whole response.** See **Restoration**.
+
+**A phone number sent as a JSON number is forwarded.** The vocabulary has no
+telephone entity, so nothing detects it — in tool arguments or in ordinary text.
+See the numeric-leaf section; closing it is detection-quality work, like issue
+#20.
 
 **A large tool result is refused, not served slowly.** See **Latency**.
