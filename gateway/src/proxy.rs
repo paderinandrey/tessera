@@ -15,8 +15,8 @@ use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping;
 use crate::mapping::{Mapping, MappingError, Span};
 use crate::provider::{
-    read_document, read_pointer, write_document, write_pointer, Anthropic, OpenAi, Provider,
-    ShapeError, Slot,
+    as_response_error, read_document, read_pointer, write_document, write_pointer, Anthropic,
+    OpenAi, Provider, ShapeError, Slot,
 };
 use crate::session::{key_from, Limits, SessionError, SessionStore};
 
@@ -573,8 +573,19 @@ async fn handle(
         serde_json::from_slice(&raw).map_err(|error| ProxyError::Upstream(error.to_string()))?;
 
     // Restore, and refuse rather than hand a placeholder to the client.
+    //
+    // Every shape failure from here down is re-blamed by `as_response_error`.
+    // The functions doing the reading are shared with the request path, where
+    // an unreadable shape is the caller's mistake and 400 is the answer; on the
+    // way back the same failure is the upstream's. A model emitting truncated
+    // `arguments` is the live case — models do it — and without this the caller
+    // would be told the request they sent was malformed and would go looking
+    // for it there forever.
     let mut restored = upstream.clone();
-    for slot in provider.response_pointers(&upstream)? {
+    for slot in provider
+        .response_pointers(&upstream)
+        .map_err(as_response_error)?
+    {
         match slot {
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(&upstream, &pointer)?;
@@ -586,7 +597,8 @@ async fn handle(
             Slot::Json {
                 pointer, embedded, ..
             } => {
-                let document = read_document(&upstream, &pointer, embedded, provider.name())?;
+                let document = read_document(&upstream, &pointer, embedded, provider.name())
+                    .map_err(as_response_error)?;
                 let restored_document = mapping.restore_value(&document)?;
                 write_document(&mut restored, &pointer, &restored_document, embedded)?;
             }
@@ -688,7 +700,7 @@ mod tests {
     const UNCAPPED: usize = usize::MAX;
     /// The production default, so tests exercise the bound callers get rather
     /// than one chosen to make a test convenient.
-    const TEST_MAX_TOOL_CHARS: usize = 20_000;
+    const TEST_MAX_TOOL_CHARS: usize = 18_000;
     const TEST_MAX_TOOL_LEAVES: usize = 160;
 
     fn person_span() -> Value {
@@ -1162,6 +1174,325 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_openai_tool_call_is_masked_going_up_and_restored_coming_back() {
+        // The whole of OpenAI's difference from Anthropic in one body: the
+        // arguments are a *string* holding a document, so the masker has to
+        // parse it, mask its leaves and write the string back — and the
+        // restoration has to undo exactly that, because the client parses the
+        // string and executes what it finds.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "t1", "type": "function", "function": {
+                    "name": "read_file", "arguments": "{\"path\":\"/home/[PERSON_1]\"}"}}]
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "gpt",
+                "tools": [{"type": "function", "function": {
+                    "name": "read_file",
+                    "description": "Weber wrote this file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+                }}],
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "t1", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"who\":\"Weber\"}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "t1", "content": "Weber"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+
+        let sent = sent_to(&upstream).await;
+        let arguments = sent["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments reach the upstream as a string, not as a document");
+        assert_eq!(
+            arguments, r#"{"who":"[PERSON_1]"}"#,
+            "the document inside the string is masked and the string is still a string"
+        );
+        assert_eq!(
+            sent["tools"][0]["function"]["description"], "[PERSON_1] wrote this file",
+            "a definition's prose is text like any other: {sent}"
+        );
+        assert_eq!(
+            sent["messages"][1]["content"], "[PERSON_1]",
+            "a tool message's content is a result and is masked: {sent}"
+        );
+        assert_eq!(
+            sent["messages"][1]["tool_call_id"], "t1",
+            "the id pairs the result with its call and is never masked: {sent}"
+        );
+        assert_eq!(
+            sent["messages"][0]["tool_calls"][0]["function"]["name"], "read_file",
+            "the function name is dispatch: {sent}"
+        );
+
+        let returned: Value = serde_json::from_str(&returned).expect("a JSON body");
+        assert_eq!(
+            returned["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"/home/Weber"}"#,
+            "the client executes this, so it has to be the real value"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_dispatch_survives_even_when_it_looks_like_a_value() {
+        // Every identifier here carries the detector's own trigger word, so a
+        // slot describing any of them would visibly rewrite it. That is the
+        // whole point: with ordinary ids like `t1` the detector finds nothing,
+        // masking one is a no-op, and an assertion that the id survived passes
+        // whether or not the id is described. This one cannot.
+        //
+        // What each of them is: `tool_call_id` pairs a result with the call it
+        // answers, the call's `id` is what that pairs against, and both `name`s
+        // say which function to run. Masked, the request still parses, the
+        // provider still answers, and the client executes a call addressed to
+        // nothing — a break with no error attached to it anywhere.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "gpt",
+                "tools": [{"type": "function", "function": {
+                    "name": "Weber_read_file", "parameters": {}}}],
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "Weber-call-1", "type": "function",
+                        "function": {"name": "Weber_read_file", "arguments": "{}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "Weber-call-1", "content": "ok"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sent = sent_to(&upstream).await;
+        assert_eq!(
+            sent["tools"][0]["function"]["name"], "Weber_read_file",
+            "a tool's name is dispatch: {sent}"
+        );
+        assert_eq!(
+            sent["messages"][0]["tool_calls"][0]["id"], "Weber-call-1",
+            "a call's id is dispatch: {sent}"
+        );
+        assert_eq!(
+            sent["messages"][0]["tool_calls"][0]["function"]["name"], "Weber_read_file",
+            "the called function's name is dispatch: {sent}"
+        );
+        assert_eq!(
+            sent["messages"][1]["tool_call_id"], "Weber-call-1",
+            "the id a result answers to is dispatch: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_openai_arguments_key_is_never_masked_even_when_it_looks_like_a_value() {
+        // Key and value are the same string, so nothing but the keys-are-not-
+        // values rule can tell them apart. Through an embedded document the
+        // rule has one more chance to go wrong: the string is parsed and
+        // rebuilt, so a walk that yielded keys would write them back masked.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "gpt",
+                "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"Weber\":\"Weber\"}"}
+                }]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sent = sent_to(&upstream).await;
+        let arguments: Value = serde_json::from_str(
+            sent["messages"][0]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("a string"),
+        )
+        .expect("the arguments still parse");
+        assert_eq!(
+            arguments["Weber"], "[PERSON_1]",
+            "the value must be masked: {arguments}"
+        );
+        assert!(
+            arguments.get("Weber").is_some(),
+            "the key the tool reads its argument from must survive: {arguments}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_openai_tool_message_counts_against_both_tool_bounds() {
+        // A `role: "tool"` message is the OpenAI shape of a result, and results
+        // are the largest surface this slice opens — a coding agent's file
+        // reads arrive in one. Charged against neither bound they would be
+        // limited only by axum's 2 MB body default.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "tool", "tool_call_id": "t1",
+                 "content": "x".repeat(TEST_MAX_TOOL_CHARS + 1)}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("more text than"),
+            "refused by the text bound: {body}"
+        );
+
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let messages: Vec<Value> = (0..(TEST_MAX_TOOL_LEAVES + 1))
+            .map(|n| json!({"role": "tool", "tool_call_id": format!("t{n}"), "content": "ok"}))
+            .collect();
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": messages}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("separate strings"),
+            "refused by the leaf bound rather than the text bound: {body}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "neither refusal may cost the caller an upstream call"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_openai_prompt_text_is_not_counted_against_the_tool_bounds() {
+        // The other half of the bound: it must charge tool traffic and nothing
+        // else, or a bound that refused every long conversation would satisfy
+        // the test above.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "x".repeat(TEST_MAX_TOOL_CHARS + 1)}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn arguments_that_are_not_json_are_the_callers_mistake_going_up() {
+        // Models emit truncated `arguments`, and a client echoes the turn back
+        // verbatim on the next request — so on the way up this is the caller's
+        // to fix, and 400 says so.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({"choices": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"path\": \"/home/we"}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(journal(&path)[0]["error"], "tool_arguments_malformed");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the refusal must cost the caller nothing upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn arguments_that_are_not_json_are_the_upstreams_mistake_coming_back() {
+        // The same failure in the other direction, and the same 400 would be a
+        // lie: the caller sent nothing wrong, the model wrote arguments that do
+        // not parse, and a client told to fix its request would look for a
+        // defect that is not there. `read_document` takes one provider name and
+        // cannot tell the directions apart, so the response loop is where the
+        // blame is set.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "t1", "type": "function", "function": {
+                    "name": "f", "arguments": "{\"path\": \"/home/we"}}]
+            }}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hallo"}]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a malformed response is not the caller's mistake: {body}"
+        );
+        let lines = journal(&path);
+        assert_eq!(
+            lines[lines.len() - 1]["error"],
+            "shape_response",
+            "and the journal must not record it as the caller's either: {:?}",
+            lines
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_shape_this_gateway_cannot_read_is_not_the_callers_mistake_either() {
+        // The same re-blaming, one step earlier: `response_pointers` reads the
+        // upstream body with the allowlists and the content dispatch that were
+        // written for the request path, and every refusal they raise is a 400
+        // by `status()`'s own rule. A tool call the gateway cannot account for
+        // is the upstream's doing.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "t1", "type": "function", "notes": "new field",
+                                "function": {"name": "f", "arguments": "{}"}}]
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hallo"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    }
+
+    #[tokio::test]
     async fn a_tool_schemas_nested_prose_is_masked_and_its_property_names_are_not() {
         // The schema goes in whole, so a string the gateway was never told to
         // look for — a `default`, here — is reached anyway. Its property name
@@ -1257,11 +1588,11 @@ mod tests {
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let properties: serde_json::Map<String, Value> = (0..155)
+        let properties: serde_json::Map<String, Value> = (0..150)
             .map(|n| {
                 (
                     format!("parameter_{n:03}"),
-                    json!({"type": "string", "description": "y".repeat(100)}),
+                    json!({"type": "string", "description": "y".repeat(70)}),
                 )
             })
             .collect();
@@ -1275,12 +1606,10 @@ mod tests {
             "messages": [{"role": "user", "content": "hallo"}]
         });
 
-        // 155 descriptions of 100 characters, plus the tool's own one-character
-        // description: 15 501 characters of text against a 20 000 bound, and
-        // well past it once the punctuation around them is charged too. The
-        // count stays under `max_tool_leaves` so that only the text/serialized
-        // distinction can decide the verdict.
-        let text: usize = 155 * 100 + 1;
+        // 150 descriptions of 70 characters, plus the tool's own one-character
+        // description: 10 501 characters of text against an 18 000 bound, and
+        // well past it once the punctuation around them is charged too.
+        let text: usize = 150 * 70 + 1;
         assert!(text < TEST_MAX_TOOL_CHARS, "{text} characters of text");
         let serialized = body["tools"][0]["input_schema"].to_string().len();
         assert!(

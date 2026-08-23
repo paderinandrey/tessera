@@ -136,25 +136,33 @@ const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "a
 /// strings past the masker — the same silence-is-a-leak shape as an
 /// unrecognized content part.
 ///
-/// Per provider, because the two are relaxed one slice at a time. OpenAI's is
-/// still the whole set until its own slice describes them; sharing one list
-/// would have relaxed OpenAI's refusal here, where nothing yet produces a slot
-/// to replace it.
+/// Per provider, because the two are relaxed one slice at a time, and per
+/// *level*, because a field is only described where the protocol puts it.
+/// `tools` is described on the body and is undefined on a message; `tool_calls`
+/// is described on a message and is undefined on the body. Each one therefore
+/// stays refused at the level it did not move at: relaxing both lists together
+/// would have left a `tools` smuggled onto a message carrying its descriptions
+/// and schemas straight past the masker, and a `tool_calls` on the body
+/// carrying its arguments.
+///
+/// What both OpenAI lists keep is `functions` and `function_call`, the
+/// deprecated shape of all of this. Nothing here produces a slot for either —
+/// `functions` holds descriptions and schemas, and an assistant message's
+/// `function_call` holds `arguments` — so both are refused rather than becoming
+/// fields that are silently forwarded. `tool_choice` is deliberately absent
+/// from the body list: OpenAI defines it there, and it holds a function's name,
+/// which is dispatch and is therefore left alone rather than masked or refused.
+/// It stays on the message list because OpenAI does not define it there.
 ///
 /// Anthropic's tool traffic is described now, so what is left on its list is
 /// the three fields Anthropic's API does not define at all. They are still
 /// refused rather than ignored: a field no slot addresses is forwarded exactly
 /// as it came, so `tool_calls` smuggled into an Anthropic body would carry its
-/// arguments past the masker. `tool_choice` is deliberately absent — Anthropic
-/// does define it, and it holds a tool's name, which is dispatch and is
-/// therefore left alone rather than masked or refused.
-const OPENAI_TOOL_FIELDS: [&str; 5] = [
-    "tools",
-    "tool_choice",
-    "functions",
-    "function_call",
-    "tool_calls",
-];
+/// arguments past the masker. `tool_choice` is deliberately absent for the same
+/// reason as OpenAI's.
+const OPENAI_BODY_TOOL_FIELDS: [&str; 3] = ["functions", "function_call", "tool_calls"];
+const OPENAI_MESSAGE_TOOL_FIELDS: [&str; 4] =
+    ["functions", "function_call", "tools", "tool_choice"];
 const ANTHROPIC_TOOL_FIELDS: [&str; 4] = [
     "functions",
     "function_call",
@@ -166,11 +174,22 @@ const ANTHROPIC_TOOL_FIELDS: [&str; 4] = [
     "mcp_servers",
 ];
 
-/// Every message must be an object carrying `content`. A bare string entry, or
-/// an object without content, produced no pointer and was forwarded untouched —
-/// the same silence-is-a-leak shape as the others.
-fn require_scannable_message(message: &Value, provider: &'static str) -> Result<(), ShapeError> {
-    if !message.is_object() || message.get("content").is_none() {
+/// Every message must be an object carrying something this gateway describes.
+/// A bare string entry, or an object with none of the carriers, produced no
+/// pointer and was forwarded untouched — the same silence-is-a-leak shape as
+/// the others.
+///
+/// `carriers` is per provider because what a message may carry instead of
+/// `content` is: an OpenAI assistant turn may hold `tool_calls` and no content
+/// at all, and describing those is what makes such a message scannable. A
+/// shared list would have relaxed the rule for a provider that describes no
+/// such field.
+fn require_scannable_message(
+    message: &Value,
+    carriers: &[&str],
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    if !message.is_object() || !carriers.iter().any(|field| message.get(field).is_some()) {
         return Err(ShapeError::Request(provider));
     }
     Ok(())
@@ -232,6 +251,71 @@ const ANTHROPIC_TOOL_DEFINITION_FIELDS: [&str; 5] = [
     "cache_control",
 ];
 
+/// OpenAI wraps a definition: `{"type": "function", "function": {...}}`. The
+/// wrapper is checked as its own object because a field beside `function` — a
+/// vendor extension, a `custom` payload — would otherwise travel exactly as it
+/// came. `strict` on the inner object is a boolean and carries nothing of the
+/// caller's; `name` is dispatch.
+const OPENAI_TOOL_WRAPPER_FIELDS: [&str; 2] = ["type", "function"];
+const OPENAI_TOOL_DEFINITION_FIELDS: [&str; 4] = ["name", "description", "parameters", "strict"];
+
+/// A tool call the client echoes back, and the function inside it. The
+/// arguments live here, so a field beside them is the one place an added key
+/// walks a document past the masker. `id`, `type` and `name` are dispatch.
+const OPENAI_TOOL_CALL_FIELDS: [&str; 3] = ["id", "type", "function"];
+const OPENAI_TOOL_CALL_FUNCTION_FIELDS: [&str; 2] = ["name", "arguments"];
+
+/// A `role: "tool"` message is OpenAI's shape of a tool result, and OpenAI
+/// defines exactly these three fields on it. `name` is deliberately absent:
+/// OpenAI does not define it here, and the two ways of treating it are both
+/// silent — described, it is masked, and if the client meant the function's
+/// name the call it answers is broken with no way to learn why. Refusing costs
+/// nothing that worked before this slice, since the whole message was refused
+/// for its `tool_call_id`.
+const OPENAI_TOOL_MESSAGE_FIELDS: [&str; 3] = ["role", "content", "tool_call_id"];
+
+/// An object every field of which this gateway can account for. A field outside
+/// the list is refused rather than forwarded, because a field no slot addresses
+/// travels to the provider exactly as it came — which is the whole reason any
+/// of these lists are allowlists rather than denylists.
+fn known_fields(
+    value: &Value,
+    allowed: &[&'static str],
+    what: &'static str,
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    // Not an object means no fields to describe and a value that would travel
+    // whole: `"tools": ["Martina Weber"]` produced no slot and no refusal.
+    let fields = value.as_object().ok_or(ShapeError::Request(provider))?;
+    for key in fields.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(ShapeError::Unsupported(provider, what));
+        }
+    }
+    Ok(())
+}
+
+/// The same shape failure, re-blamed at the response.
+///
+/// `content_pointers`, `read_document` and the field allowlists are all written
+/// for the request path, where an unreadable shape is the caller's mistake and
+/// 400 is the honest answer. Reading the *upstream's* body with them would tell
+/// a caller they got wrong something they never sent — a model emitting
+/// truncated `arguments` is the upstream's doing, and `status()` maps every one
+/// of these variants to 400 on the stated rule that they are the caller's. This
+/// keeps that rule true by not letting any of them escape from the response
+/// path in the first place.
+pub fn as_response_error(error: ShapeError) -> ShapeError {
+    match error {
+        ShapeError::Request(provider)
+        | ShapeError::Unsupported(provider, _)
+        | ShapeError::MalformedDocument(provider, _) => ShapeError::Response(provider),
+        // A pointer addressing nothing is this gateway describing a location
+        // that does not exist, which is ours and is already a 502.
+        other => other,
+    }
+}
+
 /// A tool definition's prose and its schema. The schema goes in whole rather
 /// than by naming the keywords that carry text: `description` is not the only
 /// one — `default`, `const`, `enum`, `examples`, `title` and `$comment` are all
@@ -247,17 +331,7 @@ fn tool_definition_slots(
     provider: &'static str,
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
-    // A definition that is not an object has no fields to describe and would
-    // travel whole: `"tools": ["Martina Weber"]` produced no slot and no
-    // refusal.
-    let fields = definition
-        .as_object()
-        .ok_or(ShapeError::Request(provider))?;
-    for key in fields.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(ShapeError::Unsupported(provider, "tool definition field"));
-        }
-    }
+    known_fields(definition, allowed, "tool definition field", provider)?;
     // Present but not a string cannot be masked, so it is refused rather than
     // forwarded as it is — the rule `identifier_pointer` already applies to
     // `/user` and `/name`, which this once did not.
@@ -284,6 +358,62 @@ fn tool_definition_slots(
             embedded: false,
             shape: Shape::Schema,
         });
+    }
+    Ok(())
+}
+
+/// The arguments of every call in a `tool_calls` array, wherever it sits — an
+/// assistant message the client echoes back, or a choice in the response. Both
+/// directions read the same shape, so both read it here.
+///
+/// `arguments` is a **string holding a document**, which is the whole of the
+/// difference from Anthropic's `input` and is carried by `embedded`. One
+/// consequence is client-visible and is intended rather than incidental:
+/// masking parses the string and re-serializes it, and this crate's
+/// `serde_json::Map` is a `BTreeMap` with no `preserve_order`, so the arguments
+/// that reach the provider carry the same keys in alphabetical order. JSON
+/// objects are unordered and a client parses rather than compares, so nothing
+/// breaks — but somebody debugging changed argument bytes should find it
+/// written down. `an_embedded_document_round_trips_through_read_and_write`
+/// pins it.
+fn tool_call_slots(
+    prefix: &str,
+    calls: &Value,
+    provider: &'static str,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    let calls = calls.as_array().ok_or(ShapeError::Request(provider))?;
+    for (index, call) in calls.iter().enumerate() {
+        known_fields(call, &OPENAI_TOOL_CALL_FIELDS, "tool call field", provider)?;
+        // A custom tool call carries `custom: {name, input}`, where `input` is
+        // a raw string in whatever grammar the tool declared — not JSON, and
+        // not something any slot here describes. The allowlist above already
+        // refuses it for its `custom` field; this refuses the type itself, so
+        // a call that declares one and carries nothing is refused too rather
+        // than passing as a call with no arguments.
+        if call.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(ShapeError::Unsupported(provider, "tool call type"));
+        }
+        let function = call.get("function").ok_or(ShapeError::Request(provider))?;
+        known_fields(
+            function,
+            &OPENAI_TOOL_CALL_FUNCTION_FIELDS,
+            "tool call field",
+            provider,
+        )?;
+        // `name` is dispatch. Absent or null arguments is a call with none;
+        // present but unreadable is `read_document`'s answer to give, since it
+        // is the one that knows whether the string parses.
+        if function
+            .get("arguments")
+            .is_some_and(|value| !value.is_null())
+        {
+            out.push(Slot::Json {
+                pointer: format!("{prefix}/{index}/function/arguments"),
+                embedded: true,
+                shape: Shape::Instance,
+            });
+        }
     }
     Ok(())
 }
@@ -469,7 +599,7 @@ impl Provider for OpenAi {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
-        reject_tool_fields(body, &OPENAI_TOOL_FIELDS, "openai")?;
+        reject_tool_fields(body, &OPENAI_BODY_TOOL_FIELDS, "openai")?;
         // With logprobs on, every choice carries the model's output again as
         // token strings under `logprobs`. Those are the masked tokens: joined
         // back together they spell the placeholder, and their probabilities
@@ -512,11 +642,49 @@ impl Provider for OpenAi {
         // forwarding them verbatim would leak exactly what the proxy exists to
         // stop.
         identifier_pointer(body, "/user", "/user".to_owned(), "openai", &mut pointers)?;
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use tools — the same reading `logprobs` and `audio` already get.
+        if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
+            let tools = tools.as_array().ok_or(ShapeError::Request("openai"))?;
+            for (index, tool) in tools.iter().enumerate() {
+                known_fields(
+                    tool,
+                    &OPENAI_TOOL_WRAPPER_FIELDS,
+                    "tool definition field",
+                    "openai",
+                )?;
+                // A wrapper that does not declare itself a function is a tool
+                // kind described nowhere here — a custom tool's `custom` object
+                // carries its own `description` and grammar.
+                if tool.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err(ShapeError::Unsupported("openai", "tool type"));
+                }
+                let function = tool.get("function").ok_or(ShapeError::Request("openai"))?;
+                tool_definition_slots(
+                    &format!("/tools/{index}/function"),
+                    function,
+                    "parameters",
+                    &OPENAI_TOOL_DEFINITION_FIELDS,
+                    "openai",
+                    &mut pointers,
+                )?;
+            }
+        }
         for (index, message) in messages.iter().enumerate() {
-            require_scannable_message(message, "openai")?;
-            reject_tool_fields(message, &OPENAI_TOOL_FIELDS, "openai")?;
-            if message.get("tool_call_id").is_some() {
-                return Err(ShapeError::Unsupported("openai", "tool_call_id"));
+            require_scannable_message(message, &["content", "tool_calls"], "openai")?;
+            reject_tool_fields(message, &OPENAI_MESSAGE_TOOL_FIELDS, "openai")?;
+            // A `role: "tool"` message is a tool result and nothing else, so it
+            // gets the allowlist a result deserves. Checked before anything is
+            // described, so the message is refused for what it carries as
+            // readily as for what it is.
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            if role == "tool" {
+                known_fields(
+                    message,
+                    &OPENAI_TOOL_MESSAGE_FIELDS,
+                    "tool message field",
+                    "openai",
+                )?;
             }
             identifier_pointer(
                 message,
@@ -525,15 +693,45 @@ impl Provider for OpenAi {
                 "openai",
                 &mut pointers,
             )?;
-            if let Some(content) = message.get("content") {
+            // Null content is an assistant turn that carried tool calls
+            // instead: the provider writes it that way and clients echo it
+            // back, so reading it as an unreadable content shape refused the
+            // commonest tool body there is.
+            if let Some(content) = message.get("content").filter(|value| !value.is_null()) {
+                let from = pointers.len();
                 content_pointers(
                     &format!("/messages/{index}/content"),
                     content,
                     "openai",
                     &mut pointers,
                 )?;
+                // A tool message's content is a tool result — the OpenAI shape
+                // of what Anthropic sends as a `tool_result` block — so it is
+                // charged against the tool bounds like one. Unmarked it would
+                // be counted by neither: a coding agent's file reads arrive
+                // here, and they are the largest surface this slice opens.
+                if role == "tool" {
+                    for slot in &mut pointers[from..] {
+                        if let Slot::Text { tool, .. } = slot {
+                            *tool = true;
+                        }
+                    }
+                }
+            }
+            if let Some(calls) = message.get("tool_calls").filter(|value| !value.is_null()) {
+                tool_call_slots(
+                    &format!("/messages/{index}/tool_calls"),
+                    calls,
+                    "openai",
+                    &mut pointers,
+                )?;
             }
         }
+        // Last, because the slots are the answer: a definition, a call's
+        // arguments and a result each say they are tool traffic, so a
+        // continuation carrying only history is covered without asking for a
+        // top-level `tools` that a continuation need not repeat.
+        reject_streamed_tools(body, &pointers, "openai")?;
         Ok(pointers)
     }
 
@@ -544,10 +742,28 @@ impl Provider for OpenAi {
             .ok_or(ShapeError::Response("openai"))?;
         let mut pointers = Vec::new();
         for (index, choice) in choices.iter().enumerate() {
-            if let Some(content) = choice.pointer("/message/content") {
+            // Null content is what the provider writes beside `tool_calls`.
+            if let Some(content) = choice
+                .pointer("/message/content")
+                .filter(|value| !value.is_null())
+            {
                 content_pointers(
                     &format!("/choices/{index}/message/content"),
                     content,
+                    "openai",
+                    &mut pointers,
+                )?;
+            }
+            // The arguments the client is about to execute. Left undescribed
+            // they reach it holding the placeholders we issued, and it opens
+            // `/home/[PERSON_1]/notes.txt`.
+            if let Some(calls) = choice
+                .pointer("/message/tool_calls")
+                .filter(|value| !value.is_null())
+            {
+                tool_call_slots(
+                    &format!("/choices/{index}/message/tool_calls"),
+                    calls,
                     "openai",
                     &mut pointers,
                 )?;
@@ -702,7 +918,7 @@ impl Provider for Anthropic {
             content_pointers("/system", system, "anthropic", &mut pointers)?;
         }
         for (index, message) in messages.iter().enumerate() {
-            require_scannable_message(message, "anthropic")?;
+            require_scannable_message(message, &["content"], "anthropic")?;
             reject_tool_fields(message, &ANTHROPIC_TOOL_FIELDS, "anthropic")?;
             if let Some(content) = message.get("content") {
                 content_pointers(
@@ -1578,21 +1794,427 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openai_tool_bearing_requests_are_refused() {
-        // Masking OpenAI's tool arguments is a later slice, and nothing here
-        // produces a slot for them yet; until then a request that uses them is
-        // refused rather than forwarded past the masker. Anthropic is
-        // deliberately absent — its tool traffic is described now, and the
-        // tests above assert where.
-        let with_tools = json!({"messages": [{"role": "user", "content": "Hi"}],
-                                "tools": [{"type": "function"}]});
-        assert!(OpenAi.request_pointers(&with_tools).is_err());
+    fn embedded(pointer: &str) -> Slot {
+        Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: true,
+            shape: Shape::Instance,
+        }
+    }
 
-        let with_calls = json!({"messages": [
-            {"role": "assistant", "tool_calls": [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}
+    #[test]
+    fn openai_describes_definitions_and_arguments_and_tool_messages() {
+        let body = json!({
+            "model": "gpt",
+            "tools": [{"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read a file for Dr. Weber",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }}],
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/home/weber\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "t1", "content": "Martina Weber"}
+            ]
+        });
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                tool_text("/tools/0/function/description"),
+                schema("/tools/0/function/parameters"),
+                embedded("/messages/0/tool_calls/0/function/arguments"),
+                tool_text("/messages/1/content"),
+            ],
+            "a tool message's content is a result, and results are what the \
+             tool bounds exist to count"
+        );
+    }
+
+    #[test]
+    fn openai_marks_arguments_as_an_embedded_document() {
+        let body = json!({
+            "model": "gpt",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}
+            }]}]
+        });
+        let slots = OpenAi.request_pointers(&body).unwrap();
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Json { embedded: true, pointer, .. } if pointer.ends_with("/arguments")
+            )),
+            "arguments is a string holding a document, not a document: {slots:?}"
+        );
+    }
+
+    #[test]
+    fn openai_never_describes_a_tool_call_id_or_a_name() {
+        // All three are the client's dispatch. `tool_call_id` pairs a result
+        // with the call it answers; the two `name`s say which function. Masked,
+        // the call arrives addressed to nothing — and silently, because a
+        // placeholder is a perfectly well-formed string.
+        let body = json!({
+            "model": "gpt",
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "t1", "content": "ok"}
+            ]
+        });
+        let described = slot_pointers(OpenAi.request_pointers(&body));
+        assert!(
+            !described.iter().any(|pointer| pointer.ends_with("/name")
+                || pointer.ends_with("/tool_call_id")
+                || pointer.ends_with("/id")),
+            "dispatch must not be described: {described:?}"
+        );
+    }
+
+    #[test]
+    fn an_assistant_turn_may_carry_calls_instead_of_content() {
+        // The provider's own response says `"content": null` beside
+        // `tool_calls`, and clients echo the turn back verbatim. Read as an
+        // unreadable content shape it was a 400 on the commonest tool body
+        // there is.
+        let explicit_null = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}}]}
         ]});
-        assert!(OpenAi.request_pointers(&with_calls).is_err());
+        assert_eq!(
+            OpenAi.request_pointers(&explicit_null).unwrap(),
+            vec![embedded("/messages/0/tool_calls/0/function/arguments")]
+        );
+
+        // Omitted entirely is the same turn from an SDK that skips nulls.
+        let omitted = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}}]}
+        ]});
+        assert_eq!(
+            OpenAi.request_pointers(&omitted).unwrap(),
+            vec![embedded("/messages/0/tool_calls/0/function/arguments")]
+        );
+
+        // A message carrying neither is still the silence-is-a-leak shape.
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [{"role": "assistant"}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_openai_tool_definition_this_gateway_cannot_account_for_is_refused() {
+        // Same rule as Anthropic's, one layer deeper: a definition is an object
+        // the caller fills in, and a field no slot addresses is forwarded
+        // exactly as it came.
+        let unknown_inner = json!({"model": "gpt",
+            "tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {}, "user_location": {"city": "Zurich"}}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_inner),
+            Err(ShapeError::Unsupported("openai", "tool definition field"))
+        ));
+
+        let unknown_outer = json!({"model": "gpt",
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}},
+                       "notes": "Martina Weber"}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_outer),
+            Err(ShapeError::Unsupported("openai", "tool definition field"))
+        ));
+
+        // A wrapper shaped exactly like a function but declaring some other
+        // kind. No allowlist can catch this one — every field it carries is on
+        // the list — so the type is checked in its own right. If OpenAI ever
+        // gives `function` a different meaning under a new type, describing it
+        // as a definition would describe the wrong thing.
+        let unknown_type = json!({"model": "gpt",
+            "tools": [{"type": "custom",
+                       "function": {"name": "f", "description": "Martina Weber"}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_type),
+            Err(ShapeError::Unsupported("openai", "tool type"))
+        ));
+
+        // A custom tool's `custom` object holds a `description` and a grammar
+        // this gateway has described nowhere.
+        let custom = json!({"model": "gpt",
+            "tools": [{"type": "custom", "custom": {
+                "name": "grep", "description": "Search Martina Weber's notes"}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&custom),
+            Err(ShapeError::Unsupported("openai", _))
+        ));
+
+        // Not an object, and a `tools` that is not an array: neither has fields
+        // to describe and both would travel whole.
+        assert!(OpenAi
+            .request_pointers(&json!({"model": "gpt", "tools": ["Martina Weber"],
+                                      "messages": [{"role": "user", "content": "Hi"}]}))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&json!({"model": "gpt", "tools": {"function": {}},
+                                      "messages": [{"role": "user", "content": "Hi"}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn the_fields_an_openai_tool_definition_is_built_from_are_understood() {
+        // The allowlist must not refuse the protocol it exists to serve.
+        let body = json!({"model": "gpt",
+            "tools": [{"type": "function", "function": {
+                "name": "f", "description": "d", "parameters": {"type": "object"},
+                "strict": true}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                tool_text("/tools/0/function/description"),
+                schema("/tools/0/function/parameters"),
+                text("/messages/0/content"),
+            ]
+        );
+
+        // `tools: null` is an SDK serializing its default, not a request to use
+        // tools — the reading `logprobs` and `thinking` already get.
+        let null_tools = json!({"model": "gpt", "tools": null,
+                                "messages": [{"role": "user", "content": "Hi"}]});
+        assert_eq!(
+            OpenAi.request_pointers(&null_tools).unwrap(),
+            vec![text("/messages/0/content")]
+        );
+    }
+
+    #[test]
+    fn an_openai_tool_call_this_gateway_cannot_account_for_is_refused() {
+        // The arguments live in here. A field beside them travels as it came.
+        let unknown_on_the_call = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function", "notes": "Martina Weber",
+                "function": {"name": "f", "arguments": "{}"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_on_the_call),
+            Err(ShapeError::Unsupported("openai", "tool call field"))
+        ));
+
+        let unknown_on_the_function = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{}", "notes": "Martina Weber"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_on_the_function),
+            Err(ShapeError::Unsupported("openai", "tool call field"))
+        ));
+
+        // Shaped like a function call and declaring some other kind. The
+        // allowlist cannot catch this one either, and `arguments` under a type
+        // this gateway has not read about is not something to assume is JSON.
+        let unknown_type = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "custom",
+                "function": {"name": "f", "arguments": "Martina Weber"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_type),
+            Err(ShapeError::Unsupported("openai", "tool call type"))
+        ));
+
+        // A custom tool call carries its payload as a raw `input` string that
+        // is not JSON and has no slot.
+        let custom = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "custom",
+                "custom": {"name": "grep", "input": "Martina Weber"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&custom),
+            Err(ShapeError::Unsupported("openai", _))
+        ));
+
+        // Neither an array of calls nor an object per call would have any
+        // fields to read.
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [
+                {"role": "assistant", "content": null, "tool_calls": "Martina Weber"}]}))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [
+                {"role": "assistant", "content": null, "tool_calls": ["Martina Weber"]}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_openai_tool_message_carrying_a_field_no_slot_addresses_is_refused() {
+        // A `role: "tool"` message is the OpenAI shape of a result, and OpenAI
+        // defines exactly three fields on it. Anything else is a field this
+        // gateway would forward exactly as it came.
+        let extra = json!({"model": "gpt", "messages": [
+            {"role": "tool", "tool_call_id": "t1", "content": "ok",
+             "annotations": [{"quoted": "Martina Weber"}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&extra),
+            Err(ShapeError::Unsupported("openai", "tool message field"))
+        ));
+    }
+
+    #[test]
+    fn openai_still_refuses_the_tool_fields_it_does_not_describe() {
+        // `functions` and `function_call` are the deprecated shape of all of
+        // this: `functions` carries descriptions and schemas, and an assistant
+        // message's `function_call` carries `arguments`. Nothing here produces
+        // a slot for either, so both stay refused rather than becoming fields
+        // that are silently forwarded.
+        for field in ["functions", "function_call"] {
+            let at_body = json!({"model": "gpt", field: [{"name": "f",
+                "description": "Martina Weber", "parameters": {}}],
+                "messages": [{"role": "user", "content": "Hi"}]});
+            assert!(
+                OpenAi.request_pointers(&at_body).is_err(),
+                "{field} was allowed at the top level"
+            );
+            let at_message = json!({"model": "gpt", "messages": [
+                {"role": "assistant", "content": null,
+                 field: {"name": "f", "arguments": "{\"n\":\"Martina Weber\"}"}}]});
+            assert!(
+                OpenAi.request_pointers(&at_message).is_err(),
+                "{field} was allowed on a message"
+            );
+        }
+
+        // The two that moved from refused to described each stay refused where
+        // OpenAI does not define them, because a field no slot addresses is
+        // forwarded exactly as it came: `tools` on a message would carry its
+        // descriptions and schemas past the masker, and `tool_calls` on the
+        // body would carry its arguments.
+        let tools_on_a_message = json!({"model": "gpt", "messages": [
+            {"role": "user", "content": "Hi",
+             "tools": [{"type": "function", "function": {"name": "f",
+                        "description": "Martina Weber"}}]}]});
+        assert!(
+            matches!(
+                OpenAi.request_pointers(&tools_on_a_message),
+                Err(ShapeError::Unsupported("openai", "tools"))
+            ),
+            "described nowhere and refused nowhere, so forwarded whole: {:?}",
+            OpenAi.request_pointers(&tools_on_a_message)
+        );
+        let calls_on_the_body = json!({"model": "gpt",
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "f", "arguments": "{\"n\":\"Martina Weber\"}"}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(
+            matches!(
+                OpenAi.request_pointers(&calls_on_the_body),
+                Err(ShapeError::Unsupported("openai", "tool_calls"))
+            ),
+            "described nowhere and refused nowhere, so forwarded whole: {:?}",
+            OpenAi.request_pointers(&calls_on_the_body)
+        );
+    }
+
+    #[test]
+    fn openai_tool_choice_is_neither_masked_nor_refused() {
+        // It selects a function by name, exactly as Anthropic's does. Masking
+        // the name would break the call it dispatches; refusing it would close
+        // forced tool use for no reason.
+        let body = json!({
+            "model": "gpt",
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                schema("/tools/0/function/parameters"),
+                text("/messages/0/content"),
+            ],
+            "tool_choice must not appear here"
+        );
+    }
+
+    #[test]
+    fn openai_refuses_tool_traffic_on_a_streamed_request() {
+        // `stream_slots` refuses tool events, and it does so *after* the
+        // upstream call. Refusing here costs the caller nothing; refusing there
+        // costs them the tokens and hands back a broken stream.
+        let with_definitions = json!({
+            "model": "gpt", "stream": true,
+            "tools": [{"type": "function", "function": {"name": "f", "description": "d"}}],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&with_definitions),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
+        ));
+
+        // A continuation carrying only history is tool traffic too — the
+        // predicate reads the slots, not a field name.
+        let continuation = json!({
+            "model": "gpt", "stream": true,
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": "Weber"}
+            ]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&continuation),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
+        ));
+
+        // A result alone is enough, which is only true because a tool message's
+        // content is marked as tool traffic.
+        let result_only = json!({
+            "model": "gpt", "stream": true,
+            "messages": [{"role": "tool", "tool_call_id": "t1", "content": "Weber"}]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&result_only),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
+        ));
+
+        // And an ordinary streamed conversation is untouched by any of this.
+        let plain = json!({"model": "gpt", "stream": true,
+                           "messages": [{"role": "user", "content": "hallo"}]});
+        assert_eq!(
+            OpenAi.request_pointers(&plain).unwrap(),
+            vec![text("/messages/0/content")]
+        );
+    }
+
+    #[test]
+    fn openai_reads_tool_call_arguments_out_of_the_response() {
+        // The client executes these arguments. A placeholder left in one is a
+        // call against a path that does not exist.
+        let body = json!({"choices": [{"message": {
+            "role": "assistant", "content": null,
+            "tool_calls": [{"id": "t1", "type": "function", "function": {
+                "name": "read_file", "arguments": "{\"path\":\"/home/[PERSON_1]\"}"}}]
+        }}]});
+        assert_eq!(
+            OpenAi.response_pointers(&body).unwrap(),
+            vec![embedded(
+                "/choices/0/message/tool_calls/0/function/arguments"
+            )],
+            "the id and both names are dispatch and are not described"
+        );
     }
 
     #[test]
