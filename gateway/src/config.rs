@@ -110,21 +110,43 @@ pub struct Config {
     /// deadline anywhere on the request path that would turn that into an
     /// honest refusal instead.
     ///
-    /// **And the measurement now says these figures are optimistic.** Timed
-    /// over HTTP against the compose detector (`ner: true`), two runs of
-    /// twenty calls each: a two-character text costs **265–410 ms**, and
-    /// throughput is **~400 characters a second**. The README's own bench says
-    /// the same thing natively — its 80-character row is 109 ms total, which is
-    /// per-call cost and almost nothing else, because the price is paid per
-    /// inference pass rather than per character. So the real ten-tool payload
-    /// in `mapping`'s testdata costs about **15 s native and 52 s
-    /// containerised** on a session's first turn, and a request at these two
-    /// bounds costs **31 s and 107 s**. Per-call overhead is 56–59% of that,
-    /// not a rounding term.
+    /// **The containerised cost is measured, not derived.** The 77 leaves of
+    /// `mapping`'s real ten-tool payload were replayed through `/detect` in
+    /// sequence, three times, salted so nothing could be served from a cache:
+    /// **54.9 s median**, about 700 ms a leaf. That is a session's first turn
+    /// with a real tool set.
     ///
-    /// These defaults are under review on that evidence. The fix is issue #28 —
-    /// one call for a document instead of one per string, which collapses the
-    /// term that dominates — and not a larger or smaller number here.
+    /// Why it is quoted as a measurement rather than as arithmetic: the first
+    /// version of this figure was **derived** — characters divided by a
+    /// throughput taken from texts of 1 200 and 6 000 characters, applied to a
+    /// payload whose leaves average 116. At that size per-call overhead
+    /// dominates and throughput barely applies, so the derivation could have
+    /// been out by a factor of five in either direction and nothing in it would
+    /// have said so. It happened to land within 5% of the replay, which is luck
+    /// and not method. `9f9ce70` on this branch corrected exactly this mistake
+    /// once already, in a different comment.
+    ///
+    /// **The native figure below is still derived, and is labelled as such**
+    /// because it cannot be measured here: the host `detector/.venv` has no
+    /// `onnxruntime`, so its `/health` reports `ner: false` and it runs the
+    /// deterministic layer alone. **Derived: about 15 s**, from the README
+    /// bench's 80-character row (109 ms, per-call cost and almost nothing else,
+    /// because the price is paid per inference pass rather than per character)
+    /// plus its 1 200-character row for the marginal rate. Treat it as an
+    /// estimate until somebody runs the replay on a host with the NER extras
+    /// installed.
+    ///
+    /// Per-call overhead is the majority of both figures — 265–410 ms of a call
+    /// against the compose detector, 109 ms natively — not a rounding term.
+    ///
+    /// These defaults are under review on that evidence, and the number was not
+    /// lowered on the strength of it: a bound below real traffic turns a long
+    /// wait into a refusal of a client that did nothing wrong. The fix is issue
+    /// #28 — one call for a document instead of one per string, which collapses
+    /// the term that dominates — and not a larger or smaller number here.
+    ///
+    /// 20 000 rather than 18 000 because the headroom rule above is now
+    /// asserted rather than described, and 18 000 failed it by ten characters.
     ///
     /// **It is not a timeout budget**, and this comment used to say it was
     /// ("one constraint written twice"). `detector_timeout_secs` becomes
@@ -245,7 +267,7 @@ fn default_max_spans_per_entry() -> usize {
     250
 }
 pub fn default_max_tool_chars() -> usize {
-    18_000
+    20_000
 }
 pub fn default_max_tool_leaves() -> usize {
     160
@@ -439,7 +461,7 @@ mod tests {
     #[test]
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(config.max_tool_chars, 18_000);
+        assert_eq!(config.max_tool_chars, 20_000);
         assert_eq!(config.max_tool_leaves, 160);
     }
 

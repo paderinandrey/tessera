@@ -28,11 +28,11 @@ max_spans_per_entry = 250
 # rather than serialized bytes: braces, quotes and property names are structure
 # the detector never reads, and on a real ten-tool payload the two differ by
 # 1.46x. Set at twice that measured payload, which costs 9 005 characters.
-# UNDER REVIEW: measured per-call overhead is 265-410 ms containerised, so a
-# real ten-tool payload costs about 52 s on a session's first turn and a request
-# at this bound about 107 s. Nothing bounds a request's wall clock, and the
-# caller's own timeout is not ours to set. See gateway/tessera.example.toml.
-max_tool_chars = 18000
+# UNDER REVIEW: replaying that payload's 77 leaves through the detector took a
+# measured 54.9 s -- a session's first turn -- because a call costs 265-410 ms
+# whatever its length. Nothing bounds a request's wall clock, and the caller's
+# own timeout is not ours to set. See gateway/tessera.example.toml.
+max_tool_chars = 20000
 # How many separate strings those structures may hold. A second bound because
 # max_tool_chars bounds the wrong quantity for this failure: detection is one
 # round-trip per string, awaited in turn, so cost tracks the number of strings

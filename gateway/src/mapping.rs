@@ -1279,11 +1279,15 @@ mod tests {
             })
             .sum();
         assert_eq!(leaves, 77, "the figure the leaf bound is set from");
+        // The headroom rule, asserted rather than described. The comment above
+        // says both defaults are set to admit twice this payload; without this
+        // that is a note somebody can quietly falsify, and `<= measured` alone
+        // would pass at a default of 78.
         assert!(
-            leaves <= crate::config::default_max_tool_leaves(),
-            "the default bound must admit a real tool payload: {leaves} leaves against a \
-             bound of {}. A gateway that refuses the tool set its own users run is not \
-             configured conservatively, it is broken.",
+            crate::config::default_max_tool_leaves() >= 2 * leaves,
+            "the default bound must admit twice a real tool payload: {leaves} leaves \
+             against a bound of {}. A gateway that refuses the tool set its own users \
+             run is not configured conservatively, it is broken.",
             crate::config::default_max_tool_leaves()
         );
 
@@ -1322,9 +1326,9 @@ mod tests {
             "and what charging structure would have cost"
         );
         assert!(
-            chars <= crate::config::default_max_tool_chars(),
-            "the default bound must admit a real tool payload: {chars} characters against a \
-             bound of {}",
+            crate::config::default_max_tool_chars() >= 2 * chars,
+            "the default bound must admit twice a real tool payload: {chars} characters \
+             against a bound of {}",
             crate::config::default_max_tool_chars()
         );
     }

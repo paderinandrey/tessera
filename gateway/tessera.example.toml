@@ -143,18 +143,31 @@ max_spans_per_entry = 250
 # cumulative deadline exists anywhere on the request path that would turn that
 # into an honest refusal instead.
 #
-# AND THE MEASUREMENT SAYS THESE FIGURES ARE OPTIMISTIC. Timed over HTTP against
-# the compose detector (ner: true), two runs of twenty calls: a two-character
-# text costs 265-410 ms and throughput is about 400 characters a second. The
-# README's bench says the same natively -- its 80-character row is 109 ms total,
-# which is per-call cost and almost nothing else, because the price is paid per
-# inference pass rather than per character. So the real ten-tool payload costs
-# about 15 s native and 52 s containerised on a first turn, and a request at
-# both bounds costs 31 s and 107 s. Per-call overhead is 56-59% of that.
+# THE CONTAINERISED COST IS MEASURED, NOT DERIVED. The 77 leaves of the real
+# ten-tool payload were replayed through /detect in sequence, three times,
+# salted so nothing could come from a cache: 54.9 s median, about 700 ms a leaf.
+# That is a session's first turn with a real tool set. A single call costs
+# 265-410 ms whatever its length, so per-call overhead is the majority of it.
 #
-# These defaults are under review on that evidence. The fix is issue #28 --
-# one call per document instead of one per string, which collapses the term
-# that dominates -- not a larger or smaller number here.
+# The first version of this figure was DERIVED -- characters over a throughput
+# taken from 1 200- and 6 000-character texts, applied to leaves averaging 116,
+# where overhead dominates and throughput barely applies. It could have been out
+# by a factor of five and nothing in it would have said so. It landed within 5%
+# of the replay, which is luck rather than method.
+#
+# THE NATIVE FIGURE BELOW IS STILL DERIVED and is labelled so, because it cannot
+# be measured here: the host detector/.venv has no onnxruntime, so its /health
+# reports ner: false and it runs the deterministic layer alone. Derived: about
+# 15 s, from the README bench's 80-character row (109 ms, per-call cost and
+# almost nothing else) plus its 1 200-character row for the marginal rate. An
+# estimate until someone runs the replay on a host with the NER extras.
+#
+# These defaults are under review on that evidence, and the number was NOT
+# lowered on the strength of it: a bound below real traffic turns a long wait
+# into a refusal of a client that did nothing wrong. The fix is issue #28 -- one
+# call per document instead of one per string -- not a number here. 20 000
+# rather than 18 000 because the headroom rule is now asserted rather than
+# described, and 18 000 failed it by ten characters.
 #
 # It is NOT a timeout budget, and this comment used to say it was.
 # detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
@@ -165,7 +178,7 @@ max_spans_per_entry = 250
 # Still unmeasured: per-call overhead. This bounds the characters and
 # max_tool_leaves bounds the calls; nobody has measured what a call costs before
 # any text is read.
-max_tool_chars = 18000
+max_tool_chars = 20000
 
 # How many separate strings those structures may hold.
 #
@@ -184,10 +197,10 @@ max_tool_chars = 18000
 # prediction.
 #
 # Measured, and it is the high end. A call costs 265-410 ms against the compose
-# detector and 109 ms natively by the README's bench -- the price is paid per
-# inference pass, so a two-character string costs very nearly what an
-# eighty-character one does. At 160 that is 17 s native and 63 s containerised
-# in overhead alone, before a character is read. Under review; see
-# max_tool_chars above. The answer is issue #28, not a smaller bound, because a
-# smaller bound refuses real clients instead.
+# detector -- the price is paid per inference pass, so a two-character string
+# costs very nearly what an eighty-character one does. Replaying the real
+# ten-tool payload's 77 leaves took 54.9 s, about 700 ms each. At 160 leaves
+# that is well over a minute in overhead alone, before a character is read.
+# Under review; see max_tool_chars above. The answer is issue #28, not a smaller
+# bound, because a smaller bound refuses real clients instead.
 max_tool_leaves = 160
