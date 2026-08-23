@@ -77,7 +77,7 @@ pub enum Slot {
     Text {
         pointer: String,
         /// Whether this string is tool traffic, and so counts against
-        /// `max_tool_bytes`. A `tool_result` is a `Text` slot like any prompt
+        /// `max_tool_chars`. A `tool_result` is a `Text` slot like any prompt
         /// text — it is a bare string — but it is the largest surface tool
         /// support opens, and a bound that skipped it would be a bound on the
         /// smaller half. False for ordinary prompt and message text, which the

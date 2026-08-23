@@ -1219,6 +1219,47 @@ mod tests {
              configured conservatively, it is broken.",
             crate::config::default_max_tool_leaves()
         );
+
+        // The other bound, on the basis it is actually denominated in. Both
+        // figures are asserted so that the gap between them stays visible: a
+        // bound charging serialized size charges 1.49 characters for every one
+        // the detector reads, and would refuse this payload at 10 970 against a
+        // ceiling of 10 000 while the real cost is 7 379.
+        let chars: usize = tools
+            .iter()
+            .map(|tool| {
+                tool["description"]
+                    .as_str()
+                    .map_or(0, |d| d.chars().count())
+                    + json_leaves(&tool["input_schema"], Shape::Schema)
+                        .unwrap()
+                        .iter()
+                        .map(|leaf| match leaf {
+                            Leaf::Text(text) => text.chars().count(),
+                            // Charged nothing because nothing sends it. Task 6
+                            // changes that, and this sum with it.
+                            Leaf::Number(_) => 0,
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(chars, 7_379, "the figure the text bound is set from");
+        let serialized: usize = tools
+            .iter()
+            .map(|tool| {
+                tool["input_schema"].to_string().len() + tool["description"].to_string().len()
+            })
+            .sum();
+        assert_eq!(
+            serialized, 10_970,
+            "and what charging structure would have cost"
+        );
+        assert!(
+            chars <= crate::config::default_max_tool_chars(),
+            "the default bound must admit a real tool payload: {chars} characters against a \
+             bound of {}",
+            crate::config::default_max_tool_chars()
+        );
     }
 
     #[test]

@@ -28,17 +28,19 @@ audit_path = "/var/lib/tessera/audit.jsonl"
 detection_cache_entries = 10000
 max_spans_per_entry = 250
 
-# How many bytes of tool structure (definitions, arguments and results,
-# summed across one request) the gateway will newly scan. Tied to
-# detector_timeout_secs above: cost scales with text length, and 10 000
-# characters costs roughly eight to fifteen seconds depending on hardware,
-# comfortably inside the 30-second timeout. A larger tool result is refused,
-# not served slowly; raise the timeout and this has to rise with it. See
-# gateway/tessera.example.toml for the measured sources and the full
-# arithmetic.
-max_tool_bytes = 10000
+# How many characters of tool text (definitions, arguments and results,
+# summed across one request) the gateway will hand to the detector. Characters
+# rather than serialized bytes: braces, quotes and property names are structure
+# the detector never reads, and on a real eight-tool payload the two differ by
+# 1.49x, so charging structure refuses payloads a third below the ceiling it
+# claims. 10 000 characters costs roughly eight to fifteen seconds depending on
+# hardware -- that is the caller's wait, not a timeout budget, since
+# detector_timeout_secs bounds each call rather than their sum. A larger tool
+# result is refused, not served slowly. See gateway/tessera.example.toml for the
+# measured sources and the full arithmetic.
+max_tool_chars = 10000
 # How many separate strings those structures may hold. A second bound because
-# max_tool_bytes bounds the wrong quantity for this failure: detection is one
+# max_tool_chars bounds the wrong quantity for this failure: detection is one
 # round-trip per string, awaited in turn, so cost tracks the number of strings
 # rather than their total size. A schema of a thousand two-character strings is
 # about 10000 bytes and a thousand sequential calls. 128 comes from counting a

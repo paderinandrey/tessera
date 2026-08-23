@@ -14,8 +14,8 @@ pub enum ConfigError {
         "max_spans_per_entry must be greater than zero unless detection_cache_entries is zero"
     )]
     ZeroSpansPerEntry,
-    #[error("max_tool_bytes must be greater than zero")]
-    ZeroToolBytes,
+    #[error("max_tool_chars must be greater than zero")]
+    ZeroToolChars,
     #[error("max_tool_leaves must be greater than zero")]
     ZeroToolLeaves,
 }
@@ -69,32 +69,47 @@ pub struct Config {
     /// a large result into a refusal.
     #[serde(default = "default_max_spans_per_entry")]
     pub max_spans_per_entry: usize,
-    /// How many bytes of tool structure one request may newly scan, summed
-    /// across every tool definition, argument and result in it.
+    /// How many **characters of text** one request's tool structures will hand
+    /// to the detector, summed across every definition, argument and result.
     ///
-    /// This key and `detector_timeout_secs` are one constraint written twice.
-    /// Cost scales with text length; the README's latency table is the
-    /// measured source. On the machine that table names (Apple M3 Pro, 11
-    /// cores), 10 000 characters is roughly eight to nine seconds; on the
-    /// containerised stack the detection-cache design measured (20.3
-    /// CPU-seconds per 1 200 characters), closer to fifteen. Either sits
-    /// inside the 30-second default with headroom, which is why 10 000 is
-    /// the default here too. Slower hardware, or a lower timeout, has to
-    /// lower this to match — the relationship is the thing to carry, not
-    /// the number.
+    /// Characters, not serialized bytes, and the distinction is the whole
+    /// point. Detection cost scales with the text the detector reads; braces,
+    /// quotes and property names are structure it never sees. On `mapping`'s
+    /// real eight-tool payload the two differ by 1.49x — 10 970 serialized
+    /// against 7 379 detected — so a bound charging serialized size refuses
+    /// payloads a third below the ceiling it claims to enforce. The figure is
+    /// pinned by `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with`
+    /// so nobody re-derives this from serialized size later.
     ///
-    /// It is not derived from the timeout automatically on purpose: a derived
-    /// default changes behaviour silently when an unrelated key moves.
+    /// **What it is denominated against.** The README's latency table is the
+    /// measured source: on the machine it names (Apple M3 Pro, 11 cores) 10 000
+    /// characters is roughly eight to nine seconds, and on the containerised
+    /// stack the detection-cache design measured, closer to fifteen. That is
+    /// the caller's wait for one request, and 10 000 keeps it in that range.
+    /// Slower hardware has to lower this to match — the relationship is the
+    /// thing to carry, not the number.
+    ///
+    /// **It is not a timeout budget, and an earlier comment here said it was.**
+    /// `detector_timeout_secs` becomes `reqwest`'s per-request timeout, so it
+    /// bounds each detector *call* on its own, never their sum. A request may
+    /// spend far longer than the timeout in total and no call ever come near
+    /// it. So this key and that one are two constraints, not "one constraint
+    /// written twice": the timeout catches a single stuck call, and this caps
+    /// how long a caller waits for the whole request.
+    ///
+    /// Still unmeasured, and the honest gap: per-call overhead. This bounds the
+    /// characters; `max_tool_leaves` bounds the calls; nobody has measured what
+    /// a call costs before any text is read. See that key.
     ///
     /// The ceiling exists because the detection cache does not help the first
     /// time a text is seen, and a tool result is usually seen once. Issue #28
     /// carries the work that lifts it.
-    #[serde(default = "default_max_tool_bytes")]
-    pub max_tool_bytes: usize,
+    #[serde(default = "default_max_tool_chars")]
+    pub max_tool_chars: usize,
 
     /// How many separate strings one request's tool structures may hold.
     ///
-    /// A second bound because `max_tool_bytes` bounds the wrong quantity for
+    /// A second bound because `max_tool_chars` bounds the wrong quantity for
     /// this failure. Detection is one round-trip per string, awaited in turn
     /// while the request holds its session, so cost tracks the *number* of
     /// strings and not their total size — and the two come apart badly. A
@@ -116,7 +131,7 @@ pub struct Config {
     /// more.
     ///
     /// What is *not* measured is the cost, and this is the number's weak point.
-    /// Total text is already bounded by `max_tool_bytes`, so what leaves add is
+    /// Total text is already bounded by `max_tool_chars`, so what leaves add is
     /// per-call overhead, and nobody has measured that (the figures under
     /// `detector_timeout_secs` are for texts of 1 200 and 6 000 characters). At
     /// 50 ms a call, 128 is under seven seconds; at 300 ms it is thirty-eight
@@ -203,7 +218,7 @@ fn default_detection_cache_entries() -> usize {
 fn default_max_spans_per_entry() -> usize {
     250
 }
-fn default_max_tool_bytes() -> usize {
+pub fn default_max_tool_chars() -> usize {
     10_000
 }
 pub fn default_max_tool_leaves() -> usize {
@@ -227,8 +242,8 @@ impl Config {
         if config.detection_cache_entries > 0 && config.max_spans_per_entry == 0 {
             return Err(ConfigError::ZeroSpansPerEntry);
         }
-        if config.max_tool_bytes == 0 {
-            return Err(ConfigError::ZeroToolBytes);
+        if config.max_tool_chars == 0 {
+            return Err(ConfigError::ZeroToolChars);
         }
         if config.max_tool_leaves == 0 {
             return Err(ConfigError::ZeroToolLeaves);
@@ -398,7 +413,7 @@ mod tests {
     #[test]
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(config.max_tool_bytes, 10_000);
+        assert_eq!(config.max_tool_chars, 10_000);
         assert_eq!(config.max_tool_leaves, 128);
     }
 
@@ -406,10 +421,10 @@ mod tests {
     fn a_zero_tool_bound_is_rejected() {
         // Either bound at zero is a typo rather than a configuration: it
         // refuses every tool request, and says so only in a 400 per call.
-        let text = with_audit("max_tool_bytes = 0");
+        let text = with_audit("max_tool_chars = 0");
         assert!(matches!(
             Config::from_toml(&text),
-            Err(ConfigError::ZeroToolBytes)
+            Err(ConfigError::ZeroToolChars)
         ));
         let text = with_audit("max_tool_leaves = 0");
         assert!(matches!(

@@ -114,29 +114,44 @@ detection_cache_entries = 10000
 # the true ceiling is nearer 200 MB at these defaults.
 max_spans_per_entry = 250
 
-# How many bytes of tool structure — every tool definition, call argument and
-# result, summed across one request — may newly pass through detection. This
-# key and detector_timeout_secs above are one constraint written twice. Cost
-# scales with text length; the README's latency table is the measured
-# source. On the machine that table names (Apple M3 Pro, 11 cores), 10 000
-# characters is roughly eight to nine seconds; on the containerised stack the
-# detection-cache design measured (20.3 CPU-seconds per 1 200 characters),
-# closer to fifteen. Either sits inside the 30-second timeout above with
-# headroom, which is why 10 000 is the default here too. Slower hardware, or
-# a lower timeout, has to lower this to match — the relationship is the
-# thing to carry, not the number. It is not derived from the timeout
-# automatically — a derived default would change behaviour silently when an
-# unrelated key moved.
+# How many characters of text — every tool definition, call argument and
+# result, summed across one request — may be handed to the detector.
+#
+# Characters, not serialized bytes, and the distinction is the point. Cost
+# scales with the text the detector reads; braces, quotes and property names
+# are structure it never sees. On the real eight-tool payload in
+# gateway/src/testdata/claude_code_tools.json the two differ by 1.49x —
+# 10 970 serialized against 7 379 detected — so a bound charging serialized
+# size refuses payloads a third below the ceiling it claims to enforce. The
+# test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins both
+# figures, so nobody re-derives this from serialized size later.
+#
+# What the number is denominated against: the README's latency table is the
+# measured source. On the machine that table names (Apple M3 Pro, 11 cores),
+# 10 000 characters is roughly eight to nine seconds; on the containerised
+# stack the detection-cache design measured (20.3 CPU-seconds per 1 200
+# characters), closer to fifteen. That is what a caller waits for one
+# request. Slower hardware has to lower this to match — the relationship is
+# the thing to carry, not the number.
+#
+# It is NOT a timeout budget, and this comment used to say it was ("one
+# constraint written twice"). detector_timeout_secs becomes reqwest's
+# per-request timeout, so it bounds each detector call on its own and never
+# their sum: a request may spend far longer than the timeout in total with no
+# single call coming near it. Two constraints, not one — the timeout catches a
+# stuck call, this caps how long a caller waits for the whole request.
+#
+# Still unmeasured, and the honest gap: per-call overhead. This bounds the
+# characters and max_tool_leaves bounds the calls; nobody has measured what a
+# call costs before any text is read.
 #
 # The ceiling exists because the detection cache above does not help the
-# first time a text is seen, and a tool result is usually seen once. An
-# oversized first-seen result would otherwise be a timeout, not a slow
-# answer; this refuses it honestly instead. Issue #28 carries the work that
-# lifts it.
-max_tool_bytes = 10000
+# first time a text is seen, and a tool result is usually seen once. Issue #28
+# carries the work that lifts it.
+max_tool_chars = 10000
 # How many separate strings those structures may hold.
 #
-# A second bound, because max_tool_bytes bounds the wrong quantity for this
+# A second bound, because max_tool_chars bounds the wrong quantity for this
 # failure. Detection is one round-trip per string, awaited in turn while the
 # request holds its session, so the cost tracks the *number* of strings and not
 # their total size -- and the two come apart badly. A schema of a thousand
@@ -153,7 +168,7 @@ max_tool_bytes = 10000
 # with room to roughly double. The test fails if this stops admitting it.
 #
 # What is NOT measured is the cost, and that is this number's weak point. Total
-# text is already bounded by max_tool_bytes, so what leaves add is per-call
+# text is already bounded by max_tool_chars, so what leaves add is per-call
 # overhead, which nobody has measured -- the figures above are for texts of
 # 1200 and 6000 characters. At 50 ms a call, 128 is under seven seconds; at
 # 300 ms it is thirty-eight and blows the timeout by itself. If it proves to be

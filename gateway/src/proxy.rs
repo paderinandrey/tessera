@@ -34,14 +34,17 @@ pub enum ProxyError {
     Session(#[from] crate::session::SessionError),
     #[error("{0}")]
     Audit(#[from] crate::audit::AuditError),
+    /// Neither message names the detector timeout, though both once did. That
+    /// timeout bounds each detector call on its own; these two bound the work
+    /// of one request across all of its calls, which is a different thing.
     #[error(
-        "this request's tool structures are larger than this gateway will detect over within \
-         its detector timeout; it is refused rather than forwarded"
+        "this request's tool structures carry more text than this gateway will detect for a \
+         single request; it is refused rather than forwarded"
     )]
     ToolTooLarge,
     #[error(
         "this request's tool structures hold more separate strings than this gateway will \
-         detect over within its detector timeout; it is refused rather than forwarded"
+         detect for a single request; it is refused rather than forwarded"
     )]
     TooManyToolLeaves,
 }
@@ -168,10 +171,10 @@ pub struct AppState {
     /// exhausting the stack, and this one stops a request whose detection would
     /// outlast the detector timeout — a different failure, so a different
     /// number, and it lives here because `handle` is where it is asked.
-    pub max_tool_bytes: usize,
+    pub max_tool_chars: usize,
     /// How many separate strings that structure may hold. Each is its own
     /// detector round-trip, awaited in turn, so this bounds *calls* where
-    /// `max_tool_bytes` bounds *size*.
+    /// `max_tool_chars` bounds *size*.
     pub max_tool_leaves: usize,
 }
 
@@ -193,7 +196,7 @@ impl AppState {
                 max_values: config.max_session_values,
             }),
             audit,
-            max_tool_bytes: config.max_tool_bytes,
+            max_tool_chars: config.max_tool_chars,
             max_tool_leaves: config.max_tool_leaves,
         }
     }
@@ -344,63 +347,69 @@ async fn handle(
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let slots = provider.request_pointers(&body)?;
 
-    // Every tool structure this request newly scans, summed. Arguments count,
-    // not only results: `Write` and `Edit` carry whole files in arguments, and
-    // a tool call the model produced is restored to real values and echoed back
-    // in the next turn's history — text the cache has never seen, because the
-    // cache holds the masked request rather than the restored response.
-    // A `tool_result` is a `Text` slot, because it is a bare string — and it is
-    // the largest surface here, not the smallest: a coding agent's file reads
-    // arrive in one. Counting only the documents would have bounded the
-    // arguments and left the results to axum's 2 MB body default, two hundred
-    // times this bound.
-    let tool_bytes: usize = slots
-        .iter()
-        .filter_map(|slot| match slot {
-            Slot::Json { pointer, .. } => body.pointer(pointer),
+    // Every tool structure this request newly scans, counted twice over: how
+    // many times the detector will be called, and how many characters it will
+    // be given across those calls. One walk answers both, because both are
+    // questions about the same text leaves.
+    //
+    // **Characters, not serialized bytes.** What costs the detector time is the
+    // text it reads; braces, quotes and property names are structure it never
+    // sees. Measured on `mapping`'s real tool payload the difference is 1.49x —
+    // 10 970 serialized against 7 379 detected — so charging serialized size
+    // refuses payloads a third smaller than the ceiling it claims to enforce.
+    // `mapping::a_real_tool_payload_fits_the_bounds_this_gateway_ships_with`
+    // pins both figures.
+    //
+    // Arguments count, not only results: `Write` and `Edit` carry whole files
+    // in arguments, and a tool call the model produced is restored to real
+    // values and echoed back in the next turn's history — text the cache has
+    // never seen, because the cache holds the masked request rather than the
+    // restored response. A `tool_result` is a `Text` slot, because it is a bare
+    // string, and it is the largest surface here rather than the smallest: a
+    // coding agent's file reads arrive in one. Counting only the documents
+    // would have left results to axum's 2 MB body default.
+    //
+    // Ordinary prompt text is counted by neither, for the same reason: the tool
+    // bounds have no business limiting how long a conversation may be.
+    //
+    // Both are counted here, before a single round-trip is made, rather than
+    // spent down as the masking loop goes — a bound that charges each document
+    // just before detecting it spends most of itself and *then* refuses, and
+    // the caller waits out nearly the whole cost to be told no. `json_leaves`
+    // is a pure walk with no I/O, so the price is walking each document twice.
+    //
+    // A numeric leaf is charged nothing because nothing sends it anywhere; see
+    // `mapping::Leaf::Number`. Task 6 gives numbers to the detector, and both
+    // counts here have to start including them on that day.
+    let mut tool_leaves = 0usize;
+    let mut tool_chars = 0usize;
+    for slot in &slots {
+        match slot {
+            Slot::Text { tool: false, .. } => {}
             Slot::Text {
                 pointer,
                 tool: true,
-            } => body.pointer(pointer),
-            Slot::Text { tool: false, .. } => None,
-        })
-        .map(|value| value.to_string().len())
-        .sum();
-    if tool_bytes > state.max_tool_bytes {
-        return Err(ProxyError::ToolTooLarge);
-    }
-    // A separate bound from the byte one because it bounds a different cost:
-    // bytes bound how much text the detector reads, this bounds how many times
-    // it is asked, and the two come apart badly for many tiny strings.
-    //
-    // Counted in full here, before a single round-trip is made, rather than
-    // spent down as the masking loop goes. The bound exists to cap how long one
-    // request holds its session, so a version that charges each document just
-    // before detecting it spends most of the budget and *then* refuses — the
-    // caller waits out nearly the whole cost to be told no, and the byte bound
-    // next door already refuses for free. `json_leaves` is a pure walk with no
-    // I/O, so the price of counting first is walking each document twice.
-    //
-    // Ordinary prompt text is not counted, for the same reason it is not
-    // weighed: the tool bound has no business limiting how long a conversation
-    // may be.
-    let mut tool_leaves = 0usize;
-    for slot in &slots {
-        tool_leaves += match slot {
-            Slot::Text { tool: true, .. } => 1,
-            Slot::Text { tool: false, .. } => 0,
+            } => {
+                tool_leaves += 1;
+                tool_chars += read_pointer(&body, pointer)?.chars().count();
+            }
             Slot::Json {
                 pointer,
                 embedded,
                 shape,
-            } => mapping::json_leaves(
-                &read_document(&body, pointer, *embedded, provider.name())?,
-                *shape,
-            )?
-            .iter()
-            .filter(|leaf| matches!(leaf, mapping::Leaf::Text(_)))
-            .count(),
-        };
+            } => {
+                let document = read_document(&body, pointer, *embedded, provider.name())?;
+                for leaf in mapping::json_leaves(&document, *shape)? {
+                    if let mapping::Leaf::Text(text) = leaf {
+                        tool_leaves += 1;
+                        tool_chars += text.chars().count();
+                    }
+                }
+            }
+        }
+    }
+    if tool_chars > state.max_tool_chars {
+        return Err(ProxyError::ToolTooLarge);
     }
     if tool_leaves > state.max_tool_leaves {
         return Err(ProxyError::TooManyToolLeaves);
@@ -679,7 +688,7 @@ mod tests {
     const UNCAPPED: usize = usize::MAX;
     /// The production default, so tests exercise the bound callers get rather
     /// than one chosen to make a test convenient.
-    const TEST_MAX_TOOL_BYTES: usize = 10_000;
+    const TEST_MAX_TOOL_CHARS: usize = 10_000;
     const TEST_MAX_TOOL_LEAVES: usize = 128;
 
     fn person_span() -> Value {
@@ -696,8 +705,8 @@ mod tests {
     // `TooLarge` cannot fire first at any sane configuration. Its bound is
     // 10 000 nodes, and the cheapest node an array can hold costs two bytes
     // (`0,`), so a document reaching it is upwards of 20 000 bytes and
-    // `max_tool_bytes` — 10 000 by default — has already refused it. It stays
-    // as depth behind the byte bound rather than as a check that fires.
+    // `max_tool_chars` — 10 000 by default — has already refused it. It stays
+    // as depth behind the text bound rather than as a check that fires.
     //
     // `MaskCountMismatch` fires only if this gateway's two walks disagree with
     // each other, which no input can arrange; it is reachable by mutating one
@@ -807,7 +816,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(limits),
             audit,
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         });
         (state, dir, path)
@@ -1197,7 +1206,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_result_counts_against_the_byte_bound() {
+    async fn a_structure_heavy_schema_is_charged_for_its_text_and_not_its_punctuation() {
+        // The bound is denominated in characters the detector reads. A schema
+        // is mostly punctuation and property names, which it never reads, so
+        // charging serialized size charges for structure — and refuses payloads
+        // well under the ceiling it claims to enforce. This body is that case:
+        // comfortably inside the bound by text, comfortably outside it by
+        // serialization.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let properties: serde_json::Map<String, Value> = (0..120)
+            .map(|n| {
+                (
+                    format!("parameter_{n:03}"),
+                    json!({"type": "string", "description": "y".repeat(70)}),
+                )
+            })
+            .collect();
+        let body = json!({
+            "model": "claude",
+            "tools": [{
+                "name": "wide",
+                "description": "d",
+                "input_schema": {"type": "object", "properties": properties}
+            }],
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+
+        // 120 descriptions of 70 characters, plus the tool's own one-character
+        // description: 8 401 characters of text against a 10 000 bound.
+        let text: usize = 120 * 70 + 1;
+        assert!(text < TEST_MAX_TOOL_CHARS, "{text} characters of text");
+        let serialized = body["tools"][0]["input_schema"].to_string().len();
+        assert!(
+            serialized > TEST_MAX_TOOL_CHARS,
+            "and {serialized} serialized — the two verdicts have to disagree or this \
+             test proves nothing"
+        );
+
+        let (status, returned) = call(state, "/v1/messages", body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a schema whose text fits must be served whatever its punctuation costs: {returned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_result_counts_against_the_text_bound() {
         // A result is a `Text` slot, and counting only documents would have
         // left the largest surface bounded by axum's 2 MB body default —
         // two hundred times this bound. A coding agent's file reads land here.
@@ -1211,7 +1268,7 @@ mod tests {
                 "model": "claude",
                 "messages": [{"role": "user", "content": [
                     {"type": "tool_result", "tool_use_id": "t1",
-                     "content": "x".repeat(TEST_MAX_TOOL_BYTES + 1)}
+                     "content": "x".repeat(TEST_MAX_TOOL_CHARS + 1)}
                 ]}]
             }),
         )
@@ -1237,7 +1294,7 @@ mod tests {
             json!({
                 "model": "claude",
                 "messages": [{"role": "user",
-                              "content": "x".repeat(TEST_MAX_TOOL_BYTES + 1)}]
+                              "content": "x".repeat(TEST_MAX_TOOL_CHARS + 1)}]
             }),
         )
         .await;
@@ -1246,10 +1303,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_document_of_many_tiny_strings_is_refused_though_it_is_small() {
-        // The byte bound does not bound this. Each string is its own detector
+        // The text bound does not bound this. Each string is its own detector
         // round-trip, awaited in turn while the request holds its session, so
         // the cost is the count and not the size — and a document of hundreds
-        // of two-character strings is well inside the byte bound.
+        // of two-character strings is well inside the text bound.
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
@@ -1258,8 +1315,9 @@ mod tests {
             .collect();
         let document = json!({ "items": many });
         assert!(
-            document.to_string().len() < TEST_MAX_TOOL_BYTES,
-            "the point of this test is that the byte bound lets it through"
+            document.to_string().len() < TEST_MAX_TOOL_CHARS,
+            "serialized length is an upper bound on characters, so this proves the text \
+             bound lets it through"
         );
         let (status, body) = call(
             state,
@@ -1275,7 +1333,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(
             body.contains("separate strings"),
-            "refused by the leaf bound rather than the byte bound: {body}"
+            "refused by the leaf bound rather than the text bound: {body}"
         );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),
@@ -1284,7 +1342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_definitions_prose_counts_against_the_byte_bound() {
+    async fn a_tool_definitions_prose_counts_against_the_text_bound() {
         // Before this slice `tools` was refused whole, so every tool
         // description is text newly sent to the detector. Left uncharged it was
         // the definition-side twin of the `tool_result` gap: the bound named
@@ -1300,7 +1358,7 @@ mod tests {
                 "model": "claude",
                 "tools": [{
                     "name": "read_file",
-                    "description": "x".repeat(TEST_MAX_TOOL_BYTES + 1),
+                    "description": "x".repeat(TEST_MAX_TOOL_CHARS + 1),
                     "input_schema": {}
                 }],
                 "messages": [{"role": "user", "content": "hallo"}]
@@ -1331,14 +1389,15 @@ mod tests {
             "messages": [{"role": "user", "content": "hallo"}]
         });
         assert!(
-            body.to_string().len() < TEST_MAX_TOOL_BYTES,
-            "the point of this test is that the byte bound lets it through"
+            body.to_string().len() < TEST_MAX_TOOL_CHARS,
+            "serialized length is an upper bound on characters, so this proves the text \
+             bound lets it through"
         );
         let (status, returned) = call(state, "/v1/messages", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
         assert!(
             returned.contains("separate strings"),
-            "refused by the leaf bound rather than the byte bound: {returned}"
+            "refused by the leaf bound rather than the text bound: {returned}"
         );
         assert!(
             detector.received_requests().await.unwrap().is_empty(),
@@ -1373,8 +1432,9 @@ mod tests {
             "messages": [{"role": "assistant", "content": blocks}]
         });
         assert!(
-            body.to_string().len() < TEST_MAX_TOOL_BYTES,
-            "the point of this test is that the byte bound lets it through"
+            body.to_string().len() < TEST_MAX_TOOL_CHARS,
+            "serialized length is an upper bound on characters, so this proves the text \
+             bound lets it through"
         );
         let (status, returned) = call(state, "/v1/messages", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
@@ -1411,7 +1471,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
         assert!(
             returned.contains("separate strings"),
-            "refused by the leaf bound rather than the byte bound: {returned}"
+            "refused by the leaf bound rather than the text bound: {returned}"
         );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),
@@ -1420,7 +1480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_document_past_the_byte_bound_is_refused_before_the_upstream_call() {
+    async fn a_tool_document_past_the_text_bound_is_refused_before_the_upstream_call() {
         // Detection runs at roughly a thousand characters a second, so a
         // document past the bound would outlast the detector timeout and cost
         // the caller the wait before failing. Refused here instead, and
@@ -1435,7 +1495,7 @@ mod tests {
                 "model": "claude",
                 "messages": [{"role": "assistant", "content": [
                     {"type": "tool_use", "id": "t1", "name": "write_file",
-                     "input": {"text": "x".repeat(TEST_MAX_TOOL_BYTES + 1)}}
+                     "input": {"text": "x".repeat(TEST_MAX_TOOL_CHARS + 1)}}
                 ]}]
             }),
         )
@@ -1487,7 +1547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_document_within_the_byte_bound_is_served() {
+    async fn a_tool_document_within_the_text_bound_is_served() {
         // The other side of the same bound: a refusal that fired on everything
         // would satisfy the test above and serve nobody.
         let detector = detector_returning(json!([])).await;
@@ -1500,7 +1560,7 @@ mod tests {
                 "model": "claude",
                 "messages": [{"role": "assistant", "content": [
                     {"type": "tool_use", "id": "t1", "name": "write_file",
-                     "input": {"text": "x".repeat(TEST_MAX_TOOL_BYTES - 100)}}
+                     "input": {"text": "x".repeat(TEST_MAX_TOOL_CHARS - 100)}}
                 ]}]
             }),
         )
@@ -1986,7 +2046,7 @@ mod tests {
             anthropic_base: upstream_base,
             sessions: SessionStore::new(test_limits()),
             audit,
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         })
     }
@@ -2588,7 +2648,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(test_limits()),
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         });
 
@@ -2991,7 +3051,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(test_limits()),
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         });
 
@@ -3049,7 +3109,7 @@ mod tests {
             anthropic_base: upstream.uri(),
             sessions: SessionStore::new(test_limits()),
             audit,
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         });
         call(
@@ -3087,7 +3147,7 @@ mod tests {
             anthropic_base: base,
             sessions: SessionStore::new(test_limits()),
             audit,
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         });
         (state, dir, path)
@@ -3571,7 +3631,7 @@ mod tests {
             anthropic_base: base,
             sessions: SessionStore::new(test_limits()),
             audit,
-            max_tool_bytes: TEST_MAX_TOOL_BYTES,
+            max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_leaves: TEST_MAX_TOOL_LEAVES,
         });
 
