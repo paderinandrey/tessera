@@ -129,16 +129,32 @@ max_spans_per_entry = 250
 # arbitrary one. The test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with
 # pins the figure and fails if this default stops admitting it.
 #
-# What that costs, plainly: the README's latency table measures 10 000
-# characters at eight to nine seconds on an Apple M3 Pro and about fifteen on
-# the containerised stack, so 18 000 is roughly fifteen seconds native and
-# twenty-seven containerised. Slower hardware has to lower this rather than
-# inherit it. Two things make it tolerable: it is the FIRST turn of a session
-# only, since tool definitions are byte-identical afterwards and the detection
-# cache serves them; and the alternative is not a faster gateway but a refused
-# one, because a bound below real traffic makes this unusable with the clients
-# it exists for. The real fix is issue #28 — detecting a document's strings in
-# one call instead of N — not a larger number here.
+# What that costs. Two things were offered as making it tolerable: it is the
+# FIRST turn of a session only, since tool definitions are byte-identical
+# afterwards and the detection cache serves them; and the alternative is not a
+# faster gateway but a refused one, because a bound below real traffic makes
+# this unusable with the clients it exists for.
+#
+# NOTHING BOUNDS A REQUEST'S WALL CLOCK, and the caller's patience is not ours
+# to set. Whatever this number permits is what the caller waits, and the caller
+# has its own timeout that this gateway neither sees nor controls. At thirty
+# seconds a client is inside these figures by a hair; at twenty it gives up
+# first and the failure arrives on its side looking like an outage here. No
+# cumulative deadline exists anywhere on the request path that would turn that
+# into an honest refusal instead.
+#
+# AND THE MEASUREMENT SAYS THESE FIGURES ARE OPTIMISTIC. Timed over HTTP against
+# the compose detector (ner: true), two runs of twenty calls: a two-character
+# text costs 265-410 ms and throughput is about 400 characters a second. The
+# README's bench says the same natively -- its 80-character row is 109 ms total,
+# which is per-call cost and almost nothing else, because the price is paid per
+# inference pass rather than per character. So the real ten-tool payload costs
+# about 15 s native and 52 s containerised on a first turn, and a request at
+# both bounds costs 31 s and 107 s. Per-call overhead is 56-59% of that.
+#
+# These defaults are under review on that evidence. The fix is issue #28 --
+# one call per document instead of one per string, which collapses the term
+# that dominates -- not a larger or smaller number here.
 #
 # It is NOT a timeout budget, and this comment used to say it was.
 # detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
@@ -167,8 +183,11 @@ max_tool_chars = 18000
 # payload cost 21 and 24 between them. A per-tool average is a floor, not a
 # prediction.
 #
-# The weak point is the same one: nobody has measured what a call costs before
-# any text is read. At 50 ms a call, 160 is eight seconds; at 300 ms it is
-# forty-eight. If it proves to be the high end the answer is issue #28, not a
-# smaller bound, because a smaller bound refuses real clients.
+# Measured, and it is the high end. A call costs 265-410 ms against the compose
+# detector and 109 ms natively by the README's bench -- the price is paid per
+# inference pass, so a two-character string costs very nearly what an
+# eighty-character one does. At 160 that is 17 s native and 63 s containerised
+# in overhead alone, before a character is read. Under review; see
+# max_tool_chars above. The answer is issue #28, not a smaller bound, because a
+# smaller bound refuses real clients instead.
 max_tool_leaves = 160

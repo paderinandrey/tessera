@@ -95,13 +95,36 @@ pub struct Config {
     /// twenty-seven containerised — a long wait, and close enough to the edge
     /// that slower hardware has to lower this rather than inherit it.
     ///
-    /// Two things make that tolerable rather than reckless. It is the *first*
-    /// turn of a session only: tool definitions are byte-identical every turn
-    /// after, and the detection cache serves them. And the alternative is not a
-    /// faster gateway but a refused one — a bound below real traffic makes this
-    /// unusable with the clients it exists for. The real fix is issue #28,
-    /// detecting a document's strings in one call instead of N, and not a
-    /// larger number here.
+    /// Two things were offered as making that tolerable. It is the *first* turn
+    /// of a session only: tool definitions are byte-identical every turn after,
+    /// and the detection cache serves them. And the alternative is not a faster
+    /// gateway but a refused one — a bound below real traffic makes this
+    /// unusable with the clients it exists for.
+    ///
+    /// **Nothing bounds a request's wall clock, and the caller's patience is
+    /// not ours to set.** Whatever this number permits is what the caller
+    /// waits, and the caller has its own timeout that this gateway neither
+    /// sees nor controls. At thirty seconds a client is inside a figure like
+    /// the one above by a hair; at twenty it gives up first, and the failure
+    /// arrives on its side looking like an outage here. There is no cumulative
+    /// deadline anywhere on the request path that would turn that into an
+    /// honest refusal instead.
+    ///
+    /// **And the measurement now says these figures are optimistic.** Timed
+    /// over HTTP against the compose detector (`ner: true`), two runs of
+    /// twenty calls each: a two-character text costs **265–410 ms**, and
+    /// throughput is **~400 characters a second**. The README's own bench says
+    /// the same thing natively — its 80-character row is 109 ms total, which is
+    /// per-call cost and almost nothing else, because the price is paid per
+    /// inference pass rather than per character. So the real ten-tool payload
+    /// in `mapping`'s testdata costs about **15 s native and 52 s
+    /// containerised** on a session's first turn, and a request at these two
+    /// bounds costs **31 s and 107 s**. Per-call overhead is 56–59% of that,
+    /// not a rounding term.
+    ///
+    /// These defaults are under review on that evidence. The fix is issue #28 —
+    /// one call for a document instead of one per string, which collapses the
+    /// term that dominates — and not a larger or smaller number here.
     ///
     /// **It is not a timeout budget**, and this comment used to say it was
     /// ("one constraint written twice"). `detector_timeout_secs` becomes
@@ -110,9 +133,8 @@ pub struct Config {
     /// request path. Two constraints — the timeout catches one stuck call, this
     /// caps how long a caller waits for the whole request.
     ///
-    /// Still unmeasured: per-call overhead. This bounds the characters,
-    /// `max_tool_leaves` bounds the calls, and nobody has measured what a call
-    /// costs before any text is read.
+    /// Per-call overhead is no longer unmeasured; see above. It is the larger
+    /// half of what both bounds permit.
     #[serde(default = "default_max_tool_chars")]
     pub max_tool_chars: usize,
 
@@ -134,13 +156,15 @@ pub struct Config {
     /// between them, which is why a per-tool average is a floor and not a
     /// prediction.
     ///
-    /// What is *not* measured is the cost of a call, and this is the number's
-    /// weak point. Total text is already bounded by `max_tool_chars`, so what
-    /// leaves add is per-call overhead, and nobody has measured that — the
-    /// figures under `detector_timeout_secs` are for texts of 1 200 and 6 000
-    /// characters. At 50 ms a call, 160 is eight seconds; at 300 ms it is
-    /// forty-eight. If it proves to be the high end the answer is issue #28,
-    /// not a smaller bound, because a smaller bound refuses real clients.
+    /// **Measured, and it is the high end.** A call costs 265–410 ms against the
+    /// compose detector and 109 ms natively by the README's own bench — the
+    /// price is paid per inference pass, so a two-character string costs very
+    /// nearly what an eighty-character one does. At 160 that is **17 s native
+    /// and 63 s containerised in overhead alone**, before a character is read,
+    /// which is the larger half of what a request at both bounds costs. This
+    /// default is under review on that evidence; see `max_tool_chars`. The
+    /// answer is issue #28 — one call per document rather than one per string —
+    /// because a smaller bound here refuses real clients instead.
     #[serde(default = "default_max_tool_leaves")]
     pub max_tool_leaves: usize,
 }
