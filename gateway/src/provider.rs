@@ -155,7 +155,16 @@ const OPENAI_TOOL_FIELDS: [&str; 5] = [
     "function_call",
     "tool_calls",
 ];
-const ANTHROPIC_TOOL_FIELDS: [&str; 3] = ["functions", "function_call", "tool_calls"];
+const ANTHROPIC_TOOL_FIELDS: [&str; 4] = [
+    "functions",
+    "function_call",
+    "tool_calls",
+    // Not an OpenAI-shaped field but the same hole: `mcp_servers` grants the
+    // model tools that are declared nowhere in the body, so their calls and
+    // results arrive shaped by a server this gateway never described — and it
+    // carries the caller's own `authorization_token` besides.
+    "mcp_servers",
+];
 
 /// Every message must be an object carrying `content`. A bare string entry, or
 /// an object without content, produced no pointer and was forwarded untouched —
@@ -188,10 +197,17 @@ fn reject_tool_fields(
 /// else should.
 fn reject_streamed_tools(
     body: &Value,
-    carries_tools: bool,
+    slots: &[Slot],
     provider: &'static str,
 ) -> Result<(), ShapeError> {
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // Every `Json` slot is tool traffic, and a `Text` slot says whether it is.
+    // Reading the slots rather than a field name is what makes this cover a
+    // continuation that carries an earlier call and its result without
+    // repeating the definitions.
+    let carries_tools = slots
+        .iter()
+        .any(|slot| matches!(slot, Slot::Json { .. } | Slot::Text { tool: true, .. }));
     if streaming && carries_tools {
         return Err(ShapeError::Unsupported(provider, "streamed tool traffic"));
     }
@@ -322,11 +338,25 @@ fn content_pointers(
         Value::String(_) => out.push(Slot::text(prefix.to_owned())),
         Value::Array(parts) => {
             for (index, part) in parts.iter().enumerate() {
-                if part.get("text").and_then(Value::as_str).is_some() {
-                    out.push(Slot::text(format!("{prefix}/{index}/text")));
-                    continue;
-                }
+                // `type` first, always. A block's type is what says which of
+                // its fields carry the caller's text; reading a field before
+                // the type meant any block that carried a `text` was described
+                // by that alone, and every other field in it — a tool call's
+                // `input`, a result's `content` — was forwarded untouched. A
+                // block with no type cannot be read at all, so it falls to the
+                // refusal below with everything else we do not understand.
                 match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text" => {
+                        // Present but not a string cannot be masked, and the
+                        // arm below refuses it rather than dropping the block.
+                        match part.get("text") {
+                            Some(Value::String(_)) => {
+                                out.push(Slot::text(format!("{prefix}/{index}/text")));
+                                continue;
+                            }
+                            _ => return Err(ShapeError::Request(provider)),
+                        }
+                    }
                     // `id` and `name` are the client's dispatch and are never
                     // described; only the arguments are.
                     "tool_use" => {
@@ -582,8 +612,6 @@ impl Provider for Anthropic {
             .ok_or(ShapeError::Request("anthropic"))?;
         reject_tool_fields(body, &ANTHROPIC_TOOL_FIELDS, "anthropic")?;
         let mut pointers = Vec::new();
-        let carries_tools = body.get("tools").is_some_and(|value| !value.is_null());
-        reject_streamed_tools(body, carries_tools, "anthropic")?;
         // Explicitly null is an SDK serializing its default, not a request to
         // use tools — the same reading `thinking` and `logprobs` already get.
         if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
@@ -637,6 +665,12 @@ impl Provider for Anthropic {
                 )?;
             }
         }
+        // Last, because the slots are the answer. A definition, a call's
+        // arguments and a result are all tool traffic, and each of them already
+        // says so — so asking the slots cannot miss a location the way asking
+        // for a top-level `tools` did, and a location added later is covered
+        // the day it is described.
+        reject_streamed_tools(body, &pointers, "anthropic")?;
         Ok(pointers)
     }
 
@@ -1260,6 +1294,136 @@ mod tests {
         ]}]});
         assert!(OpenAi.request_pointers(&body).is_err());
         assert!(Anthropic.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn a_streamed_continuation_is_refused_for_its_tool_history_not_its_definitions() {
+        // The refusal keyed on top-level `tools`, so a continuation carrying an
+        // earlier call and its result — but no repeated definitions — passed,
+        // and `stream_slots` would refuse the tool events afterwards, once the
+        // caller had already paid for them.
+        //
+        // Whether Anthropic itself accepts such a request is not the question.
+        // Anthropic's tool-use documentation passes `tools` on every
+        // continuation in every example but nowhere states it is required, and
+        // `mcp_servers` grants tools without `tools` at all — so "no
+        // definitions means no tool events" is not something to rest a refusal
+        // on. What this gateway can mask is its own business to decide.
+        let continuation = json!({
+            "model": "claude",
+            "stream": true,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"path": "x"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Weber"}]}
+            ]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&continuation),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "streamed tool traffic"
+            ))
+        ));
+
+        // A result alone is enough — it is tool traffic and `stream_slots` does
+        // not know how to mask what comes back for it either.
+        let result_only = json!({
+            "model": "claude",
+            "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "Weber"}]}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&result_only),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "streamed tool traffic"
+            ))
+        ));
+
+        // And an ordinary streamed conversation is untouched by any of this.
+        let plain = json!({
+            "model": "claude",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&plain).unwrap(),
+            vec![text("/messages/0/content")]
+        );
+    }
+
+    #[test]
+    fn an_mcp_server_grants_tools_this_gateway_cannot_see_and_is_refused() {
+        // `mcp_servers` gives the model tools without `tools`, so its calls and
+        // results would arrive shaped by a server this gateway never described.
+        // It also carries the caller's own `authorization_token`. A field no
+        // slot addresses is forwarded exactly as it came, so it is refused.
+        let body = json!({
+            "model": "claude",
+            "mcp_servers": [{"type": "url", "url": "https://example.invalid/sse",
+                             "name": "weber-notes", "authorization_token": "secret"}],
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&body),
+            Err(ShapeError::Unsupported("anthropic", _))
+        ));
+    }
+
+    #[test]
+    fn a_block_cannot_hide_its_payload_behind_a_text_field() {
+        // The dispatch read `text` before `type`, so *any* block that carried a
+        // `text` field was described by that field alone and everything else in
+        // it travelled to the provider exactly as it came. Adding one key was
+        // enough to walk a tool call's arguments straight past the masker.
+        let smuggled_call = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_use", "id": "t1", "name": "f",
+             "text": "nothing to see", "input": {"who": "Martina Weber"}}
+        ]}]});
+        for described in [
+            Anthropic.request_pointers(&smuggled_call).unwrap(),
+            OpenAi.request_pointers(&smuggled_call).unwrap(),
+        ] {
+            assert!(
+                described.iter().any(|slot| matches!(
+                    slot,
+                    Slot::Json { pointer, .. } if pointer.ends_with("/input")
+                )),
+                "the arguments are described whatever else the block carries: {described:?}"
+            );
+        }
+
+        let smuggled_result = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "text": "nothing to see", "content": "Martina Weber"}
+        ]}]});
+        for described in [
+            Anthropic.request_pointers(&smuggled_result).unwrap(),
+            OpenAi.request_pointers(&smuggled_result).unwrap(),
+        ] {
+            assert!(
+                described
+                    .iter()
+                    .any(|slot| slot.pointer().ends_with("/content")),
+                "a result's content is described whatever else the block carries: {described:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_that_does_not_say_what_it_is_is_refused() {
+        // The `text`-first dispatch also meant a part with no `type` at all was
+        // described from its `text` and forwarded. Type is what says which
+        // fields a block has, so a block that does not declare one cannot be
+        // read — and an unreadable shape is refused, never forwarded.
+        let untyped = json!({"messages": [{"role": "user", "content": [
+            {"text": "hello", "input": {"who": "Martina Weber"}}
+        ]}]});
+        assert!(Anthropic.request_pointers(&untyped).is_err());
+        assert!(OpenAi.request_pointers(&untyped).is_err());
     }
 
     #[test]

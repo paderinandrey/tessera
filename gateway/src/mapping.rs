@@ -29,6 +29,16 @@ pub enum MappingError {
              refused rather than served with a value misplaced or left in"
     )]
     MaskCountMismatch(&'static str),
+    /// Carries the key for tests and logs, deliberately *not* for the message.
+    /// A placeholder is this gateway's own token and a client is never supposed
+    /// to see one — restoration exists so they do not. An error body is the one
+    /// path that could hand one over, so it does not.
+    #[error(
+        "upstream response uses a placeholder as a property name; a placeholder names a \
+             value, and a key is dispatch, so the response is refused rather than served \
+             with it"
+    )]
+    PlaceholderKey(String),
 }
 
 /// The longest entity type that can be written as a placeholder.
@@ -262,7 +272,19 @@ impl Mapping {
             Value::Object(fields) => Value::Object(
                 fields
                     .iter()
-                    .map(|(key, item)| Ok((key.clone(), self.restore_value(item)?)))
+                    .map(|(key, item)| {
+                        // Keys are never masked going up, so a placeholder in
+                        // key position did not come from us rewriting one — the
+                        // model wrote it, having seen placeholders in the text.
+                        // Restoring it would rename the property the client's
+                        // tool reads its argument from; leaving it puts our own
+                        // token in the client's hands. Both change dispatch, so
+                        // neither is served.
+                        if key.starts_with('[') && key.ends_with(']') && is_placeholder(key) {
+                            return Err(MappingError::PlaceholderKey(key.clone()));
+                        }
+                        Ok((key.clone(), self.restore_value(item)?))
+                    })
                     .collect::<Result<serde_json::Map<_, _>, MappingError>>()?,
             ),
             other => other.clone(),
@@ -332,6 +354,11 @@ pub enum Shape {
     /// is an ordinary name for a parameter, and treating it as a keyword would
     /// skip that parameter's whole subschema and forward its prose unmasked.
     SchemaMap,
+    /// A subschema whose *instances* are property names — the value of
+    /// `propertyNames`. Prose inside it is prose like anywhere else, but the
+    /// strings it constrains are names, so the keywords that hold example
+    /// instances hold names rather than data and stay unscanned.
+    NameSchema,
     /// An object under draft-07's `dependencies`, whose keys are property
     /// names and whose values are *either* an array of property names or a
     /// subschema. 2020-12 split those into `dependentRequired` and
@@ -350,13 +377,12 @@ pub enum Shape {
 /// much masks a value that did not need it, while scanning too little forwards
 /// one that did.
 ///
-/// `propertyNames` and `dependentRequired` are skipped whole rather than
-/// descended into: everything meaningful inside them constrains or lists
-/// property names. That does mean a `description` written inside a
-/// `propertyNames` subschema is not scanned. It is the one place this list
-/// trades a marginal leak against a certain dispatch break, and it is the right
-/// way round — a schema nobody can satisfy fails every call that uses it.
-const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 15] = [
+/// `dependentRequired` is skipped whole rather than descended into: it maps
+/// property names to lists of property names, and there is no prose anywhere in
+/// it. `propertyNames` is *not* on this list even though part of it is dispatch,
+/// because only part of it is — see `Shape::NameSchema`, which is what a keyword
+/// gets when it needs a rule rather than a verdict.
+const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 14] = [
     "$anchor",
     "$dynamicAnchor",
     "$dynamicRef",
@@ -372,7 +398,6 @@ const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 15] = [
     // `$ref` that resolves against it.
     "id",
     "pattern",
-    "propertyNames",
     "required",
     "type",
 ];
@@ -430,6 +455,13 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
             Value::Object(_) => Some(Shape::Schema),
             _ => Some(Shape::Instance),
         },
+        // The strings this subschema constrains are property names, so the
+        // keywords that hold instances hold names. Everything else about it is
+        // an ordinary subschema, prose included.
+        Shape::NameSchema if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
+        Shape::NameSchema if SCHEMA_INSTANCE_KEYWORDS.contains(&key) => None,
+        Shape::NameSchema => Some(Shape::NameSchema),
+        Shape::Schema if key == "propertyNames" => Some(Shape::NameSchema),
         Shape::Schema if key == "dependencies" => Some(Shape::DependencyMap),
         Shape::Schema if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
         Shape::Schema if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
@@ -443,10 +475,20 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Leaf {
     Text(String),
-    /// Rendered as the client wrote it. A card number, a German tax ID and a
-    /// French NIR are digits alone, so a number has to be looked at — but it is
-    /// never replaced, because a schema that declared a number may reject a
-    /// string.
+    /// Rendered as the client wrote it, and **nothing looks at it yet**.
+    ///
+    /// The walk yields numbers because they will have to be inspected: a credit
+    /// card, a German tax ID and a French NIR are digits alone, so a document
+    /// whose personal data sits in a numeric leaf is not covered by anything
+    /// this gateway does today — `mask_all` matches this variant and does
+    /// nothing with it, and the rebuild copies the number straight through.
+    /// Task 6 is where the plan schedules detecting them and refusing the
+    /// request when a span is found; until it lands, a numeric leaf reaches the
+    /// provider verbatim. Do not read this variant's existence as coverage.
+    ///
+    /// What will not change is that a number is never *replaced*: a schema that
+    /// declared a number may reject a string, so the outcome for a number that
+    /// carries an identifier has to be a refusal rather than a placeholder.
     Number(String),
 }
 
@@ -1180,6 +1222,38 @@ mod tests {
     }
 
     #[test]
+    fn a_property_names_subschema_carries_prose_and_names_and_is_split_by_position() {
+        // `propertyNames` was skipped whole because *part* of it is dispatch.
+        // Only part of it is: it is a subschema like any other, and its
+        // `description` is prose that the same word elsewhere in the document
+        // gets masked for. What is dispatch is what it *constrains* — the
+        // strings it matches are property names — so its instance-valued
+        // keywords list names rather than data, and those stay excluded.
+        let schema = json!({
+            "propertyNames": {
+                "description": "Owned by Martina Weber",
+                "pattern": "^Weber-[0-9]+$",
+                "enum": ["credit_card", "billing_address"],
+                "const": "Weber"
+            }
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Owned by Martina Weber".to_owned())],
+            "the prose is scanned; the pattern and the names it may match are not"
+        );
+        // And it is copied through rather than dropped, like every other skip.
+        let rebuilt = replace_text_leaves(&schema, &["MASKED".to_owned()], Shape::Schema).unwrap();
+        assert_eq!(rebuilt["propertyNames"]["description"], "MASKED");
+        assert_eq!(rebuilt["propertyNames"]["pattern"], "^Weber-[0-9]+$");
+        assert_eq!(
+            rebuilt["propertyNames"]["enum"],
+            json!(["credit_card", "billing_address"])
+        );
+        assert_eq!(rebuilt["propertyNames"]["const"], "Weber");
+    }
+
+    #[test]
     fn a_draft_07_dependency_is_read_by_its_value_rather_than_its_name() {
         // The one keyword whose meaning is in its value's *type*. Draft-07's
         // `dependencies` holds, per key, either an array of property names
@@ -1381,9 +1455,61 @@ mod tests {
     }
 
     #[test]
+    fn a_placeholder_shaped_key_in_a_response_is_refused_rather_than_restored() {
+        // Nothing this gateway sends up ever masks a key, so a placeholder in
+        // key position was written by the model — which sees placeholders in
+        // the prose and may echo one anywhere. Restoring it renames the
+        // property the client's tool reads its argument from; leaving it hands
+        // the client our own token as a property name. Both break dispatch, so
+        // the response is refused instead.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask(
+                "Weber",
+                &[Span {
+                    entity_type: "PERSON".to_owned(),
+                    start: 0,
+                    end: 5,
+                }],
+            )
+            .unwrap();
+        assert_eq!(masked, "[PERSON_1]");
+
+        assert!(matches!(
+            mapping.restore_value(&json!({"[PERSON_1]": "anything"})),
+            Err(MappingError::PlaceholderKey(key)) if key == "[PERSON_1]"
+        ));
+        // Nested just as much as at the top: the walk reaches every object.
+        assert!(matches!(
+            mapping.restore_value(&json!({"outer": [{"[PERSON_1]": 1}]})),
+            Err(MappingError::PlaceholderKey(_))
+        ));
+        // A placeholder we never issued is refused too. Whether it names one of
+        // ours is not the question — the client cannot dispatch on it either
+        // way, and asking would leak which numbers this session has issued.
+        assert!(matches!(
+            mapping.restore_value(&json!({"[LOCATION_97]": 1})),
+            Err(MappingError::PlaceholderKey(_))
+        ));
+
+        // A key that merely looks placeholder-ish is an ordinary key. The
+        // brackets are the grammar, and `PERSON_1` without them is a perfectly
+        // ordinary thing to call a field.
+        assert_eq!(
+            mapping
+                .restore_value(&json!({"PERSON_1": "x", "[not a placeholder]": "y"}))
+                .unwrap(),
+            json!({"PERSON_1": "x", "[not a placeholder]": "y"})
+        );
+    }
+
+    #[test]
     fn a_number_survives_replacement_with_its_type_intact() {
         let document = json!({"count": 7, "nested": {"ratio": 1.5}});
         let result = replace_text_leaves(&document, &[], Shape::Instance).unwrap();
-        assert_eq!(result, document, "a number is looked at, never rewritten");
+        assert_eq!(
+            result, document,
+            "a number is copied through untouched — and, until task 6, unexamined"
+        );
     }
 }

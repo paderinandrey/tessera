@@ -89,6 +89,7 @@ impl ProxyError {
             | ProxyError::Mapping(MappingError::Unknown(_))
             | ProxyError::Mapping(MappingError::BadSpan(_))
             | ProxyError::Mapping(MappingError::MaskCountMismatch(_))
+            | ProxyError::Mapping(MappingError::PlaceholderKey(_))
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -109,6 +110,7 @@ impl ProxyError {
             ProxyError::Mapping(MappingError::TooDeep) => "mapping_too_deep",
             ProxyError::Mapping(MappingError::TooLarge) => "mapping_too_large",
             ProxyError::Mapping(MappingError::MaskCountMismatch(_)) => "mapping_mask_mismatch",
+            ProxyError::Mapping(MappingError::PlaceholderKey(_)) => "mapping_placeholder_key",
             ProxyError::Upstream(_) => "upstream_failed",
             ProxyError::Session(SessionError::BadId) => "session_bad_id",
             ProxyError::Session(SessionError::Disabled) => "session_disabled",
@@ -277,9 +279,15 @@ async fn mask_all(
                             count_distinct(text, &spans, &mut distinct);
                             replacements.push(mapping.mask(text, &spans)?);
                         }
-                        // Task 6 refuses this when it carries a span. Until
-                        // then a number is looked at by nobody, which is the
-                        // behaviour that task exists to change.
+                        // Deliberately nothing, and deliberately not covered:
+                        // a numeric leaf is never sent to the detector, so a
+                        // card number or a numeric tax ID sitting in one reaches
+                        // the provider verbatim. Task 6 is where the plan puts
+                        // detecting them and refusing the request when a span is
+                        // found — refusing rather than masking, because a schema
+                        // that declared a number may reject a string. Anything
+                        // that reads as though numbers are handled today is
+                        // wrong; see `mapping::Leaf::Number`.
                         mapping::Leaf::Number(_) => {}
                     }
                 }
@@ -977,6 +985,45 @@ mod tests {
             lines[0]["redacted"], 1,
             "the line names a type no placeholder carried and does not say so: {}",
             lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_keying_arguments_by_a_placeholder_is_refused_not_forwarded() {
+        // The model sees placeholders in the prose and can echo one anywhere,
+        // including as a property name it invents. Restoration walks values, so
+        // a placeholder in key position would travel to the client untouched
+        // and its tool would be called with an argument it cannot read.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [
+                {"type": "tool_use", "id": "t1", "name": "read_file",
+                 "input": {"[PERSON_1]": "notes.txt"}}
+            ]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"path": "Weber"}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "the upstream produced something we cannot serve: {returned}"
+        );
+        assert!(
+            !returned.contains("PERSON_1"),
+            "and the placeholder must not reach the client even in the refusal: {returned}"
         );
     }
 
