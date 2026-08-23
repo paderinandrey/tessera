@@ -16,6 +16,8 @@ pub enum ConfigError {
     ZeroSpansPerEntry,
     #[error("max_tool_bytes must be greater than zero")]
     ZeroToolBytes,
+    #[error("max_tool_leaves must be greater than zero")]
+    ZeroToolLeaves,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +91,29 @@ pub struct Config {
     /// carries the work that lifts it.
     #[serde(default = "default_max_tool_bytes")]
     pub max_tool_bytes: usize,
+
+    /// How many separate strings one request's tool structures may hold.
+    ///
+    /// A second bound because `max_tool_bytes` bounds the wrong quantity for
+    /// this failure. Detection is one round-trip per string, awaited in turn
+    /// while the request holds its session, so cost tracks the *number* of
+    /// strings and not their total size — and the two come apart badly. A
+    /// schema of a thousand two-character strings is about 10 000 bytes, passes
+    /// the byte bound, and is a thousand sequential calls.
+    ///
+    /// The number is not derived from a measurement, and should not be read as
+    /// one. The measured figures this repo has are for texts of 1 200 and 6 000
+    /// characters (see `detector_timeout_secs`); nobody has measured what a
+    /// ten-character text costs, and per-call overhead is exactly what dominates
+    /// there. 64 is chosen to be clearly under any plausible timeout rather than
+    /// to sit near a known edge: even at a pessimistic 300 ms of fixed overhead
+    /// it is about 19 seconds, inside a 30-second timeout with room left.
+    ///
+    /// Raising it wants that measurement first. The real fix is not a larger
+    /// number but detecting a document's strings in one call instead of N, which
+    /// is issue #28's scope.
+    #[serde(default = "default_max_tool_leaves")]
+    pub max_tool_leaves: usize,
 }
 
 fn default_bind() -> String {
@@ -169,6 +194,9 @@ fn default_max_spans_per_entry() -> usize {
 fn default_max_tool_bytes() -> usize {
     10_000
 }
+fn default_max_tool_leaves() -> usize {
+    64
+}
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -189,6 +217,9 @@ impl Config {
         }
         if config.max_tool_bytes == 0 {
             return Err(ConfigError::ZeroToolBytes);
+        }
+        if config.max_tool_leaves == 0 {
+            return Err(ConfigError::ZeroToolLeaves);
         }
         Ok(config)
     }
@@ -353,17 +384,31 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_bound_has_a_default() {
+    fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
         assert_eq!(config.max_tool_bytes, 10_000);
+        assert_eq!(config.max_tool_leaves, 64);
     }
 
     #[test]
     fn a_zero_tool_bound_is_rejected() {
+        // Either bound at zero is a typo rather than a configuration: it
+        // refuses every tool request, and says so only in a 400 per call.
         let text = with_audit("max_tool_bytes = 0");
         assert!(matches!(
             Config::from_toml(&text),
             Err(ConfigError::ZeroToolBytes)
         ));
+        let text = with_audit("max_tool_leaves = 0");
+        assert!(matches!(
+            Config::from_toml(&text),
+            Err(ConfigError::ZeroToolLeaves)
+        ));
+    }
+
+    #[test]
+    fn the_leaf_bound_can_be_sized() {
+        let config = Config::from_toml(&with_audit("max_tool_leaves = 8")).unwrap();
+        assert_eq!(config.max_tool_leaves, 8);
     }
 }

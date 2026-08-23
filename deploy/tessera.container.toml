@@ -37,3 +37,10 @@ max_spans_per_entry = 250
 # gateway/tessera.example.toml for the measured sources and the full
 # arithmetic.
 max_tool_bytes = 10000
+# How many separate strings those structures may hold. A second bound because
+# max_tool_bytes bounds the wrong quantity for this failure: detection is one
+# round-trip per string, awaited in turn, so cost tracks the number of strings
+# rather than their total size. A schema of a thousand two-character strings is
+# about 10000 bytes and a thousand sequential calls. See
+# gateway/tessera.example.toml for why this number is not a measurement.
+max_tool_leaves = 64

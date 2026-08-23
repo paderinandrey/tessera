@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::mapping::Shape;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShapeError {
     #[error("request body is not in the expected {0} shape")]
@@ -10,6 +12,14 @@ pub enum ShapeError {
     Pointer(String),
     #[error("{0} request uses {1}, which this gateway does not mask yet; it is refused rather than forwarded")]
     Unsupported(&'static str, &'static str),
+    /// An embedded document that is not the JSON it claims to be. Its own
+    /// variant because it is the *caller's* mistake and nothing else here is:
+    /// `Pointer` is a 502 that blames the upstream, and a model emitting
+    /// truncated `arguments` — which they do — is echoed back by the client on
+    /// the next turn as ordinary input. Blaming the provider for that would
+    /// send the caller looking in the wrong place forever.
+    #[error("{0} tool arguments at {1} are not the JSON they are declared to be")]
+    MalformedDocument(&'static str, String),
 }
 
 /// Where the text lives. Providers describe locations; masking and restoration
@@ -60,14 +70,41 @@ pub enum Terminates {
 /// string masked as it stands. `Json` is a document whose string leaves are
 /// masked and whose keys are not — `embedded` distinguishes a document from a
 /// string holding one, which is the only difference between Anthropic's
-/// `input` object and OpenAI's `arguments`.
+/// `input` object and OpenAI's `arguments`, and `shape` says whether the
+/// document is a schema, whose strings are not all data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Slot {
-    Text(String),
-    Json { pointer: String, embedded: bool },
+    Text {
+        pointer: String,
+        /// Whether this string is tool traffic, and so counts against
+        /// `max_tool_bytes`. A `tool_result` is a `Text` slot like any prompt
+        /// text — it is a bare string — but it is the largest surface tool
+        /// support opens, and a bound that skipped it would be a bound on the
+        /// smaller half. False for ordinary prompt and message text, which the
+        /// tool bound has no business limiting.
+        tool: bool,
+    },
+    Json {
+        pointer: String,
+        embedded: bool,
+        /// Whether the document is a JSON Schema. Every `Json` slot is tool
+        /// traffic, so there is no `tool` flag here — there would be nothing
+        /// to distinguish.
+        shape: Shape,
+    },
 }
 
 impl Slot {
+    /// A plain string that is not tool traffic — prompt text, an identifier
+    /// field, a message part. The common case, named so the call sites do not
+    /// each repeat `tool: false`.
+    fn text(pointer: String) -> Self {
+        Slot::Text {
+            pointer,
+            tool: false,
+        }
+    }
+
     /// Test-only, and marked so rather than suppressed. Every production site
     /// has to know *which* kind it holds — masking reads a string or a
     /// document, the size bound counts documents alone — so each destructures
@@ -77,7 +114,7 @@ impl Slot {
     #[cfg(test)]
     pub fn pointer(&self) -> &str {
         match self {
-            Slot::Text(pointer) => pointer,
+            Slot::Text { pointer, .. } => pointer,
             Slot::Json { pointer, .. } => pointer,
         }
     }
@@ -161,30 +198,69 @@ fn reject_streamed_tools(
     Ok(())
 }
 
+/// Fields a tool definition may carry that this gateway can account for.
+/// `name` is dispatch and `type` names a server tool; `cache_control` is
+/// `{"type": "ephemeral"}` and carries nothing of the caller's. `description`
+/// and the schema are described as slots.
+///
+/// Anything else is refused, because a tool definition is an object the caller
+/// fills in and a field no slot addresses is forwarded exactly as it came.
+/// Anthropic's own server tools are why this is not theoretical:
+/// `web_search_20250305` carries `user_location: {city, region, country,
+/// timezone}`, and `city` is a LOCATION in this gateway's own vocabulary.
+const ANTHROPIC_TOOL_DEFINITION_FIELDS: [&str; 5] = [
+    "name",
+    "description",
+    "input_schema",
+    "type",
+    "cache_control",
+];
+
 /// A tool definition's prose and its schema. The schema goes in whole rather
 /// than by naming the keywords that carry text: `description` is not the only
 /// one — `default`, `const`, `enum`, `examples`, `title` and `$comment` are all
 /// client-controlled strings — and a list of what to scan is wrong the day
-/// someone adds to it. Property names are keys, which the walk never yields.
+/// someone adds to it. Property names are keys, which the walk never yields in
+/// key position; `Shape::Schema` is what handles the positions where a schema
+/// names one as a value.
 fn tool_definition_slots(
     prefix: &str,
     definition: &Value,
     schema_field: &str,
+    allowed: &[&'static str],
+    provider: &'static str,
     out: &mut Vec<Slot>,
-) {
-    if definition
-        .get("description")
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        out.push(Slot::Text(format!("{prefix}/description")));
+) -> Result<(), ShapeError> {
+    // A definition that is not an object has no fields to describe and would
+    // travel whole: `"tools": ["Martina Weber"]` produced no slot and no
+    // refusal.
+    let fields = definition
+        .as_object()
+        .ok_or(ShapeError::Request(provider))?;
+    for key in fields.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(ShapeError::Unsupported(provider, "tool definition field"));
+        }
     }
-    if definition.get(schema_field).is_some() {
+    // Present but not a string cannot be masked, so it is refused rather than
+    // forwarded as it is — the rule `identifier_pointer` already applies to
+    // `/user` and `/name`, which this once did not.
+    match definition.get("description") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(_)) => out.push(Slot::text(format!("{prefix}/description"))),
+        Some(_) => return Err(ShapeError::Request(provider)),
+    }
+    if definition
+        .get(schema_field)
+        .is_some_and(|value| !value.is_null())
+    {
         out.push(Slot::Json {
             pointer: format!("{prefix}/{schema_field}"),
             embedded: false,
+            shape: Shape::Schema,
         });
     }
+    Ok(())
 }
 
 /// A field that should hold a maskable string. Absent is fine; present but not
@@ -199,7 +275,7 @@ fn identifier_pointer(
     match body.pointer(lookup) {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(_)) => {
-            out.push(Slot::Text(output));
+            out.push(Slot::text(output));
             Ok(())
         }
         Some(_) => Err(ShapeError::Request(provider)),
@@ -234,11 +310,11 @@ fn content_pointers(
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
     match content {
-        Value::String(_) => out.push(Slot::Text(prefix.to_owned())),
+        Value::String(_) => out.push(Slot::text(prefix.to_owned())),
         Value::Array(parts) => {
             for (index, part) in parts.iter().enumerate() {
                 if part.get("text").and_then(Value::as_str).is_some() {
-                    out.push(Slot::Text(format!("{prefix}/{index}/text")));
+                    out.push(Slot::text(format!("{prefix}/{index}/text")));
                     continue;
                 }
                 match part.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -249,6 +325,7 @@ fn content_pointers(
                             out.push(Slot::Json {
                                 pointer: format!("{prefix}/{index}/input"),
                                 embedded: false,
+                                shape: Shape::Instance,
                             });
                         }
                         continue;
@@ -260,12 +337,22 @@ fn content_pointers(
                     // is dispatch and is left alone.
                     "tool_result" => {
                         if let Some(content) = part.get("content") {
+                            let from = out.len();
                             content_pointers(
                                 &format!("{prefix}/{index}/content"),
                                 content,
                                 provider,
                                 out,
                             )?;
+                            // Whatever the recursion just produced is tool
+                            // traffic, however deep it went. Marked here rather
+                            // than inside the recursion because this is the
+                            // only frame that knows it is inside a result.
+                            for slot in &mut out[from..] {
+                                if let Slot::Text { tool, .. } = slot {
+                                    *tool = true;
+                                }
+                            }
                         }
                         continue;
                     }
@@ -497,8 +584,10 @@ impl Provider for Anthropic {
                     &format!("/tools/{index}"),
                     definition,
                     "input_schema",
+                    &ANTHROPIC_TOOL_DEFINITION_FIELDS,
+                    "anthropic",
                     &mut pointers,
-                );
+                )?;
             }
         }
         // Extended thinking opens the stream with a `thinking` block whose text
@@ -550,7 +639,7 @@ impl Provider for Anthropic {
         let mut pointers = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
             if block.get("text").and_then(Value::as_str).is_some() {
-                pointers.push(Slot::Text(format!("/content/{index}/text")));
+                pointers.push(Slot::text(format!("/content/{index}/text")));
                 continue;
             }
             // A tool_use block's arguments carry the placeholders we issued,
@@ -562,6 +651,7 @@ impl Provider for Anthropic {
                     pointers.push(Slot::Json {
                         pointer: format!("/content/{index}/input"),
                         embedded: false,
+                        shape: Shape::Instance,
                     });
                 }
                 continue;
@@ -654,17 +744,26 @@ pub fn write_pointer(body: &mut Value, pointer: &str, text: &str) -> Result<(), 
 /// A `Json` slot's document. `embedded` means the pointer addresses a string
 /// holding a document rather than the document itself — OpenAI's `arguments`
 /// against Anthropic's `input`.
-pub fn read_document(body: &Value, pointer: &str, embedded: bool) -> Result<Value, ShapeError> {
+pub fn read_document(
+    body: &Value,
+    pointer: &str,
+    embedded: bool,
+    provider: &'static str,
+) -> Result<Value, ShapeError> {
     let at = body
         .pointer(pointer)
         .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
     if !embedded {
         return Ok(at.clone());
     }
+    // Both failures below are the caller's: a slot said this holds a document,
+    // and it does not. Neither is the upstream's fault, and a 502 would say it
+    // was.
     let text = at
         .as_str()
-        .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
-    serde_json::from_str(text).map_err(|_| ShapeError::Pointer(pointer.to_owned()))
+        .ok_or_else(|| ShapeError::MalformedDocument(provider, pointer.to_owned()))?;
+    serde_json::from_str(text)
+        .map_err(|_| ShapeError::MalformedDocument(provider, pointer.to_owned()))
 }
 
 pub fn write_document(
@@ -701,6 +800,37 @@ mod tests {
     // Unwraps `request_pointers`/`response_pointers`' `Slot` results — a
     // different type from `TextSlot` above, so a second helper rather than a
     // shared one; Rust does not overload free functions by parameter type.
+    // Named constructors so a full-`Slot` expectation stays as readable as a
+    // list of pointers was. The kind is the point: `slot_pointers` below cannot
+    // see it, and the first slot whose kind mattered got through a mutation
+    // because of that.
+    fn text(pointer: &str) -> Slot {
+        Slot::text(pointer.to_owned())
+    }
+    fn tool_text(pointer: &str) -> Slot {
+        Slot::Text {
+            pointer: pointer.to_owned(),
+            tool: true,
+        }
+    }
+    fn instance(pointer: &str) -> Slot {
+        Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: false,
+            shape: Shape::Instance,
+        }
+    }
+    fn schema(pointer: &str) -> Slot {
+        Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: false,
+            shape: Shape::Schema,
+        }
+    }
+
+    /// Pointers alone, for the one kind of assertion that is a predicate over
+    /// pointer strings rather than a description of what was found. Everything
+    /// that says "these are the slots" asserts the slots.
     fn slot_pointers(slots: Result<Vec<Slot>, ShapeError>) -> Vec<String> {
         slots
             .unwrap()
@@ -711,8 +841,12 @@ mod tests {
 
     #[test]
     fn a_text_slot_names_the_pointer_it_wraps() {
-        let slot = Slot::Text("/messages/0/content".to_owned());
+        let slot = Slot::text("/messages/0/content".to_owned());
         assert_eq!(slot.pointer(), "/messages/0/content");
+        assert!(
+            matches!(slot, Slot::Text { tool: false, .. }),
+            "prompt text is not tool traffic and the tool bound must not count it"
+        );
     }
 
     #[test]
@@ -720,10 +854,12 @@ mod tests {
         let plain = Slot::Json {
             pointer: "/messages/0/content/0/input".to_owned(),
             embedded: false,
+            shape: Shape::Instance,
         };
         let embedded = Slot::Json {
             pointer: "/messages/0/tool_calls/0/function/arguments".to_owned(),
             embedded: true,
+            shape: Shape::Instance,
         };
         assert_eq!(plain.pointer(), "/messages/0/content/0/input");
         assert!(!matches!(plain, Slot::Json { embedded: true, .. }));
@@ -780,8 +916,8 @@ mod tests {
     fn openai_finds_string_content() {
         let body = json!({"messages": [{"role": "user", "content": "Weber"}]});
         assert_eq!(
-            slot_pointers(OpenAi.request_pointers(&body)),
-            vec!["/messages/0/content"]
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![text("/messages/0/content")]
         );
     }
 
@@ -792,8 +928,8 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "http://x"}}
         ]}]});
         assert_eq!(
-            slot_pointers(OpenAi.request_pointers(&body)),
-            vec!["/messages/0/content/0/text"]
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![text("/messages/0/content/0/text")]
         );
     }
 
@@ -804,8 +940,12 @@ mod tests {
             "messages": [{"role": "user", "name": "Weber", "content": "Hallo"}]
         });
         assert_eq!(
-            slot_pointers(OpenAi.request_pointers(&body)),
-            vec!["/user", "/messages/0/name", "/messages/0/content"]
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                text("/user"),
+                text("/messages/0/name"),
+                text("/messages/0/content")
+            ]
         );
     }
 
@@ -816,8 +956,8 @@ mod tests {
             "messages": [{"role": "user", "content": "Hallo"}]
         });
         assert_eq!(
-            slot_pointers(Anthropic.request_pointers(&body)),
-            vec!["/metadata/user_id", "/messages/0/content"]
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![text("/metadata/user_id"), text("/messages/0/content")]
         );
     }
 
@@ -825,8 +965,8 @@ mod tests {
     fn openai_reads_the_response_content() {
         let body = json!({"choices": [{"message": {"role": "assistant", "content": "Hallo"}}]});
         assert_eq!(
-            slot_pointers(OpenAi.response_pointers(&body)),
-            vec!["/choices/0/message/content"]
+            OpenAi.response_pointers(&body).unwrap(),
+            vec![text("/choices/0/message/content")]
         );
     }
 
@@ -837,8 +977,8 @@ mod tests {
             "messages": [{"role": "user", "content": [{"type": "text", "text": "Weber"}]}]
         });
         assert_eq!(
-            slot_pointers(Anthropic.request_pointers(&body)),
-            vec!["/system", "/messages/0/content/0/text"]
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![text("/system"), text("/messages/0/content/0/text")]
         );
     }
 
@@ -846,8 +986,8 @@ mod tests {
     fn anthropic_reads_the_response_blocks() {
         let body = json!({"content": [{"type": "text", "text": "Hallo"}]});
         assert_eq!(
-            slot_pointers(Anthropic.response_pointers(&body)),
-            vec!["/content/0/text"]
+            Anthropic.response_pointers(&body).unwrap(),
+            vec![text("/content/0/text")]
         );
     }
 
@@ -871,12 +1011,12 @@ mod tests {
             ]
         });
         assert_eq!(
-            slot_pointers(Anthropic.request_pointers(&body)),
+            Anthropic.request_pointers(&body).unwrap(),
             vec![
-                "/tools/0/description",
-                "/tools/0/input_schema",
-                "/messages/0/content/0/input",
-                "/messages/1/content/0/content",
+                text("/tools/0/description"),
+                schema("/tools/0/input_schema"),
+                instance("/messages/0/content/0/input"),
+                tool_text("/messages/1/content/0/content"),
             ]
         );
     }
@@ -896,6 +1036,125 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("/name") || p.ends_with("/tool_use_id")),
             "a tool name and a result id are the client's dispatch: {described:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_definition_this_gateway_cannot_account_for_is_refused() {
+        // A tool definition is an object the caller fills in, and a field no
+        // slot addresses travels exactly as it came. Anthropic's own server
+        // tools are the live case: `web_search_20250305` carries
+        // `user_location`, whose `city` is a LOCATION in this gateway's
+        // vocabulary.
+        let server_tool = json!({
+            "model": "claude",
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "user_location": {"city": "Zurich", "country": "CH"}
+            }],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&server_tool),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "tool definition field"
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_tool_definition_that_cannot_be_read_is_refused_rather_than_forwarded() {
+        // Each of these produced no slot and no refusal, which is the shape
+        // that forwards a value untouched. `identifier_pointer` has refused
+        // exactly this for `/user` and `/name` all along.
+        let not_an_object = json!({
+            "model": "claude",
+            "tools": ["Martina Weber"],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(Anthropic.request_pointers(&not_an_object).is_err());
+
+        let description_not_a_string = json!({
+            "model": "claude",
+            "tools": [{"name": "f", "description": {"long": "Martina Weber"},
+                       "input_schema": {}}],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(Anthropic
+            .request_pointers(&description_not_a_string)
+            .is_err());
+
+        let tools_not_an_array = json!({
+            "model": "claude",
+            "tools": {"name": "f"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(Anthropic.request_pointers(&tools_not_an_array).is_err());
+    }
+
+    #[test]
+    fn a_tool_definitions_schema_is_described_as_a_schema_not_an_instance() {
+        // The kind is load-bearing and a pointer list cannot see it: a schema
+        // read as an instance masks the property names it states as values.
+        let body = json!({
+            "model": "claude",
+            "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}}
+            ]}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![
+                Slot::text("/tools/0/description".to_owned()),
+                Slot::Json {
+                    pointer: "/tools/0/input_schema".to_owned(),
+                    embedded: false,
+                    shape: Shape::Schema,
+                },
+                Slot::Json {
+                    pointer: "/messages/0/content/0/input".to_owned(),
+                    embedded: false,
+                    shape: Shape::Instance,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_results_text_is_marked_as_tool_traffic_and_a_prompts_is_not() {
+        // The byte bound reads this flag. A result is a bare string like any
+        // prompt text, so nothing but the flag distinguishes the largest
+        // surface tool support opens from ordinary conversation.
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "prompt"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "result"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": [
+                    {"type": "text", "text": "nested result"}
+                ]}
+            ]}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![
+                Slot::Text {
+                    pointer: "/messages/0/content/0/text".to_owned(),
+                    tool: false,
+                },
+                Slot::Text {
+                    pointer: "/messages/0/content/1/content".to_owned(),
+                    tool: true,
+                },
+                Slot::Text {
+                    pointer: "/messages/0/content/2/content/0/text".to_owned(),
+                    tool: true,
+                },
+            ],
+            "a result nested inside blocks is still a result"
         );
     }
 
@@ -939,8 +1198,8 @@ mod tests {
             "messages": [{"role": "user", "content": "Hi"}]
         });
         assert_eq!(
-            slot_pointers(Anthropic.request_pointers(&body)),
-            vec!["/tools/0/input_schema", "/messages/0/content"],
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![schema("/tools/0/input_schema"), text("/messages/0/content")],
             "tool_choice must not appear here"
         );
     }
@@ -1009,14 +1268,14 @@ mod tests {
             ]}
         ]}]});
         for described in [
-            slot_pointers(OpenAi.request_pointers(&body)),
-            slot_pointers(Anthropic.request_pointers(&body)),
+            OpenAi.request_pointers(&body).unwrap(),
+            Anthropic.request_pointers(&body).unwrap(),
         ] {
             assert_eq!(
                 described,
                 vec![
-                    "/messages/0/content/0/content",
-                    "/messages/0/content/1/content/0/text",
+                    tool_text("/messages/0/content/0/content"),
+                    tool_text("/messages/0/content/1/content/0/text"),
                 ],
                 "the image is unscanned and the tool_use_id is dispatch"
             );
@@ -1030,8 +1289,8 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "http://x"}}
         ]}]});
         assert_eq!(
-            slot_pointers(OpenAi.request_pointers(&body)),
-            vec!["/messages/0/content/0/text"]
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![text("/messages/0/content/0/text")]
         );
     }
 
@@ -1105,14 +1364,69 @@ mod tests {
         assert_eq!(
             slots,
             vec![
-                Slot::Text("/content/0/text".to_owned()),
+                Slot::text("/content/0/text".to_owned()),
                 Slot::Json {
                     pointer: "/content/1/input".to_owned(),
                     embedded: false,
+                    shape: Shape::Instance,
                 },
             ],
             "the id and the name are dispatch and are not described"
         );
+    }
+
+    #[test]
+    fn an_embedded_document_round_trips_through_read_and_write() {
+        // The `embedded: true` branch has no production caller yet — OpenAI's
+        // `arguments` is its first, in the next slice — but both functions are
+        // pure, so nothing about testing them needs to wait for one.
+        let mut body = json!({"call": {"arguments": "{\"b\":\"Weber\",\"a\":1}"}});
+        let document = read_document(&body, "/call/arguments", true, "openai").unwrap();
+        assert_eq!(document, json!({"a": 1, "b": "Weber"}));
+
+        write_document(&mut body, "/call/arguments", &document, true).unwrap();
+        // Alphabetical, and deliberately asserted rather than discovered: this
+        // crate's `serde_json::Map` is a `BTreeMap` — no `preserve_order`
+        // feature — so re-serializing an embedded document sorts its keys.
+        // Harmless (JSON objects are unordered and the client parses rather
+        // than compares) but somebody debugging changed argument bytes should
+        // find it written down.
+        assert_eq!(body["call"]["arguments"], r#"{"a":1,"b":"Weber"}"#);
+    }
+
+    #[test]
+    fn an_embedded_document_that_is_not_json_is_the_callers_mistake() {
+        // Models emit truncated `arguments`, and clients echo the turn back
+        // verbatim, so this is routine input rather than an exotic failure.
+        // `Pointer` would have made it a 502 blaming the upstream and sent the
+        // caller looking in the wrong place.
+        let truncated = json!({"call": {"arguments": "{\"path\": \"/home/we"}});
+        assert!(matches!(
+            read_document(&truncated, "/call/arguments", true, "openai"),
+            Err(ShapeError::MalformedDocument("openai", _))
+        ));
+
+        let not_a_string = json!({"call": {"arguments": {"path": "x"}}});
+        assert!(matches!(
+            read_document(&not_a_string, "/call/arguments", true, "openai"),
+            Err(ShapeError::MalformedDocument("openai", _))
+        ));
+
+        // A pointer addressing nothing is still a `Pointer`: that is this
+        // gateway describing a location that does not exist, which is ours.
+        assert!(matches!(
+            read_document(&truncated, "/call/missing", true, "openai"),
+            Err(ShapeError::Pointer(_))
+        ));
+    }
+
+    #[test]
+    fn a_plain_document_is_read_and_written_as_itself() {
+        let mut body = json!({"input": {"path": "Weber"}});
+        let document = read_document(&body, "/input", false, "anthropic").unwrap();
+        assert_eq!(document, json!({"path": "Weber"}));
+        write_document(&mut body, "/input", &json!({"path": "[PERSON_1]"}), false).unwrap();
+        assert_eq!(body["input"], json!({"path": "[PERSON_1]"}));
     }
 
     #[test]

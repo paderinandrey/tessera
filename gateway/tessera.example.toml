@@ -134,3 +134,23 @@ max_spans_per_entry = 250
 # answer; this refuses it honestly instead. Issue #28 carries the work that
 # lifts it.
 max_tool_bytes = 10000
+# How many separate strings those structures may hold.
+#
+# A second bound, because max_tool_bytes bounds the wrong quantity for this
+# failure. Detection is one round-trip per string, awaited in turn while the
+# request holds its session, so the cost tracks the *number* of strings and not
+# their total size -- and the two come apart badly. A schema of a thousand
+# two-character strings is about 10000 bytes, passes the byte bound, and is a
+# thousand sequential detector calls.
+#
+# This number is NOT a measurement, and should not be read as one. The measured
+# figures above are for texts of 1200 and 6000 characters; nobody has measured
+# what a ten-character text costs, and per-call overhead is exactly what
+# dominates there. 64 is chosen to sit clearly under any plausible timeout
+# rather than near a known edge: even at a pessimistic 300 ms of fixed overhead
+# it is about 19 seconds, inside a 30-second timeout with room left.
+#
+# Raising it wants that measurement first. The real fix is not a larger number
+# but detecting a document's strings in one call instead of N, which is issue
+# #28's scope.
+max_tool_leaves = 64

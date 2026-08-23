@@ -236,11 +236,20 @@ impl Mapping {
     /// and, since tool traffic, for a `tool_use` block's arguments, whose shape
     /// is the *client's* schema and whose content the model wrote.
     ///
-    /// Unbounded recursion, unlike `walk` below, and safe for a reason that is
-    /// worth stating because it is not local: every value reaching here came
-    /// out of `serde_json`, whose parser refuses to nest past 128 (measured, not
-    /// assumed). A caller that ever hands this a value built in memory rather
-    /// than parsed loses that bound and needs its own.
+    /// Unbounded recursion, unlike `walk` below, and the reason it is safe is
+    /// worth stating because it is not local. The primary protection is one
+    /// direction earlier: a `tool_use` response mirrors a schema this gateway
+    /// already refused past `MAX_JSON_DEPTH`, so a response deep enough to
+    /// matter describes a request that never reached the provider.
+    ///
+    /// Behind that, `serde_json` bounds deserialization depth at all — which is
+    /// why `disable_recursion_limit` exists to switch it off. That is the
+    /// backstop, and it is a dependency's promise rather than ours: the figure
+    /// is 128 today (measured), under a `serde_json = "1"` that any `cargo
+    /// update` may move. Do not build on the number.
+    ///
+    /// A caller handing this a value assembled in memory rather than parsed has
+    /// neither protection and needs its own bound.
     pub fn restore_value(&self, value: &Value) -> Result<Value, MappingError> {
         Ok(match value {
             Value::String(text) => Value::String(self.restore(text)?),
@@ -292,13 +301,114 @@ impl Mapping {
 }
 
 /// How deep a client's document may nest, and how many values it may hold.
-/// `restore_value` needs neither: it walks a provider's own response envelope,
-/// whose shape is the provider's business. This walk is reachable from a
-/// client's tool arguments, which are untrusted input — a document nested ten
-/// thousand deep would end the process by exhausting the stack, and the
-/// recursion below is the one that would do it.
+/// This walk is reachable from a client's tool arguments, which are untrusted
+/// input — a document nested ten thousand deep would end the process by
+/// exhausting the stack, and the recursion below is the one that would do it.
+///
+/// `restore_value` has no bound of its own; see the note on it for why this one
+/// is the protection that matters.
 pub const MAX_JSON_DEPTH: usize = 64;
 pub const MAX_JSON_NODES: usize = 10_000;
+
+/// What a document *is*, which decides whether every string in it is data.
+///
+/// The distinction exists because "keys are never masked" is a rule about
+/// position, and JSON Schema breaks the assumption that position is enough: it
+/// names properties as string *values* as well as keys. `{"required":
+/// ["Weber"]}` puts a property name where the walk sees data, and masking it
+/// leaves the provider a schema requiring a property that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// A tool's arguments, or anything else somebody wrote as data. Every
+    /// string in it is a value, and all of them are scanned.
+    Instance,
+    /// A JSON Schema. Most of its strings are prose and are scanned; the ones
+    /// listed below are identifiers, and masking one changes what the schema
+    /// *means* rather than what it says.
+    Schema,
+    /// An object under `properties` or `$defs`, whose keys are names the
+    /// caller chose and whose values are subschemas. It is its own shape
+    /// because the keyword lists must not be read against those keys: `type`
+    /// is an ordinary name for a parameter, and treating it as a keyword would
+    /// skip that parameter's whole subschema and forward its prose unmasked.
+    SchemaMap,
+}
+
+/// Keywords whose contents are identifiers rather than prose.
+///
+/// A list of what to *scan* would be wrong the day someone adds a keyword. This
+/// is the inverse list, and it is a different kind of thing: it is closed by
+/// the JSON Schema specification rather than by our imagination, and a keyword
+/// added later is scanned — which is the safe direction, because scanning too
+/// much masks a value that did not need it, while scanning too little forwards
+/// one that did.
+///
+/// `propertyNames` and `dependentRequired` are skipped whole rather than
+/// descended into: everything meaningful inside them constrains or lists
+/// property names. That does mean a `description` written inside a
+/// `propertyNames` subschema is not scanned. It is the one place this list
+/// trades a marginal leak against a certain dispatch break, and it is the right
+/// way round — a schema nobody can satisfy fails every call that uses it.
+const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 14] = [
+    "$anchor",
+    "$dynamicAnchor",
+    "$dynamicRef",
+    "$id",
+    "$ref",
+    "$schema",
+    "contentEncoding",
+    "contentMediaType",
+    "dependentRequired",
+    "format",
+    "pattern",
+    "propertyNames",
+    "required",
+    "type",
+];
+
+/// Keywords holding an *instance* rather than a subschema.
+///
+/// Without this list the one above would be unsound rather than merely
+/// conservative. `{"default": {"required": "Martina Weber"}}` is a default
+/// value that happens to have a property called `required`; skipping it because
+/// of its name would forward a real name unmasked. Below one of these, schema
+/// keywords stop being keywords and the walk goes back to scanning everything.
+const SCHEMA_INSTANCE_KEYWORDS: [&str; 4] = ["const", "default", "enum", "examples"];
+
+/// Keywords whose object *keys* are names the caller chose, and whose values
+/// are subschemas.
+///
+/// The third list, and the list above is unsound without it in the mirror of
+/// the way it is unsound without the instance one. `{"properties": {"type":
+/// {"description": "Martina Weber"}}}` describes a parameter called `type` —
+/// an ordinary name for a parameter — and reading that key as a keyword skips
+/// the subschema whole, forwarding its prose to the provider unmasked. The
+/// keys themselves are keys and were never at risk; it is what hangs below
+/// them that is.
+const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
+
+/// What the walk does with one field of an object, given the shape it is in.
+/// Shared by both walks so they cannot drift: they correspond by position, and
+/// a field one of them skipped and the other did not would silently put a
+/// masked string somewhere it does not belong.
+fn descend_into(shape: Shape, key: &str) -> Option<Shape> {
+    match shape {
+        Shape::Instance => Some(Shape::Instance),
+        // No keyword test here: every key at this level is a name the caller
+        // chose, and below it is a subschema again.
+        Shape::SchemaMap => Some(Shape::Schema),
+        Shape::Schema if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
+        Shape::Schema if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
+        Shape::Schema if SCHEMA_INSTANCE_KEYWORDS.contains(&key) => Some(Shape::Instance),
+        Shape::Schema => Some(Shape::Schema),
+    }
+}
 
 /// A value a document carries, in the order the walk finds it. Keys are absent
 /// by construction: this walk descends into values and never yields a name.
@@ -312,15 +422,16 @@ pub enum Leaf {
     Number(String),
 }
 
-pub fn json_leaves(value: &Value) -> Result<Vec<Leaf>, MappingError> {
+pub fn json_leaves(value: &Value, shape: Shape) -> Result<Vec<Leaf>, MappingError> {
     let mut leaves = Vec::new();
     let mut nodes = 0usize;
-    walk(value, 0, &mut nodes, &mut leaves)?;
+    walk(value, shape, 0, &mut nodes, &mut leaves)?;
     Ok(leaves)
 }
 
 fn walk(
     value: &Value,
+    shape: Shape,
     depth: usize,
     nodes: &mut usize,
     leaves: &mut Vec<Leaf>,
@@ -337,14 +448,17 @@ fn walk(
         Value::Number(number) => leaves.push(Leaf::Number(number.to_string())),
         Value::Array(items) => {
             for item in items {
-                walk(item, depth + 1, nodes, leaves)?;
+                walk(item, shape, depth + 1, nodes, leaves)?;
             }
         }
         Value::Object(fields) => {
             // `fields` is iterated, never yielded: a key is the client's
             // dispatch, and masking one would break the call it dispatches.
-            for (_key, item) in fields {
-                walk(item, depth + 1, nodes, leaves)?;
+            // `descend_into` says whether this field's *value* is one too.
+            for (key, item) in fields {
+                if let Some(inner) = descend_into(shape, key) {
+                    walk(item, inner, depth + 1, nodes, leaves)?;
+                }
             }
         }
         Value::Bool(_) | Value::Null => {}
@@ -356,10 +470,14 @@ fn walk(
 /// above collected the leaves, `mask_all` detected them, and this puts the
 /// masked strings back where they came from. Order is the only correspondence,
 /// which is why both walks are the same function shape.
-pub fn replace_text_leaves(value: &Value, masked: &[String]) -> Result<Value, MappingError> {
+pub fn replace_text_leaves(
+    value: &Value,
+    masked: &[String],
+    shape: Shape,
+) -> Result<Value, MappingError> {
     let mut next = 0usize;
     let mut nodes = 0usize;
-    let result = replace(value, 0, &mut nodes, masked, &mut next)?;
+    let result = replace(value, shape, 0, &mut nodes, masked, &mut next)?;
     if next != masked.len() {
         return Err(MappingError::MaskCountMismatch(
             "more masked strings than text leaves",
@@ -370,6 +488,7 @@ pub fn replace_text_leaves(value: &Value, masked: &[String]) -> Result<Value, Ma
 
 fn replace(
     value: &Value,
+    shape: Shape,
     depth: usize,
     nodes: &mut usize,
     masked: &[String],
@@ -393,14 +512,20 @@ fn replace(
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| replace(item, depth + 1, nodes, masked, next))
+                .map(|item| replace(item, shape, depth + 1, nodes, masked, next))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        // The skipped fields are copied through untouched rather than dropped:
+        // `descend_into` decides what is *scanned*, never what is kept.
         Value::Object(fields) => Value::Object(
             fields
                 .iter()
                 .map(|(key, item)| {
-                    Ok((key.clone(), replace(item, depth + 1, nodes, masked, next)?))
+                    let replaced = match descend_into(shape, key) {
+                        Some(inner) => replace(item, inner, depth + 1, nodes, masked, next)?,
+                        None => item.clone(),
+                    };
+                    Ok((key.clone(), replaced))
                 })
                 .collect::<Result<serde_json::Map<_, _>, MappingError>>()?,
         ),
@@ -886,13 +1011,146 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_does_not_yield_the_property_names_it_states_as_values() {
+        // The whole reason `Shape` exists. "Keys are never masked" is a rule
+        // about position, and JSON Schema states property names in value
+        // position too: masked, `required` names a property that does not
+        // exist and the schema can no longer be satisfied.
+        let schema = json!({
+            "type": "object",
+            "$id": "https://example.invalid/Weber",
+            "$ref": "#/definitions/Weber",
+            "required": ["Weber"],
+            "pattern": "^Weber-[0-9]+$",
+            "format": "date-time",
+            "propertyNames": {"pattern": "^Weber$"},
+            "dependentRequired": {"Weber": ["Schmidt"]},
+            "description": "Belongs to Weber"
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Belongs to Weber".to_owned())],
+            "only the prose is data"
+        );
+        // The same document read as an instance has no keywords in it at all,
+        // and every one of those strings is an ordinary value.
+        assert!(
+            json_leaves(&schema, Shape::Instance).unwrap().len() > 1,
+            "Shape::Instance must not inherit the schema exemptions"
+        );
+    }
+
+    #[test]
+    fn a_schemas_instance_valued_keywords_go_back_to_scanning_everything() {
+        // Without this the exemption list would be unsound rather than merely
+        // conservative: `default` holds an *instance*, so a property called
+        // `required` inside one is data, and skipping it by name would forward
+        // a real name unmasked.
+        let schema = json!({
+            "type": "object",
+            "default": {"required": "Martina Weber", "type": "Zurich"},
+            "enum": ["Weber"],
+            "const": "Schmidt"
+        });
+        let leaves = json_leaves(&schema, Shape::Schema).unwrap();
+        assert!(
+            leaves.contains(&Leaf::Text("Martina Weber".to_owned()))
+                && leaves.contains(&Leaf::Text("Zurich".to_owned())),
+            "a value under `default` is data whatever its key is called: {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&Leaf::Text("Weber".to_owned()))
+                && leaves.contains(&Leaf::Text("Schmidt".to_owned())),
+            "enum and const are values the model chooses among: {leaves:?}"
+        );
+    }
+
+    #[test]
+    fn a_property_named_like_a_keyword_is_still_a_property() {
+        // The other way the exemption list can be wrong. Under `properties`
+        // the keys are the *caller's* parameter names, and `type` is an
+        // ordinary thing to call a parameter. Reading one as a keyword skips
+        // its whole subschema, and the prose inside it reaches the provider
+        // unmasked — the leak this list exists to avoid, arrived at from the
+        // opposite direction.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "description": "Weber chose this"},
+                "required": {"type": "string", "default": "Schmidt"}
+            },
+            "$defs": {
+                "format": {"title": "Bern"}
+            }
+        });
+        let leaves = json_leaves(&schema, Shape::Schema).unwrap();
+        assert!(
+            leaves.contains(&Leaf::Text("Weber chose this".to_owned()))
+                && leaves.contains(&Leaf::Text("Schmidt".to_owned()))
+                && leaves.contains(&Leaf::Text("Bern".to_owned())),
+            "a subschema's prose is data whatever the property is called: {leaves:?}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_schema_keyword_is_copied_through_rather_than_dropped() {
+        // `descend_into` decides what is scanned. It must never decide what is
+        // kept: a schema that came back missing its `required` would be as
+        // broken as one whose `required` was masked.
+        let schema = json!({
+            "required": ["Weber"],
+            "$ref": "#/definitions/Weber",
+            "description": "prose"
+        });
+        let rebuilt = replace_text_leaves(&schema, &["MASKED".to_owned()], Shape::Schema).unwrap();
+        assert_eq!(rebuilt["required"], json!(["Weber"]));
+        assert_eq!(rebuilt["$ref"], "#/definitions/Weber");
+        assert_eq!(rebuilt["description"], "MASKED");
+    }
+
+    #[test]
+    fn both_walks_agree_on_position_in_schema_shape_too() {
+        // The correspondence the masking path rests on, under the shape that
+        // makes the two walks skip things. They skip through one shared
+        // function precisely so this cannot come apart.
+        let schema = json!({
+            "type": "object",
+            "required": ["a", "b"],
+            "description": "one",
+            "properties": {
+                "a": {"type": "string", "description": "two", "default": "three"},
+                "b": {"$ref": "#/definitions/x", "title": "four"}
+            }
+        });
+        let leaves = json_leaves(&schema, Shape::Schema).unwrap();
+        let texts: Vec<String> = leaves
+            .iter()
+            .filter_map(|leaf| match leaf {
+                Leaf::Text(text) => Some(text.clone()),
+                Leaf::Number(_) => None,
+            })
+            .collect();
+        // Arity agreeing is what `MaskCountMismatch` would otherwise catch;
+        // asserting it here says the two walks agree rather than that one of
+        // them noticed they did not.
+        let masked: Vec<String> = texts.iter().map(|text| format!("<{text}>")).collect();
+        let rebuilt = replace_text_leaves(&schema, &masked, Shape::Schema).unwrap();
+        assert_eq!(rebuilt["description"], "<one>");
+        assert_eq!(rebuilt["properties"]["a"]["description"], "<two>");
+        assert_eq!(rebuilt["properties"]["a"]["default"], "<three>");
+        assert_eq!(rebuilt["properties"]["b"]["title"], "<four>");
+        assert_eq!(rebuilt["required"], json!(["a", "b"]));
+        assert_eq!(rebuilt["properties"]["a"]["type"], "string");
+    }
+
+    #[test]
     fn a_walk_reports_string_leaves_in_order_and_ignores_keys() {
         let document = json!({
             "b_second": "Weber",
             "a_first": {"nested": "Meier"},
             "list": ["Schmidt", 7, true, null]
         });
-        let leaves = json_leaves(&document).unwrap();
+        let leaves = json_leaves(&document, Shape::Instance).unwrap();
         assert_eq!(
             leaves,
             vec![
@@ -920,7 +1178,7 @@ mod tests {
         // is in force.
         let document = json!({"who": "Weber", "n": 7, "where": "Bern"});
         let masked = vec!["[PERSON_1]".to_owned(), "[LOCATION_2]".to_owned()];
-        let result = replace_text_leaves(&document, &masked).unwrap();
+        let result = replace_text_leaves(&document, &masked, Shape::Instance).unwrap();
         assert_eq!(
             result,
             json!({"who": "[LOCATION_2]", "n": 7, "where": "[PERSON_1]"}),
@@ -942,15 +1200,15 @@ mod tests {
             "location": {"city": "Bern", "notes": ["Schmidt", 7]},
             "count": 3
         });
-        let text_leaf_count = json_leaves(&document)
+        let text_leaf_count = json_leaves(&document, Shape::Instance)
             .unwrap()
             .into_iter()
             .filter(|leaf| matches!(leaf, Leaf::Text(_)))
             .count();
         // Each replacement encodes the position it should land in.
         let masked: Vec<String> = (0..text_leaf_count).map(|i| format!("leaf-{i}")).collect();
-        let replaced = replace_text_leaves(&document, &masked).unwrap();
-        let text_leaves_after: Vec<String> = json_leaves(&replaced)
+        let replaced = replace_text_leaves(&document, &masked, Shape::Instance).unwrap();
+        let text_leaves_after: Vec<String> = json_leaves(&replaced, Shape::Instance)
             .unwrap()
             .into_iter()
             .filter_map(|leaf| match leaf {
@@ -973,14 +1231,17 @@ mod tests {
         for _ in 0..(MAX_JSON_DEPTH + 1) {
             document = json!([document]);
         }
-        assert!(matches!(json_leaves(&document), Err(MappingError::TooDeep)));
+        assert!(matches!(
+            json_leaves(&document, Shape::Instance),
+            Err(MappingError::TooDeep)
+        ));
     }
 
     #[test]
     fn a_document_past_the_node_bound_is_refused() {
         let wide: Vec<Value> = (0..=MAX_JSON_NODES).map(|n| json!(n)).collect();
         assert!(matches!(
-            json_leaves(&Value::Array(wide)),
+            json_leaves(&Value::Array(wide), Shape::Instance),
             Err(MappingError::TooLarge)
         ));
     }
@@ -988,7 +1249,7 @@ mod tests {
     #[test]
     fn a_number_survives_replacement_with_its_type_intact() {
         let document = json!({"count": 7, "nested": {"ratio": 1.5}});
-        let result = replace_text_leaves(&document, &[]).unwrap();
+        let result = replace_text_leaves(&document, &[], Shape::Instance).unwrap();
         assert_eq!(result, document, "a number is looked at, never rewritten");
     }
 }
