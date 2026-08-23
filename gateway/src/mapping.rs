@@ -332,6 +332,13 @@ pub enum Shape {
     /// is an ordinary name for a parameter, and treating it as a keyword would
     /// skip that parameter's whole subschema and forward its prose unmasked.
     SchemaMap,
+    /// An object under draft-07's `dependencies`, whose keys are property
+    /// names and whose values are *either* an array of property names or a
+    /// subschema. 2020-12 split those into `dependentRequired` and
+    /// `dependentSchemas` precisely because one keyword meaning two things is
+    /// hard to read; the older spelling is still what a client may send, and
+    /// the two halves need opposite treatment.
+    DependencyMap,
 }
 
 /// Keywords whose contents are identifiers rather than prose.
@@ -349,7 +356,7 @@ pub enum Shape {
 /// `propertyNames` subschema is not scanned. It is the one place this list
 /// trades a marginal leak against a certain dispatch break, and it is the right
 /// way round — a schema nobody can satisfy fails every call that uses it.
-const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 14] = [
+const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 15] = [
     "$anchor",
     "$dynamicAnchor",
     "$dynamicRef",
@@ -360,6 +367,10 @@ const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 14] = [
     "contentMediaType",
     "dependentRequired",
     "format",
+    // draft-04 spelled `$id` this way. A schema written to that draft is
+    // still a schema a client may send, and a masked base URI breaks every
+    // `$ref` that resolves against it.
+    "id",
     "pattern",
     "propertyNames",
     "required",
@@ -397,12 +408,29 @@ const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
 /// Shared by both walks so they cannot drift: they correspond by position, and
 /// a field one of them skipped and the other did not would silently put a
 /// masked string somewhere it does not belong.
-fn descend_into(shape: Shape, key: &str) -> Option<Shape> {
+///
+/// The `value` is here for one keyword. Every other rule reads the key alone,
+/// which works while a keyword means one thing — and draft-07's `dependencies`
+/// does not: per key it holds either an array of property names or a subschema,
+/// and only its type says which. A list of names cannot express that, so the
+/// decision has to be able to look.
+fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
     match shape {
         Shape::Instance => Some(Shape::Instance),
         // No keyword test here: every key at this level is a name the caller
         // chose, and below it is a subschema again.
         Shape::SchemaMap => Some(Shape::Schema),
+        // The array half is `dependentRequired` under its old name — property
+        // names, every one of them, so the whole array is skipped. The object
+        // half is `dependentSchemas`, an ordinary subschema whose prose is
+        // data. Anything else is malformed, and scanning is the safe way to
+        // be wrong.
+        Shape::DependencyMap => match value {
+            Value::Array(_) => None,
+            Value::Object(_) => Some(Shape::Schema),
+            _ => Some(Shape::Instance),
+        },
+        Shape::Schema if key == "dependencies" => Some(Shape::DependencyMap),
         Shape::Schema if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
         Shape::Schema if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
         Shape::Schema if SCHEMA_INSTANCE_KEYWORDS.contains(&key) => Some(Shape::Instance),
@@ -456,7 +484,7 @@ fn walk(
             // dispatch, and masking one would break the call it dispatches.
             // `descend_into` says whether this field's *value* is one too.
             for (key, item) in fields {
-                if let Some(inner) = descend_into(shape, key) {
+                if let Some(inner) = descend_into(shape, key, item) {
                     walk(item, inner, depth + 1, nodes, leaves)?;
                 }
             }
@@ -521,7 +549,7 @@ fn replace(
             fields
                 .iter()
                 .map(|(key, item)| {
-                    let replaced = match descend_into(shape, key) {
+                    let replaced = match descend_into(shape, key, item) {
                         Some(inner) => replace(item, inner, depth + 1, nodes, masked, next)?,
                         None => item.clone(),
                     };
@@ -1089,6 +1117,112 @@ mod tests {
                 && leaves.contains(&Leaf::Text("Schmidt".to_owned()))
                 && leaves.contains(&Leaf::Text("Bern".to_owned())),
             "a subschema's prose is data whatever the property is called: {leaves:?}"
+        );
+    }
+
+    /// What a real agent's `tools` payload costs this gateway, counted by the
+    /// walk that will actually count it rather than estimated.
+    ///
+    /// `testdata/claude_code_tools.json` is a transcription of the eight tool
+    /// definitions loaded in one Claude Code session — Read, Write, Edit, Bash,
+    /// Skill, ToolSearch, Agent, Artifact — copied from the definitions as the
+    /// session presented them. It is a real tool set rather than an invented
+    /// one, and it is a *subset*: a stock session also carries Glob, Grep,
+    /// WebFetch, WebSearch, TodoWrite and others, all of them simple, and an
+    /// MCP server adds more. So this is a floor on real traffic, not a ceiling.
+    ///
+    /// The figures it produces, and the reason `max_tool_leaves` is what it is:
+    ///
+    /// | tool       | leaves |
+    /// |------------|--------|
+    /// | Read       | 5      |
+    /// | Write      | 3      |
+    /// | Edit       | 5      |
+    /// | Bash       | 6      |
+    /// | Skill      | 3      |
+    /// | ToolSearch | 3      |
+    /// | Agent      | 21     |
+    /// | Artifact   | 24     |
+    /// | **total**  | **70** |
+    ///
+    /// A plain tool costs three to six. What makes the last two expensive is
+    /// `enum`: it is an instance keyword, so every member is a text leaf, and
+    /// that is correct — an enum lists values the model chooses among, and a
+    /// name can be one of them. Two enum-carrying tools cost more than the
+    /// other six together, which is why a per-tool rule of thumb underestimates
+    /// badly and why this is counted rather than reasoned about.
+    #[test]
+    fn a_real_tool_payload_fits_the_bounds_this_gateway_ships_with() {
+        let tools: Vec<Value> =
+            serde_json::from_str(include_str!("testdata/claude_code_tools.json")).unwrap();
+        assert_eq!(tools.len(), 8);
+        let leaves: usize = tools
+            .iter()
+            .map(|tool| {
+                // One for the definition's own `description`, which is a slot
+                // of its own, plus every text leaf the schema yields.
+                usize::from(tool.get("description").is_some())
+                    + json_leaves(&tool["input_schema"], Shape::Schema)
+                        .unwrap()
+                        .iter()
+                        .filter(|leaf| matches!(leaf, Leaf::Text(_)))
+                        .count()
+            })
+            .sum();
+        assert_eq!(leaves, 70, "the figure the leaf bound is set from");
+        assert!(
+            leaves <= crate::config::default_max_tool_leaves(),
+            "the default bound must admit a real tool payload: {leaves} leaves against a \
+             bound of {}. A gateway that refuses the tool set its own users run is not \
+             configured conservatively, it is broken.",
+            crate::config::default_max_tool_leaves()
+        );
+    }
+
+    #[test]
+    fn a_draft_07_dependency_is_read_by_its_value_rather_than_its_name() {
+        // The one keyword whose meaning is in its value's *type*. Draft-07's
+        // `dependencies` holds, per key, either an array of property names
+        // (2020-12 split this off as `dependentRequired`) or a subschema
+        // (`dependentSchemas`). A rule that reads the key alone cannot tell
+        // them apart, and getting it wrong either masks a property name or
+        // stops scanning a subschema's prose.
+        let schema = json!({
+            "type": "object",
+            "dependencies": {
+                "credit_card": ["billing_address", "Weber"],
+                "shipping": {"required": ["Weber"], "description": "Weber pays"}
+            },
+            "id": "https://example.invalid/Weber"
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Weber pays".to_owned())],
+            "the array lists property names; the object is a subschema whose prose is data"
+        );
+        // Both walks read the same rule, so the half that is skipped comes back
+        // intact and the half that is scanned comes back replaced.
+        let rebuilt = replace_text_leaves(&schema, &["MASKED".to_owned()], Shape::Schema).unwrap();
+        assert_eq!(
+            rebuilt["dependencies"]["credit_card"],
+            json!(["billing_address", "Weber"])
+        );
+        assert_eq!(
+            rebuilt["dependencies"]["shipping"]["required"],
+            json!(["Weber"])
+        );
+        assert_eq!(rebuilt["dependencies"]["shipping"]["description"], "MASKED");
+    }
+
+    #[test]
+    fn a_draft_04_id_is_an_identifier_like_its_prefixed_successor() {
+        // draft-04 spelled `$id` as `id`. Masked, every `$ref` that resolves
+        // against it becomes a pointer into a base URI that does not exist.
+        let schema = json!({"id": "https://example.invalid/Weber", "title": "Weber"});
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Weber".to_owned())],
+            "the title is prose; the id is a base URI"
         );
     }
 

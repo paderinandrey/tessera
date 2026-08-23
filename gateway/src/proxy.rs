@@ -240,7 +240,6 @@ async fn mask_all(
     slots: &[Slot],
     mapping: &mut Mapping,
     credential: Option<&[u8]>,
-    leaf_budget: &mut usize,
 ) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
@@ -266,19 +265,9 @@ async fn mask_all(
                 shape,
             } => {
                 let document = read_document(body, pointer, *embedded, provider)?;
+                // Already counted against `max_tool_leaves` in `handle`, before
+                // any of these round-trips were made.
                 let leaves = mapping::json_leaves(&document, *shape)?;
-                // Each text leaf is its own detector round-trip, awaited in
-                // turn while this request holds its session. The byte bound
-                // does not bound this: it is a bound on size, and a thousand
-                // two-character strings are small and still a thousand calls.
-                *leaf_budget = leaf_budget
-                    .checked_sub(
-                        leaves
-                            .iter()
-                            .filter(|leaf| matches!(leaf, mapping::Leaf::Text(_)))
-                            .count(),
-                    )
-                    .ok_or(ProxyError::TooManyToolLeaves)?;
                 let mut replacements = Vec::new();
                 for leaf in &leaves {
                     match leaf {
@@ -374,20 +363,40 @@ async fn handle(
     }
     // A separate bound from the byte one because it bounds a different cost:
     // bytes bound how much text the detector reads, this bounds how many times
-    // it is asked, and the two come apart badly for many tiny strings. Each
-    // tool `Text` slot is one call and is charged here, where the count is
-    // already known; the documents are charged inside `mask_all`, which is the
-    // first place their leaves have been counted. Ordinary prompt text is not
-    // charged, for the same reason it is not weighed: the tool bound has no
-    // business limiting how long a conversation may be.
-    let tool_texts = slots
-        .iter()
-        .filter(|slot| matches!(slot, Slot::Text { tool: true, .. }))
-        .count();
-    let mut leaf_budget = state
-        .max_tool_leaves
-        .checked_sub(tool_texts)
-        .ok_or(ProxyError::TooManyToolLeaves)?;
+    // it is asked, and the two come apart badly for many tiny strings.
+    //
+    // Counted in full here, before a single round-trip is made, rather than
+    // spent down as the masking loop goes. The bound exists to cap how long one
+    // request holds its session, so a version that charges each document just
+    // before detecting it spends most of the budget and *then* refuses — the
+    // caller waits out nearly the whole cost to be told no, and the byte bound
+    // next door already refuses for free. `json_leaves` is a pure walk with no
+    // I/O, so the price of counting first is walking each document twice.
+    //
+    // Ordinary prompt text is not counted, for the same reason it is not
+    // weighed: the tool bound has no business limiting how long a conversation
+    // may be.
+    let mut tool_leaves = 0usize;
+    for slot in &slots {
+        tool_leaves += match slot {
+            Slot::Text { tool: true, .. } => 1,
+            Slot::Text { tool: false, .. } => 0,
+            Slot::Json {
+                pointer,
+                embedded,
+                shape,
+            } => mapping::json_leaves(
+                &read_document(&body, pointer, *embedded, provider.name())?,
+                *shape,
+            )?
+            .iter()
+            .filter(|leaf| matches!(leaf, mapping::Leaf::Text(_)))
+            .count(),
+        };
+    }
+    if tool_leaves > state.max_tool_leaves {
+        return Err(ProxyError::TooManyToolLeaves);
+    }
 
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         record.streaming();
@@ -421,7 +430,6 @@ async fn handle(
                 &slots,
                 &mut work,
                 credential,
-                &mut leaf_budget,
             )
             .await?;
             record.detected(slots.len(), spans, types, work.redacted_count());
@@ -452,7 +460,6 @@ async fn handle(
                 &slots,
                 &mut work,
                 credential,
-                &mut leaf_budget,
             )
             .await?;
             record.detected(slots.len(), spans, types, work.redacted_count());
@@ -665,7 +672,7 @@ mod tests {
     /// The production default, so tests exercise the bound callers get rather
     /// than one chosen to make a test convenient.
     const TEST_MAX_TOOL_BYTES: usize = 10_000;
-    const TEST_MAX_TOOL_LEAVES: usize = 64;
+    const TEST_MAX_TOOL_LEAVES: usize = 128;
 
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
@@ -1222,6 +1229,113 @@ mod tests {
         assert!(
             body.contains("separate strings"),
             "refused by the leaf bound rather than the byte bound: {body}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the refusal must cost the caller nothing upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_definitions_prose_counts_against_the_byte_bound() {
+        // Before this slice `tools` was refused whole, so every tool
+        // description is text newly sent to the detector. Left uncharged it was
+        // the definition-side twin of the `tool_result` gap: the bound named
+        // "every tool structure this request newly scans" would have skipped
+        // the one string every tool definition is guaranteed to carry.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "tools": [{
+                    "name": "read_file",
+                    "description": "x".repeat(TEST_MAX_TOOL_BYTES + 1),
+                    "input_schema": {}
+                }],
+                "messages": [{"role": "user", "content": "hallo"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the refusal must cost the caller nothing upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_definitions_prose_counts_against_the_leaf_bound_too() {
+        // One round-trip per definition, and a client may carry many. The
+        // schemas here are empty, so the descriptions are the only leaves and
+        // nothing else can account for the refusal.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let tools: Vec<Value> = (0..(TEST_MAX_TOOL_LEAVES + 1))
+            .map(|n| json!({"name": format!("t{n}"), "description": "d", "input_schema": {}}))
+            .collect();
+        let body = json!({
+            "model": "claude",
+            "tools": tools,
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(
+            body.to_string().len() < TEST_MAX_TOOL_BYTES,
+            "the point of this test is that the byte bound lets it through"
+        );
+        let (status, returned) = call(state, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            returned.contains("separate strings"),
+            "refused by the leaf bound rather than the byte bound: {returned}"
+        );
+        assert!(
+            detector.received_requests().await.unwrap().is_empty(),
+            "and refused before any of those round-trips were made"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_leaf_bound_refuses_before_it_spends_the_budget_it_is_refusing_over() {
+        // The bound exists to cap how long one request holds its session. A
+        // bound charged per document, inside the masking loop, spends most of
+        // itself on detector round-trips and *then* refuses — the caller waits
+        // out nearly the whole budget to be told no. `json_leaves` is a pure
+        // walk with no I/O, so every document can be counted first, at the cost
+        // of walking each of them twice.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        // Twenty documents of ten leaves each: no single one is anywhere near
+        // the bound, so only counting them together can refuse this at all.
+        let blocks: Vec<Value> = (0..20)
+            .map(|doc| {
+                let fields: serde_json::Map<String, Value> = (0..10)
+                    .map(|leaf| (format!("k{leaf}"), json!(format!("v{doc}{leaf}"))))
+                    .collect();
+                json!({"type": "tool_use", "id": format!("t{doc}"), "name": "f",
+                       "input": Value::Object(fields)})
+            })
+            .collect();
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": blocks}]
+        });
+        assert!(
+            body.to_string().len() < TEST_MAX_TOOL_BYTES,
+            "the point of this test is that the byte bound lets it through"
+        );
+        let (status, returned) = call(state, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            detector.received_requests().await.unwrap().is_empty(),
+            "a refusal must cost the caller nothing, and the detector calls are the cost: \
+             {} were made before the bound said no",
+            detector.received_requests().await.unwrap().len()
         );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),

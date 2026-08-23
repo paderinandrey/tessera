@@ -245,9 +245,18 @@ fn tool_definition_slots(
     // Present but not a string cannot be masked, so it is refused rather than
     // forwarded as it is — the rule `identifier_pointer` already applies to
     // `/user` and `/name`, which this once did not.
+    //
+    // `tool: true`, because before this slice `tools` was refused whole: every
+    // one of these strings is text newly sent to the detector, one round-trip
+    // each, and a request carrying thirty tools carries thirty of them. Prompt
+    // text is exempt from the tool bounds because it predates them; a tool
+    // definition's prose does not.
     match definition.get("description") {
         None | Some(Value::Null) => {}
-        Some(Value::String(_)) => out.push(Slot::text(format!("{prefix}/description"))),
+        Some(Value::String(_)) => out.push(Slot::Text {
+            pointer: format!("{prefix}/description"),
+            tool: true,
+        }),
         Some(_) => return Err(ShapeError::Request(provider)),
     }
     if definition
@@ -1013,7 +1022,7 @@ mod tests {
         assert_eq!(
             Anthropic.request_pointers(&body).unwrap(),
             vec![
-                text("/tools/0/description"),
+                tool_text("/tools/0/description"),
                 schema("/tools/0/input_schema"),
                 instance("/messages/0/content/0/input"),
                 tool_text("/messages/1/content/0/content"),
@@ -1108,7 +1117,10 @@ mod tests {
         assert_eq!(
             Anthropic.request_pointers(&body).unwrap(),
             vec![
-                Slot::text("/tools/0/description".to_owned()),
+                Slot::Text {
+                    pointer: "/tools/0/description".to_owned(),
+                    tool: true,
+                },
                 Slot::Json {
                     pointer: "/tools/0/input_schema".to_owned(),
                     embedded: false,

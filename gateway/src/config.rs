@@ -101,17 +101,29 @@ pub struct Config {
     /// schema of a thousand two-character strings is about 10 000 bytes, passes
     /// the byte bound, and is a thousand sequential calls.
     ///
-    /// The number is not derived from a measurement, and should not be read as
-    /// one. The measured figures this repo has are for texts of 1 200 and 6 000
-    /// characters (see `detector_timeout_secs`); nobody has measured what a
-    /// ten-character text costs, and per-call overhead is exactly what dominates
-    /// there. 64 is chosen to be clearly under any plausible timeout rather than
-    /// to sit near a known edge: even at a pessimistic 300 ms of fixed overhead
-    /// it is about 19 seconds, inside a 30-second timeout with room left.
+    /// The number comes from counting a real payload, not from a cost model.
+    /// `mapping::a_real_tool_payload_fits_the_bounds_this_gateway_ships_with`
+    /// walks eight tool definitions taken from a live Claude Code session and
+    /// gets **70 leaves** — already past the 64 this once was. A plain tool
+    /// costs three to six; two that carry `enum`s cost 21 and 24 between them,
+    /// because every enum member is a value the model may choose and so is
+    /// scanned. That test fails if this number ever stops admitting that
+    /// payload, which is the property worth pinning: a gateway that refuses the
+    /// tool set its own users run is broken, not conservative.
     ///
-    /// Raising it wants that measurement first. The real fix is not a larger
-    /// number but detecting a document's strings in one call instead of N, which
-    /// is issue #28's scope.
+    /// 128 leaves that payload room to roughly double, which it needs — those
+    /// eight tools are a subset of a stock session's, and an MCP server adds
+    /// more.
+    ///
+    /// What is *not* measured is the cost, and this is the number's weak point.
+    /// Total text is already bounded by `max_tool_bytes`, so what leaves add is
+    /// per-call overhead, and nobody has measured that (the figures under
+    /// `detector_timeout_secs` are for texts of 1 200 and 6 000 characters). At
+    /// 50 ms a call, 128 is under seven seconds; at 300 ms it is thirty-eight
+    /// and blows the timeout on its own. If it turns out to be the high end,
+    /// the answer is issue #28 — detecting a document's strings in one call
+    /// instead of N — and not a smaller bound, because a smaller bound refuses
+    /// real clients.
     #[serde(default = "default_max_tool_leaves")]
     pub max_tool_leaves: usize,
 }
@@ -194,8 +206,8 @@ fn default_max_spans_per_entry() -> usize {
 fn default_max_tool_bytes() -> usize {
     10_000
 }
-fn default_max_tool_leaves() -> usize {
-    64
+pub fn default_max_tool_leaves() -> usize {
+    128
 }
 
 impl Config {
@@ -387,7 +399,7 @@ mod tests {
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
         assert_eq!(config.max_tool_bytes, 10_000);
-        assert_eq!(config.max_tool_leaves, 64);
+        assert_eq!(config.max_tool_leaves, 128);
     }
 
     #[test]

@@ -143,14 +143,21 @@ max_tool_bytes = 10000
 # two-character strings is about 10000 bytes, passes the byte bound, and is a
 # thousand sequential detector calls.
 #
-# This number is NOT a measurement, and should not be read as one. The measured
-# figures above are for texts of 1200 and 6000 characters; nobody has measured
-# what a ten-character text costs, and per-call overhead is exactly what
-# dominates there. 64 is chosen to sit clearly under any plausible timeout
-# rather than near a known edge: even at a pessimistic 300 ms of fixed overhead
-# it is about 19 seconds, inside a 30-second timeout with room left.
+# The number comes from counting a real payload rather than from a cost model.
+# The test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with walks
+# eight tool definitions taken from a live Claude Code session and gets 70
+# leaves -- already past the 64 this key once held. A plain tool costs three to
+# six; the two carrying enums cost 21 and 24, because every enum member is a
+# value the model may choose and so is scanned. Those eight are a subset of a
+# stock session's tools, and an MCP server adds more, so 128 is that payload
+# with room to roughly double. The test fails if this stops admitting it.
 #
-# Raising it wants that measurement first. The real fix is not a larger number
-# but detecting a document's strings in one call instead of N, which is issue
-# #28's scope.
-max_tool_leaves = 64
+# What is NOT measured is the cost, and that is this number's weak point. Total
+# text is already bounded by max_tool_bytes, so what leaves add is per-call
+# overhead, which nobody has measured -- the figures above are for texts of
+# 1200 and 6000 characters. At 50 ms a call, 128 is under seven seconds; at
+# 300 ms it is thirty-eight and blows the timeout by itself. If it proves to be
+# the high end, the answer is issue #28 -- detecting a document's strings in one
+# call instead of N -- and not a smaller bound, because a smaller bound refuses
+# real clients.
+max_tool_leaves = 128
