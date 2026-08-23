@@ -2311,6 +2311,37 @@ mod tests {
             !served.contains("data: [DONE]"),
             "served as complete: {served}"
         );
+        // Nor does the error event hand over the token. A client is never
+        // supposed to see a placeholder — restoration exists so they do not —
+        // and a failure is not a reason to show them one.
+        assert!(
+            !served.contains("PERSON_9"),
+            "the error event names the placeholder: {served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_buffered_unknown_placeholder_is_refused_without_naming_it() {
+        // The same rule on the buffered path, where the refusal body is the
+        // whole response rather than a trailing event.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "text", "text": "Hallo [PERSON_9]"}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Hallo"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{returned}");
+        assert!(
+            !returned.contains("PERSON_9"),
+            "the refusal body names the placeholder: {returned}"
+        );
     }
 
     #[tokio::test]

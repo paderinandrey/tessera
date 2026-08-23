@@ -49,7 +49,8 @@ pub enum StreamError {
 impl StreamError {
     /// The fixed vocabulary the journal records. `Mapping`'s inner
     /// `MappingError::Unknown` carries a token and `Unplaceable` a run key;
-    /// neither reaches the journal, only the class. Matched with no `_` arm:
+    /// neither reaches the journal, only the class — and the token no longer
+    /// reaches the client either, see `error_event`. Matched with no `_` arm:
     /// a new variant must fail to compile here rather than be silently
     /// recorded as an existing class.
     pub(crate) fn audit_class(&self) -> &'static str {
@@ -715,8 +716,13 @@ pub fn restore_stream(
 }
 
 /// What the client sees when restoration fails after bytes have already gone
-/// out. The message names the failure and, at most, a placeholder — never a
-/// value: `MappingError::Unknown` carries the token, not what it stood for.
+/// out. The message names the failure and nothing else — not a value, and not
+/// a placeholder either. This comment used to promise only the first: a
+/// placeholder was judged safe to show because it is not the value it stood
+/// for. It is still the gateway's own token, and a client is never otherwise
+/// supposed to see one, so `MappingError::Unknown` no longer puts it in the
+/// message. `Unplaceable` still names a run key, which is a position in the
+/// provider's own envelope rather than anything of ours or the caller's.
 fn error_event(message: &str) -> String {
     SseEvent::new(
         Some("error".to_owned()),

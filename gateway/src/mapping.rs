@@ -13,7 +13,17 @@ pub struct Span {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MappingError {
-    #[error("no mapping for placeholder {0}; the request is refused rather than served with it")]
+    /// Carries the placeholder for tests and logs, deliberately not for the
+    /// message — the same split `PlaceholderKey` below makes, and for the same
+    /// reason. A client is never supposed to see a placeholder; restoration
+    /// exists so they do not, and a refusal body (or a stream's error event) is
+    /// the one path that could hand one over. This predates tool traffic: it
+    /// was leaking the token on both paths long before this slice, and the rule
+    /// arriving late is not a reason for it to keep doing so.
+    #[error(
+        "no mapping for a placeholder in the upstream response; the request is refused \
+             rather than served with it"
+    )]
     Unknown(String),
     #[error(
         "detector reported an unusable span ({0}); the request is refused rather than \
