@@ -414,7 +414,7 @@ envelope, and this walks a client's tool arguments."
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Config::max_tool_bytes: usize`. Task 4 wires it.
+- Produces: `Config::max_tool_chars: usize`. Task 4 wires it.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -424,15 +424,15 @@ In `config.rs`'s `mod tests`:
     #[test]
     fn the_tool_bound_has_a_default() {
         let config: Config = toml::from_str(MINIMAL).unwrap();
-        assert_eq!(config.max_tool_bytes, 10_000);
+        assert_eq!(config.max_tool_chars, 10_000);
     }
 
     #[test]
     fn a_zero_tool_bound_is_rejected() {
-        let text = format!("{MINIMAL}\nmax_tool_bytes = 0\n");
+        let text = format!("{MINIMAL}\nmax_tool_chars = 0\n");
         assert!(matches!(
             Config::from_toml(&text),
-            Err(ConfigError::ZeroToolBytes)
+            Err(ConfigError::ZeroToolChars)
         ));
     }
 ```
@@ -442,15 +442,15 @@ In `config.rs`'s `mod tests`:
 - [ ] **Step 2: Run them and watch them fail**
 
 Run: `cd gateway && cargo test --quiet tool_bound`
-Expected: FAIL — no field `max_tool_bytes`.
+Expected: FAIL — no field `max_tool_chars`.
 
 - [ ] **Step 3: Add the key**
 
 In `config.rs`:
 
 ```rust
-    #[error("max_tool_bytes must be greater than zero")]
-    ZeroToolBytes,
+    #[error("max_tool_chars must be greater than zero")]
+    ZeroToolChars,
 ```
 
 ```rust
@@ -469,12 +469,12 @@ In `config.rs`:
     /// The ceiling exists because the detection cache does not help the first
     /// time a text is seen, and a tool result is usually seen once. Issue #28
     /// carries the work that lifts it.
-    #[serde(default = "default_max_tool_bytes")]
-    pub max_tool_bytes: usize,
+    #[serde(default = "default_max_tool_chars")]
+    pub max_tool_chars: usize,
 ```
 
 ```rust
-fn default_max_tool_bytes() -> usize {
+fn default_max_tool_chars() -> usize {
     10_000
 }
 ```
@@ -482,8 +482,8 @@ fn default_max_tool_bytes() -> usize {
 And in `Config::from_toml`'s validation, beside the existing checks:
 
 ```rust
-        if config.max_tool_bytes == 0 {
-            return Err(ConfigError::ZeroToolBytes);
+        if config.max_tool_chars == 0 {
+            return Err(ConfigError::ZeroToolChars);
         }
 ```
 
@@ -498,7 +498,7 @@ Add to `gateway/tessera.example.toml`, `deploy/tessera.container.toml` and `depl
 
 - [ ] **Step 6: Prove it by mutation**
 
-Change `default_max_tool_bytes` to return `20_000`.
+Change `default_max_tool_chars` to return `20_000`.
 Expected: `the_tool_bound_has_a_default` fails. Restore.
 
 Delete the zero check from `from_toml`.
@@ -526,7 +526,7 @@ The first task that emits a `Json` slot, relaxes a refusal, and can be tested th
 - Modify: `gateway/src/provider.rs`, `gateway/src/proxy.rs`
 
 **Interfaces:**
-- Consumes: `Slot`, `json_leaves`, `replace_text_leaves`, `Config::max_tool_bytes`.
+- Consumes: `Slot`, `json_leaves`, `replace_text_leaves`, `Config::max_tool_chars`.
 - Produces: `mask_all` handling both slot kinds; the `stream: true` + tool refusal.
 
 - [ ] **Step 1: Write the failing tests**
@@ -835,12 +835,12 @@ In `proxy.rs`, before the masking loop:
         })
         .map(|value| value.to_string().len())
         .sum();
-    if tool_bytes > state.max_tool_bytes {
+    if tool_bytes > state.max_tool_chars {
         return Err(ProxyError::ToolTooLarge);
     }
 ```
 
-`max_tool_bytes` reaches here through `AppState`, threaded from `Config` in
+`max_tool_chars` reaches here through `AppState`, threaded from `Config` in
 `from_config` the way `max_spans_per_entry` reaches `DetectorClient` — it does
 not belong in `session::Limits`, which the session store owns.
 
@@ -1156,7 +1156,7 @@ Expected: PASS if Task 4 wired `count_distinct` into the `Json` arm, FAIL otherw
 
 - [ ] **Step 3: Update the README**
 
-`README.md` states what this gateway refuses. Find every sentence that says tool traffic is refused and correct it: tool definitions, arguments and results are masked on the buffered path; streamed tool traffic is still refused; extended thinking is still refused. Write in the README's existing voice, and state the `max_tool_bytes` ceiling where a reader meets the other limits, with issue #28 named as the work that lifts it.
+`README.md` states what this gateway refuses. Find every sentence that says tool traffic is refused and correct it: tool definitions, arguments and results are masked on the buffered path; streamed tool traffic is still refused; extended thinking is still refused. Write in the README's existing voice, and state the `max_tool_chars` ceiling where a reader meets the other limits, with issue #28 named as the work that lifts it.
 
 - [ ] **Step 4: Full verification**
 
@@ -1182,10 +1182,10 @@ streamed half."
 
 ## Self-Review
 
-**Spec coverage.** Every section maps to a task: the `Slot` kind to Task 1; the bounded walk and its depth and node limits to Task 2; `max_tool_bytes` and its three TOML files to Task 3; Anthropic's definitions, arguments and results, the whole-schema walk, the streamed-tool refusal and the size bound's wiring to Task 4; OpenAI's embedded arguments and `tool_call_id` to Task 5; the numeric-leaf refusal to Task 6; the journal and the README to Task 7. The spec's ten testing invariants map to tasks 2, 4, 5, 6 and 7.
+**Spec coverage.** Every section maps to a task: the `Slot` kind to Task 1; the bounded walk and its depth and node limits to Task 2; `max_tool_chars` and its three TOML files to Task 3; Anthropic's definitions, arguments and results, the whole-schema walk, the streamed-tool refusal and the size bound's wiring to Task 4; OpenAI's embedded arguments and `tool_call_id` to Task 5; the numeric-leaf refusal to Task 6; the journal and the README to Task 7. The spec's ten testing invariants map to tasks 2, 4, 5, 6 and 7.
 
 **Out of scope, as the spec says:** streaming, extended thinking, making large results fast (issue #28), and images, which keep the policy they have.
 
-**Type consistency.** `Slot` is defined in Task 1 and consumed unchanged by 4 and 5. `json_leaves` returns `Vec<Leaf>` in Task 2 and is destructured as `Leaf::Text`/`Leaf::Number` in Tasks 4 and 6. `replace_text_leaves` takes `&[String]` in Task 2 and is given `Vec<String>` by deref in Task 4. `read_document`/`write_document` are defined in Task 4 and reused by Task 5's response work. `max_tool_bytes` is `usize` in Task 3 and compared against a `usize` sum in Task 4. `ProxyError::ToolTooLarge` is added in Task 4 and `NumericPersonalData` beside it in Task 6.
+**Type consistency.** `Slot` is defined in Task 1 and consumed unchanged by 4 and 5. `json_leaves` returns `Vec<Leaf>` in Task 2 and is destructured as `Leaf::Text`/`Leaf::Number` in Tasks 4 and 6. `replace_text_leaves` takes `&[String]` in Task 2 and is given `Vec<String>` by deref in Task 4. `read_document`/`write_document` are defined in Task 4 and reused by Task 5's response work. `max_tool_chars` is `usize` in Task 3 and compared against a `usize` sum in Task 4. `ProxyError::ToolTooLarge` is added in Task 4 and `NumericPersonalData` beside it in Task 6.
 
 **Known rough edges for implementers.** Task 4 is the largest and the only one that touches three concerns at once — it is not split because none of the three is independently testable: the refusal cannot be tested while tool fields are refused anyway, and the size bound has nothing to bound until a `Json` slot exists. Task 4's step 4 moves a `let mut pointers` declaration; move only that, and leave the `thinking` and `logprobs` checks where they are. Several tests name helpers that already exist in `proxy.rs` — read a neighbouring test and match its shape rather than trusting this plan's memory of their signatures.

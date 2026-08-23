@@ -292,16 +292,24 @@ because the client would execute it.
 
 ## Configuration
 
-One key, `max_tool_bytes`, defaulting to **10 000**, applied to the sum of the
+One key, `max_tool_chars`, defaulting to **10 000**, applied to the sum of the
 tool structures a request newly scans rather than to any one of them. The
 relationship is the point rather than the number: 10 000 characters is about nine
 seconds on the machine the README's table names and about fifteen on the
 containerised stack, both inside a 30-second `detector_timeout_secs` with
 headroom. Slower hardware, or a lowered timeout, has to lower this with it.
 
-The two keys are one constraint written twice, and the config comment says so:
-an operator who raises the timeout to serve larger results has to raise this as
-well, and one who lowers the timeout has to lower this. Deriving it
+**These are two constraints, not one written twice — an earlier draft of this
+document had that wrong.** `detector_timeout_secs` becomes a per-request timeout
+on each HTTP call to the detector, so it bounds one call and never their sum: a
+request making seventy calls of a hundred characters can spend two minutes
+without any single call approaching it. `max_tool_chars` is the other constraint,
+capping how long a caller waits for the whole request.
+
+It counts the characters that reach the detector rather than the serialized size
+of the structures carrying them. Measured on a real eight-tool payload: 10 970
+bytes serialized against 7 379 characters detected, so a third of every charge
+would have been punctuation and property names, which cost detection nothing. Deriving it
 automatically was rejected because a derived default would silently change
 behaviour when an unrelated key moved.
 
