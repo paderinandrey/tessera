@@ -380,12 +380,18 @@ pub enum Shape {
 
 /// Keywords whose contents are identifiers rather than prose.
 ///
-/// A list of what to *scan* would be wrong the day someone adds a keyword. This
-/// is the inverse list, and it is a different kind of thing: it is closed by
-/// the JSON Schema specification rather than by our imagination, and a keyword
-/// added later is scanned — which is the safe direction, because scanning too
-/// much masks a value that did not need it, while scanning too little forwards
-/// one that did.
+/// Closed by the JSON Schema specification rather than by our imagination, and
+/// a keyword missing from it is scanned rather than skipped — which for *this*
+/// list is the harmless direction: the value is masked when it need not have
+/// been, the call breaks visibly, and nobody's data left.
+///
+/// This comment used to claim that safety on behalf of the mechanism as a
+/// whole, and that was wrong. The lists are not symmetric. A keyword missing
+/// from this one or from `SCHEMA_MAP_KEYWORDS` over-masks; a keyword holding an
+/// *instance* that no list names would be walked as though it were schema
+/// structure, and then this list would skip the client's own data inside it.
+/// That direction leaks, and `SCHEMA_APPLICATOR_KEYWORDS` is what closes it —
+/// see the rule in `descend_into`.
 ///
 /// `dependentRequired` is skipped whole rather than descended into: it maps
 /// property names to lists of property names, and there is no prose anywhere in
@@ -412,14 +418,45 @@ const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 14] = [
     "type",
 ];
 
-/// Keywords holding an *instance* rather than a subschema.
+/// Keywords whose values are subschemas — the ones under which schema keywords
+/// go on meaning what they mean.
 ///
-/// Without this list the one above would be unsound rather than merely
-/// conservative. `{"default": {"required": "Martina Weber"}}` is a default
-/// value that happens to have a property called `required`; skipping it because
-/// of its name would forward a real name unmasked. Below one of these, schema
-/// keywords stop being keywords and the walk goes back to scanning everything.
-const SCHEMA_INSTANCE_KEYWORDS: [&str; 4] = ["const", "default", "enum", "examples"];
+/// This list is what lets the walk treat *everything it does not recognize* as
+/// the client's data, which is the rule that closes the leak. The inverse
+/// arrangement — structure by default, data only where named — cannot work:
+/// `enum` and `default` are enumerable but `example` (OpenAPI 3.0's singular
+/// spelling), `x-anything`, and whatever a vendor invents tomorrow are not, and
+/// each of them walked as structure hands the identifier list a chance to skip
+/// real data.
+///
+/// The list has to be right in the other direction too, and it can be: which
+/// keywords hold subschemas is closed by the specification. Miss one and every
+/// `required` below it is masked — a broken schema rather than a leak, which is
+/// the way round to be wrong.
+const SCHEMA_APPLICATOR_KEYWORDS: [&str; 15] = [
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "oneOf",
+    "prefixItems",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+
+/// Keywords holding prose about a schema rather than a value it constrains.
+///
+/// Named separately because they are the one thing scanned in *both* schema
+/// shapes: under `propertyNames` an `enum` lists property names and is skipped,
+/// but a `description` there is still a sentence somebody wrote.
+const SCHEMA_ANNOTATION_KEYWORDS: [&str; 3] = ["$comment", "description", "title"];
 
 /// Keywords whose object *keys* are names the caller chose, and whose values
 /// are subschemas.
@@ -450,33 +487,50 @@ const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
 /// and only its type says which. A list of names cannot express that, so the
 /// decision has to be able to look.
 fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
-    match shape {
-        Shape::Instance => Some(Shape::Instance),
-        // No keyword test here: every key at this level is a name the caller
-        // chose, and below it is a subschema again.
-        Shape::SchemaMap => Some(Shape::Schema),
+    // The two schema shapes share one body rather than one re-implementing the
+    // other minus a few arms. `NameSchema` differs from `Schema` in exactly one
+    // respect — the instances it constrains are property names — so it is a
+    // modifier on a shape and not a second shape's worth of rules. Written as
+    // two arms it drifted twice: `$defs` under `propertyNames` read definition
+    // names against the keyword lists, which is the `properties` fault from two
+    // rounds ago reproduced inside the newer shape.
+    let names = match shape {
+        Shape::Instance => return Some(Shape::Instance),
+        // Every key here is a name the caller chose, and below it is a
+        // subschema again.
+        Shape::SchemaMap => return Some(Shape::Schema),
         // The array half is `dependentRequired` under its old name — property
         // names, every one of them, so the whole array is skipped. The object
-        // half is `dependentSchemas`, an ordinary subschema whose prose is
-        // data. Anything else is malformed, and scanning is the safe way to
-        // be wrong.
-        Shape::DependencyMap => match value {
-            Value::Array(_) => None,
-            Value::Object(_) => Some(Shape::Schema),
-            _ => Some(Shape::Instance),
-        },
-        // The strings this subschema constrains are property names, so the
-        // keywords that hold instances hold names. Everything else about it is
-        // an ordinary subschema, prose included.
-        Shape::NameSchema if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
-        Shape::NameSchema if SCHEMA_INSTANCE_KEYWORDS.contains(&key) => None,
-        Shape::NameSchema => Some(Shape::NameSchema),
-        Shape::Schema if key == "propertyNames" => Some(Shape::NameSchema),
-        Shape::Schema if key == "dependencies" => Some(Shape::DependencyMap),
-        Shape::Schema if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
-        Shape::Schema if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
-        Shape::Schema if SCHEMA_INSTANCE_KEYWORDS.contains(&key) => Some(Shape::Instance),
-        Shape::Schema => Some(Shape::Schema),
+        // half is `dependentSchemas`, an ordinary subschema. Anything else is
+        // malformed, and scanning is the safe way to be wrong.
+        Shape::DependencyMap => {
+            return match value {
+                Value::Array(_) => None,
+                Value::Object(_) => Some(Shape::Schema),
+                _ => Some(Shape::Instance),
+            }
+        }
+        Shape::Schema => false,
+        Shape::NameSchema => true,
+    };
+    match key {
+        "propertyNames" => Some(Shape::NameSchema),
+        "dependencies" => Some(Shape::DependencyMap),
+        key if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
+        key if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
+        // Prose either way. Under `propertyNames` the values are names, but a
+        // description of them is still a sentence.
+        key if SCHEMA_ANNOTATION_KEYWORDS.contains(&key) => Some(Shape::Instance),
+        // A subschema, so the shape carries — modifier included, because an
+        // `enum` inside an `allOf` inside a `propertyNames` still lists names.
+        key if SCHEMA_APPLICATOR_KEYWORDS.contains(&key) => Some(shape),
+        // Everything else: `enum`, `default`, `example`, `x-whatever`, and any
+        // keyword written after this line. It holds an instance, and an
+        // instance is the client's data — unless we are under `propertyNames`,
+        // where the instances are property names and masking one breaks the
+        // schema.
+        _ if names => None,
+        _ => Some(Shape::Instance),
     }
 }
 
@@ -1173,41 +1227,44 @@ mod tests {
     }
 
     /// What a real agent's `tools` payload costs this gateway, counted by the
-    /// walk that will actually count it rather than estimated.
+    /// walks that will actually count it rather than estimated.
     ///
-    /// `testdata/claude_code_tools.json` is a transcription of the eight tool
+    /// `testdata/claude_code_tools.json` is a transcription of ten tool
     /// definitions loaded in one Claude Code session — Read, Write, Edit, Bash,
-    /// Skill, ToolSearch, Agent, Artifact — copied from the definitions as the
-    /// session presented them. It is a real tool set rather than an invented
-    /// one, and it is a *subset*: a stock session also carries Glob, Grep,
-    /// WebFetch, WebSearch, TodoWrite and others, all of them simple, and an
-    /// MCP server adds more. So this is a floor on real traffic, not a ceiling.
+    /// Skill, ToolSearch, Agent, Artifact, WebFetch, SendMessage — copied from
+    /// the definitions as that session presented them. **It is a real tool set
+    /// and it is still a floor.** A stock session also carries Glob, Grep,
+    /// WebSearch, TodoWrite, NotebookEdit and others, and an MCP server adds
+    /// more; these are the ten this session could transcribe verbatim rather
+    /// than reconstruct from memory, which would not be measurement.
     ///
-    /// The figures it produces, and the reason `max_tool_leaves` is what it is:
+    /// | | measured |
+    /// |---|---|
+    /// | tools | 10 |
+    /// | leaves (detector calls) | **77** |
+    /// | characters detected | **9 005** |
+    /// | serialized bytes | 13 177 |
     ///
-    /// | tool       | leaves |
-    /// |------------|--------|
-    /// | Read       | 5      |
-    /// | Write      | 3      |
-    /// | Edit       | 5      |
-    /// | Bash       | 6      |
-    /// | Skill      | 3      |
-    /// | ToolSearch | 3      |
-    /// | Agent      | 21     |
-    /// | Artifact   | 24     |
-    /// | **total**  | **70** |
+    /// Two things fall out. **The ratio is 1.46x**, so a bound charging
+    /// serialized size charges half again what detection costs. And **cost per
+    /// tool is about 900 characters and 7.7 calls**, of which roughly 500
+    /// characters is the definition's own prose; the rest is schema. What makes
+    /// a tool expensive is `enum`, whose every member is a value the model may
+    /// choose and so is scanned — `Agent` and `Artifact` cost 21 and 24 leaves
+    /// against three to six for a plain tool, so a per-tool average
+    /// underestimates a payload carrying enum-heavy tools.
     ///
-    /// A plain tool costs three to six. What makes the last two expensive is
-    /// `enum`: it is an instance keyword, so every member is a text leaf, and
-    /// that is correct — an enum lists values the model chooses among, and a
-    /// name can be one of them. Two enum-carrying tools cost more than the
-    /// other six together, which is why a per-tool rule of thumb underestimates
-    /// badly and why this is counted rather than reasoned about.
+    /// **Both defaults are set to admit twice this payload**, which is the
+    /// stated headroom: a stock fifteen-tool session extrapolates to roughly
+    /// 13 500 characters and 116 calls, and doubling the floor leaves room for
+    /// that plus a small MCP server. It is not room for an arbitrary one — see
+    /// `config::max_tool_chars` for what that costs and why the answer to a
+    /// bigger payload is issue #28 rather than a bigger number.
     #[test]
     fn a_real_tool_payload_fits_the_bounds_this_gateway_ships_with() {
         let tools: Vec<Value> =
             serde_json::from_str(include_str!("testdata/claude_code_tools.json")).unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
         let leaves: usize = tools
             .iter()
             .map(|tool| {
@@ -1221,7 +1278,7 @@ mod tests {
                         .count()
             })
             .sum();
-        assert_eq!(leaves, 70, "the figure the leaf bound is set from");
+        assert_eq!(leaves, 77, "the figure the leaf bound is set from");
         assert!(
             leaves <= crate::config::default_max_tool_leaves(),
             "the default bound must admit a real tool payload: {leaves} leaves against a \
@@ -1253,7 +1310,7 @@ mod tests {
                         .sum::<usize>()
             })
             .sum();
-        assert_eq!(chars, 7_379, "the figure the text bound is set from");
+        assert_eq!(chars, 9_005, "the figure the text bound is set from");
         let serialized: usize = tools
             .iter()
             .map(|tool| {
@@ -1261,7 +1318,7 @@ mod tests {
             })
             .sum();
         assert_eq!(
-            serialized, 10_970,
+            serialized, 13_177,
             "and what charging structure would have cost"
         );
         assert!(
@@ -1269,6 +1326,82 @@ mod tests {
             "the default bound must admit a real tool payload: {chars} characters against a \
              bound of {}",
             crate::config::default_max_tool_chars()
+        );
+    }
+
+    #[test]
+    fn a_definition_map_under_property_names_still_reads_its_keys_as_names() {
+        // The third instance of one fault: a shape that re-implements another
+        // minus a few arms loses the arms it did not copy. `NameSchema` was
+        // written without the map arm, so a definition called `type` under
+        // `propertyNames` was read as a keyword and its whole subschema
+        // skipped — the `properties` bug from two rounds earlier, reproduced
+        // inside the newer shape. Both shapes now share one body.
+        let schema = json!({
+            "propertyNames": {
+                "$defs": {"type": {"description": "Weber wrote this"}},
+                "enum": ["credit_card"]
+            }
+        });
+        let leaves = json_leaves(&schema, Shape::Schema).unwrap();
+        assert!(
+            leaves.contains(&Leaf::Text("Weber wrote this".to_owned())),
+            "a definition's name is a name, not a keyword: {leaves:?}"
+        );
+        assert!(
+            !leaves.contains(&Leaf::Text("credit_card".to_owned())),
+            "and the enum here still lists property names: {leaves:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyword_this_gateway_does_not_know_holds_data_rather_than_structure() {
+        // The three lists are not symmetric, and this is the direction that
+        // leaks. A missing identifier or map keyword over-masks — visible, and
+        // it breaks a call. A keyword holding an *instance* that nothing
+        // recognizes is walked as though it were schema structure, and then the
+        // identifier list skips the client's own data inside it.
+        //
+        // OpenAPI 3.0's `example` is singular where JSON Schema's `examples` is
+        // plural, so it matched nothing; a vendor extension matches nothing by
+        // construction and no list can ever enumerate them.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "user": {
+                    "type": "object",
+                    "example": {"id": "Martina Weber", "required": "Schmidt"},
+                    "x-sample": {"format": "Zurich"}
+                }
+            }
+        });
+        let leaves = json_leaves(&schema, Shape::Schema).unwrap();
+        for expected in ["Martina Weber", "Schmidt", "Zurich"] {
+            assert!(
+                leaves.contains(&Leaf::Text(expected.to_owned())),
+                "{expected} is a value the client wrote, not schema structure: {leaves:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_structural_keywords_still_read_as_structure_underneath_it() {
+        // The other half, and what makes "unknown means data" safe rather than
+        // a trade of one fault for another: the keywords that really do hold
+        // subschemas are named, so a property name nested under one of them is
+        // still a property name. Treating unknown keys as data without this
+        // list would mask every `required` below an `items` or an `allOf`.
+        let schema = json!({
+            "items": {"required": ["Weber"], "description": "one"},
+            "allOf": [{"$ref": "#/definitions/Weber"}],
+            "if": {"required": ["Schmidt"]},
+            "not": {"type": "Zurich"},
+            "additionalProperties": {"required": ["Meier"]}
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("one".to_owned())],
+            "only the prose; every property name below an applicator is dispatch"
         );
     }
 

@@ -328,6 +328,42 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
     })
 }
 
+/// Fields a content block may carry that this gateway can account for, by block
+/// type. `type` names the block; the rest are either described as slots or are
+/// dispatch this gateway deliberately leaves alone — a `tool_use_id`, an
+/// `is_error` flag, a `cache_control` that is only `{"type": "ephemeral"}`.
+///
+/// The rule `ANTHROPIC_TOOL_DEFINITION_FIELDS` applies to tool definitions,
+/// one layer up: a block is an object the caller fills in, and a field no slot
+/// addresses is forwarded exactly as it came. Anthropic's `citations` is why
+/// this is not hypothetical — a `text` block may carry `cited_text`, which is
+/// quoted source material, and clients echo assistant turns back as history so
+/// it arrives on the request path. Refusing costs a caller who does not use
+/// citations nothing, and the alternative is forwarding quoted documents
+/// unmasked.
+///
+/// An empty slice means a type this function does not know. Those are left to
+/// the dispatch below, which refuses them for being unrecognized rather than
+/// for their fields.
+fn content_block_fields(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "text" => &["type", "text", "cache_control"],
+        "image" => &["type", "source", "cache_control"],
+        "image_url" => &["type", "image_url", "cache_control"],
+        "input_audio" => &["type", "input_audio", "cache_control"],
+        "audio" => &["type", "audio", "cache_control"],
+        "tool_use" => &["type", "id", "name", "input", "cache_control"],
+        "tool_result" => &[
+            "type",
+            "tool_use_id",
+            "content",
+            "is_error",
+            "cache_control",
+        ],
+        _ => &[],
+    }
+}
+
 fn content_pointers(
     prefix: &str,
     content: &Value,
@@ -345,7 +381,19 @@ fn content_pointers(
                 // `input`, a result's `content` — was forwarded untouched. A
                 // block with no type cannot be read at all, so it falls to the
                 // refusal below with everything else we do not understand.
-                match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+                // Checked before the dispatch, so a block is refused for what
+                // it carries as readily as for what it is.
+                let allowed = content_block_fields(kind);
+                if !allowed.is_empty() {
+                    let fields = part.as_object().ok_or(ShapeError::Request(provider))?;
+                    for field in fields.keys() {
+                        if !allowed.contains(&field.as_str()) {
+                            return Err(ShapeError::Unsupported(provider, "content block field"));
+                        }
+                    }
+                }
+                match kind {
                     "text" => {
                         // Present but not a string cannot be masked, and the
                         // arm below refuses it rather than dropping the block.
@@ -1383,16 +1431,22 @@ mod tests {
             {"type": "tool_use", "id": "t1", "name": "f",
              "text": "nothing to see", "input": {"who": "Martina Weber"}}
         ]}]});
+        // Two outcomes are acceptable and one is not. Describing the arguments
+        // is fine; refusing the block is fine — the field allowlist does exactly
+        // that, because `text` is not a field a `tool_use` may carry. What must
+        // never happen is the third thing: served, with the arguments described
+        // nowhere and forwarded as they came.
         for described in [
-            Anthropic.request_pointers(&smuggled_call).unwrap(),
-            OpenAi.request_pointers(&smuggled_call).unwrap(),
+            Anthropic.request_pointers(&smuggled_call),
+            OpenAi.request_pointers(&smuggled_call),
         ] {
+            let Ok(slots) = described else { continue };
             assert!(
-                described.iter().any(|slot| matches!(
+                slots.iter().any(|slot| matches!(
                     slot,
                     Slot::Json { pointer, .. } if pointer.ends_with("/input")
                 )),
-                "the arguments are described whatever else the block carries: {described:?}"
+                "served with the arguments described nowhere: {slots:?}"
             );
         }
 
@@ -1401,16 +1455,70 @@ mod tests {
              "text": "nothing to see", "content": "Martina Weber"}
         ]}]});
         for described in [
-            Anthropic.request_pointers(&smuggled_result).unwrap(),
-            OpenAi.request_pointers(&smuggled_result).unwrap(),
+            Anthropic.request_pointers(&smuggled_result),
+            OpenAi.request_pointers(&smuggled_result),
         ] {
+            let Ok(slots) = described else { continue };
             assert!(
-                described
+                slots
                     .iter()
                     .any(|slot| slot.pointer().ends_with("/content")),
-                "a result's content is described whatever else the block carries: {described:?}"
+                "served with the result described nowhere: {slots:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_content_block_carrying_a_field_no_slot_addresses_is_refused() {
+        // Tool definitions got an allowlist; content blocks never did, so a
+        // block's undeclared fields still travelled exactly as they came. This
+        // is not hypothetical: Anthropic's `text` blocks may carry `citations`,
+        // whose `cited_text` is quoted source material — among the likeliest
+        // fields in the protocol to hold somebody's personal data — and clients
+        // echo assistant turns back as history, so it arrives on the request
+        // path where `/text` is described and the citation is not.
+        let cited = json!({"model": "claude", "messages": [{"role": "assistant", "content": [
+            {"type": "text", "text": "As established,",
+             "citations": [{"type": "char_location", "cited_text": "Martina Weber lives in Bern",
+                            "document_title": "Weber file", "start_char_index": 0}]}
+        ]}]});
+        assert!(matches!(
+            Anthropic.request_pointers(&cited),
+            Err(ShapeError::Unsupported("anthropic", "content block field"))
+        ));
+
+        // A tool_use block is an object the caller fills in too.
+        let extra_on_a_call = json!({"model": "claude", "messages": [{"role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {},
+                         "annotations": {"who": "Martina Weber"}}]}]});
+        assert!(Anthropic.request_pointers(&extra_on_a_call).is_err());
+    }
+
+    #[test]
+    fn the_fields_a_content_block_is_built_from_are_still_understood() {
+        // The allowlist must not refuse the protocol it exists to serve. Every
+        // field here is one this gateway describes or deliberately leaves
+        // alone, across all four block types it reads.
+        let ordinary = json!({"model": "claude", "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hallo", "cache_control": {"type": "ephemeral"}},
+                {"type": "image", "source": {"type": "base64", "data": "x", "media_type": "image/png"}}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {"path": "x"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": false}
+            ]}
+        ]});
+        assert_eq!(
+            Anthropic.request_pointers(&ordinary).unwrap(),
+            vec![
+                text("/messages/0/content/0/text"),
+                instance("/messages/1/content/0/input"),
+                tool_text("/messages/2/content/0/content"),
+            ]
+        );
     }
 
     #[test]

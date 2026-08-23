@@ -117,62 +117,58 @@ max_spans_per_entry = 250
 # How many characters of text — every tool definition, call argument and
 # result, summed across one request — may be handed to the detector.
 #
-# Characters, not serialized bytes, and the distinction is the point. Cost
-# scales with the text the detector reads; braces, quotes and property names
-# are structure it never sees. On the real eight-tool payload in
-# gateway/src/testdata/claude_code_tools.json the two differ by 1.49x —
-# 10 970 serialized against 7 379 detected — so a bound charging serialized
-# size refuses payloads a third below the ceiling it claims to enforce. The
-# test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins both
-# figures, so nobody re-derives this from serialized size later.
+# Characters, not serialized bytes. Cost scales with the text the detector
+# reads; braces, quotes and property names are structure it never sees. On the
+# real ten-tool payload in gateway/src/testdata/claude_code_tools.json the two
+# differ by 1.46x — 13 177 serialized against 9 005 detected.
 #
-# What the number is denominated against: the README's latency table is the
-# measured source. On the machine that table names (Apple M3 Pro, 11 cores),
-# 10 000 characters is roughly eight to nine seconds; on the containerised
-# stack the detection-cache design measured (20.3 CPU-seconds per 1 200
-# characters), closer to fifteen. That is what a caller waits for one
-# request. Slower hardware has to lower this to match — the relationship is
-# the thing to carry, not the number.
+# Set from that measurement, at twice it. Ten real tool definitions cost 9 005
+# characters, about 900 per tool. Those ten are a floor: a stock session carries
+# about fifteen tools, extrapolating to roughly 13 500, so 18 000 covers a stock
+# session with room for a small MCP server and does not pretend to cover an
+# arbitrary one. The test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with
+# pins the figure and fails if this default stops admitting it.
 #
-# It is NOT a timeout budget, and this comment used to say it was ("one
-# constraint written twice"). detector_timeout_secs becomes reqwest's
-# per-request timeout, so it bounds each detector call on its own and never
-# their sum: a request may spend far longer than the timeout in total with no
-# single call coming near it. Two constraints, not one — the timeout catches a
-# stuck call, this caps how long a caller waits for the whole request.
+# What that costs, plainly: the README's latency table measures 10 000
+# characters at eight to nine seconds on an Apple M3 Pro and about fifteen on
+# the containerised stack, so 18 000 is roughly fifteen seconds native and
+# twenty-seven containerised. Slower hardware has to lower this rather than
+# inherit it. Two things make it tolerable: it is the FIRST turn of a session
+# only, since tool definitions are byte-identical afterwards and the detection
+# cache serves them; and the alternative is not a faster gateway but a refused
+# one, because a bound below real traffic makes this unusable with the clients
+# it exists for. The real fix is issue #28 — detecting a document's strings in
+# one call instead of N — not a larger number here.
 #
-# Still unmeasured, and the honest gap: per-call overhead. This bounds the
-# characters and max_tool_leaves bounds the calls; nobody has measured what a
-# call costs before any text is read.
+# It is NOT a timeout budget, and this comment used to say it was.
+# detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
+# detector call on its own and never their sum; no cumulative deadline exists
+# anywhere on the request path. Two constraints: the timeout catches a stuck
+# call, this caps how long a caller waits for the whole request.
 #
-# The ceiling exists because the detection cache above does not help the
-# first time a text is seen, and a tool result is usually seen once. Issue #28
-# carries the work that lifts it.
-max_tool_chars = 10000
+# Still unmeasured: per-call overhead. This bounds the characters and
+# max_tool_leaves bounds the calls; nobody has measured what a call costs before
+# any text is read.
+max_tool_chars = 18000
+
 # How many separate strings those structures may hold.
 #
-# A second bound, because max_tool_chars bounds the wrong quantity for this
-# failure. Detection is one round-trip per string, awaited in turn while the
-# request holds its session, so the cost tracks the *number* of strings and not
-# their total size -- and the two come apart badly. A schema of a thousand
-# two-character strings is about 10000 bytes, passes the byte bound, and is a
-# thousand sequential detector calls.
+# A second bound, because max_tool_chars bounds a different cost. Detection is
+# one round-trip per string, awaited in turn while the request holds its
+# session, so cost tracks the number of strings as well as their size, and the
+# two come apart: a schema of a thousand two-character strings is small by
+# characters and still a thousand sequential calls.
 #
-# The number comes from counting a real payload rather than from a cost model.
-# The test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with walks
-# eight tool definitions taken from a live Claude Code session and gets 70
-# leaves -- already past the 64 this key once held. A plain tool costs three to
-# six; the two carrying enums cost 21 and 24, because every enum member is a
-# value the model may choose and so is scanned. Those eight are a subset of a
-# stock session's tools, and an MCP server adds more, so 128 is that payload
-# with room to roughly double. The test fails if this stops admitting it.
+# Set from the same measurement on the same basis. Ten real tool definitions
+# cost 77 calls, about 7.7 per tool; a stock fifteen-tool session extrapolates
+# to roughly 116, and 160 covers that with room. A plain tool costs three to
+# six — enum is what makes one expensive, since every member is a value the
+# model may choose and so is scanned, and two enum-carrying tools in that
+# payload cost 21 and 24 between them. A per-tool average is a floor, not a
+# prediction.
 #
-# What is NOT measured is the cost, and that is this number's weak point. Total
-# text is already bounded by max_tool_chars, so what leaves add is per-call
-# overhead, which nobody has measured -- the figures above are for texts of
-# 1200 and 6000 characters. At 50 ms a call, 128 is under seven seconds; at
-# 300 ms it is thirty-eight and blows the timeout by itself. If it proves to be
-# the high end, the answer is issue #28 -- detecting a document's strings in one
-# call instead of N -- and not a smaller bound, because a smaller bound refuses
-# real clients.
-max_tool_leaves = 128
+# The weak point is the same one: nobody has measured what a call costs before
+# any text is read. At 50 ms a call, 160 is eight seconds; at 300 ms it is
+# forty-eight. If it proves to be the high end the answer is issue #28, not a
+# smaller bound, because a smaller bound refuses real clients.
+max_tool_leaves = 160

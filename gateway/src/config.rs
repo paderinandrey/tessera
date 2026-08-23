@@ -72,73 +72,75 @@ pub struct Config {
     /// How many **characters of text** one request's tool structures will hand
     /// to the detector, summed across every definition, argument and result.
     ///
-    /// Characters, not serialized bytes, and the distinction is the whole
-    /// point. Detection cost scales with the text the detector reads; braces,
-    /// quotes and property names are structure it never sees. On `mapping`'s
-    /// real eight-tool payload the two differ by 1.49x — 10 970 serialized
-    /// against 7 379 detected — so a bound charging serialized size refuses
-    /// payloads a third below the ceiling it claims to enforce. The figure is
-    /// pinned by `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with`
-    /// so nobody re-derives this from serialized size later.
+    /// Characters, not serialized bytes, and the distinction is the point.
+    /// Detection cost scales with the text the detector reads; braces, quotes
+    /// and property names are structure it never sees. On `mapping`'s real
+    /// ten-tool payload the two differ by 1.46x — 13 177 serialized against
+    /// 9 005 detected — so a bound charging serialized size charges half again
+    /// what detection costs.
     ///
-    /// **What it is denominated against.** The README's latency table is the
-    /// measured source: on the machine it names (Apple M3 Pro, 11 cores) 10 000
-    /// characters is roughly eight to nine seconds, and on the containerised
-    /// stack the detection-cache design measured, closer to fifteen. That is
-    /// the caller's wait for one request, and 10 000 keeps it in that range.
-    /// Slower hardware has to lower this to match — the relationship is the
-    /// thing to carry, not the number.
+    /// **Set from measurement, at twice the measured payload.** Ten real tool
+    /// definitions cost 9 005 characters, about 900 per tool.
+    /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` pins that
+    /// figure and fails if this default stops admitting it. Those ten are a
+    /// floor — a stock session carries about fifteen tools, extrapolating to
+    /// roughly 13 500 characters — so 18 000 covers a stock session with room
+    /// for a small MCP server, and does not pretend to cover an arbitrary one.
     ///
-    /// **It is not a timeout budget, and an earlier comment here said it was.**
-    /// `detector_timeout_secs` becomes `reqwest`'s per-request timeout, so it
-    /// bounds each detector *call* on its own, never their sum. A request may
-    /// spend far longer than the timeout in total and no call ever come near
-    /// it. So this key and that one are two constraints, not "one constraint
-    /// written twice": the timeout catches a single stuck call, and this caps
-    /// how long a caller waits for the whole request.
+    /// **What that costs, stated plainly, because it is not free.** The
+    /// README's latency table is the measured source: on the machine it names
+    /// (Apple M3 Pro, 11 cores) 10 000 characters is eight to nine seconds, and
+    /// on the containerised stack the detection-cache design measured, about
+    /// fifteen. So 18 000 characters is roughly fifteen seconds native and
+    /// twenty-seven containerised — a long wait, and close enough to the edge
+    /// that slower hardware has to lower this rather than inherit it.
     ///
-    /// Still unmeasured, and the honest gap: per-call overhead. This bounds the
-    /// characters; `max_tool_leaves` bounds the calls; nobody has measured what
-    /// a call costs before any text is read. See that key.
+    /// Two things make that tolerable rather than reckless. It is the *first*
+    /// turn of a session only: tool definitions are byte-identical every turn
+    /// after, and the detection cache serves them. And the alternative is not a
+    /// faster gateway but a refused one — a bound below real traffic makes this
+    /// unusable with the clients it exists for. The real fix is issue #28,
+    /// detecting a document's strings in one call instead of N, and not a
+    /// larger number here.
     ///
-    /// The ceiling exists because the detection cache does not help the first
-    /// time a text is seen, and a tool result is usually seen once. Issue #28
-    /// carries the work that lifts it.
+    /// **It is not a timeout budget**, and this comment used to say it was
+    /// ("one constraint written twice"). `detector_timeout_secs` becomes
+    /// `reqwest`'s per-request timeout, so it bounds each detector call on its
+    /// own and never their sum; no cumulative deadline exists anywhere on the
+    /// request path. Two constraints — the timeout catches one stuck call, this
+    /// caps how long a caller waits for the whole request.
+    ///
+    /// Still unmeasured: per-call overhead. This bounds the characters,
+    /// `max_tool_leaves` bounds the calls, and nobody has measured what a call
+    /// costs before any text is read.
     #[serde(default = "default_max_tool_chars")]
     pub max_tool_chars: usize,
 
     /// How many separate strings one request's tool structures may hold.
     ///
-    /// A second bound because `max_tool_chars` bounds the wrong quantity for
-    /// this failure. Detection is one round-trip per string, awaited in turn
-    /// while the request holds its session, so cost tracks the *number* of
-    /// strings and not their total size — and the two come apart badly. A
-    /// schema of a thousand two-character strings is about 10 000 bytes, passes
-    /// the byte bound, and is a thousand sequential calls.
+    /// A second bound because `max_tool_chars` bounds a different cost.
+    /// Detection is one round-trip per string, awaited in turn while the
+    /// request holds its session, so cost tracks the *number* of strings as
+    /// well as their total size — and the two come apart badly. A schema of a
+    /// thousand two-character strings is small by characters and is still a
+    /// thousand sequential calls.
     ///
-    /// The number comes from counting a real payload, not from a cost model.
-    /// `mapping::a_real_tool_payload_fits_the_bounds_this_gateway_ships_with`
-    /// walks eight tool definitions taken from a live Claude Code session and
-    /// gets **70 leaves** — already past the 64 this once was. A plain tool
-    /// costs three to six; two that carry `enum`s cost 21 and 24 between them,
-    /// because every enum member is a value the model may choose and so is
-    /// scanned. That test fails if this number ever stops admitting that
-    /// payload, which is the property worth pinning: a gateway that refuses the
-    /// tool set its own users run is broken, not conservative.
+    /// **Set from the same measurement, on the same basis: twice the measured
+    /// payload.** Ten real tool definitions cost 77 calls, about 7.7 per tool;
+    /// a stock fifteen-tool session extrapolates to roughly 116, and 160 covers
+    /// that with room. A plain tool costs three to six; `enum` is what makes
+    /// one expensive, because every member is a value the model may choose and
+    /// so is scanned — two enum-carrying tools in that payload cost 21 and 24
+    /// between them, which is why a per-tool average is a floor and not a
+    /// prediction.
     ///
-    /// 128 leaves that payload room to roughly double, which it needs — those
-    /// eight tools are a subset of a stock session's, and an MCP server adds
-    /// more.
-    ///
-    /// What is *not* measured is the cost, and this is the number's weak point.
-    /// Total text is already bounded by `max_tool_chars`, so what leaves add is
-    /// per-call overhead, and nobody has measured that (the figures under
-    /// `detector_timeout_secs` are for texts of 1 200 and 6 000 characters). At
-    /// 50 ms a call, 128 is under seven seconds; at 300 ms it is thirty-eight
-    /// and blows the timeout on its own. If it turns out to be the high end,
-    /// the answer is issue #28 — detecting a document's strings in one call
-    /// instead of N — and not a smaller bound, because a smaller bound refuses
-    /// real clients.
+    /// What is *not* measured is the cost of a call, and this is the number's
+    /// weak point. Total text is already bounded by `max_tool_chars`, so what
+    /// leaves add is per-call overhead, and nobody has measured that — the
+    /// figures under `detector_timeout_secs` are for texts of 1 200 and 6 000
+    /// characters. At 50 ms a call, 160 is eight seconds; at 300 ms it is
+    /// forty-eight. If it proves to be the high end the answer is issue #28,
+    /// not a smaller bound, because a smaller bound refuses real clients.
     #[serde(default = "default_max_tool_leaves")]
     pub max_tool_leaves: usize,
 }
@@ -219,10 +221,10 @@ fn default_max_spans_per_entry() -> usize {
     250
 }
 pub fn default_max_tool_chars() -> usize {
-    10_000
+    18_000
 }
 pub fn default_max_tool_leaves() -> usize {
-    128
+    160
 }
 
 impl Config {
@@ -413,8 +415,8 @@ mod tests {
     #[test]
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(config.max_tool_chars, 10_000);
-        assert_eq!(config.max_tool_leaves, 128);
+        assert_eq!(config.max_tool_chars, 18_000);
+        assert_eq!(config.max_tool_leaves, 160);
     }
 
     #[test]

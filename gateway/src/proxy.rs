@@ -688,8 +688,8 @@ mod tests {
     const UNCAPPED: usize = usize::MAX;
     /// The production default, so tests exercise the bound callers get rather
     /// than one chosen to make a test convenient.
-    const TEST_MAX_TOOL_CHARS: usize = 10_000;
-    const TEST_MAX_TOOL_LEAVES: usize = 128;
+    const TEST_MAX_TOOL_CHARS: usize = 18_000;
+    const TEST_MAX_TOOL_LEAVES: usize = 160;
 
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
@@ -1037,6 +1037,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_numeric_leaf_is_never_shown_to_the_detector_and_reaches_the_upstream_intact() {
+        // The never-detected half, pinned rather than described. A card number
+        // or a numeric tax ID in a tool argument is not covered by anything
+        // this gateway does today: no detector call is made for it, and it
+        // travels verbatim. `a_number_survives_replacement_with_its_type_intact`
+        // pins that a number is never *replaced*, which is a different claim
+        // and stays true after task 6.
+        //
+        // **Task 6 should have to delete this test.** That is what it is for:
+        // the day numbers are detected and a span refuses the request, this
+        // asserts the opposite of the intended behaviour and fails loudly
+        // rather than letting the old promise persist beside the new one.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "charge",
+                     "input": {"card": 4_111_111_111_111_111i64, "ratio": 1.5}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert!(
+            detector.received_requests().await.unwrap().is_empty(),
+            "a document of numbers alone asks the detector nothing"
+        );
+        let sent = sent_to(&upstream).await;
+        assert_eq!(
+            sent["messages"][0]["content"][0]["input"],
+            json!({"card": 4_111_111_111_111_111i64, "ratio": 1.5}),
+            "and every number reached the provider exactly as the client wrote it"
+        );
+    }
+
+    #[tokio::test]
     async fn a_tool_call_is_masked_going_up_and_restored_coming_back() {
         let detector = detector_returning(person_span()).await;
         let upstream = upstream_returning(
@@ -1216,7 +1257,7 @@ mod tests {
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let properties: serde_json::Map<String, Value> = (0..120)
+        let properties: serde_json::Map<String, Value> = (0..150)
             .map(|n| {
                 (
                     format!("parameter_{n:03}"),
@@ -1234,9 +1275,10 @@ mod tests {
             "messages": [{"role": "user", "content": "hallo"}]
         });
 
-        // 120 descriptions of 70 characters, plus the tool's own one-character
-        // description: 8 401 characters of text against a 10 000 bound.
-        let text: usize = 120 * 70 + 1;
+        // 150 descriptions of 70 characters, plus the tool's own one-character
+        // description: 10 501 characters of text against an 18 000 bound, and
+        // well past it once the punctuation around them is charged too.
+        let text: usize = 150 * 70 + 1;
         assert!(text < TEST_MAX_TOOL_CHARS, "{text} characters of text");
         let serialized = body["tools"][0]["input_schema"].to_string().len();
         assert!(
