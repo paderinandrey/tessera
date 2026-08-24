@@ -398,3 +398,21 @@ See the numeric-leaf section; closing it is detection-quality work, like issue
 
 **A large tool result is refused, not served slowly.** See **Latency**, and
 issue #28, which exists to raise this ceiling.
+
+**Masking tool definitions degrades tool selection, measurably.** The decision
+above accepted this in principle; here is the number. Ten real Claude Code tool
+definitions, containing no personal data whatsoever, yield **thirteen spans** —
+tool names, ordinary English words in capitals, a parameter called `main`. Every
+one is masked, so the model chooses among tools whose descriptions have been
+partly replaced by placeholders.
+
+This is not a detector defect to be tuned away: `main` and `ORG`-shaped words are
+exactly what a general-purpose recogniser is built to catch, and a name really
+can appear in a tool description. It is the cost of the promise, paid in a place
+where the text is instructions rather than content. Recorded here because an
+operator seeing `[PERSON_1]` inside a tool description should find it explained
+rather than report it as corruption.
+
+Batching relocates these rather than reducing them: measured across the same
+payload, per-leaf and joined detection both found thirteen, differing in four —
+and all four differences were false positives on both sides.
