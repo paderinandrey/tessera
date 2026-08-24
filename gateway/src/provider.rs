@@ -189,7 +189,20 @@ fn require_scannable_message(
     carriers: &[&str],
     provider: &'static str,
 ) -> Result<(), ShapeError> {
-    if !message.is_object() || !carriers.iter().any(|field| message.get(field).is_some()) {
+    // `is_some_and(!is_null)`, not `is_some`: `{"content": null}` is
+    // `Some(Value::Null)`, so a presence test passed the guard while the
+    // filter that reads the field further down treats the same null as absent
+    // and produces no slot. A message with no slots and no allowlist is
+    // forwarded field for field, which is the shape this guard exists to stop.
+    //
+    // It stays true that a null `content` is a valid turn — the provider
+    // writes it beside `tool_calls` and clients echo it back. That turn is
+    // admitted by `tool_calls` being a carrier, not by its null content.
+    if !message.is_object()
+        || !carriers
+            .iter()
+            .any(|field| message.get(field).is_some_and(|value| !value.is_null()))
+    {
         return Err(ShapeError::Request(provider));
     }
     Ok(())
@@ -696,7 +709,11 @@ impl Provider for OpenAi {
             // Null content is an assistant turn that carried tool calls
             // instead: the provider writes it that way and clients echo it
             // back, so reading it as an unreadable content shape refused the
-            // commonest tool body there is.
+            // commonest tool body there is. Skipping it here is safe only
+            // because `require_scannable_message` above does not count a null
+            // as a carrier — otherwise a message whose content is null and
+            // whose carriers are all null would produce no slot and still be
+            // forwarded.
             if let Some(content) = message.get("content").filter(|value| !value.is_null()) {
                 let from = pointers.len();
                 content_pointers(
@@ -1875,6 +1892,40 @@ mod tests {
                 || pointer.ends_with("/id")),
             "dispatch must not be described: {described:?}"
         );
+    }
+
+    #[test]
+    fn a_null_content_with_nothing_beside_it_is_still_refused() {
+        // The guard tested `.is_some()`, and `{"content": null}` is
+        // `Some(Value::Null)` — so it passed, while the filter further down
+        // reads the same null as absent and produces no slot. A message with
+        // zero slots and no allowlist is forwarded field for field: the
+        // silence-is-a-leak shape, defeating the one guard written against it.
+        //
+        // One field between this and `an_assistant_turn_may_carry_calls_...`
+        // below, which tests `{"role": "assistant"}` with no `content` key at
+        // all and therefore never reaches the hole.
+        let refusal_beside_a_null = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "refusal": "Martina Weber",
+             "audio": {"id": "a", "transcript": "Martina Weber"}}
+        ]});
+        assert!(
+            OpenAi.request_pointers(&refusal_beside_a_null).is_err(),
+            "a turn whose only text is in fields no slot addresses must not travel"
+        );
+
+        // Not confined to assistant turns or to tool traffic: any message whose
+        // content is null carries whatever else it likes.
+        let vendor_field = json!({"model": "gpt", "messages": [
+            {"role": "user", "content": null, "vendor_notes": "Martina Weber"}
+        ]});
+        assert!(OpenAi.request_pointers(&vendor_field).is_err());
+
+        // And Anthropic reads the same guard.
+        let anthropic = json!({"model": "claude", "messages": [
+            {"role": "user", "content": null, "vendor_notes": "Martina Weber"}
+        ]});
+        assert!(Anthropic.request_pointers(&anthropic).is_err());
     }
 
     #[test]
