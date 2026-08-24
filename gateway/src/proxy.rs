@@ -43,10 +43,10 @@ pub enum ProxyError {
     )]
     ToolTooLarge,
     #[error(
-        "this request's tool structures hold more separate strings than this gateway will \
-         detect for a single request; it is refused rather than forwarded"
+        "this request's tool structures need more detector calls than this gateway will \
+         make for a single request; it is refused rather than forwarded"
     )]
-    TooManyToolLeaves,
+    TooManyToolCalls,
 }
 
 impl ProxyError {
@@ -67,7 +67,7 @@ impl ProxyError {
             | ProxyError::Session(SessionError::Disabled)
             | ProxyError::Session(SessionError::NoCredential(_))
             | ProxyError::ToolTooLarge
-            | ProxyError::TooManyToolLeaves => StatusCode::BAD_REQUEST,
+            | ProxyError::TooManyToolCalls => StatusCode::BAD_REQUEST,
             // Saturation is this gateway's own capacity rather than anything
             // the caller got wrong, and the same request may well succeed a
             // moment later. No `Retry-After`: the wait is another request's
@@ -121,7 +121,7 @@ impl ProxyError {
             ProxyError::Session(SessionError::Saturated) => "session_saturated",
             ProxyError::Audit(_) => "audit_write_failed",
             ProxyError::ToolTooLarge => "tool_too_large",
-            ProxyError::TooManyToolLeaves => "tool_too_many_leaves",
+            ProxyError::TooManyToolCalls => "tool_too_many_calls",
         }
     }
 }
@@ -172,10 +172,11 @@ pub struct AppState {
     /// outlast the detector timeout — a different failure, so a different
     /// number, and it lives here because `handle` is where it is asked.
     pub max_tool_chars: usize,
-    /// How many separate strings that structure may hold. Each is its own
-    /// detector round-trip, awaited in turn, so this bounds *calls* where
-    /// `max_tool_chars` bounds *size*.
-    pub max_tool_leaves: usize,
+    /// How many detector round-trips that structure may need — one per tool
+    /// description and one per schema holding any text, since a document is
+    /// detected in a single call. Bounds *calls* where `max_tool_chars` bounds
+    /// *size*.
+    pub max_tool_calls: usize,
 }
 
 impl AppState {
@@ -197,7 +198,7 @@ impl AppState {
             }),
             audit,
             max_tool_chars: config.max_tool_chars,
-            max_tool_leaves: config.max_tool_leaves,
+            max_tool_calls: config.max_tool_calls,
         }
     }
 
@@ -270,16 +271,55 @@ async fn mask_all(
                 shape,
             } => {
                 let document = read_document(body, pointer, *embedded, provider)?;
-                // Already counted against `max_tool_leaves` in `handle`, before
-                // any of these round-trips were made.
+                // Already counted against `max_tool_calls` in `handle`, before
+                // this round-trip was made.
                 let leaves = mapping::json_leaves(&document, *shape)?;
+                // **One call for the whole document.** Per string it was not
+                // merely slow — 77 calls against a real tool payload measured
+                // 54.9 s, of which 30 s was per-call overhead — it was blind:
+                // a two-character leaf detected alone carries no context, and
+                // inside its schema it carries the whole of it.
+                //
+                // Joining is safe here in a way a general chunker cannot be,
+                // because the boundaries are ours: `Joined` records where each
+                // leaf went and `split` returns every span to the leaf it came
+                // from, refusing the ones that cross. Masking below is still
+                // leaf by leaf, so `mask`, `check_spans`, `reserve_literals`,
+                // placeholder allocation and the positional correspondence
+                // `replace_text_leaves` rests on are all untouched.
+                let texts: Vec<&str> = leaves
+                    .iter()
+                    .filter_map(|leaf| match leaf {
+                        mapping::Leaf::Text(text) => Some(text.as_str()),
+                        mapping::Leaf::Number(_) => None,
+                    })
+                    .collect();
+                let per_leaf = if texts.is_empty() {
+                    // A document of numbers and nothing else asks the detector
+                    // nothing, exactly as it did before.
+                    Vec::new()
+                } else {
+                    let joined = mapping::Joined::of(&texts);
+                    let spans = detector.detect(joined.text(), credential).await?;
+                    total += spans.len();
+                    // Read off the joined text with the spans as the detector
+                    // reported them, before any rebasing — the values are the
+                    // same either way and this cannot disagree with `split`
+                    // about which leaf they fell in.
+                    count_distinct(joined.text(), &spans, &mut distinct);
+                    // Bounds and ordering checked against the text the detector
+                    // actually saw, where "past the end" still means something.
+                    // After rebasing, an out-of-range span could land plausibly
+                    // inside the wrong leaf.
+                    mapping::check_spans(joined.text(), &spans)?;
+                    joined.split(&spans)?
+                };
+                let mut spans_for = per_leaf.into_iter();
                 let mut replacements = Vec::new();
                 for leaf in &leaves {
                     match leaf {
                         mapping::Leaf::Text(text) => {
-                            let spans = detector.detect(text, credential).await?;
-                            total += spans.len();
-                            count_distinct(text, &spans, &mut distinct);
+                            let spans = spans_for.next().unwrap_or_default();
                             replacements.push(mapping.mask(text, &spans)?);
                         }
                         // Deliberately nothing, and deliberately not covered:
@@ -381,7 +421,7 @@ async fn handle(
     // A numeric leaf is charged nothing because nothing sends it anywhere; see
     // `mapping::Leaf::Number`. Task 6 gives numbers to the detector, and both
     // counts here have to start including them on that day.
-    let mut tool_leaves = 0usize;
+    let mut tool_calls = 0usize;
     let mut tool_chars = 0usize;
     for slot in &slots {
         match slot {
@@ -390,7 +430,7 @@ async fn handle(
                 pointer,
                 tool: true,
             } => {
-                tool_leaves += 1;
+                tool_calls += 1;
                 tool_chars += read_pointer(&body, pointer)?.chars().count();
             }
             Slot::Json {
@@ -399,20 +439,35 @@ async fn handle(
                 shape,
             } => {
                 let document = read_document(&body, pointer, *embedded, provider.name())?;
+                let mut leaves = 0usize;
                 for leaf in mapping::json_leaves(&document, *shape)? {
                     if let mapping::Leaf::Text(text) = leaf {
-                        tool_leaves += 1;
+                        leaves += 1;
                         tool_chars += text.chars().count();
                     }
                 }
+                // One call for the document however many strings are in it,
+                // and none at all for a document holding no text. This is the
+                // whole of what batching changed about the bounds: the count
+                // moved from strings to round-trips, and the strings stopped
+                // being what costs.
+                if leaves > 0 {
+                    tool_calls += 1;
+                }
+                // The separators are charged because the detector reads them,
+                // and this bound is denominated in characters sent. Leaving
+                // them out would also leave the join itself unbounded: a
+                // million empty leaves are no characters of the caller's and
+                // two million of ours.
+                tool_chars += mapping::Joined::separator_chars(leaves);
             }
         }
     }
     if tool_chars > state.max_tool_chars {
         return Err(ProxyError::ToolTooLarge);
     }
-    if tool_leaves > state.max_tool_leaves {
-        return Err(ProxyError::TooManyToolLeaves);
+    if tool_calls > state.max_tool_calls {
+        return Err(ProxyError::TooManyToolCalls);
     }
 
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
@@ -702,7 +757,7 @@ mod tests {
     /// than one chosen to make a test convenient. Asserted below rather than
     /// promised here.
     const TEST_MAX_TOOL_CHARS: usize = 20_000;
-    const TEST_MAX_TOOL_LEAVES: usize = 160;
+    const TEST_MAX_TOOL_CALLS: usize = 40;
 
     #[test]
     fn the_bounds_these_tests_exercise_are_the_bounds_callers_get() {
@@ -722,8 +777,8 @@ mod tests {
             "the tool character bound under test has drifted from the shipped default"
         );
         assert_eq!(
-            TEST_MAX_TOOL_LEAVES,
-            crate::config::default_max_tool_leaves(),
+            TEST_MAX_TOOL_CALLS,
+            crate::config::default_max_tool_calls(),
             "the tool call bound under test has drifted from the shipped default"
         );
     }
@@ -854,7 +909,7 @@ mod tests {
             sessions: SessionStore::new(limits),
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         });
         (state, dir, path)
     }
@@ -1388,7 +1443,7 @@ mod tests {
         );
 
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let messages: Vec<Value> = (0..(TEST_MAX_TOOL_LEAVES + 1))
+        let messages: Vec<Value> = (0..(TEST_MAX_TOOL_CALLS + 1))
             .map(|n| json!({"role": "tool", "tool_call_id": format!("t{n}"), "content": "ok"}))
             .collect();
         let (status, body) = call(
@@ -1399,8 +1454,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(
-            body.contains("separate strings"),
-            "refused by the leaf bound rather than the text bound: {body}"
+            body.contains("detector calls"),
+            "refused by the call bound rather than the text bound: {body}"
         );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),
@@ -1634,7 +1689,7 @@ mod tests {
         // 155 descriptions of 100 characters, plus the tool's own one-character
         // description: 15 501 characters of text against a 20 000 bound, and
         // well past it once the punctuation around them is charged too. The
-        // count stays under `max_tool_leaves` so that only the text/serialized
+        // count stays under `max_tool_calls` so that only the text/serialized
         // distinction can decide the verdict.
         let text: usize = 155 * 100 + 1;
         assert!(text < TEST_MAX_TOOL_CHARS, "{text} characters of text");
@@ -1702,15 +1757,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_document_of_many_tiny_strings_is_refused_though_it_is_small() {
-        // The text bound does not bound this. Each string is its own detector
-        // round-trip, awaited in turn while the request holds its session, so
-        // the cost is the count and not the size — and a document of hundreds
-        // of two-character strings is well inside the text bound.
+    async fn a_second_turn_reuses_the_first_turns_detection_of_the_same_tools() {
+        // The regression whole-request batching would have introduced, and the
+        // reason a document rather than a request is the unit. The cache keys
+        // on the text, so what matters is that a joined text is *stable*: the
+        // same tools joined the same way on turn two are the same string, and
+        // the detector is not asked again. Join the whole request instead and
+        // one new `tool_result` makes that string unique every turn, so the
+        // definitions — free from here on — would be re-detected forever.
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let many: Vec<Value> = (0..(TEST_MAX_TOOL_LEAVES + 1))
+        let tools = json!([{
+            "name": "read_file",
+            "description": "Read a file from the workspace",
+            "input_schema": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "where the file lives"},
+                "limit": {"type": "integer", "description": "how much of it to read"}
+            }}
+        }]);
+
+        // With a credential, because the cache deliberately refuses to serve a
+        // credential-less caller at all: folding them into one bucket would
+        // make a hit distinguishable from a miss by response time across
+        // tenants. So the second-turn saving is real for any caller with an API
+        // key — which is every caller a provider will answer — and absent for a
+        // demo stand that has none.
+        let key = [("x-api-key", "tenant-one")];
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/messages",
+            json!({"model": "claude", "tools": tools,
+                   "messages": [{"role": "user", "content": "hallo"}]}),
+            &key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let after_first = detector.received_requests().await.unwrap().len();
+        assert_eq!(
+            after_first, 3,
+            "one call for the description, one for the whole schema, one for the prompt"
+        );
+
+        // Turn two: the same tools, plus a turn's worth of new conversation.
+        let (status, _) = call_with_headers(
+            state,
+            "/v1/messages",
+            json!({"model": "claude", "tools": tools, "messages": [
+                {"role": "user", "content": "hallo"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"path": "/tmp/notes"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "some output"}]}
+            ]}),
+            &key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let second_turn = detector.received_requests().await.unwrap().len() - after_first;
+        assert_eq!(
+            second_turn, 2,
+            "the tool definitions and the repeated prompt cost nothing the second time — \
+             only the call's arguments and the result are text the cache has not seen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_document_of_many_tiny_strings_is_one_call_and_is_served() {
+        // **Repointed, because batching removed its subject.** It used to
+        // assert that hundreds of two-character strings were refused: each was
+        // its own round-trip, so the cost was the count and the text bound
+        // could not see it. A document is now one call however many strings it
+        // holds, so the refusal it guarded no longer exists and asserting it
+        // would be asserting a bug.
+        //
+        // Inverted, it guards the thing that replaced it: this is the exact
+        // payload the old bound existed to stop, and it now goes through in a
+        // single detector call.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let many: Vec<Value> = (0..(TEST_MAX_TOOL_CALLS * 10))
             .map(|n| json!(format!("v{n}")))
             .collect();
         let document = json!({ "items": many });
@@ -1730,14 +1858,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(
-            body.contains("separate strings"),
-            "refused by the leaf bound rather than the text bound: {body}"
-        );
-        assert!(
-            upstream.received_requests().await.unwrap().is_empty(),
-            "the refusal must cost the caller nothing upstream"
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            detector.received_requests().await.unwrap().len(),
+            1,
+            "four hundred strings, one call — that is the whole of the change"
         );
     }
 
@@ -1773,14 +1898,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tool_definitions_prose_counts_against_the_leaf_bound_too() {
+    async fn a_tool_definitions_prose_counts_against_the_call_bound_too() {
         // One round-trip per definition, and a client may carry many. The
         // schemas here are empty, so the descriptions are the only leaves and
         // nothing else can account for the refusal.
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let tools: Vec<Value> = (0..(TEST_MAX_TOOL_LEAVES + 1))
+        let tools: Vec<Value> = (0..(TEST_MAX_TOOL_CALLS + 1))
             .map(|n| json!({"name": format!("t{n}"), "description": "d", "input_schema": {}}))
             .collect();
         let body = json!({
@@ -1796,8 +1921,8 @@ mod tests {
         let (status, returned) = call(state, "/v1/messages", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
         assert!(
-            returned.contains("separate strings"),
-            "refused by the leaf bound rather than the text bound: {returned}"
+            returned.contains("detector calls"),
+            "refused by the call bound rather than the text bound: {returned}"
         );
         assert!(
             detector.received_requests().await.unwrap().is_empty(),
@@ -1806,21 +1931,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_leaf_bound_refuses_before_it_spends_the_budget_it_is_refusing_over() {
-        // The bound exists to cap how long one request holds its session. A
-        // bound charged per document, inside the masking loop, spends most of
-        // itself on detector round-trips and *then* refuses — the caller waits
-        // out nearly the whole budget to be told no. `json_leaves` is a pure
-        // walk with no I/O, so every document can be counted first, at the cost
-        // of walking each of them twice.
+    async fn the_call_bound_refuses_before_it_spends_the_budget_it_is_refusing_over() {
+        // The bound exists to cap how long one request holds its session, so
+        // spending most of it and then refusing defeats the point. Resized for
+        // the call bound: one document is one call now, so it takes documents
+        // rather than leaves to exceed it.
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        // Twenty documents of ten leaves each: no single one is anywhere near
-        // the bound, so only counting them together can refuse this at all.
-        let blocks: Vec<Value> = (0..20)
+        // No single document is anywhere near the bound, so only counting them
+        // together can refuse this at all.
+        let blocks: Vec<Value> = (0..(TEST_MAX_TOOL_CALLS + 1))
             .map(|doc| {
-                let fields: serde_json::Map<String, Value> = (0..10)
+                let fields: serde_json::Map<String, Value> = (0..3)
                     .map(|leaf| (format!("k{leaf}"), json!(format!("v{doc}{leaf}"))))
                     .collect();
                 json!({"type": "tool_use", "id": format!("t{doc}"), "name": "f",
@@ -1851,7 +1974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn many_small_tool_results_are_refused_by_the_leaf_bound_too() {
+    async fn many_small_tool_results_are_refused_by_the_call_bound_too() {
         // A `tool_result` is one detector round-trip like a document's leaf,
         // and it costs the same second. Spending the budget only on documents
         // would have bounded the calls a schema makes and left the calls a
@@ -1860,7 +1983,7 @@ mod tests {
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let results: Vec<Value> = (0..(TEST_MAX_TOOL_LEAVES + 1))
+        let results: Vec<Value> = (0..(TEST_MAX_TOOL_CALLS + 1))
             .map(|n| json!({"type": "tool_result", "tool_use_id": format!("t{n}"), "content": "x"}))
             .collect();
         let body = json!({
@@ -1870,8 +1993,8 @@ mod tests {
         let (status, returned) = call(state, "/v1/messages", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
         assert!(
-            returned.contains("separate strings"),
-            "refused by the leaf bound rather than the text bound: {returned}"
+            returned.contains("detector calls"),
+            "refused by the call bound rather than the text bound: {returned}"
         );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),
@@ -2447,7 +2570,7 @@ mod tests {
             sessions: SessionStore::new(test_limits()),
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         })
     }
 
@@ -3080,7 +3203,7 @@ mod tests {
             sessions: SessionStore::new(test_limits()),
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         });
 
         let (status, _) = call_with_headers(
@@ -3483,7 +3606,7 @@ mod tests {
             sessions: SessionStore::new(test_limits()),
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         });
 
         let (status, body) = call(
@@ -3541,7 +3664,7 @@ mod tests {
             sessions: SessionStore::new(test_limits()),
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         });
         call(
             state,
@@ -3579,7 +3702,7 @@ mod tests {
             sessions: SessionStore::new(test_limits()),
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         });
         (state, dir, path)
     }
@@ -4063,7 +4186,7 @@ mod tests {
             sessions: SessionStore::new(test_limits()),
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
-            max_tool_leaves: TEST_MAX_TOOL_LEAVES,
+            max_tool_calls: TEST_MAX_TOOL_CALLS,
         });
 
         let response = streamed_response(state).await;

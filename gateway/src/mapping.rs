@@ -4,7 +4,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// A span as the detector reports it: offsets are in characters, not bytes.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `PartialEq` so that `Joined::split`'s rebasing can be asserted as a value
+/// rather than field by field — the arithmetic is the whole of that function.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Span {
     pub entity_type: String,
     pub start: usize,
@@ -554,6 +557,97 @@ pub enum Leaf {
     /// declared a number may reject a string, so the outcome for a number that
     /// carries an identifier has to be a refusal rather than a placeholder.
     Number(String),
+}
+
+/// What separates two leaves inside one detection call.
+///
+/// **Not a delimiter.** Nothing ever scans for it: splitting uses the character
+/// ranges recorded while joining, so a leaf that happens to contain this
+/// sequence changes nothing. Its only job is to stop the model reading the end
+/// of one leaf and the start of the next as a single phrase, and a paragraph
+/// break is what does that in the prose the model was trained on. It carries no
+/// entity of its own, which a row of punctuation or a bracketed marker could
+/// not promise.
+const JOIN_SEPARATOR: &str = "\n\n";
+
+/// Several text leaves presented to the detector as one call.
+///
+/// One call per string is not merely slow, it is blind: a two-character leaf
+/// detected alone carries no context, and the same leaf inside its schema
+/// carries the whole of it. What makes joining safe here — and what a general
+/// chunker cannot claim — is that **we choose the boundaries rather than
+/// discovering them**, so a span that crosses one is exactly detectable instead
+/// of a thing to hope about.
+pub struct Joined {
+    text: String,
+    /// One character range per leaf, in the order given. Characters, never
+    /// bytes: the detector reports characters and `Mapping::mask` slices them,
+    /// so a byte-based offset here would put a span inside the wrong leaf
+    /// rather than out of range, and nothing would fail.
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl Joined {
+    pub fn of(leaves: &[&str]) -> Self {
+        let mut text = String::new();
+        let mut ranges = Vec::with_capacity(leaves.len());
+        let mut at = 0usize;
+        for (index, leaf) in leaves.iter().enumerate() {
+            // Between leaves, never after the last: one leaf has to join to
+            // itself byte for byte, or the detection cache stops recognising a
+            // text it has already seen and every second turn pays again.
+            if index > 0 {
+                text.push_str(JOIN_SEPARATOR);
+                at += JOIN_SEPARATOR.chars().count();
+            }
+            let length = leaf.chars().count();
+            ranges.push(at..at + length);
+            text.push_str(leaf);
+            at += length;
+        }
+        Self { text, ranges }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// How many characters joining adds to what the detector reads, beyond the
+    /// leaves themselves. Counted against `max_tool_chars` because the detector
+    /// reads them: that bound is denominated in characters sent, and separators
+    /// are characters sent.
+    pub fn separator_chars(leaf_count: usize) -> usize {
+        leaf_count.saturating_sub(1) * JOIN_SEPARATOR.chars().count()
+    }
+
+    /// Spans over the joined text, each returned to the leaf it came from and
+    /// rebased to that leaf's start.
+    ///
+    /// The result has one entry per leaf, empty where the detector found
+    /// nothing — `replace_text_leaves` corresponds by position, so a leaf
+    /// without spans still has to occupy its place.
+    pub fn split(&self, spans: &[Span]) -> Result<Vec<Vec<Span>>, MappingError> {
+        let mut out = vec![Vec::new(); self.ranges.len()];
+        for span in spans {
+            let leaf = self
+                .ranges
+                .iter()
+                .position(|range| {
+                    range.start < range.end && range.start <= span.start && span.end <= range.end
+                })
+                // Inside no single leaf: either straddling two of them or
+                // landing in a separator we inserted. Neither can be applied,
+                // and neither may be dropped.
+                .ok_or(MappingError::BadSpan("across a joined boundary"))?;
+            let start = self.ranges[leaf].start;
+            out[leaf].push(Span {
+                entity_type: span.entity_type.clone(),
+                start: span.start - start,
+                end: span.end - start,
+            });
+        }
+        Ok(out)
+    }
 }
 
 pub fn json_leaves(value: &Value, shape: Shape) -> Result<Vec<Leaf>, MappingError> {
@@ -1283,12 +1377,28 @@ mod tests {
         // says both defaults are set to admit twice this payload; without this
         // that is a note somebody can quietly falsify, and `<= measured` alone
         // would pass at a default of 78.
+        // What the bound counts now is *calls*, not leaves: one per tool
+        // description, and one per schema that holds any text at all. Leaves
+        // stopped being what costs the moment a document became one call.
+        let calls: usize = tools
+            .iter()
+            .map(|tool| {
+                usize::from(tool.get("description").is_some())
+                    + usize::from(
+                        json_leaves(&tool["input_schema"], Shape::Schema)
+                            .unwrap()
+                            .iter()
+                            .any(|leaf| matches!(leaf, Leaf::Text(_))),
+                    )
+            })
+            .sum();
+        assert_eq!(calls, 20, "the figure the call bound is set from");
         assert!(
-            crate::config::default_max_tool_leaves() >= 2 * leaves,
-            "the default bound must admit twice a real tool payload: {leaves} leaves \
+            crate::config::default_max_tool_calls() >= 2 * calls,
+            "the default bound must admit twice a real tool payload: {calls} calls \
              against a bound of {}. A gateway that refuses the tool set its own users \
              run is not configured conservatively, it is broken.",
-            crate::config::default_max_tool_leaves()
+            crate::config::default_max_tool_calls()
         );
 
         // The other bound, on the basis it is actually denominated in. Both
@@ -1537,6 +1647,120 @@ mod tests {
         assert_eq!(rebuilt["properties"]["b"]["title"], "<four>");
         assert_eq!(rebuilt["required"], json!(["a", "b"]));
         assert_eq!(rebuilt["properties"]["a"]["type"], "string");
+    }
+
+    fn span_at(entity_type: &str, start: usize, end: usize) -> Span {
+        Span {
+            entity_type: entity_type.to_owned(),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn one_leaf_joins_to_itself_exactly() {
+        // The no-op case, and it has to be exact rather than equivalent: the
+        // detection cache keys on the text, so a joined text that differs from
+        // the leaf by even a trailing separator silently stops serving every
+        // second turn, and nothing fails while it happens.
+        let joined = Joined::of(&["Martina Weber"]);
+        assert_eq!(joined.text(), "Martina Weber");
+        assert_eq!(
+            joined.split(&[span_at("PERSON", 0, 13)]).unwrap(),
+            vec![vec![span_at("PERSON", 0, 13)]],
+            "and the span comes back untouched"
+        );
+    }
+
+    #[test]
+    fn leaves_join_with_a_separator_and_spans_come_back_rebased() {
+        let joined = Joined::of(&["Weber", "Bern", "Schmidt"]);
+        assert_eq!(joined.text(), "Weber\n\nBern\n\nSchmidt");
+        //                          0..5     7..11    13..20
+        let split = joined
+            .split(&[
+                span_at("PERSON", 0, 5),
+                span_at("LOCATION", 7, 11),
+                span_at("PERSON", 13, 20),
+            ])
+            .unwrap();
+        assert_eq!(
+            split,
+            vec![
+                vec![span_at("PERSON", 0, 5)],
+                vec![span_at("LOCATION", 0, 4)],
+                vec![span_at("PERSON", 0, 7)],
+            ],
+            "each span is returned to its leaf and rebased to that leaf's start"
+        );
+    }
+
+    #[test]
+    fn a_leaf_with_no_spans_gets_an_empty_list_and_keeps_its_position() {
+        // Positional correspondence is what `replace_text_leaves` rests on, so
+        // a leaf the detector found nothing in must still occupy its slot.
+        let joined = Joined::of(&["nothing", "Weber", "nothing"]);
+        // "nothing" 0..7, "Weber" 9..14, "nothing" 16..23.
+        let split = joined.split(&[span_at("PERSON", 9, 14)]).unwrap();
+        assert_eq!(split.len(), 3);
+        assert!(split[0].is_empty() && split[2].is_empty());
+        assert_eq!(split[1], vec![span_at("PERSON", 0, 5)]);
+    }
+
+    #[test]
+    fn offsets_are_characters_and_not_bytes() {
+        // The whole join is arithmetic on offsets, and the detector speaks
+        // characters while `String` speaks bytes. "Müller" is 6 characters and
+        // 7 bytes, so a byte-based join puts every later leaf one place out —
+        // and the failure would be a span landing inside the wrong leaf rather
+        // than an error.
+        let joined = Joined::of(&["Müller", "Weber"]);
+        assert_eq!(joined.text().chars().count(), 6 + 2 + 5);
+        assert_eq!(
+            joined.text().len(),
+            7 + 2 + 5,
+            "and it really is longer in bytes"
+        );
+        assert_eq!(
+            joined.split(&[span_at("PERSON", 8, 13)]).unwrap()[1],
+            vec![span_at("PERSON", 0, 5)],
+            "the second leaf starts at character 8, not byte 9"
+        );
+    }
+
+    #[test]
+    fn a_span_across_a_boundary_is_refused_rather_than_applied() {
+        // The seam, and the reason the boundaries are recorded rather than
+        // searched for: a span the detector believes covers two leaves cannot
+        // be applied to either. Masking it in both invents a decision nobody
+        // made and splits one placeholder across two values; dropping it
+        // forwards the data. `BadSpan` already means exactly this — a span this
+        // gateway cannot apply — and is already the 502 that names the
+        // detector as the party that produced it.
+        let joined = Joined::of(&["Weber", "Bern"]);
+        assert!(matches!(
+            joined.split(&[span_at("PERSON", 3, 9)]),
+            Err(MappingError::BadSpan("across a joined boundary"))
+        ));
+        // A span that lies entirely in the separator we inserted is the same
+        // failure: it belongs to no leaf.
+        assert!(matches!(
+            joined.split(&[span_at("PERSON", 5, 7)]),
+            Err(MappingError::BadSpan("across a joined boundary"))
+        ));
+    }
+
+    #[test]
+    fn a_leaf_containing_the_separator_changes_nothing() {
+        // The separator is not a delimiter and nothing scans for it, so a leaf
+        // that happens to contain one splits exactly as any other would.
+        let joined = Joined::of(&["first\n\nstill first", "Weber"]);
+        // The first leaf is 18 characters whatever is inside it, so the second
+        // starts at 20 — the embedded separator is just text.
+        assert_eq!(
+            joined.split(&[span_at("PERSON", 20, 25)]).unwrap()[1],
+            vec![span_at("PERSON", 0, 5)]
+        );
     }
 
     #[test]

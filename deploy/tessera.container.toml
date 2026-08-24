@@ -38,11 +38,12 @@ max_spans_per_entry = 250
 # whatever its length. Nothing bounds a request's wall clock, and the caller's
 # own timeout is not ours to set. See gateway/tessera.example.toml.
 max_tool_chars = 20000
-# How many separate strings those structures may hold. A second bound because
-# max_tool_chars bounds the wrong quantity for this failure: detection is one
-# round-trip per string, awaited in turn, so cost tracks the number of strings
-# rather than their total size. A schema of a thousand two-character strings is
-# about 10000 bytes and a thousand sequential calls. 160 comes from counting a
-# real ten-tool Claude Code payload, which needs 77. See
-# gateway/tessera.example.toml for the count and what is still unmeasured.
-max_tool_leaves = 160
+# How many detector round-trips those structures may need. A document's leaves
+# are detected in a single call, so this counts one per tool description and one
+# per schema holding text -- not one per string, which is what the old
+# max_tool_leaves counted before batching. The failure it stops is unchanged:
+# max_tool_chars cannot bound calls, since ten thousand one-character
+# definitions are ten thousand characters and ten thousand calls. 40 comes from
+# counting a real ten-tool Claude Code payload, which needs 20. See
+# gateway/tessera.example.toml.
+max_tool_calls = 40

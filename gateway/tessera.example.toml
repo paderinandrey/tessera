@@ -176,31 +176,30 @@ max_spans_per_entry = 250
 # call, this caps how long a caller waits for the whole request.
 #
 # Still unmeasured: per-call overhead. This bounds the characters and
-# max_tool_leaves bounds the calls; nobody has measured what a call costs before
+# max_tool_calls bounds the calls; nobody has measured what a call costs before
 # any text is read.
 max_tool_chars = 20000
 
-# How many separate strings those structures may hold.
+# How many detector round-trips those structures may need.
 #
-# A second bound, because max_tool_chars bounds a different cost. Detection is
-# one round-trip per string, awaited in turn while the request holds its
-# session, so cost tracks the number of strings as well as their size, and the
-# two come apart: a schema of a thousand two-character strings is small by
-# characters and still a thousand sequential calls.
+# One per tool description and one per schema holding any text at all: a
+# document's leaves are detected in a SINGLE call, so a schema of a thousand
+# short strings costs one round-trip rather than a thousand.
 #
-# Set from the same measurement on the same basis. Ten real tool definitions
-# cost 77 calls, about 7.7 per tool; a stock fifteen-tool session extrapolates
-# to roughly 116, and 160 covers that with room. A plain tool costs three to
-# six — enum is what makes one expensive, since every member is a value the
-# model may choose and so is scanned, and two enum-carrying tools in that
-# payload cost 21 and 24 between them. A per-tool average is a floor, not a
-# prediction.
+# This key was max_tool_leaves and counted strings, because detection really was
+# one call per string. Batching changed the unit, not the failure: an unbounded
+# number of sequential calls is still what this stops, and max_tool_chars does
+# not stop it -- ten thousand definitions each with a one-character description
+# are ten thousand characters, inside that bound, and ten thousand calls.
 #
-# Measured, and it is the high end. A call costs 265-410 ms against the compose
-# detector -- the price is paid per inference pass, so a two-character string
-# costs very nearly what an eighty-character one does. Replaying the real
-# ten-tool payload's 77 leaves took 54.9 s, about 700 ms each. At 160 leaves
-# that is well over a minute in overhead alone, before a character is read.
-# Under review; see max_tool_chars above. The answer is issue #28, not a smaller
-# bound, because a smaller bound refuses real clients instead.
-max_tool_leaves = 160
+# Set from measurement at twice the measured payload, the same rule
+# max_tool_chars uses. The real ten-tool payload needs 20 calls -- ten
+# descriptions and ten schemas -- where it needed 77 strings before. The test
+# a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins that and
+# fails if this default stops admitting twice it.
+#
+# A call costs 265-410 ms against the compose detector and 109 ms natively,
+# because the price is paid per inference pass rather than per character. At 40
+# that is about sixteen seconds of overhead containerised, against 63 before
+# batching.
+max_tool_calls = 40

@@ -16,8 +16,8 @@ pub enum ConfigError {
     ZeroSpansPerEntry,
     #[error("max_tool_chars must be greater than zero")]
     ZeroToolChars,
-    #[error("max_tool_leaves must be greater than zero")]
-    ZeroToolLeaves,
+    #[error("max_tool_calls must be greater than zero")]
+    ZeroToolCalls,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,35 +160,36 @@ pub struct Config {
     #[serde(default = "default_max_tool_chars")]
     pub max_tool_chars: usize,
 
-    /// How many separate strings one request's tool structures may hold.
+    /// How many detector round-trips one request's tool structures may need.
     ///
-    /// A second bound because `max_tool_chars` bounds a different cost.
-    /// Detection is one round-trip per string, awaited in turn while the
-    /// request holds its session, so cost tracks the *number* of strings as
-    /// well as their total size — and the two come apart badly. A schema of a
-    /// thousand two-character strings is small by characters and is still a
-    /// thousand sequential calls.
+    /// One per tool description, and one per schema that holds any text at all:
+    /// **a document's leaves are detected in a single call**, so a schema of a
+    /// thousand short strings costs one round-trip rather than a thousand.
     ///
-    /// **Set from the same measurement, on the same basis: twice the measured
-    /// payload.** Ten real tool definitions cost 77 calls, about 7.7 per tool;
-    /// a stock fifteen-tool session extrapolates to roughly 116, and 160 covers
-    /// that with room. A plain tool costs three to six; `enum` is what makes
-    /// one expensive, because every member is a value the model may choose and
-    /// so is scanned — two enum-carrying tools in that payload cost 21 and 24
-    /// between them, which is why a per-tool average is a floor and not a
-    /// prediction.
+    /// This key was `max_tool_leaves` and counted strings, because detection
+    /// really was one call per string and cost tracked the count. Batching
+    /// changed the unit, not the failure — an unbounded number of sequential
+    /// calls is still what this stops, and `max_tool_chars` does not stop it:
+    /// ten thousand tool definitions each carrying a one-character description
+    /// are ten thousand characters, inside that bound, and ten thousand calls.
+    /// So it is renamed to what it now counts rather than kept pointing at a
+    /// quantity that stopped costing anything.
     ///
-    /// **Measured, and it is the high end.** A call costs 265–410 ms against the
-    /// compose detector and 109 ms natively by the README's own bench — the
-    /// price is paid per inference pass, so a two-character string costs very
-    /// nearly what an eighty-character one does. At 160 that is **17 s native
-    /// and 63 s containerised in overhead alone**, before a character is read,
-    /// which is the larger half of what a request at both bounds costs. This
-    /// default is under review on that evidence; see `max_tool_chars`. The
-    /// answer is issue #28 — one call per document rather than one per string —
-    /// because a smaller bound here refuses real clients instead.
-    #[serde(default = "default_max_tool_leaves")]
-    pub max_tool_leaves: usize,
+    /// **Set from measurement, at twice the measured payload**, the same rule
+    /// `max_tool_chars` is set by and asserted the same way. The real ten-tool
+    /// payload in `mapping`'s testdata needs **20 calls** — ten descriptions
+    /// and ten schemas — where it used to need 77.
+    /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` pins that
+    /// figure and fails if this default stops admitting twice it.
+    ///
+    /// What a call costs is measured and is the reason this number is small:
+    /// 265–410 ms against the compose detector and 109 ms natively, because the
+    /// price is paid per inference pass rather than per character. At 40 that
+    /// is roughly sixteen seconds of overhead containerised — still the larger
+    /// half of what a request at both bounds costs, but against 63 seconds
+    /// before batching.
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: usize,
 }
 
 fn default_bind() -> String {
@@ -269,8 +270,8 @@ fn default_max_spans_per_entry() -> usize {
 pub fn default_max_tool_chars() -> usize {
     20_000
 }
-pub fn default_max_tool_leaves() -> usize {
-    160
+pub fn default_max_tool_calls() -> usize {
+    40
 }
 
 impl Config {
@@ -293,8 +294,8 @@ impl Config {
         if config.max_tool_chars == 0 {
             return Err(ConfigError::ZeroToolChars);
         }
-        if config.max_tool_leaves == 0 {
-            return Err(ConfigError::ZeroToolLeaves);
+        if config.max_tool_calls == 0 {
+            return Err(ConfigError::ZeroToolCalls);
         }
         Ok(config)
     }
@@ -462,7 +463,7 @@ mod tests {
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
         assert_eq!(config.max_tool_chars, 20_000);
-        assert_eq!(config.max_tool_leaves, 160);
+        assert_eq!(config.max_tool_calls, 40);
     }
 
     #[test]
@@ -474,16 +475,16 @@ mod tests {
             Config::from_toml(&text),
             Err(ConfigError::ZeroToolChars)
         ));
-        let text = with_audit("max_tool_leaves = 0");
+        let text = with_audit("max_tool_calls = 0");
         assert!(matches!(
             Config::from_toml(&text),
-            Err(ConfigError::ZeroToolLeaves)
+            Err(ConfigError::ZeroToolCalls)
         ));
     }
 
     #[test]
-    fn the_leaf_bound_can_be_sized() {
-        let config = Config::from_toml(&with_audit("max_tool_leaves = 8")).unwrap();
-        assert_eq!(config.max_tool_leaves, 8);
+    fn the_call_bound_can_be_sized() {
+        let config = Config::from_toml(&with_audit("max_tool_calls = 8")).unwrap();
+        assert_eq!(config.max_tool_calls, 8);
     }
 }
