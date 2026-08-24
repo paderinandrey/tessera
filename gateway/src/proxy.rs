@@ -699,9 +699,34 @@ mod tests {
     /// handful of spans never accidentally brushes against it.
     const UNCAPPED: usize = usize::MAX;
     /// The production default, so tests exercise the bound callers get rather
-    /// than one chosen to make a test convenient.
-    const TEST_MAX_TOOL_CHARS: usize = 18_000;
+    /// than one chosen to make a test convenient. Asserted below rather than
+    /// promised here.
+    const TEST_MAX_TOOL_CHARS: usize = 20_000;
     const TEST_MAX_TOOL_LEAVES: usize = 160;
+
+    #[test]
+    fn the_bounds_these_tests_exercise_are_the_bounds_callers_get() {
+        // The comment above has claimed this since the constants were added and
+        // nothing checked it. `c0c6d3d` reverted `TEST_MAX_TOOL_CHARS` to a
+        // stale value by collision and **all 380 tests stayed green**: every use
+        // of it is relative — `+ 1`, `- 100`, `< `, `> ` — so the suite cannot
+        // feel the difference between one number and another. The claim was
+        // true only for as long as somebody kept it true by hand.
+        //
+        // The same shape as the headroom rule one commit earlier: stated in a
+        // comment, unasserted, and quietly false. This is the assertion that
+        // makes the constants self-defending instead.
+        assert_eq!(
+            TEST_MAX_TOOL_CHARS,
+            crate::config::default_max_tool_chars(),
+            "the tool character bound under test has drifted from the shipped default"
+        );
+        assert_eq!(
+            TEST_MAX_TOOL_LEAVES,
+            crate::config::default_max_tool_leaves(),
+            "the tool call bound under test has drifted from the shipped default"
+        );
+    }
 
     fn person_span() -> Value {
         json!([{"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
@@ -1588,11 +1613,11 @@ mod tests {
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let properties: serde_json::Map<String, Value> = (0..150)
+        let properties: serde_json::Map<String, Value> = (0..155)
             .map(|n| {
                 (
                     format!("parameter_{n:03}"),
-                    json!({"type": "string", "description": "y".repeat(70)}),
+                    json!({"type": "string", "description": "y".repeat(100)}),
                 )
             })
             .collect();
@@ -1606,10 +1631,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hallo"}]
         });
 
-        // 150 descriptions of 70 characters, plus the tool's own one-character
-        // description: 10 501 characters of text against an 18 000 bound, and
-        // well past it once the punctuation around them is charged too.
-        let text: usize = 150 * 70 + 1;
+        // 155 descriptions of 100 characters, plus the tool's own one-character
+        // description: 15 501 characters of text against a 20 000 bound, and
+        // well past it once the punctuation around them is charged too. The
+        // count stays under `max_tool_leaves` so that only the text/serialized
+        // distinction can decide the verdict.
+        let text: usize = 155 * 100 + 1;
         assert!(text < TEST_MAX_TOOL_CHARS, "{text} characters of text");
         let serialized = body["tools"][0]["input_schema"].to_string().len();
         assert!(
