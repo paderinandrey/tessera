@@ -275,6 +275,36 @@ this one should not try to also make the detector three times faster.
 The ceiling rises when that work lands, and the configuration key it moves is
 already in place.
 
+### Why a document is one detector call rather than one per leaf
+
+Detection costs almost nothing per character and a great deal per call: two NER
+passes run whatever the text's length, so a two-character string costs nearly
+what an eighty-character one does. Measured per call — 108 ms native from the
+README's own 80-character row, 265–410 ms containerised.
+
+Walking a document leaf by leaf therefore multiplies the dominant cost by however
+many strings a client happened to write. Measured on ten real tool definitions:
+77 calls, 9 005 characters, **15 seconds native and 52 containerised on a
+session's first turn** — of which 57% is call overhead rather than text. A
+correct payload from a correct client, refused by nothing, and unusable.
+
+No pair of bounds fixes that. Lowering them converts the wait into a refusal of a
+client that did nothing wrong; raising them makes the wait longer. So the leaves
+of one document are detected in one call, and the cost scales with text rather
+than with how a client chose to divide it — the same payload becomes about 7
+seconds native and 23 containerised, and the dominant term is gone.
+
+This is not issue #28's work, which is about making detection faster on a large
+text. It is about not making seventy-seven calls where one will do, and the
+per-leaf pattern is one this slice introduced.
+
+**The seam is the risk, and it is a milder one than chunking.** Reassembling
+spans across concatenated leaves means offset arithmetic, and a span missed at a
+boundary is raw egress. But the boundaries here are chosen rather than
+discovered: the gateway knows exactly where each leaf begins and ends, so a span
+that straddles one is detectable and is refused rather than silently dropped.
+Issue #28's chunking has no such luxury.
+
 ## Errors
 
 Every failure is a refusal, and the vocabulary is the existing one. A document
