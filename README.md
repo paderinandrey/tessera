@@ -179,6 +179,26 @@ message content are masked too — OpenAI's `user` and per-message `name`, Anthr
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.
 
+Tool traffic is masked on the buffered path, for both providers and in both directions: a
+tool definition's description and the whole of its schema — `enum` members, `default`,
+`title`, `examples`, not `description` alone — a tool call's arguments, and a tool result.
+Names are not. A tool's name, a schema property name and a `tool_call_id` are the client's
+own dispatch, matched against strings it authored, so masking one breaks the call and
+leaves the client no way to learn why. Arguments are walked as JSON and only string leaves
+are touched, so the masker never sees a brace or a quote and cannot hand back a document
+the client fails to parse — and a tool call in a response is restored before the client
+executes it, the one place here where a failed restoration would be a wrong action rather
+than a wrong display.
+
+Masking a definition costs two things, both deliberate and both visible from outside. A
+definition is prose the model reads, so a placeholder in one changes how the model chooses
+a tool: ten real Claude Code tool definitions carrying no personal data at all yield
+thirteen spans — tool names, ordinary English words in capitals, a parameter called
+`main` — and every one is masked. `[PERSON_1]` inside a tool description is this working
+rather than corruption. And definitions are scanned on a session's first turn, which is
+seconds of detector time a caller waits through once; every turn after that is free,
+because definitions are byte-identical and the detection cache serves them.
+
 Provider credentials pass through on a per-provider allowlist: `Authorization` and OpenAI's
 routing headers go to OpenAI, `x-api-key` and `anthropic-version` go to Anthropic, and
 nothing else goes anywhere. A caller holding both sets of credentials does not have one
@@ -188,15 +208,49 @@ client's. Coming back, the provider's status and its rate-limit headers are pres
 
 **Every failure refuses the request**, and refuses it *before* the upstream call wherever
 the problem is visible there. A detector that errors or exceeds its timeout; a body whose
-shape the gateway has no rule for, including tool definitions, tool traffic, Anthropic's
+shape the gateway has no rule for, including Anthropic's
 extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
 OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
 span the detector reports at a position that cannot be applied — inverted, past the end of the
 text, or overlapping another; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
-left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing
-unmasked is forwarded, and no placeholder is ever handed to the client in place of a value.
-No error body or log line carries the submitted text.
+left to refuse, so it ends mid-flight instead; the rule it protects is the same. No text
+this gateway scans is forwarded unmasked, and no placeholder is ever handed to the client
+in place of a value. No error body or log line carries the submitted text.
+
+There is one thing it deliberately does not scan, and it is worth knowing before you rely
+on the sentence above: **image and audio parts are forwarded untouched**, including a
+screenshot inside a tool result, which is the same exposure through a different field
+rather than a new one. Nothing here reads pixels, so a photograph of an identity document
+reaches the provider as the client sent it.
+
+Tool traffic is masked now, so what it still refuses is worth stating on its own.
+**Streamed tool calls**, which the buffered path's masking does not reach: a document
+arriving a delta at a time is not well formed until its block closes, so masking it means
+buffering the block first, which the streamed path does not do yet. A
+**tool-field shape the gateway has no rule for** — and the rule is a *closed allowlist*, so
+an unrecognized content-block type, or a field beside the ones each tool structure is
+described by, is refused rather than forwarded. That is deliberately the expensive
+direction: a field no slot addresses would travel to the provider exactly as the caller
+wrote it, so a provider feature shipped tomorrow refuses here instead of leaking through.
+It is also what closes two things a caller may miss. Anthropic's **citations** are refused
+on the request path — a `text` block may carry `cited_text`, which is quoted source
+material, and clients echo assistant turns back as history, so a conversation that used
+citations refuses on its next turn. And the server tools that carry configuration of their
+own go with them: `computer_*` for its display dimensions, `web_search_*` for a
+`user_location` whose `city` is a `LOCATION` in this gateway's own vocabulary.
+`text_editor_*` and `bash_*` declare nothing but a name and a type, so they pass and the
+coding-agent category is unaffected. Anthropic's **`mcp_servers`** is refused for a sharper
+version of the same reason: it grants the model tools this gateway never described, so
+their calls and results arrive shaped by a server it cannot account for — and it carries
+the caller's own `authorization_token` besides. A **number that carries personal data** is
+refused rather than masked, because replacing `4111111111111111` with `[CREDIT_CARD_1]`
+turns a JSON number into a string and a schema that declared a number may reject it; that
+refusal fires only on the eight deterministic identifiers, the ones the detector decides
+from the value itself, since an NER label on a bare digit run is a judgement about meaning
+where there is no meaning to judge — a number an NER label alone finds is forwarded. And a
+request whose tool structures exceed `max_tool_chars` or `max_tool_calls` is refused before
+the detector is called at all.
 
 Placeholders carry the type the detector reported, but only when it is one this gateway
 declares — twenty-two of them, the catalog's eight deterministic identifiers plus the
@@ -263,8 +317,12 @@ density rather than assumed: real text runs roughly 1.0 to 2.5 spans per 1 000
 characters, so the default covers prose to about 100 KB, logs to about 188 KB and source
 to 250 KB — every realistic single tool result. A detection over the cap is masked,
 restored and returned exactly like any other; it is simply not stored, so an oversized
-result never becomes a refusal, only a permanent miss. At the shipped defaults the worst
-case is about 118 MB. Unlike the session table, the cache has no idle TTL — an entry
+result never becomes a refusal, only a permanent miss. At the shipped defaults that
+arithmetic comes to about 118 MB, which is a typical case rather than a ceiling: the 46
+bytes per span were measured against real detector output, where a type name is `PERSON`
+or `IBAN`, and the cache now declines any entry carrying a span whose type name runs past
+40 bytes, so the true ceiling is nearer 200 MB — analytical, from the struct's layout,
+rather than re-measured the way the 46 bytes were. Unlike the session table, the cache has no idle TTL — an entry
 outlives its conversation and stays reachable for as long as the process runs, until the
 detector's
 version changes or the cache fills and something else is used more recently. And unlike
@@ -291,6 +349,22 @@ a deployment whose texts really are dense throughout, priced by the formula in
 `gateway/tessera.example.toml` (`entries × (264 + spans × 46)`), and recomputed there
 against the deployment's own texts.
 
+The tool structures a request newly scans have two bounds of their own, and unlike the
+cache's, exceeding either is a refusal rather than a miss: `max_tool_chars` (default
+20 000) bounds how many characters they send to the detector, and `max_tool_calls`
+(default 40) bounds how many detector round-trips they need. Both are denominated in what
+detection costs rather than in what the request weighs. A document is **one call however
+many strings are in it**, so a schema of a thousand short values is a single round-trip;
+and the characters charged are the ones the detector reads, not the braces, quotes and
+property names carrying them, which cost it nothing. Both defaults are twice a measurement
+taken on ten real Claude Code tool definitions, which charge 9 193 characters across 20
+calls. That payload is a **floor** and is stated as one: a stock session also carries tools
+the measurement did not, and an MCP server adds more, so a large enough tool payload is
+refused rather than served slowly. Issue #28 — making detection fast on a large text — is
+the work that lifts the ceiling; until it lands, the honest answer to a payload past these
+numbers is a refusal, not a wait long enough that the client's own HTTP timeout would cut
+it off anyway.
+
 A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or
 `session_idle_secs = 0` — is refused before the detector runs rather than served without
@@ -314,8 +388,15 @@ headers and fields like `id:` reach the client as the provider sent them.
 If a token turns out to have no mapping, bytes have already gone out and the request cannot
 be refused. The stream ends instead, with an `error` event naming the failure — the client
 gets a truncated answer, never a placeholder in place of a name. Streamed tool calls
-(`tool_calls`, `input_json_delta`) end the stream for the same reason they are refused on
-the buffered path: their arguments are not masked yet. Extended thinking is refused before
+(`tool_calls`, `input_json_delta`) end the stream, and no longer for the reason they once
+did — the buffered path masks tool arguments now. What it cannot do in fragments is read
+them: a document arriving a delta at a time is not well formed until its block closes, and
+a placeholder can be split across two deltas *and* land inside a half-written JSON value
+at the same time, so masking one means buffering the whole block first — which is exactly
+what the streamed path does not do yet. A request carrying tool traffic together with
+`stream: true` is therefore refused before the upstream call, where it costs no tokens,
+and a tool block the model produces inside a stream that was allowed ends that stream.
+Extended thinking is refused before
 the upstream call rather than at its first streamed block, so the refusal costs no tokens.
 
 Whatever was already restored is served before the error event, whether the stream ends
@@ -555,7 +636,8 @@ stable signal and p95 as an upper bound until these run on dedicated hardware.
 ## Status
 
 Early development. The detector, the gateway — sessions, streaming, the audit
-journal — and the two-container stack above all work end to end. Not ready for
+journal, tool traffic on the buffered path — and the two-container stack above
+all work end to end. Not ready for
 production use: the gateway authenticates no caller, and nothing here has been
 run in anger.
 

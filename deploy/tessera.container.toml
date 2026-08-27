@@ -32,11 +32,12 @@ max_spans_per_entry = 250
 # summed across one request) the gateway will hand to the detector. Characters
 # rather than serialized bytes: braces, quotes and property names are structure
 # the detector never reads, and on a real ten-tool payload the two differ by
-# 1.46x. Set at twice that measured payload, which costs 9 005 characters.
-# UNDER REVIEW: replaying that payload's 77 leaves through the detector took a
-# measured 54.9 s -- a session's first turn -- because a call costs 265-410 ms
-# whatever its length. Nothing bounds a request's wall clock, and the caller's
-# own timeout is not ours to set. See gateway/tessera.example.toml.
+# 1.43x. Set at twice that measured payload, which charges 9 193 characters --
+# 9 005 of text, 50 of numbers, 138 of join separators. Replaying that payload
+# leaf by leaf took a measured 54.9 s, a session's first turn, because a call
+# costs 265-410 ms whatever its length; batching a document into one call cuts
+# it to 20 calls from 77. Nothing bounds a request's wall clock, and the
+# caller's own timeout is not ours to set. See gateway/tessera.example.toml.
 max_tool_chars = 20000
 # How many detector round-trips those structures may need. A document's leaves
 # are detected in a single call, so this counts one per tool description and one

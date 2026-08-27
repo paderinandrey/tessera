@@ -912,17 +912,20 @@ mod tests {
                 "recognizer": "ner:fake", "tier": 2, "boosted": false}])
     }
 
-    // Direct construction, not a request through the router. `json_leaves` and
-    // `replace_text_leaves` are wired into the request handler now, and
-    // `a_tool_document_nested_past_the_walks_bound_is_refused` reaches `TooDeep`
-    // the whole way through — but the other two are still not reachable that
-    // way, for different reasons worth knowing:
+    // Direct construction, not a request through the router. Both bounds are
+    // reachable the whole way through and each has a test that drives it
+    // there — `a_tool_document_nested_past_the_walks_bound_is_refused` for
+    // `TooDeep` and `a_tool_document_past_the_walks_node_bound_is_refused` for
+    // `TooLarge`.
     //
-    // `TooLarge` cannot fire first at any sane configuration. Its bound is
-    // 10 000 nodes, and the cheapest node an array can hold costs two bytes
-    // (`0,`), so a document reaching it is upwards of 20 000 bytes and
-    // `max_tool_chars` — 10 000 by default — has already refused it. It stays
-    // as depth behind the text bound rather than as a check that fires.
+    // This comment used to say `TooLarge` could not fire first at any sane
+    // configuration, because a document of 10 000 nodes is upwards of 20 000
+    // bytes and `max_tool_chars` — then 10 000 — had already refused it. Both
+    // halves went stale. `handle` calls `json_leaves` to count the document
+    // *before* it compares anything against either bound, so `TooLarge`
+    // propagates first regardless; and the node bound counts nodes while the
+    // character bound counts what the detector reads, so 10 001 empty arrays
+    // reach one while charging nothing at all against the other.
     //
     // `MaskCountMismatch` fires only if this gateway's two walks disagree with
     // each other, which no input can arrange; it is reachable by mutating one
@@ -2437,6 +2440,43 @@ mod tests {
         assert!(
             body.contains("nested deeper"),
             "refused by the depth bound rather than something else: {body}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the refusal must cost the caller nothing upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_document_past_the_walks_node_bound_is_refused() {
+        // The node bound was described in this file as unreachable through the
+        // router — "`max_tool_chars` has already refused it" — and that stopped
+        // being true. `handle` calls `json_leaves` to count the document before
+        // it compares anything against either bound, so `TooLarge` propagates
+        // first whatever the characters say. And a document can reach the node
+        // bound while charging *nothing*: 10 001 empty arrays are 10 001 nodes,
+        // no leaves, no characters and no detector call, so no character bound
+        // at any setting would have stopped it. Shallow on purpose — this must
+        // fail on nodes, not on the depth bound above it.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let wide = Value::Array(vec![json!([]); mapping::MAX_JSON_NODES]);
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file", "input": wide}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("more values than this gateway will walk"),
+            "refused by the node bound rather than by depth or by size: {body}"
         );
         assert!(
             upstream.received_requests().await.unwrap().is_empty(),
@@ -4357,6 +4397,104 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("readable");
         assert!(!text.contains(SECRET), "the journal does not");
         assert!(!text.contains("PERSON_1"), "nor a placeholder name");
+    }
+
+    #[tokio::test]
+    async fn the_journal_counts_spans_found_in_tool_traffic() {
+        // The evidence layer must not get weaker because the personal data
+        // arrived in an argument rather than in a message. The counts come
+        // from `count_distinct`, and the `Json` arm has to call it for the
+        // same reason the `Text` arm does — a slot kind is not a reason for a
+        // request to go unrecorded.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "read_file",
+                 "input": {"path": SECRET}}
+            ]}]
+        });
+        let (status, _) = call(state, "/v1/messages", body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let lines = journal(&path);
+        let masked = lines
+            .iter()
+            .find(|line| line["event"] == "masked")
+            .expect("a masked record");
+        assert_eq!(masked["types"]["PERSON"], 1);
+        assert_eq!(
+            masked["spans"], 1,
+            "one occurrence, counted where the argument was: {masked}"
+        );
+        let text = serde_json::to_string(masked).unwrap();
+        assert!(
+            !text.contains(SECRET),
+            "the journal never carries a value: {text}"
+        );
+        assert!(
+            !text.contains("path"),
+            "the journal never carries a key name either — an argument's key is \
+             the client's own vocabulary and can name the person in it: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_tool_request_leaves_one_line_that_quotes_none_of_it() {
+        // The other half of the same promise. A request refused before the
+        // provider is called leaves a single outcome line, and it answers both
+        // questions on its own: whether bytes left, and what class of failure
+        // it was. `error` is drawn from a fixed vocabulary rather than
+        // formatted, so the key name the caller chose and the digits it held
+        // cannot reach the file through it — which is the whole reason the
+        // vocabulary is fixed.
+        let detector = detector_returning(json!([
+            {"entity_type": "CREDIT_CARD", "start": 0, "end": 16}
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, _) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "settle",
+                     "input": {"cardholder_pan": 4_111_111_111_111_111u64}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "nothing left, so there is nothing to record having left"
+        );
+
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 1, "a refusal has no masked line to join to");
+        assert_eq!(lines[0]["event"], "outcome");
+        assert_eq!(lines[0]["result"], "refused");
+        assert_eq!(lines[0]["upstream"], false);
+        assert_eq!(lines[0]["status"], 400);
+        assert_eq!(
+            lines[0]["error"], "tool_numeric_personal_data",
+            "and it names the class, so a refusal is legible without the body"
+        );
+
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            !text.contains("4111"),
+            "the value the request was refused over is the last thing that \
+             belongs in the record of refusing it: {text}"
+        );
+        assert!(
+            !text.contains("cardholder_pan"),
+            "nor the key naming it: {text}"
+        );
     }
 
     #[tokio::test]

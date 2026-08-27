@@ -120,14 +120,16 @@ max_spans_per_entry = 250
 # Characters, not serialized bytes. Cost scales with the text the detector
 # reads; braces, quotes and property names are structure it never sees. On the
 # real ten-tool payload in gateway/src/testdata/claude_code_tools.json the two
-# differ by 1.46x — 13 177 serialized against 9 005 detected.
+# differ by 1.43x — 13 177 serialized against 9 193 charged.
 #
-# Set from that measurement, at twice it. Ten real tool definitions cost 9 005
-# characters, about 900 per tool. Those ten are a floor: a stock session carries
-# about fifteen tools, extrapolating to roughly 13 500, so 18 000 covers a stock
-# session with room for a small MCP server and does not pretend to cover an
-# arbitrary one. The test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with
-# pins the figure and fails if this default stops admitting it.
+# Set from that measurement, at twice it. Ten real tool definitions charge 9 193
+# characters: 9 005 of text, 50 of numbers, and 138 of the separators the join
+# inserts between leaves, every one of which the detector reads. Those ten are a
+# floor: a stock session carries about fifteen tools, extrapolating to roughly
+# 13 800, so 20 000 covers a stock session with room for a small MCP server and
+# does not pretend to cover an arbitrary one. The test
+# a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins the figure and
+# fails if this default stops admitting twice it.
 #
 # What that costs. Two things were offered as making it tolerable: it is the
 # FIRST turn of a session only, since tool definitions are byte-identical
@@ -149,6 +151,13 @@ max_spans_per_entry = 250
 # That is a session's first turn with a real tool set. A single call costs
 # 265-410 ms whatever its length, so per-call overhead is the majority of it.
 #
+# That measurement is what BATCHING was built on, and it describes the cost that
+# no longer applies: a document's leaves are one call now, so the same payload is
+# 20 calls rather than 77. The 57 calls that went away were 265-410 ms each --
+# fifteen to twenty-three seconds of pure overhead, derived from the two
+# measurements either side of it. The post-batching wall clock has not been
+# re-replayed.
+#
 # The first version of this figure was DERIVED -- characters over a throughput
 # taken from 1 200- and 6 000-character texts, applied to leaves averaging 116,
 # where overhead dominates and throughput barely applies. It could have been out
@@ -162,22 +171,19 @@ max_spans_per_entry = 250
 # almost nothing else) plus its 1 200-character row for the marginal rate. An
 # estimate until someone runs the replay on a host with the NER extras.
 #
-# These defaults are under review on that evidence, and the number was NOT
-# lowered on the strength of it: a bound below real traffic turns a long wait
-# into a refusal of a client that did nothing wrong. The fix is issue #28 -- one
-# call per document instead of one per string -- not a number here. 20 000
-# rather than 18 000 because the headroom rule is now asserted rather than
-# described, and 18 000 failed it by ten characters.
+# The number was NOT lowered on the strength of that evidence: a bound below
+# real traffic turns a long wait into a refusal of a client that did nothing
+# wrong. One call per document instead of one per string was the fix, and it has
+# landed; what is left for issue #28 is making detection fast on a large text,
+# which is a different problem and not a number here. 20 000 rather than 18 000
+# because the headroom rule is now asserted rather than described, and 18 000
+# failed it by ten characters.
 #
 # It is NOT a timeout budget, and this comment used to say it was.
 # detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
 # detector call on its own and never their sum; no cumulative deadline exists
 # anywhere on the request path. Two constraints: the timeout catches a stuck
 # call, this caps how long a caller waits for the whole request.
-#
-# Still unmeasured: per-call overhead. This bounds the characters and
-# max_tool_calls bounds the calls; nobody has measured what a call costs before
-# any text is read.
 max_tool_chars = 20000
 
 # How many detector round-trips those structures may need.

@@ -30,12 +30,19 @@ inside a partially written JSON value, so the hold-back buffer cannot know the
 document is well formed until the block closes.
 
 **The cut has to be enforced, not merely intended.** `request_pointers` runs
-before `proxy.rs` looks at `stream`, so relaxing `TOOL_FIELDS` admits streamed
-tool requests as readily as buffered ones — and `stream_slots`, unchanged, would
-then reject the tool events *after* the upstream call, spending the caller's
-tokens to return a broken stream. So `stream: true` together with tool traffic
-is refused before the upstream call, explicitly, and that refusal is deleted by
-the second slice rather than by accident.
+before `proxy.rs` looks at `stream`, so relaxing the tool-field refusal admits
+streamed tool requests as readily as buffered ones — and `stream_slots`,
+unchanged, would then reject the tool events *after* the upstream call, spending
+the caller's tokens to return a broken stream. So `stream: true` together with
+tool traffic is refused before the upstream call, explicitly, and that refusal is
+deleted by the second slice rather than by accident.
+
+`reject_streamed_tools` decides that from the **slots**, not from a field name.
+A continuation carrying an earlier call and its result need not repeat `tools`,
+and Anthropic's `mcp_servers` grants tools without a `tools` array at all, so
+asking "does the body have a tool field" was the wrong question; asking "did any
+location we describe turn out to be tool traffic" covers both, and covers a
+location added later on the day it is described.
 
 Being honest about what this opens: an agent whose results are small works end
 to end after this slice, and one that reads a large file does not (see
@@ -218,8 +225,13 @@ Detection is asynchronous and `Mapping` is not, so the leaves are collected and
 detected first and the walk is handed their spans — the same split `mask_all`
 already makes between `detect` and `Mapping::mask`.
 
-`proxy.rs`'s `mask_all` learns the two slot kinds and nothing else. `TOOL_FIELDS`
-loses the fields this slice masks; what remains refused stays refused.
+`proxy.rs`'s `mask_all` learns the two slot kinds and nothing else. The
+tool-field refusal loses the fields this slice masks; what remains refused stays
+refused. It is three lists rather than the one this section first imagined —
+`OPENAI_BODY_TOOL_FIELDS`, `OPENAI_MESSAGE_TOOL_FIELDS` and
+`ANTHROPIC_TOOL_FIELDS` — because a field is only described where the protocol
+puts it, and relaxing both levels together would have let a `tools` array
+smuggled onto a *message* carry its descriptions past the masker.
 
 ### What is masked, by provider
 
@@ -296,9 +308,13 @@ turn's history, and that text has never been detected — the cache holds the
 masked request text, not the restored response. So a large generated argument is
 first-seen on the following request, which is exactly when the timeout bites.
 
-At the default timeout the ceiling lands near 10 KB, which passes ordinary agent
-traffic — a 200-line file read, `grep` output, a small edit, short `bash` output
-— and refuses a large file read or a whole-file write honestly.
+The ceiling as shipped is 20 000 characters and 40 detector calls, set from the
+measurement in **Configuration** rather than from the timeout — which bounds one
+call and never their sum, so it was never the quantity to derive this from. That
+passes ordinary agent traffic — a 200-line file read, `grep` output, a small
+edit, short `bash` output — and refuses a large file read or a whole-file write
+honestly. An earlier draft put the ceiling "near 10 KB, at the default timeout",
+which was both the superseded default and the wrong reason for it.
 
 Making large results fast is its own work, filed as issue #28, with its own
 measurements: chunking
@@ -320,16 +336,37 @@ what an eighty-character one does. Measured per call — 108 ms native from the
 README's own 80-character row, 265–410 ms containerised.
 
 Walking a document leaf by leaf therefore multiplies the dominant cost by however
-many strings a client happened to write. Measured on ten real tool definitions:
-77 calls, 9 005 characters, **15 seconds native and 52 containerised on a
-session's first turn** — of which 57% is call overhead rather than text. A
-correct payload from a correct client, refused by nothing, and unusable.
+many strings a client happened to write. On ten real tool definitions — 77 calls,
+9 005 characters of text — that is **54.9 seconds containerised on a session's
+first turn**, of which 57% is call overhead rather than text. Measured, not
+derived: the payload's own leaves, taken through the same `json_leaves` walk the
+gateway uses, replayed through `/detect` in sequence three times with salted text
+so nothing could come from a cache. A correct payload from a correct client,
+refused by nothing, and unusable.
+
+The **native** equivalent is about 15 seconds and is **derived**, not measured:
+this host's detector venv has no onnxruntime, so its detector runs the
+deterministic layer alone. It comes from the README bench's 80-character row
+(109 ms, per-call cost and almost nothing else) plus the 1 200-character row for
+the marginal rate, and stays an estimate until someone runs the replay on a host
+with the NER extras installed.
+
+An earlier draft of this section reported **52 seconds containerised as
+measured**. It was derived — characters over a throughput taken on 1 200- and
+6 000-character texts, applied to leaves averaging 116, where per-call overhead
+dominates and throughput barely applies — and it was replaced by the replay above
+at `53e94cb`. It landed within 5%, which that commit records as luck rather than
+as method.
 
 No pair of bounds fixes that. Lowering them converts the wait into a refusal of a
 client that did nothing wrong; raising them makes the wait longer. So the leaves
 of one document are detected in one call, and the cost scales with text rather
-than with how a client chose to divide it — the same payload becomes about 7
-seconds native and 23 containerised, and the dominant term is gone.
+than with how a client chose to divide it: the same payload becomes **20 calls
+rather than 77**, and the 57 calls that go away were costing 265–410 ms each, so
+fifteen to twenty-three seconds of pure overhead leave with them. That last
+figure is derived from the two measurements either side of it rather than
+replayed — the post-batching wall clock has not been re-measured. The dominant
+term is gone.
 
 This is not issue #28's work, which is about making detection faster on a large
 text. It is about not making seventy-seven calls where one will do, and the
@@ -345,10 +382,11 @@ Issue #28's chunking has no such luxury.
 ## Errors
 
 Every failure is a refusal, and the vocabulary is the existing one. A document
-past the depth or node bound, a numeric leaf carrying a detected span, a content
-block whose shape this gateway does not understand, tool structures summing past
-the size bound, and tool traffic arriving with `stream: true` are all refused
-before the upstream call.
+past the depth or node bound, a numeric leaf carrying a span of one of the eight
+deterministic types, a content block whose shape this gateway does not
+understand, a tool field it has no rule for, `mcp_servers`, tool structures
+summing past either bound, and tool traffic arriving with `stream: true` are all
+refused before the upstream call.
 
 Refusing *before* it is the whole point in each case: every one of these is
 knowable from the request alone, and a refusal issued after the upstream call
@@ -359,28 +397,60 @@ because the client would execute it.
 
 ## Configuration
 
-One key, `max_tool_chars`, defaulting to **10 000**, applied to the sum of the
-tool structures a request newly scans rather than to any one of them. The
-relationship is the point rather than the number: 10 000 characters is about nine
-seconds on the machine the README's table names and about fifteen on the
-containerised stack, both inside a 30-second `detector_timeout_secs` with
-headroom. Slower hardware, or a lowered timeout, has to lower this with it.
+**Two keys, not one — an earlier draft of this section named only the first, and
+batching is why there are two.** Both apply to the sum of the tool structures a
+request newly scans rather than to any one of them.
 
-**These are two constraints, not one written twice — an earlier draft of this
-document had that wrong.** `detector_timeout_secs` becomes a per-request timeout
-on each HTTP call to the detector, so it bounds one call and never their sum: a
-request making seventy calls of a hundred characters can spend two minutes
-without any single call approaching it. `max_tool_chars` is the other constraint,
-capping how long a caller waits for the whole request.
+`max_tool_chars` defaults to **20 000** and bounds the characters those
+structures send to the detector. `max_tool_calls` defaults to **40** and bounds
+the detector round-trips they need. The second exists because the first cannot
+stop what it used to stop: once a document's leaves are detected in one call
+(see **Why a document is one detector call**), ten thousand tool definitions
+each carrying a one-character description are ten thousand characters — inside
+the character bound — and ten thousand sequential calls. The key was
+`max_tool_leaves` and counted strings, which stopped being what a call costs the
+day batching landed; it is renamed to what it now counts rather than left
+pointing at a quantity that no longer prices anything.
 
-It counts the characters that reach the detector rather than the serialized size
-of the structures carrying them. Measured on a real eight-tool payload: 10 970
-bytes serialized against 7 379 characters detected, so a third of every charge
-would have been punctuation and property names, which cost detection nothing. Deriving it
-automatically was rejected because a derived default would silently change
-behaviour when an unrelated key moved.
+**Both defaults are twice a measurement, and the measurement is a floor.** Ten
+real Claude Code tool definitions, pinned in
+`gateway/src/testdata/claude_code_tools.json` and asserted by
+`mapping::tests::a_real_tool_payload_fits_the_bounds_this_gateway_ships_with`:
+**13 177 bytes serialized against 9 193 characters charged**, in **20 calls**
+(ten descriptions, ten schemas). The 9 193 is 9 005 characters of text, 50 of
+numbers and 138 of the separators the join inserts, all three of which the
+detector reads. So charging serialized size would charge 1.43 characters for
+every one detection actually costs — braces, quotes and property names, none of
+which the detector sees.
 
-Added to `gateway/tessera.example.toml`, `deploy/tessera.container.toml` and
+The doubling is asserted rather than described, because the same rule stated in
+a comment was already quietly false once: twice the payload is 18 386 characters
+and 40 calls, against defaults of 20 000 and 40. An earlier pair, 18 000 and
+18 010, failed by ten characters and was raised. The call bound holds at 40 ≥ 40
+exactly, with no headroom, so one more tool in the testdata breaks the
+assertion — which is the assertion working. A floor that has moved is a
+measurement to retake and a default to reconsider, not a rule to relax.
+
+The figures this section carried before were **10 000**, and 10 970 bytes
+against 7 379 characters from an **eight**-tool payload. Both were superseded
+during the slice — the default at `53e94cb`, the measurement when the payload
+grew to ten tools and again when numeric leaves and join separators started
+being charged — and the section was not updated with them. Recorded because a
+configuration section quoting a superseded default is trusted precisely for
+being specific.
+
+**`detector_timeout_secs` is a third thing, not a restatement of the first — an
+earlier draft of this document had that wrong too.** It becomes a per-request
+timeout on each HTTP call to the detector, so it bounds one call and never their
+sum: a request making forty calls of a hundred characters can spend a minute
+without any single call approaching it. No cumulative deadline exists anywhere on
+the request path. These two bounds are what cap how long a caller waits for the
+whole request.
+
+Deriving either default automatically was rejected: a derived default would
+silently change behaviour when an unrelated key moved.
+
+Both are in `gateway/tessera.example.toml`, `deploy/tessera.container.toml` and
 `deploy/tessera.demo.toml`.
 
 ## Testing
@@ -394,8 +464,8 @@ fail:
    unchanged.
 3. OpenAI's `arguments` survives a round trip as valid JSON the client can
    parse.
-4. A numeric leaf carrying a detected span refuses the request rather than
-   forwarding it.
+4. A numeric leaf carrying a span of a deterministic type refuses the request
+   rather than forwarding it, and one carrying an NER label alone does not.
 5. A document past the depth bound refuses rather than recursing.
 6. A tool call restored for the client carries the original values, not
    placeholders.
@@ -440,6 +510,18 @@ measurement on both sides of it.
 
 **A large tool result is refused, not served slowly.** See **Latency**, and
 issue #28, which exists to raise this ceiling.
+
+**The closed allowlist refuses citations and two of Anthropic's server tools.**
+A `text` block carrying `citations` is refused on the request path, and clients
+echo assistant turns back as history, so a conversation that used citations
+refuses on its next turn. `computer_*` (display dimensions) and `web_search_*`
+(a `user_location` whose `city` is a `LOCATION` in this vocabulary) carry
+configuration the allowlist has no rule for and are refused with it;
+`text_editor_*` and `bash_*` declare a name and a type and nothing else, so they
+pass and the coding-agent category is unaffected. This is the allowlist working
+in the direction it was chosen for — a field no slot addresses would otherwise
+travel exactly as the caller wrote it — and the follow-up for citations is to
+describe `cited_text` as a slot rather than leave the feature closed.
 
 **Masking tool definitions degrades tool selection, measurably.** The decision
 above accepted this in principle; here is the number. Ten real Claude Code tool
