@@ -154,16 +154,25 @@ const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "a
 /// which is dispatch and is therefore left alone rather than masked or refused.
 /// It stays on the message list because OpenAI does not define it there.
 ///
-/// Anthropic's tool traffic is described now, so what is left on its list is
-/// the three fields Anthropic's API does not define at all. They are still
-/// refused rather than ignored: a field no slot addresses is forwarded exactly
-/// as it came, so `tool_calls` smuggled into an Anthropic body would carry its
-/// arguments past the masker. `tool_choice` is deliberately absent for the same
-/// reason as OpenAI's.
+/// Anthropic's tool traffic is described now, so what is left on its lists is
+/// the fields Anthropic's API does not define at the level they appear. They are
+/// still refused rather than ignored: a field no slot addresses is forwarded
+/// exactly as it came, so `tool_calls` smuggled into an Anthropic body would
+/// carry its arguments past the masker. `tool_choice` is deliberately absent for
+/// the same reason as OpenAI's.
+///
+/// **Anthropic is split into two lists for the same reason OpenAI is, and it was
+/// one list for longer.** A single list cannot express the only rule that
+/// matters here — `tools` is described on the body and is undefined on a
+/// message — so while the two levels shared a list, `tools` could be on neither
+/// of them: adding it refuses every tool-using request the body carries, and
+/// leaving it off forwards a message's tool descriptions verbatim, which is what
+/// happened. Whatever a level does not describe, that level refuses. Keeping the
+/// providers symmetrical is part of the fix: the asymmetry is why nobody saw it.
 const OPENAI_BODY_TOOL_FIELDS: [&str; 3] = ["functions", "function_call", "tool_calls"];
 const OPENAI_MESSAGE_TOOL_FIELDS: [&str; 4] =
     ["functions", "function_call", "tools", "tool_choice"];
-const ANTHROPIC_TOOL_FIELDS: [&str; 4] = [
+const ANTHROPIC_BODY_TOOL_FIELDS: [&str; 4] = [
     "functions",
     "function_call",
     "tool_calls",
@@ -172,6 +181,19 @@ const ANTHROPIC_TOOL_FIELDS: [&str; 4] = [
     // results arrive shaped by a server this gateway never described — and it
     // carries the caller's own `authorization_token` besides.
     "mcp_servers",
+];
+/// The body list plus `tools`, which a message does not define and no slot here
+/// addresses at that level. `mcp_servers` stays on both deliberately rather than
+/// by copy: Anthropic defines it on the body alone, so on a message it is a
+/// field this gateway describes nowhere — and it is the one that carries an
+/// `authorization_token`. A field undefined at a level is the strongest case for
+/// refusing it there, not a reason to drop it from the list.
+const ANTHROPIC_MESSAGE_TOOL_FIELDS: [&str; 5] = [
+    "functions",
+    "function_call",
+    "tool_calls",
+    "mcp_servers",
+    "tools",
 ];
 
 /// Every message must be an object carrying something this gateway describes.
@@ -891,7 +913,7 @@ impl Provider for Anthropic {
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
-        reject_tool_fields(body, &ANTHROPIC_TOOL_FIELDS, "anthropic")?;
+        reject_tool_fields(body, &ANTHROPIC_BODY_TOOL_FIELDS, "anthropic")?;
         let mut pointers = Vec::new();
         // Explicitly null is an SDK serializing its default, not a request to
         // use tools — the same reading `thinking` and `logprobs` already get.
@@ -936,7 +958,7 @@ impl Provider for Anthropic {
         }
         for (index, message) in messages.iter().enumerate() {
             require_scannable_message(message, &["content"], "anthropic")?;
-            reject_tool_fields(message, &ANTHROPIC_TOOL_FIELDS, "anthropic")?;
+            reject_tool_fields(message, &ANTHROPIC_MESSAGE_TOOL_FIELDS, "anthropic")?;
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
@@ -1511,6 +1533,47 @@ mod tests {
                 "{field} was allowed on a message"
             );
         }
+    }
+
+    #[test]
+    fn anthropic_refuses_a_tools_array_on_a_message_and_still_describes_one_on_the_body() {
+        // The Anthropic twin of the hole the OpenAI list closed. Anthropic
+        // defines `tools` on the body and nowhere else, so on a message no slot
+        // addresses it and it travels exactly as the caller wrote it —
+        // descriptions, schemas and all. Verified before the fix: 200, and
+        // `"description":"Weber"` in the upstream's body.
+        //
+        // Both halves are asserted here because one list served both levels,
+        // and the fix is the split. Refusing the message without still serving
+        // the body would close the feature this slice exists to open.
+        let on_a_message = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi",
+                          "tools": [{"name": "t", "description": "Weber",
+                                     "input_schema": {"type": "object"}}]}]
+        });
+        assert!(
+            matches!(
+                Anthropic.request_pointers(&on_a_message),
+                Err(ShapeError::Unsupported("anthropic", "tools"))
+            ),
+            "described nowhere and refused nowhere, so forwarded whole: {:?}",
+            Anthropic.request_pointers(&on_a_message)
+        );
+        let on_the_body = json!({
+            "model": "claude",
+            "tools": [{"name": "t", "description": "Weber", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&on_the_body).unwrap(),
+            vec![
+                tool_text("/tools/0/description"),
+                schema("/tools/0/input_schema"),
+                text("/messages/0/content"),
+            ],
+            "the body's tools are described, not refused"
+        );
     }
 
     #[test]
