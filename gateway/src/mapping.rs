@@ -515,6 +515,24 @@ const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
     "properties",
 ];
 
+/// Under `propertyNames`, the keywords whose instances are property *names*.
+///
+/// The fourth list, and the only one written the way `SCHEMA_INSTANCE_KEYWORDS`
+/// was before it was deleted — small, closed, and consulted before a default.
+/// The difference is which way the default falls, which is the whole of the
+/// lesson that deletion taught: a list of keywords holding *data* cannot be
+/// closed, because every `x-` a vendor invents extends it, so the default there
+/// has to be "scan". A list of keywords holding *names* can be, because it is
+/// the same enumerable set the drafts define — `enum`, `const`, `default`,
+/// `examples` — and a keyword written after this line is far likelier to be a
+/// vendor's prose than a fifth way of stating a name.
+///
+/// Wrong in the other direction the schema pays for and the caller sees: a name
+/// stated under a keyword not on this list is masked, which breaks the schema
+/// rather than leaking anything. That is the way round this walk chooses
+/// everywhere else, and this arm is the one place it did not.
+const SCHEMA_NAME_INSTANCE_KEYWORDS: [&str; 4] = ["const", "default", "enum", "examples"];
+
 /// What the walk does with one field of an object, given the shape it is in.
 /// Shared by both walks so they cannot drift: they correspond by position, and
 /// a field one of them skipped and the other did not would silently put a
@@ -563,12 +581,18 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         // A subschema, so the shape carries — modifier included, because an
         // `enum` inside an `allOf` inside a `propertyNames` still lists names.
         key if SCHEMA_APPLICATOR_KEYWORDS.contains(&key) => Some(shape),
-        // Everything else: `enum`, `default`, `example`, `x-whatever`, and any
-        // keyword written after this line. It holds an instance, and an
-        // instance is the client's data — unless we are under `propertyNames`,
-        // where the instances are property names and masking one breaks the
-        // schema.
-        _ if names => None,
+        // Under `propertyNames` the instances are property names, and masking
+        // one breaks the schema — but only for the keywords that state a name.
+        // That set is small and closed; the set of keywords holding a client's
+        // prose is neither, which is why this arm names the first rather than
+        // defaulting to it. Skipping every unrecognized keyword here forwarded
+        // an `x-note` under `propertyNames` verbatim while masking the
+        // `description` beside it: the same inversion `SCHEMA_INSTANCE_KEYWORDS`
+        // was deleted for, in the one shape that deletion did not reach.
+        key if names && SCHEMA_NAME_INSTANCE_KEYWORDS.contains(&key) => None,
+        // Everything else: `enum` and `default` outside `propertyNames`,
+        // `example`, `x-whatever`, and any keyword written after this line. It
+        // holds an instance, and an instance is the client's data.
         _ => Some(Shape::Instance),
     }
 }
@@ -1750,6 +1774,51 @@ mod tests {
             json!(["credit_card", "billing_address"])
         );
         assert_eq!(rebuilt["propertyNames"]["const"], "Weber");
+    }
+
+    #[test]
+    fn an_unknown_keyword_under_property_names_holds_data_and_not_a_name() {
+        // The lesson `SCHEMA_INSTANCE_KEYWORDS` was deleted for, applied to the
+        // shape that deletion did not reach. Under `propertyNames` an
+        // unrecognized keyword was skipped as though it stated a name, so a
+        // vendor extension travelled verbatim while the `description` beside it
+        // was masked — measured through the proxy as
+        // `{"description":"[PERSON_1]","enum":["Weber"],"x-note":"Weber"}`.
+        //
+        // The keywords that really do state names are still skipped, because
+        // that is what this shape exists for.
+        let schema = json!({
+            "propertyNames": {
+                "x-note": "Martina Weber",
+                "description": "Owned by Martina Weber",
+                "enum": ["credit_card"],
+                "const": "billing_address",
+                "default": "billing_address",
+                "examples": ["billing_address"]
+            }
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![
+                Leaf::Text("Owned by Martina Weber".to_owned()),
+                Leaf::Text("Martina Weber".to_owned()),
+            ],
+            "an unknown keyword under propertyNames is the client's data"
+        );
+        let rebuilt = replace_text_leaves(
+            &schema,
+            &["MASKED".to_owned(), "ALSO MASKED".to_owned()],
+            Shape::Schema,
+        )
+        .unwrap();
+        assert_eq!(rebuilt["propertyNames"]["x-note"], "ALSO MASKED");
+        assert_eq!(rebuilt["propertyNames"]["enum"], json!(["credit_card"]));
+        assert_eq!(rebuilt["propertyNames"]["const"], "billing_address");
+        assert_eq!(rebuilt["propertyNames"]["default"], "billing_address");
+        assert_eq!(
+            rebuilt["propertyNames"]["examples"],
+            json!(["billing_address"])
+        );
     }
 
     #[test]
