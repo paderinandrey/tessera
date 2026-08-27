@@ -270,7 +270,7 @@ fn reject_streamed_tools(
 
 /// Fields a tool definition may carry that this gateway can account for.
 /// `name` is dispatch and `type` names a server tool; `cache_control` is
-/// `{"type": "ephemeral"}` and carries nothing of the caller's. `description`
+/// checked against its own allowlist below rather than assumed. `description`
 /// and the schema are described as slots.
 ///
 /// Anything else is refused, because a tool definition is an object the caller
@@ -285,6 +285,36 @@ const ANTHROPIC_TOOL_DEFINITION_FIELDS: [&str; 5] = [
     "type",
     "cache_control",
 ];
+
+/// The only object this gateway allowlists without describing it, so it is the
+/// one place the allowlist rule had to be applied to a field's *contents*
+/// rather than to the field name. A comment used to assert the shape —
+/// "`cache_control` is `{"type": "ephemeral"}` and carries nothing of the
+/// caller's" — and that assertion was false: `{"type": "ephemeral", "note":
+/// "Weber"}` reached the upstream verbatim on both a content block and a tool
+/// definition. An assertion in a comment is not a guarantee; this list is.
+///
+/// `ttl` is on it because Anthropic defines it — extended cache lifetimes are
+/// `{"type": "ephemeral", "ttl": "1h"}` — and it holds one of two spellings the
+/// provider defines, not the caller's text. Anything else is refused, for the
+/// same reason every other allowlist here refuses: a field no slot addresses
+/// is forwarded exactly as it came.
+const ANTHROPIC_CACHE_CONTROL_FIELDS: [&str; 2] = ["type", "ttl"];
+
+/// `cache_control` wherever it is allowlisted — a tool definition or any
+/// content block. One function because the field is one field: six sites
+/// allowing it and one checking it is how the gap opened.
+fn known_cache_control(value: &Value, provider: &'static str) -> Result<(), ShapeError> {
+    match value.get("cache_control") {
+        None | Some(Value::Null) => Ok(()),
+        Some(cache_control) => known_fields(
+            cache_control,
+            &ANTHROPIC_CACHE_CONTROL_FIELDS,
+            "cache_control field",
+            provider,
+        ),
+    }
+}
 
 /// OpenAI wraps a definition: `{"type": "function", "function": {...}}`. The
 /// wrapper is checked as its own object because a field beside `function` — a
@@ -367,6 +397,7 @@ fn tool_definition_slots(
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
     known_fields(definition, allowed, "tool definition field", provider)?;
+    known_cache_control(definition, provider)?;
     // Present but not a string cannot be masked, so it is refused rather than
     // forwarded as it is — the rule `identifier_pointer` already applies to
     // `/user` and `/name`, which this once did not.
@@ -496,7 +527,8 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
 /// Fields a content block may carry that this gateway can account for, by block
 /// type. `type` names the block; the rest are either described as slots or are
 /// dispatch this gateway deliberately leaves alone — a `tool_use_id`, an
-/// `is_error` flag, a `cache_control` that is only `{"type": "ephemeral"}`.
+/// `is_error` flag, a `cache_control` whose own fields are allowlisted by
+/// `known_cache_control` rather than assumed.
 ///
 /// The rule `ANTHROPIC_TOOL_DEFINITION_FIELDS` applies to tool definitions,
 /// one layer up: a block is an object the caller fills in, and a field no slot
@@ -506,6 +538,18 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
 /// it arrives on the request path. Refusing costs a caller who does not use
 /// citations nothing, and the alternative is forwarding quoted documents
 /// unmasked.
+///
+/// **Closing this list is also what keeps the response path safe, and that is a
+/// coupling rather than a guard.** `Anthropic::response_pointers` restores a
+/// `text` block's `text` and hands the client every other field of that block
+/// unrestored, `citations[].cited_text` included — so a response carrying
+/// citations would return the gateway's own placeholders to the caller. Nothing
+/// in that function stops it. What stops it is here: no request this list
+/// admits can enable citations, so no accepted request can produce such a
+/// response. The recorded follow-up — describe `cited_text` as a slot rather
+/// than leave the feature closed — opens that hole the day it lands if it is
+/// done on this path alone. Citations are one change across both paths, or the
+/// response path is closed first.
 ///
 /// An empty slice means a type this function does not know. Those are left to
 /// the dispatch below, which refuses them for being unrecognized rather than
@@ -529,12 +573,44 @@ fn content_block_fields(kind: &str) -> &'static [&'static str] {
     }
 }
 
+/// This slice gave `content_pointers` a call to itself — a `tool_result` reads
+/// its own `content` through the same function — and a self-recursive walk over
+/// a caller's document needs a bound of its own. `mapping::walk` was given
+/// `MAX_JSON_DEPTH` for the identical hazard, and `Mapping::restore_value`
+/// carries a paragraph saying why a parser's limit is a backstop rather than a
+/// guarantee. Both apply here.
+///
+/// `serde_json` does bound deserialization depth, and it does hold today: a
+/// `tool_result` nested past about sixty levels is rejected at parse
+/// (measured — 50 levels parse, 100 do not, under a limit of 128 that counts
+/// each level's array *and* object). But that figure is a dependency's promise
+/// under a `serde_json = "1"` that any `cargo update` may move, and
+/// `disable_recursion_limit` exists to switch it off entirely. The bound below
+/// is ours. `MAX_JSON_DEPTH` rather than a second number, because a document
+/// deep enough to refuse here is one the walk would refuse anyway, and two
+/// bounds on one hazard drift.
 fn content_pointers(
     prefix: &str,
     content: &Value,
     provider: &'static str,
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
+    content_pointers_at(prefix, content, provider, 0, out)
+}
+
+fn content_pointers_at(
+    prefix: &str,
+    content: &Value,
+    provider: &'static str,
+    depth: usize,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    if depth > crate::mapping::MAX_JSON_DEPTH {
+        return Err(ShapeError::Unsupported(
+            provider,
+            "tool results nested deeper than this gateway walks",
+        ));
+    }
     match content {
         Value::String(_) => out.push(Slot::text(prefix.to_owned())),
         Value::Array(parts) => {
@@ -557,6 +633,9 @@ fn content_pointers(
                             return Err(ShapeError::Unsupported(provider, "content block field"));
                         }
                     }
+                    // Every block type this function knows allows
+                    // `cache_control`, so one check here covers all of them.
+                    known_cache_control(part, provider)?;
                 }
                 match kind {
                     "text" => {
@@ -590,10 +669,11 @@ fn content_pointers(
                     "tool_result" => {
                         if let Some(content) = part.get("content") {
                             let from = out.len();
-                            content_pointers(
+                            content_pointers_at(
                                 &format!("{prefix}/{index}/content"),
                                 content,
                                 provider,
+                                depth + 1,
                                 out,
                             )?;
                             // Whatever the recursion just produced is tool
@@ -953,7 +1033,12 @@ impl Provider for Anthropic {
             "anthropic",
             &mut pointers,
         )?;
-        if let Some(system) = body.get("system") {
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use X — the same reading `tools`, `thinking` and `content` already
+        // get. Without the filter `content_pointers` saw `Value::Null`, could
+        // not say where the text was, and refused: `{"system": null}` was a 400
+        // (measured) for a body carrying no system prompt at all.
+        if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
             content_pointers("/system", system, "anthropic", &mut pointers)?;
         }
         for (index, message) in messages.iter().enumerate() {
@@ -984,6 +1069,22 @@ impl Provider for Anthropic {
             .ok_or(ShapeError::Response("anthropic"))?;
         let mut pointers = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
+            // This reads `text` before `type` and applies no field allowlist —
+            // the pattern the request path was corrected for, still here. A
+            // `text` block carrying a populated `citations` array would have
+            // its `text` restored and its `cited_text` handed to the client
+            // with the gateway's own placeholders still in it (measured:
+            // `"cited_text":"[PERSON_1] lives here"`).
+            //
+            // **It is unreachable, and what makes it unreachable is one
+            // direction earlier, not anything here.** `content_block_fields`
+            // refuses every request block that can enable citations, so no
+            // accepted request produces such a response. That is a coupling
+            // between two functions and not a guard in this one: nothing below
+            // would catch it, and a comment is not a guarantee. Describing
+            // `cited_text` as a slot on the request path — the follow-up this
+            // branch recorded — makes this reachable the day it lands unless
+            // this path is closed in the same change.
             if block.get("text").and_then(Value::as_str).is_some() {
                 pointers.push(Slot::text(format!("/content/{index}/text")));
                 continue;
@@ -1574,6 +1675,130 @@ mod tests {
             ],
             "the body's tools are described, not refused"
         );
+    }
+
+    /// A nest of `tool_result` blocks, built in memory rather than parsed.
+    /// That is the case with no backstop at all: `serde_json`'s recursion limit
+    /// bounds what it *parses*, and this walk is reachable from a value a
+    /// caller assembled — which is exactly the gap `restore_value`'s note
+    /// names.
+    fn nested_tool_results(depth: usize) -> Value {
+        let mut content = Value::String("leaf".to_owned());
+        for _ in 0..depth {
+            content = json!([{"type": "tool_result", "tool_use_id": "t", "content": content}]);
+        }
+        content
+    }
+
+    #[test]
+    fn an_explicitly_null_system_is_not_a_system_prompt() {
+        // Verified as a 400 before this filter: `content_pointers` was handed
+        // `Value::Null`, could not say where the text was, and refused the
+        // whole request. The reading this branch already applies to `tools`,
+        // `thinking` and `content` is that explicitly null is an SDK
+        // serializing its default — this is the field that predates them.
+        let body = json!({
+            "model": "claude",
+            "system": null,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic
+                .request_pointers(&body)
+                .expect("a null system is no system"),
+            vec![text("/messages/0/content")],
+        );
+        // A system prompt that is there is still described.
+        let present = json!({
+            "model": "claude",
+            "system": "you are a bot",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&present).unwrap(),
+            vec![text("/system"), text("/messages/0/content")],
+        );
+    }
+
+    #[test]
+    fn a_tool_result_nested_past_the_walks_bound_is_refused() {
+        // The recursion this slice introduced. Bounded here rather than left to
+        // the parser: a document deep enough to exhaust the stack ends the
+        // process and every live session mapping with it.
+        let too_deep = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": nested_tool_results(70)}]
+        });
+        assert!(
+            matches!(
+                Anthropic.request_pointers(&too_deep),
+                Err(ShapeError::Unsupported(
+                    "anthropic",
+                    "tool results nested deeper than this gateway walks"
+                ))
+            ),
+            "the walk recursed as deep as the caller asked: {:?}",
+            Anthropic.request_pointers(&too_deep)
+        );
+        // And a nest within the bound is still read to the bottom.
+        let within = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": nested_tool_results(60)}]
+        });
+        let slots = Anthropic
+            .request_pointers(&within)
+            .expect("within the bound");
+        assert_eq!(slots.len(), 1, "the leaf is described once: {slots:?}");
+    }
+
+    #[test]
+    fn cache_control_is_checked_rather_than_asserted() {
+        // The one allowlisted object this gateway does not describe. A comment
+        // claimed its shape — "`cache_control` is `{"type": "ephemeral"}` and
+        // carries nothing of the caller's" — and the code checked nothing, so
+        // `{"type": "ephemeral", "note": "Weber"}` reached the upstream
+        // verbatim on both a tool definition and a content block. Measured,
+        // both of them, before this test existed.
+        for body in [
+            json!({
+                "model": "claude",
+                "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object"},
+                           "cache_control": {"type": "ephemeral", "note": "Weber"}}],
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi",
+                     "cache_control": {"type": "ephemeral", "note": "Weber"}}]}]
+            }),
+        ] {
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported("anthropic", "cache_control field"))
+                ),
+                "a field no slot addresses travelled whole: {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+        // And the shapes Anthropic actually defines still work: the bare form,
+        // and the extended lifetime that is the reason `ttl` is on the list.
+        for cache_control in [
+            json!({"type": "ephemeral"}),
+            json!({"type": "ephemeral", "ttl": "1h"}),
+        ] {
+            let body = json!({
+                "model": "claude",
+                "tools": [{"name": "t", "input_schema": {"type": "object"},
+                           "cache_control": cache_control}],
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a cache_control Anthropic defines was refused: {cache_control}"
+            );
+        }
     }
 
     #[test]

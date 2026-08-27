@@ -215,14 +215,24 @@ span the detector reports at a position that cannot be applied — inverted, pas
 text, or overlapping another; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. No text
-this gateway scans is forwarded unmasked, and no placeholder is ever handed to the client
-in place of a value. No error body or log line carries the submitted text.
+this gateway scans is forwarded unmasked. No error body or log line carries the submitted
+text.
 
-There is one thing it deliberately does not scan, and it is worth knowing before you rely
-on the sentence above: **image and audio parts are forwarded untouched**, including a
-screenshot inside a tool result, which is the same exposure through a different field
-rather than a new one. Nothing here reads pixels, so a photograph of an identity document
-reaches the provider as the client sent it.
+Restoration is narrower than that, and the difference is measured rather than assumed.
+Anthropic's response path is a closed list — a block it cannot read refuses the response
+rather than handing a placeholder over — and OpenAI's is not: it restores a choice's
+`content` and forwards every other field of the message as the provider sent it. A
+`refusal`, which any OpenAI refusal populates, and an `annotations[].url_citation.title`
+both reach the client **with this gateway's own placeholder in them**. That is the one
+direction the design is not yet closed in, and closing it means closing the list rather
+than naming those two fields.
+
+Two things it does not scan, and both are worth knowing before you rely on the sentence
+above. **Image and audio parts are forwarded untouched**, including a screenshot inside a
+tool result, which is the same exposure through a different field rather than a new one.
+Nothing here reads pixels, so a photograph of an identity document reaches the provider as
+the client sent it. And **the body and the message levels are not allowlisted at all** —
+see below, because that is the other half of the closed-allowlist claim.
 
 Tool traffic is masked now, so what it still refuses is worth stating on its own.
 **Streamed tool calls**, which the buffered path's masking does not reach: a document
@@ -233,6 +243,19 @@ an unrecognized content-block type, or a field beside the ones each tool structu
 described by, is refused rather than forwarded. That is deliberately the expensive
 direction: a field no slot addresses would travel to the provider exactly as the caller
 wrote it, so a provider feature shipped tomorrow refuses here instead of leaking through.
+
+**That closure is scoped to the tool structures, and the body and the message levels have
+no allowlist at all.** It is true of a tool definition, a tool call, a tool result and a
+content block, where it was hard-won; it is false one field over. A body field this gateway
+describes no slot for travels to the provider exactly as the caller wrote it — verified for
+OpenAI's `response_format.json_schema.schema`, which is *the same artifact* as a tool's
+`parameters` (a client-authored JSON Schema whose `description`, `enum` and `default` are
+prose the model reads); `prediction.content`, the Predicted Outputs field editor clients
+fill with whole file contents; `metadata`; `stop`; a top-level `safety_identifier`; and
+Anthropic's `stop_sequences`. A field invented on a *message* travels the same way. If you
+are deciding whether to point an agent at a customer folder: the prompt, the tool
+definitions, the tool arguments and the tool results are covered, and the request envelope
+around them is not.
 It is also what closes two things a caller may miss. Anthropic's **citations** are refused
 on the request path — a `text` block may carry `cited_text`, which is quoted source
 material, and clients echo assistant turns back as history, so a conversation that used

@@ -2,11 +2,12 @@
 
 ## The problem
 
-Tessera refuses any request carrying tool definitions or tool traffic. Every one
-of those refusals is correct today: tool arguments are not masked, and
-forwarding them would send arbitrary strings past the masker. But coding agents
-are built on tool use — Claude Code declares Read, Edit and Bash in its first
-message, and Codex CLI, Cursor, Aider, Continue and Zed all do the equivalent.
+Before this slice, Tessera refused any request carrying tool definitions or
+tool traffic. Every one of those refusals was correct then: tool arguments were
+not masked, and forwarding them would send arbitrary strings past the masker.
+But coding agents are built on tool use — Claude Code declares Read, Edit and
+Bash in its first message, and Codex CLI, Cursor, Aider, Continue and Zed all
+do the equivalent.
 They send a request without `tools` almost never.
 
 All of them point at a custom base URL with one environment variable, which is
