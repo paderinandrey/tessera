@@ -347,21 +347,87 @@ async fn mask_all(
                 };
                 // `split` returns one entry per leaf of either kind, so this
                 // and the loop below line up with `leaves` position for
-                // position — the same correspondence `replace_text_leaves`
-                // rests on, and it checks the count itself if the two ever
-                // disagree.
+                // position. Nothing downstream would notice if they did not:
+                // `replace_text_leaves` counts its replacements against *text*
+                // leaves, so a `per_leaf` short by trailing **numeric** entries
+                // produces exactly as many replacements as there are text
+                // leaves and passes clean, while the `zip`s below silently drop
+                // the numbers off the end. Measured, not reasoned: with an
+                // `out.pop()` in `split`, a spanned card in
+                // `{"anote": "Weber", "card": 4111111111111111}` was forwarded
+                // at 200 with nothing erroring.
                 //
+                // The two lengths cannot disagree as the code stands — `ranges`
+                // is sized from `rendered`, `rendered` is a 1:1 map over
+                // `leaves`, and `split` returns one entry per range — so this
+                // is a guard on the next change to the join rather than on a
+                // reachable input. It refuses rather than asserting because a
+                // `debug_assert` compiles out of release, which is the build
+                // where a leaked card matters.
+                if per_leaf.len() != leaves.len() {
+                    return Err(ProxyError::Mapping(MappingError::MaskCountMismatch(
+                        "the detector's spans were split across a different number of leaves",
+                    )));
+                }
                 // **A number is looked at and never replaced.** `[CREDIT_CARD_1]`
                 // in a field a schema declared numeric is a type error the
-                // client sees, and one the model may imitate in the next turn;
-                // so a span found in a number refuses the request instead.
+                // client sees, and one the model may imitate in the next turn.
+                // So the only two outcomes for a number are forwarding it and
+                // refusing the request, and which one a span produces is the
+                // question the rest of this comment answers.
                 //
-                // The refusal is only as wide as the vocabulary. `ENTITY_TYPES`
-                // holds eight identifiers — CH_AVS, CREDIT_CARD, the two German
-                // tax numbers, EMAIL, FR_NIF, FR_NIR, IBAN — and no telephone
-                // entity at all, so a phone number written as a JSON number is
-                // still forwarded. That is the same gap it has in ordinary
-                // text, and detection-quality work rather than this slice's.
+                // **Only a type the detector decides from the digits refuses.**
+                // `DETERMINISTIC_TYPES` is `identifiers.yaml`'s eight — CH_AVS,
+                // CREDIT_CARD, the two German tax numbers, EMAIL, FR_NIF,
+                // FR_NIR, IBAN — and a span of one of those in a numeric leaf
+                // refuses. An NER label on the same leaf does not; the request
+                // is forwarded with the number in it.
+                //
+                // The reason is what the two halves of the vocabulary are
+                // evidence of. A catalog hit is grounded in the value:
+                // `4111111111111111` is a card because it passes Luhn, and
+                // `9007199254740991` is not because it fails. An NER label on a
+                // bare digit run is grounded in nothing — the model is reading
+                // a shape with no context to read it against. Measured against
+                // the live detector: `"9007199254740991\n\n9007199254740991"`
+                // comes back `PERSON` at 0.723, and that number is
+                // `Number.MAX_SAFE_INTEGER`, which sits twice in this repo's
+                // own tool payload as the `maximum` of `limit` and of `offset`.
+                // Refusing on a type that cannot be decided from the digits
+                // themselves buys no detection and spends real requests:
+                // `{"invoice_ids": [98765432109876, 98765432109877]}` is an
+                // ordinary tool call.
+                //
+                // The evidence that cuts the other way, so that a reader can
+                // weigh it rather than take this on trust. The false-positive
+                // class is narrow: paired unix timestamps, millisecond
+                // timestamps, 14-digit ids, other large powers of two, byte
+                // offsets and `0`/`2000` all come back with nothing, and
+                // *three* repeated bounds come back with nothing where two
+                // fire. The 14-digit ids are the sharpest of these, because
+                // they are the `invoice_ids` case above and they are clean.
+                // Nor does prose reliably suppress it — the two bounds behind
+                // "Maximum number of items" return nothing, but behind "The
+                // maximum number of items to return." they still return
+                // `PERSON`, at 0.784. So the argument here is not frequency. It
+                // is that labelling `Number.MAX_SAFE_INTEGER` a person is wrong
+                // however rarely it happens, and unstable in a way that makes
+                // "how rarely" not a number anyone can hold this to. Someone
+                // who weighs an ungrounded refusal as cheaper than a missed
+                // one should widen this back to `!spans.is_empty()` and say so
+                // here.
+                //
+                // `EMAIL` is in the eight and cannot occur in a numeric leaf.
+                // It stays: the set is "what the detector decides
+                // deterministically", and narrowing it to the subset someone
+                // judged capable of being numeric is the hand-maintained list
+                // this branch has corrected five times.
+                //
+                // The gap that remains is the vocabulary's, not the predicate's:
+                // there is no telephone entity in either catalog, so a phone
+                // number written as a JSON number is forwarded. That is the
+                // same gap it has in ordinary text, and detection-quality work
+                // rather than this slice's.
                 //
                 // Refused here, before the masking loop rather than inside it:
                 // a refusal partway through would have allocated placeholders
@@ -371,7 +437,11 @@ async fn mask_all(
                 // this check is also strictly cheaper than reaching the same
                 // answer later, and it does not depend on that being true.
                 for (leaf, spans) in leaves.iter().zip(&per_leaf) {
-                    if matches!(leaf, mapping::Leaf::Number(_)) && !spans.is_empty() {
+                    if matches!(leaf, mapping::Leaf::Number(_))
+                        && spans.iter().any(|span| {
+                            mapping::DETERMINISTIC_TYPES.contains(&span.entity_type.as_str())
+                        })
+                    {
                         return Err(ProxyError::NumericPersonalData);
                     }
                 }
@@ -1261,6 +1331,85 @@ mod tests {
             "the refusal exists because the value is personal data, so it must \
              not be quoted back: {returned}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_ner_label_on_a_number_does_not_refuse_the_request() {
+        // The ruling, pinned. `PERSON` is a judgement about meaning, and on a
+        // bare digit run there is no meaning to judge — measured against the
+        // live detector, `"9007199254740991\n\n9007199254740991"` comes back
+        // `PERSON`, and that number is `Number.MAX_SAFE_INTEGER`, which this
+        // repo's own tool payload carries twice. So the request goes through,
+        // and the number arrives as a number rather than as its rendering.
+        //
+        // The number is the document's only leaf, so a fixed span cannot land
+        // anywhere but on it.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 16}
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "page",
+                     "input": {"limit": 9_007_199_254_740_991i64}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let sent = sent_to(&upstream).await;
+        let limit = &sent["messages"][0]["content"][0]["input"]["limit"];
+        assert_eq!(
+            limit,
+            &json!(9_007_199_254_740_991i64),
+            "an ungrounded label must not cost the client the request"
+        );
+        assert!(
+            limit.is_number(),
+            "and it arrives as a number, not a string"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deterministic_span_refuses_a_number_an_ner_span_shares() {
+        // "Any deterministic span", not "the first span". Both land on the one
+        // numeric leaf and the NER label is the one the detector reports
+        // first; a predicate that reads only `spans[0]` forwards a card here.
+        //
+        // The two spans are disjoint because `check_spans` refuses overlapping
+        // ones, so they cannot both cover the whole leaf. The digits they
+        // divide are still one leaf, which is what this pins.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 4},
+            {"entity_type": "CREDIT_CARD", "start": 4, "end": 16}
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "pay",
+                     "input": {"card": 4_111_111_111_111_111u64}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "and the card never left the process"
+        );
+        assert_eq!(journal(&path)[0]["error"], "tool_numeric_personal_data");
     }
 
     #[tokio::test]

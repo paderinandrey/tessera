@@ -37,9 +37,17 @@ pub enum MappingError {
     TooDeep,
     #[error("a tool document carries more values than this gateway will walk")]
     TooLarge,
+    /// Two of this gateway's own walks of one document disagreeing about its
+    /// leaves. Never anything a client sent — every walk is over a document
+    /// already accepted — so it is a defect here and carries a 502.
+    ///
+    /// The prefix says "walks" rather than "masked strings" because the
+    /// correspondence it guards is wider than the masking loop: `proxy::mask_all`
+    /// raises it too, when the per-leaf spans `Joined::split` returned do not
+    /// number the leaves `json_leaves` found. Each site says which in `{0}`.
     #[error(
-        "masked strings do not correspond to a document's text leaves ({0}); the request is \
-             refused rather than served with a value misplaced or left in"
+        "this gateway's own walks of a tool document disagree about its leaves ({0}); the \
+             request is refused rather than served with a value misplaced or left in"
     )]
     MaskCountMismatch(&'static str),
     /// Carries the key for tests and logs, deliberately *not* for the message.
@@ -78,7 +86,9 @@ pub const MAX_ENTITY_TYPE: usize = 40;
 /// catalogs disagree, so adding a type stays a deliberate change in two places
 /// rather than a silent divergence.
 pub const ENTITY_TYPES: [&str; 22] = [
-    // Deterministic (identifiers.yaml)
+    // Deterministic (identifiers.yaml) — also listed, and enforced, as
+    // `DETERMINISTIC_TYPES` below. Something reads that partition now, so it
+    // is no longer only a note to the next person editing this array.
     "CH_AVS",
     "CREDIT_CARD",
     "DE_STEUERNUMMER",
@@ -103,6 +113,32 @@ pub const ENTITY_TYPES: [&str; 22] = [
     "SEXUAL_ORIENTATION",
     "SEX_LIFE",
     "TRADE_UNION",
+];
+
+/// The half of `ENTITY_TYPES` the detector decides from the value itself — a
+/// checksum, a format, a grammar — rather than from a model's reading of the
+/// text around it. These are `identifiers.yaml`'s eight; the other fourteen
+/// come from `ner.yaml` and are a judgement about meaning.
+///
+/// The distinction earns a list of its own because `proxy::mask_all` refuses a
+/// request on a span in a *numeric* leaf only when the span's type is one of
+/// these — the reasoning is written where that decision is made. Everywhere
+/// else the two halves are treated alike.
+///
+/// This is not a hand-kept subset. `scripts/check_entity_types.py` holds it to
+/// `identifiers.yaml` exactly and holds the complement to `ner.yaml` exactly,
+/// and `the_deterministic_types_are_a_subset_of_the_vocabulary` below holds it
+/// to `ENTITY_TYPES`, so a ninth identifier fails a check rather than landing
+/// silently on the side of the predicate that does not refuse.
+pub const DETERMINISTIC_TYPES: [&str; 8] = [
+    "CH_AVS",
+    "CREDIT_CARD",
+    "DE_STEUERNUMMER",
+    "DE_STEUER_ID",
+    "EMAIL",
+    "FR_NIF",
+    "FR_NIR",
+    "IBAN",
 ];
 
 /// What a span masks as when its type is not one of ours. The value is hidden
@@ -552,12 +588,16 @@ pub enum Leaf {
     /// straight through — `replace_text_leaves` asks for a replacement per
     /// *text* leaf and this variant is not one.
     ///
-    /// A span found inside one **refuses the request** rather than masking it:
-    /// a schema that declared a number may reject a string, so the outcome for
-    /// a number carrying an identifier is a refusal rather than a placeholder.
-    /// The refusal reaches only as far as `ENTITY_TYPES` does, which has no
-    /// telephone entity — a phone number written as a JSON number is forwarded,
-    /// exactly as it is in prose.
+    /// A `DETERMINISTIC_TYPES` span found inside one **refuses the request**
+    /// rather than masking it: a schema that declared a number may reject a
+    /// string, so the outcome for a number carrying an identifier is a refusal
+    /// rather than a placeholder. An NER span on a numeric leaf does not refuse
+    /// — a label on a bare digit run is grounded in nothing, and the reasoning
+    /// and the counter-evidence are both at the predicate in `proxy::mask_all`.
+    ///
+    /// Even among the eight the refusal reaches only as far as the catalogs do,
+    /// and they have no telephone entity — a phone number written as a JSON
+    /// number is forwarded, exactly as it is in prose.
     Number(String),
 }
 
@@ -1241,6 +1281,51 @@ mod tests {
     }
 
     #[test]
+    fn the_deterministic_types_are_a_subset_of_the_vocabulary() {
+        // Two arrays that must agree, held together here rather than by the
+        // care of whoever edits one of them. A name in `DETERMINISTIC_TYPES`
+        // and not in `ENTITY_TYPES` would be a type the gateway refuses a
+        // number for and then masks as REDACTED everywhere else.
+        for entity_type in DETERMINISTIC_TYPES {
+            assert!(
+                ENTITY_TYPES.contains(&entity_type),
+                "{entity_type} is deterministic but is not in this gateway's vocabulary at all"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_halves_of_the_vocabulary_add_up() {
+        // The subset check above passes if someone adds a ninth identifier to
+        // `ENTITY_TYPES` alone: it is still a superset. This is the half that
+        // notices, because a type added to one list and not the other changes
+        // which side of `proxy::mask_all`'s numeric refusal it lands on — and
+        // the side that does not refuse is the silent one.
+        //
+        // `scripts/check_entity_types.py` is the check that says *which*
+        // catalog a name came from; this one needs no catalogs and runs in the
+        // same `cargo test` as everything else.
+        assert_eq!(
+            ENTITY_TYPES.len() - DETERMINISTIC_TYPES.len(),
+            14,
+            "ENTITY_TYPES is eight identifiers from identifiers.yaml and fourteen NER types \
+             from ner.yaml; if the detector gained one, decide deliberately which list it \
+             belongs in and run `make check-entity-types`"
+        );
+        for entity_type in DETERMINISTIC_TYPES {
+            assert_eq!(
+                DETERMINISTIC_TYPES
+                    .iter()
+                    .filter(|name| **name == entity_type)
+                    .count(),
+                1,
+                "{entity_type} is listed twice, which would make the arithmetic above agree \
+                 while the partition is wrong"
+            );
+        }
+    }
+
+    #[test]
     fn a_schema_does_not_yield_the_property_names_it_states_as_values() {
         // The whole reason `Shape` exists. "Keys are never masked" is a rule
         // about position, and JSON Schema states property names in value
@@ -1366,6 +1451,13 @@ mod tests {
     /// that plus a small MCP server. It is not room for an arbitrary one — see
     /// `config::max_tool_chars` for what that costs and why the answer to a
     /// bigger payload is issue #28 rather than a bigger number.
+    ///
+    /// **This test does not pin the charging rule; it illustrates it.** It sums
+    /// the way `proxy::handle` sums rather than calling `handle`, so a change to
+    /// `handle`'s counting passes here untouched — which is exactly what
+    /// happened once. `proxy::tests::numeric_leaves_count_against_both_tool_bounds`
+    /// goes through the request handler and is the test that fails when the rule
+    /// moves. Read this one for the measurement and that one for the guarantee.
     #[test]
     fn a_real_tool_payload_fits_the_bounds_this_gateway_ships_with() {
         let tools: Vec<Value> =
@@ -1413,6 +1505,13 @@ mod tests {
             })
             .sum();
         assert_eq!(calls, 20, "the figure the call bound is set from");
+        // **This holds at 40 >= 40, exactly, with no headroom**, so one more
+        // tool in the testdata breaks it. That is the assertion working, not a
+        // fragility to file down: the payload is documented above as a floor,
+        // and a floor that moved is a measurement to retake and a default to
+        // reconsider. This branch has already been served once by exactly this
+        // kind of failure, at 18 010 against 18 000. Raise the default or
+        // re-measure; do not relax the rule.
         assert!(
             crate::config::default_max_tool_calls() >= 2 * calls,
             "the default bound must admit twice a real tool payload: {calls} calls \
@@ -1493,15 +1592,20 @@ mod tests {
     /// One thing the measurement found that reading could not. Detection is not
     /// only the checksum layer: NER runs on the same joined text, and on
     /// `"9007199254740991\n\n9007199254740991"` — two big bounds with no prose
-    /// between them — gliner returns `PERSON` at 0.72 and this gateway refuses
-    /// the request. It does not happen in the real payload because the numbers
-    /// sit among 9 005 characters of schema prose that give the model context,
-    /// which is the same reason batching was worth doing. **A document that is
-    /// mostly numbers has no such context**, so the false-positive class is
-    /// real and narrow: repeated long digit runs, alone. Refusing is the
-    /// fail-closed direction, and the fix if it ever bites is to decide which
-    /// entity types may refuse a number, not to stop looking at numbers. See
-    /// `task-6-report.md` for the runs.
+    /// between them — gliner returns `PERSON` at 0.723. **That measurement is
+    /// what narrowed the refusal.** A number refuses only on a
+    /// `DETERMINISTIC_TYPES` span now, so this label costs nobody a request;
+    /// the reasoning, and the evidence against it, are written at the predicate
+    /// in `proxy::mask_all`, which is where someone reversing the decision has
+    /// to read.
+    ///
+    /// Two claims the earlier version of this comment made that later
+    /// measurement did not support, kept here because they are the kind that
+    /// get repeated. Prose does **not** reliably supply the missing context:
+    /// the same two bounds behind "Maximum number of items" return nothing, but
+    /// behind "The maximum number of items to return." still return `PERSON`.
+    /// And *three* repeated bounds return nothing where two fire. The class is
+    /// narrower than "repeated long digit runs" and less orderly.
     #[test]
     fn numeric_leaves_are_a_rounding_error_in_a_real_tool_payload() {
         let tools: Vec<Value> =

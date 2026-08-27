@@ -116,9 +116,46 @@ the schema promised a number, answers with one, and restoration then hands the
 client the wrong type.
 
 Numeric leaves are therefore rendered as text, detected, and the request is
-refused when a span is found. Types stay as the client wrote them, and the cost
-is stated plainly: an agent sending a card number as a JSON number gets a
-refusal with no way around it.
+refused when a span of a **deterministic** type is found — one of
+`identifiers.yaml`'s eight, which the detector decides from the value itself.
+Types stay as the client wrote them, and the cost is stated plainly: an agent
+sending a card number as a JSON number gets a refusal with no way around it.
+
+**Why only those eight, and not all twenty-two.** The first implementation
+refused on any span at all, and the measurement that changed it was taken
+against the running detector: `"9007199254740991\n\n9007199254740991"` comes
+back labelled `PERSON` at 0.723. That number is `Number.MAX_SAFE_INTEGER`, and
+it appears twice in this repo's own transcribed Claude Code tool payload, as the
+`maximum` of `limit` and of `offset`. A catalog hit is grounded in the value —
+`4111111111111111` is a card because it passes Luhn and `9007199254740991` is
+not because it fails — while an NER label on a bare digit run is the model
+reading a shape it has no context for. Refusing on a type that cannot be decided
+from the digits themselves buys no detection and spends real requests:
+`{"invoice_ids": [98765432109876, 98765432109877]}` is an ordinary tool call.
+
+**The evidence against that decision, recorded rather than left out.** The
+false-positive class is narrow. Paired unix timestamps, millisecond timestamps,
+14-digit ids, other large powers of two, byte offsets and `0`/`2000` all come
+back with nothing, and *three* repeated bounds come back with nothing where two
+fire. The 14-digit ids are the sharpest, because they are the `invoice_ids` case
+above and they are clean. Nor does surrounding prose reliably suppress the
+label: the same two bounds behind "Maximum number of items" return nothing, but
+behind "The maximum number of items to return." still return `PERSON`, at 0.784.
+So the argument here is not frequency — it is that labelling
+`Number.MAX_SAFE_INTEGER` a person is wrong however rarely it happens, and
+unstable enough that "how rarely" is not a number anyone can hold the predicate
+to. Someone who weighs an ungrounded refusal as cheaper than a missed one should
+widen it back and record why here.
+
+This is not the fail-open direction. A numeric leaf was forwarded verbatim
+before this slice; the narrowed predicate is still strictly more than the gateway
+had. And it says nothing about NER in general — on prose it is the larger half of
+this gateway's coverage, and no text leaf is touched by any of this.
+
+The partition is structure rather than a comment: `mapping::DETERMINISTIC_TYPES`
+is held to `identifiers.yaml` exactly, and `ENTITY_TYPES` minus it to `ner.yaml`
+exactly, by `scripts/check_entity_types.py`. A ninth identifier fails that check
+instead of landing silently on the side of the predicate that does not refuse.
 
 **What this does not cover, since an earlier draft of this document claimed
 otherwise.** The refusal is only as wide as the vocabulary, and `ENTITY_TYPES`
@@ -395,6 +432,11 @@ hard trade-off, and folding it in here would hide it.
 telephone entity, so nothing detects it — in tool arguments or in ordinary text.
 See the numeric-leaf section; closing it is detection-quality work, like issue
 #20.
+
+**A number an NER label alone finds is forwarded.** Only the eight deterministic
+types refuse a numeric leaf, so a name or a place written as a JSON number goes
+through. That is deliberate and argued in the numeric-leaf section, with the
+measurement on both sides of it.
 
 **A large tool result is refused, not served slowly.** See **Latency**, and
 issue #28, which exists to raise this ceiling.
