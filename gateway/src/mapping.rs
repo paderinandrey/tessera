@@ -542,20 +542,22 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Leaf {
     Text(String),
-    /// Rendered as the client wrote it, and **nothing looks at it yet**.
+    /// Rendered as the client wrote it, and **looked at but never replaced**.
     ///
-    /// The walk yields numbers because they will have to be inspected: a credit
+    /// The walk yields numbers because they have to be inspected: a credit
     /// card, a German tax ID and a French NIR are digits alone, so a document
-    /// whose personal data sits in a numeric leaf is not covered by anything
-    /// this gateway does today — `mask_all` matches this variant and does
-    /// nothing with it, and the rebuild copies the number straight through.
-    /// Task 6 is where the plan schedules detecting them and refusing the
-    /// request when a span is found; until it lands, a numeric leaf reaches the
-    /// provider verbatim. Do not read this variant's existence as coverage.
+    /// whose personal data sits in a numeric leaf would otherwise be covered by
+    /// nothing. `mask_all` joins this rendering into the same detection call the
+    /// document's strings make, and the rebuild still copies the number
+    /// straight through — `replace_text_leaves` asks for a replacement per
+    /// *text* leaf and this variant is not one.
     ///
-    /// What will not change is that a number is never *replaced*: a schema that
-    /// declared a number may reject a string, so the outcome for a number that
-    /// carries an identifier has to be a refusal rather than a placeholder.
+    /// A span found inside one **refuses the request** rather than masking it:
+    /// a schema that declared a number may reject a string, so the outcome for
+    /// a number carrying an identifier is a refusal rather than a placeholder.
+    /// The refusal reaches only as far as `ENTITY_TYPES` does, which has no
+    /// telephone entity — a phone number written as a JSON number is forwarded,
+    /// exactly as it is in prose.
     Number(String),
 }
 
@@ -1335,22 +1337,32 @@ mod tests {
     /// | | measured |
     /// |---|---|
     /// | tools | 10 |
-    /// | leaves (detector calls) | **77** |
-    /// | characters detected | **9 005** |
+    /// | detector calls | **20** |
+    /// | text leaves | 77 |
+    /// | numeric leaves | 12 |
+    /// | characters, text | 9 005 |
+    /// | characters, numeric | 50 |
+    /// | characters, join separators | 138 |
+    /// | **characters charged** | **9 193** |
     /// | serialized bytes | 13 177 |
     ///
-    /// Two things fall out. **The ratio is 1.46x**, so a bound charging
-    /// serialized size charges half again what detection costs. And **cost per
-    /// tool is about 900 characters and 7.7 calls**, of which roughly 500
-    /// characters is the definition's own prose; the rest is schema. What makes
-    /// a tool expensive is `enum`, whose every member is a value the model may
-    /// choose and so is scanned — `Agent` and `Artifact` cost 21 and 24 leaves
-    /// against three to six for a plain tool, so a per-tool average
-    /// underestimates a payload carrying enum-heavy tools.
+    /// Three things fall out. **The ratio is 1.43x**, so a bound charging
+    /// serialized size charges nearly half again what detection costs. **The
+    /// numbers are noise**: twelve leaves and fifty characters, four ten-
+    /// thousandths of the payload, so joining them in — which is what makes
+    /// them detectable at all — costs the bound nothing worth measuring. And
+    /// **cost per tool is about 900 characters and 2 calls**, of which roughly
+    /// 500 characters is the definition's own prose; the rest is schema. What
+    /// makes a tool expensive is `enum`, whose every member is a value the
+    /// model may choose and so is scanned — `Agent` and `Artifact` cost 21 and
+    /// 24 leaves against three to six for a plain tool, so a per-tool average
+    /// underestimates a payload carrying enum-heavy tools. Leaves stopped being
+    /// what a call costs, but they are still what a *character* count is made
+    /// of.
     ///
     /// **Both defaults are set to admit twice this payload**, which is the
     /// stated headroom: a stock fifteen-tool session extrapolates to roughly
-    /// 13 500 characters and 116 calls, and doubling the floor leaves room for
+    /// 13 800 characters and 30 calls, and doubling the floor leaves room for
     /// that plus a small MCP server. It is not room for an arbitrary one — see
     /// `config::max_tool_chars` for what that costs and why the answer to a
     /// bigger payload is issue #28 rather than a bigger number.
@@ -1359,36 +1371,44 @@ mod tests {
         let tools: Vec<Value> =
             serde_json::from_str(include_str!("testdata/claude_code_tools.json")).unwrap();
         assert_eq!(tools.len(), 10);
-        let leaves: usize = tools
-            .iter()
-            .map(|tool| {
-                // One for the definition's own `description`, which is a slot
-                // of its own, plus every text leaf the schema yields.
-                usize::from(tool.get("description").is_some())
-                    + json_leaves(&tool["input_schema"], Shape::Schema)
-                        .unwrap()
-                        .iter()
-                        .filter(|leaf| matches!(leaf, Leaf::Text(_)))
-                        .count()
-            })
-            .sum();
-        assert_eq!(leaves, 77, "the figure the leaf bound is set from");
+        // Both kinds, counted apart, because they are charged the same and
+        // read very differently: the numbers here are schema bounds, and
+        // `numeric_leaves_are_a_rounding_error_in_a_real_tool_payload` below
+        // is where what that costs and what it risks are written down.
+        let mut text_leaves = 0usize;
+        let mut numeric_leaves = 0usize;
+        for tool in &tools {
+            // One for the definition's own `description`, which is a slot of
+            // its own rather than part of any join.
+            text_leaves += usize::from(tool.get("description").is_some());
+            for leaf in json_leaves(&tool["input_schema"], Shape::Schema).unwrap() {
+                match leaf {
+                    Leaf::Text(_) => text_leaves += 1,
+                    Leaf::Number(_) => numeric_leaves += 1,
+                }
+            }
+        }
+        assert_eq!(text_leaves, 77, "text leaves");
+        assert_eq!(
+            numeric_leaves, 12,
+            "numeric leaves, joined into the same calls"
+        );
         // The headroom rule, asserted rather than described. The comment above
         // says both defaults are set to admit twice this payload; without this
         // that is a note somebody can quietly falsify, and `<= measured` alone
         // would pass at a default of 78.
         // What the bound counts now is *calls*, not leaves: one per tool
-        // description, and one per schema that holds any text at all. Leaves
-        // stopped being what costs the moment a document became one call.
+        // description, and one per schema that holds any leaf at all — of
+        // either kind, since numbers go into the same join. Leaves stopped
+        // being what costs the moment a document became one call.
         let calls: usize = tools
             .iter()
             .map(|tool| {
                 usize::from(tool.get("description").is_some())
                     + usize::from(
-                        json_leaves(&tool["input_schema"], Shape::Schema)
+                        !json_leaves(&tool["input_schema"], Shape::Schema)
                             .unwrap()
-                            .iter()
-                            .any(|leaf| matches!(leaf, Leaf::Text(_))),
+                            .is_empty(),
                     )
             })
             .sum();
@@ -1401,30 +1421,36 @@ mod tests {
             crate::config::default_max_tool_calls()
         );
 
-        // The other bound, on the basis it is actually denominated in. Both
-        // figures are asserted so that the gap between them stays visible: a
-        // bound charging serialized size charges 1.49 characters for every one
-        // the detector reads, and would refuse this payload at 10 970 against a
-        // ceiling of 10 000 while the real cost is 7 379.
-        let chars: usize = tools
-            .iter()
-            .map(|tool| {
-                tool["description"]
-                    .as_str()
-                    .map_or(0, |d| d.chars().count())
-                    + json_leaves(&tool["input_schema"], Shape::Schema)
-                        .unwrap()
-                        .iter()
-                        .map(|leaf| match leaf {
-                            Leaf::Text(text) => text.chars().count(),
-                            // Charged nothing because nothing sends it. Task 6
-                            // changes that, and this sum with it.
-                            Leaf::Number(_) => 0,
-                        })
-                        .sum::<usize>()
-            })
-            .sum();
-        assert_eq!(chars, 9_005, "the figure the text bound is set from");
+        // The other bound, summed the way `proxy::handle` sums it: every leaf
+        // of either kind, plus the separators the join inserts between them,
+        // because the detector reads those too. Both figures are asserted so
+        // that the gap between them stays visible — a bound charging serialized
+        // size charges 1.43 characters for every one the detector reads.
+        let mut chars = 0usize;
+        let mut numeric_chars = 0usize;
+        let mut separators = 0usize;
+        for tool in &tools {
+            chars += tool["description"]
+                .as_str()
+                .map_or(0, |d| d.chars().count());
+            let leaves = json_leaves(&tool["input_schema"], Shape::Schema).unwrap();
+            separators += Joined::separator_chars(leaves.len());
+            for leaf in &leaves {
+                match leaf {
+                    Leaf::Text(text) => chars += text.chars().count(),
+                    Leaf::Number(number) => numeric_chars += number.chars().count(),
+                }
+            }
+        }
+        assert_eq!(chars, 9_005, "characters of text");
+        assert_eq!(
+            numeric_chars, 50,
+            "and of number — four ten-thousandths of the payload, which is what \
+             detecting them costs the bound"
+        );
+        assert_eq!(separators, 138, "and what joining the leaves adds");
+        let charged = chars + numeric_chars + separators;
+        assert_eq!(charged, 9_193, "the figure the text bound is set from");
         let serialized: usize = tools
             .iter()
             .map(|tool| {
@@ -1436,10 +1462,81 @@ mod tests {
             "and what charging structure would have cost"
         );
         assert!(
-            crate::config::default_max_tool_chars() >= 2 * chars,
-            "the default bound must admit twice a real tool payload: {chars} characters \
+            crate::config::default_max_tool_chars() >= 2 * charged,
+            "the default bound must admit twice a real tool payload: {charged} characters \
              against a bound of {}",
             crate::config::default_max_tool_chars()
+        );
+    }
+
+    /// What the real payload's *numbers* are, and what a detector could make of
+    /// them.
+    ///
+    /// The false-positive class this task opens, named rather than left to be
+    /// discovered: a schema bound is a digit string and so is a card number.
+    /// `9007199254740991` is `Number.MAX_SAFE_INTEGER`, it appears twice in
+    /// `testdata/claude_code_tools.json`, and it is sixteen digits — inside the
+    /// credit-card recognizer's 14-19 window. What keeps it out is the Luhn
+    /// checksum, which is a property of the detector's recognizers rather than
+    /// of this gateway: nothing here would stop a recognizer that matched on
+    /// length alone from refusing every Claude Code request that carries a
+    /// large integer bound.
+    ///
+    /// **Measured against the running detector**, not reasoned about: all ten
+    /// schemas were joined exactly as `mask_all` joins them and sent to
+    /// `/detect`. Zero spans landed on any number — including both
+    /// `9007199254740991`, which the `credit_card` validator rejects because it
+    /// fails Luhn. A real card in the same position *is* found, so the refusal
+    /// works; it does not fire on this payload because nothing in this payload
+    /// is one.
+    ///
+    /// One thing the measurement found that reading could not. Detection is not
+    /// only the checksum layer: NER runs on the same joined text, and on
+    /// `"9007199254740991\n\n9007199254740991"` — two big bounds with no prose
+    /// between them — gliner returns `PERSON` at 0.72 and this gateway refuses
+    /// the request. It does not happen in the real payload because the numbers
+    /// sit among 9 005 characters of schema prose that give the model context,
+    /// which is the same reason batching was worth doing. **A document that is
+    /// mostly numbers has no such context**, so the false-positive class is
+    /// real and narrow: repeated long digit runs, alone. Refusing is the
+    /// fail-closed direction, and the fix if it ever bites is to decide which
+    /// entity types may refuse a number, not to stop looking at numbers. See
+    /// `task-6-report.md` for the runs.
+    #[test]
+    fn numeric_leaves_are_a_rounding_error_in_a_real_tool_payload() {
+        let tools: Vec<Value> =
+            serde_json::from_str(include_str!("testdata/claude_code_tools.json")).unwrap();
+        let numbers: Vec<String> = tools
+            .iter()
+            .flat_map(|tool| json_leaves(&tool["input_schema"], Shape::Schema).unwrap())
+            .filter_map(|leaf| match leaf {
+                Leaf::Number(number) => Some(number),
+                Leaf::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            numbers,
+            [
+                "0",
+                "9007199254740991",
+                "9007199254740991",
+                "0",
+                "5",
+                "1000",
+                "32",
+                "1",
+                "60",
+                "50",
+                "1",
+                "200"
+            ],
+            "every number a real tool payload carries is a schema bound"
+        );
+        assert_eq!(
+            numbers.iter().filter(|n| n.len() >= 14).count(),
+            2,
+            "and two of them are long enough for the credit-card recognizer to \
+             consider, which is why the Luhn check is load-bearing rather than a detail"
         );
     }
 
@@ -1921,7 +2018,8 @@ mod tests {
         let result = replace_text_leaves(&document, &[], Shape::Instance).unwrap();
         assert_eq!(
             result, document,
-            "a number is copied through untouched — and, until task 6, unexamined"
+            "a number is copied through untouched — examined by the detector, \
+             never rewritten by the rebuild"
         );
     }
 }

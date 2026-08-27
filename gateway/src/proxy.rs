@@ -47,6 +47,17 @@ pub enum ProxyError {
          make for a single request; it is refused rather than forwarded"
     )]
     TooManyToolCalls,
+    /// The message names the failure and never the value. This variant exists
+    /// *because* the number is personal data, so interpolating it into a body
+    /// the client reads would hand back the thing the refusal was for — the
+    /// mistake `MappingError::PlaceholderKey` and `MappingError::Unknown` were
+    /// both corrected for earlier on this branch.
+    #[error(
+        "a number in this request's tool arguments carries personal data; it cannot be \
+         masked without changing the field from a number to a string, so the request is \
+         refused rather than forwarded with the value still in it"
+    )]
+    NumericPersonalData,
 }
 
 impl ProxyError {
@@ -67,7 +78,8 @@ impl ProxyError {
             | ProxyError::Session(SessionError::Disabled)
             | ProxyError::Session(SessionError::NoCredential(_))
             | ProxyError::ToolTooLarge
-            | ProxyError::TooManyToolCalls => StatusCode::BAD_REQUEST,
+            | ProxyError::TooManyToolCalls
+            | ProxyError::NumericPersonalData => StatusCode::BAD_REQUEST,
             // Saturation is this gateway's own capacity rather than anything
             // the caller got wrong, and the same request may well succeed a
             // moment later. No `Retry-After`: the wait is another request's
@@ -122,6 +134,7 @@ impl ProxyError {
             ProxyError::Audit(_) => "audit_write_failed",
             ProxyError::ToolTooLarge => "tool_too_large",
             ProxyError::TooManyToolCalls => "tool_too_many_calls",
+            ProxyError::NumericPersonalData => "tool_numeric_personal_data",
         }
     }
 }
@@ -287,19 +300,37 @@ async fn mask_all(
                 // leaf by leaf, so `mask`, `check_spans`, `reserve_literals`,
                 // placeholder allocation and the positional correspondence
                 // `replace_text_leaves` rests on are all untouched.
-                let texts: Vec<&str> = leaves
+                //
+                // **Numbers join the same call.** A credit card, a German tax
+                // ID and a French NIR are digits alone, so a document whose
+                // personal data sits in a numeric leaf needs the detector to
+                // read it — and it reads it here, in the call the strings are
+                // already making, rather than in a round-trip of its own that
+                // would cost a second charge against `max_tool_calls` and give
+                // back the overhead this whole slice spent itself removing.
+                //
+                // Two consequences, written down rather than hidden. A number
+                // now supplies context to the text leaves around it, so
+                // detection results for documents that already worked may
+                // change; that is the trade batching already made, extended by
+                // one leaf kind. And a span may now straddle a text/number
+                // boundary, refused as `BadSpan("across a joined boundary")` —
+                // the same mechanism as between two strings, and no new
+                // variant.
+                let rendered: Vec<&str> = leaves
                     .iter()
-                    .filter_map(|leaf| match leaf {
-                        mapping::Leaf::Text(text) => Some(text.as_str()),
-                        mapping::Leaf::Number(_) => None,
+                    .map(|leaf| match leaf {
+                        mapping::Leaf::Text(text) => text.as_str(),
+                        mapping::Leaf::Number(number) => number.as_str(),
                     })
                     .collect();
-                let per_leaf = if texts.is_empty() {
-                    // A document of numbers and nothing else asks the detector
-                    // nothing, exactly as it did before.
+                let per_leaf = if rendered.is_empty() {
+                    // A document with no leaves at all asks the detector
+                    // nothing: `{}`, or one whose every field is a boolean or a
+                    // null, both of which `json_leaves` skips.
                     Vec::new()
                 } else {
-                    let joined = mapping::Joined::of(&texts);
+                    let joined = mapping::Joined::of(&rendered);
                     let spans = detector.detect(joined.text(), credential).await?;
                     total += spans.len();
                     // Read off the joined text with the spans as the detector
@@ -314,24 +345,43 @@ async fn mask_all(
                     mapping::check_spans(joined.text(), &spans)?;
                     joined.split(&spans)?
                 };
-                let mut spans_for = per_leaf.into_iter();
+                // `split` returns one entry per leaf of either kind, so this
+                // and the loop below line up with `leaves` position for
+                // position — the same correspondence `replace_text_leaves`
+                // rests on, and it checks the count itself if the two ever
+                // disagree.
+                //
+                // **A number is looked at and never replaced.** `[CREDIT_CARD_1]`
+                // in a field a schema declared numeric is a type error the
+                // client sees, and one the model may imitate in the next turn;
+                // so a span found in a number refuses the request instead.
+                //
+                // The refusal is only as wide as the vocabulary. `ENTITY_TYPES`
+                // holds eight identifiers — CH_AVS, CREDIT_CARD, the two German
+                // tax numbers, EMAIL, FR_NIF, FR_NIR, IBAN — and no telephone
+                // entity at all, so a phone number written as a JSON number is
+                // still forwarded. That is the same gap it has in ordinary
+                // text, and detection-quality work rather than this slice's.
+                //
+                // Refused here, before the masking loop rather than inside it:
+                // a refusal partway through would have allocated placeholders
+                // for a request that is never sent. `handle` masks into a clone
+                // of the session's mapping and only commits it after the last
+                // `?`, so those placeholders would in fact be discarded — but
+                // this check is also strictly cheaper than reaching the same
+                // answer later, and it does not depend on that being true.
+                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                    if matches!(leaf, mapping::Leaf::Number(_)) && !spans.is_empty() {
+                        return Err(ProxyError::NumericPersonalData);
+                    }
+                }
                 let mut replacements = Vec::new();
-                for leaf in &leaves {
-                    match leaf {
-                        mapping::Leaf::Text(text) => {
-                            let spans = spans_for.next().unwrap_or_default();
-                            replacements.push(mapping.mask(text, &spans)?);
-                        }
-                        // Deliberately nothing, and deliberately not covered:
-                        // a numeric leaf is never sent to the detector, so a
-                        // card number or a numeric tax ID sitting in one reaches
-                        // the provider verbatim. Task 6 is where the plan puts
-                        // detecting them and refusing the request when a span is
-                        // found — refusing rather than masking, because a schema
-                        // that declared a number may reject a string. Anything
-                        // that reads as though numbers are handled today is
-                        // wrong; see `mapping::Leaf::Number`.
-                        mapping::Leaf::Number(_) => {}
+                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                    // The number's own entry is dropped: the rebuild copies it
+                    // through untouched, and `replace_text_leaves` asks for a
+                    // replacement per *text* leaf.
+                    if let mapping::Leaf::Text(text) = leaf {
+                        replacements.push(mapping.mask(text, spans)?);
                     }
                 }
                 let rebuilt = mapping::replace_text_leaves(&document, &replacements, *shape)?;
@@ -418,9 +468,11 @@ async fn handle(
     // the caller waits out nearly the whole cost to be told no. `json_leaves`
     // is a pure walk with no I/O, so the price is walking each document twice.
     //
-    // A numeric leaf is charged nothing because nothing sends it anywhere; see
-    // `mapping::Leaf::Number`. Task 6 gives numbers to the detector, and both
-    // counts here have to start including them on that day.
+    // A numeric leaf is charged like any other, because it is joined into the
+    // same detection call the strings make: its rendered digits are characters
+    // the detector reads, and it occupies a place in the join that costs a
+    // separator. A document of numbers and nothing else is therefore one call
+    // rather than none.
     let mut tool_calls = 0usize;
     let mut tool_chars = 0usize;
     for slot in &slots {
@@ -441,16 +493,18 @@ async fn handle(
                 let document = read_document(&body, pointer, *embedded, provider.name())?;
                 let mut leaves = 0usize;
                 for leaf in mapping::json_leaves(&document, *shape)? {
-                    if let mapping::Leaf::Text(text) = leaf {
-                        leaves += 1;
-                        tool_chars += text.chars().count();
-                    }
+                    leaves += 1;
+                    tool_chars += match leaf {
+                        mapping::Leaf::Text(text) => text.chars().count(),
+                        mapping::Leaf::Number(rendered) => rendered.chars().count(),
+                    };
                 }
-                // One call for the document however many strings are in it,
-                // and none at all for a document holding no text. This is the
-                // whole of what batching changed about the bounds: the count
-                // moved from strings to round-trips, and the strings stopped
-                // being what costs.
+                // One call for the document however many leaves are in it, and
+                // none at all for a document holding none — `{}`, or one whose
+                // every field is a boolean or a null, which the walk skips.
+                // This is the whole of what batching changed about the bounds:
+                // the count moved from strings to round-trips, and the strings
+                // stopped being what costs.
                 if leaves > 0 {
                     tool_calls += 1;
                 }
@@ -1129,19 +1183,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_numeric_leaf_is_never_shown_to_the_detector_and_reaches_the_upstream_intact() {
-        // The never-detected half, pinned rather than described. A card number
-        // or a numeric tax ID in a tool argument is not covered by anything
-        // this gateway does today: no detector call is made for it, and it
-        // travels verbatim. `a_number_survives_replacement_with_its_type_intact`
-        // pins that a number is never *replaced*, which is a different claim
-        // and stays true after task 6.
+    async fn a_document_of_numbers_alone_is_one_detector_call_and_reaches_the_upstream_intact() {
+        // This test used to assert the opposite — that a numeric leaf is never
+        // shown to the detector — and it was written to fail on the day that
+        // stopped being true rather than let the old promise persist beside the
+        // new one. This is that day, and this is what replaces it.
         //
-        // **Task 6 should have to delete this test.** That is what it is for:
-        // the day numbers are detected and a span refuses the request, this
-        // asserts the opposite of the intended behaviour and fails loudly
-        // rather than letting the old promise persist beside the new one.
-        let detector = detector_returning(person_span()).await;
+        // The float earns its place separately from the card: `1.5` is a leaf
+        // whose rendering has to survive a round trip through the detector's
+        // view of it and come back a float, not the string `"1.5"`.
+        // `a_number_survives_replacement_with_its_type_intact` in `mapping`
+        // pins the same claim one layer down.
+        let detector = detector_returning_expecting(json!([]), Some(1)).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
         let (status, returned) = call(
@@ -1157,15 +1210,129 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{returned}");
-        assert!(
-            detector.received_requests().await.unwrap().is_empty(),
-            "a document of numbers alone asks the detector nothing"
+        let seen = &detector.received_requests().await.unwrap()[0];
+        let asked: Value = serde_json::from_slice(&seen.body).expect("a JSON body");
+        assert_eq!(
+            asked["text"], "4111111111111111\n\n1.5",
+            "both numbers went in one call, rendered as the client wrote them"
         );
         let sent = sent_to(&upstream).await;
         assert_eq!(
             sent["messages"][0]["content"][0]["input"],
             json!({"card": 4_111_111_111_111_111i64, "ratio": 1.5}),
             "and every number reached the provider exactly as the client wrote it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_number_carrying_personal_data_refuses_the_request() {
+        // The number is the document's only leaf, so a fake detector returning
+        // a fixed span cannot land it anywhere but on the number: if this
+        // passes for the wrong reason it is not because the span drifted into
+        // a neighbouring string.
+        let detector = detector_returning(json!([
+            {"entity_type": "CREDIT_CARD", "start": 0, "end": 16}
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "pay",
+                     "input": {"card": 4_111_111_111_111_111u64}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "and the number never left the process"
+        );
+        let line = &journal(&path)[0];
+        assert_eq!(line["error"], "tool_numeric_personal_data");
+        assert_eq!(line["status"], 400);
+        assert!(
+            !returned.contains("4111"),
+            "the refusal exists because the value is personal data, so it must \
+             not be quoted back: {returned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_number_the_detector_passes_is_forwarded_unchanged() {
+        // The other half of the branch. Refusing every numeric leaf would
+        // satisfy the test above and break every schema bound in real traffic,
+        // and rendering the number back as the string the detector was shown
+        // would break the schema that declared it numeric.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "pay",
+                     "input": {"card": 4_111_111_111_111_111u64}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let sent = sent_to(&upstream).await;
+        let card = &sent["messages"][0]["content"][0]["input"]["card"];
+        assert_eq!(
+            card,
+            &json!(4_111_111_111_111_111u64),
+            "the number must reach the provider as the number the client wrote"
+        );
+        assert!(card.is_number(), "and as a number, not as its rendering");
+    }
+
+    #[tokio::test]
+    async fn a_number_beside_text_does_not_move_the_texts_spans() {
+        // Both leaves go into one detection call, so the text no longer starts
+        // at zero. The offsets here are the detector's view of the joined text
+        // — `card` sorts before `note`, so the sixteen digits come first and
+        // `Weber` begins after the separator, at 18. An implementation that
+        // joins the number in without extending the split correspondence
+        // rebases this span against the wrong leaf, or refuses it as out of
+        // range.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 18, "end": 23}
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "pay",
+                     "input": {"card": 4_111_111_111_111_111u64, "note": "Weber"}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let sent = sent_to(&upstream).await;
+        let input = &sent["messages"][0]["content"][0]["input"];
+        assert_eq!(
+            input["note"], "[PERSON_1]",
+            "the span fell inside the text leaf and had to mask all of it: {input}"
+        );
+        assert_eq!(
+            input["card"],
+            json!(4_111_111_111_111_111u64),
+            "and the number beside it is untouched: {input}"
         );
     }
 
@@ -1450,6 +1617,65 @@ mod tests {
             state,
             "/v1/chat/completions",
             json!({"model": "gpt", "messages": messages}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("detector calls"),
+            "refused by the call bound rather than the text bound: {body}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "neither refusal may cost the caller an upstream call"
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_leaves_count_against_both_tool_bounds() {
+        // A numeric leaf is joined into the document's detection call, so its
+        // digits are characters the detector reads and its place in the join
+        // costs a separator. Charged nothing — which is what they were before
+        // they were detected at all — a document of numbers would be a call
+        // and a payload that neither bound had counted.
+        //
+        // Digits only, so nothing here could be refused by a text leaf
+        // instead. 1 200 leaves of sixteen digits is 19 200 characters plus
+        // 2 398 of separator, against a test ceiling of 20 000.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let numbers: Vec<Value> = (0..1_200)
+            .map(|_| json!(9_007_199_254_740_991i64))
+            .collect();
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {"bounds": numbers}}
+            ]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("more text than"),
+            "refused by the text bound: {body}"
+        );
+
+        // And the call bound, which is the count that changed shape: a
+        // document of numbers and nothing else used to cost zero calls, so
+        // any number of them passed. It is one call each now.
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let blocks: Vec<Value> = (0..(TEST_MAX_TOOL_CALLS + 1))
+            .map(|n| {
+                json!({"type": "tool_use", "id": format!("t{n}"), "name": "f",
+                            "input": {"n": 1}})
+            })
+            .collect();
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({"model": "claude",
+                   "messages": [{"role": "assistant", "content": blocks}]}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
