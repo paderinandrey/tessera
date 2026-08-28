@@ -226,16 +226,18 @@ Restoration is narrower than that, and the difference is measured rather than as
 Anthropic's response path is a closed list of block *types* — a block whose type it cannot
 read refuses the response rather than handing a placeholder over — and OpenAI's is not: it
 restores a choice's `content` and forwards every other field of the message as the provider
-sent it. Two qualifications on the Anthropic half, both of them measured. The type check
-ran *second* until recently, after a check for a `text` field, so a block carrying a `text`
+sent it. Two things were measured wrong on the Anthropic half and both are now closed. The
+type check ran *second*, after a check for a `text` field, so a block carrying a `text`
 never reached the closed list at all: `{"type": "tool_use", "text": "ok", "input": {...}}`
 had its text described and its arguments forwarded unrestored, which is a placeholder
-reaching a client that *executes* it. And the list is closed on the type only — a field the
-block's type does not define is still handed over as the provider wrote it, which is what
-`citations[].cited_text` would be if the request path ever admitted citations. A
-`refusal`, which any OpenAI refusal populates, and an `annotations[].url_citation.title`
-both reach the client **with this gateway's own placeholder in them**. That is the one
-direction the design is not yet closed in, and closing it means closing the list rather
+reaching a client that *executes* it. And the list was closed on the type alone, so a field
+the block's type does not define was handed over as the provider wrote it — measured, at
+200, with `citations[].cited_text` carrying `[PERSON_1]` into what the client received.
+Anthropic's response blocks now have a closed list of *fields* as well as of types, and a
+field outside it refuses the response. **OpenAI's response path has neither**: a `refusal`,
+which any OpenAI refusal populates, and an `annotations[].url_citation.title` both reach
+the client **with this gateway's own placeholder in them**. That is the one direction the
+design is not closed in, it is filed as #31, and closing it means closing the list rather
 than naming those two fields.
 
 Two things it does not scan, and both are worth knowing before you rely on the sentence

@@ -1624,13 +1624,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_response_tool_use_block_carrying_a_text_field_has_its_input_restored() {
+    async fn a_response_tool_use_block_carrying_a_text_field_is_refused() {
         // The response half, and the half of the promise that is not about the
         // provider: this is a placeholder reaching a client that *acts on it*.
         // The `text` check ran before the `type` check, so a block carrying
         // both pushed the text slot and skipped the block — `input` was never
         // restored and the client opened `/home/[PERSON_1]/notes.txt`.
         // Measured at 8b6061d, in what the client received.
+        //
+        // **The answer this pins changed at 6f013b9+1, and deliberately.** The
+        // ordering fix made this body a 200 with the path restored; the closed
+        // field list makes it a 502, because `text` is not a field a `tool_use`
+        // block defines and a field the type does not define is refused rather
+        // than forwarded. The assertion that carries the promise is the second
+        // one, and it held under both: no placeholder reaches the client.
         let detector = detector_finding_weber().await;
         let upstream = upstream_returning(
             "/v1/messages",
@@ -1645,15 +1652,144 @@ mod tests {
             json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
         )
         .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !body.contains("PERSON_1"),
+            "a placeholder reached the client: {body}"
+        );
+
+        // And the shape Anthropic actually documents still works, which is what
+        // makes the refusal above cost nothing: `id` and `name` are forwarded as
+        // the model wrote them and `input` is restored.
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "read_file",
+                                "input": {"path": "/home/[PERSON_1]/notes.txt"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(
             body.contains("/home/Weber/notes.txt"),
             "the arguments the client executes were not restored: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_citation_carrying_a_placeholder_is_refused_rather_than_returned() {
+        // The whole of this round, in what the client receives. A `text` block's
+        // top-level `text` was restored and every other field of it was handed
+        // over exactly as the provider wrote it — so a `citations[].cited_text`
+        // carrying `[PERSON_1]` was the gateway returning its own placeholder as
+        // quoted source material. Measured at 6f013b9: 200, with
+        // `"cited_text":"[PERSON_1] lives here"` in the body.
+        //
+        // The cost of closing it is zero on traffic this gateway admitted: the
+        // request-side allowlist refuses every block that can enable citations,
+        // so a compliant provider answering an accepted request cannot produce
+        // one. Where it does fire, the alternative was the placeholder.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "text", "text": "ok", "citations": [
+                {"type": "char_location", "cited_text": "[PERSON_1] lives here",
+                 "document_index": 0, "document_title": "d",
+                 "start_char_index": 0, "end_char_index": 21}]}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a shape this gateway cannot restore is the provider's fault: {body}"
+        );
         assert!(
             !body.contains("PERSON_1"),
             "a placeholder reached the client: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_null_citations_every_text_block_carries_is_served() {
+        // The other half of the same list, and the reason `citations` is *on*
+        // it rather than left off. Anthropic documents `citations` as required
+        // and nullable on a response `text` block, so `"citations": null` rides
+        // on every text block of every well-formed response. A closed list that
+        // omitted the key would refuse all of them — the round's fix would have
+        // been a 502 on ordinary traffic, which is the opposite of the promise.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "text", "text": "Hallo [PERSON_1]", "citations": null}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("Hallo Weber"), "not restored: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_block_restores_the_fields_no_slot_addresses() {
+        // The streamed path does **not** have the gap the buffered one had, and
+        // this pins the reason rather than the absence. `proxy::serve` starts
+        // from the upstream body and writes only the slots, so an undescribed
+        // field travels verbatim; `stream::handle` restores the whole event and
+        // *then* rewrites the slots, so an undescribed field is restored like
+        // any other string. Same shape, opposite outcome: the `cited_text` that
+        // reaches the client here is `Weber`, not `[PERSON_1]`.
+        //
+        // So there is nothing to refuse here, which is just as well: a stream
+        // cannot refuse after its first bytes have gone out — the position
+        // `reject_streamed_tools` already records.
+        let detector = detector_returning(person_span()).await;
+        let upstream = MockServer::start().await;
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\
+             \"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\",\
+             \"citations\":[{\"type\":\"char_location\",\
+             \"cited_text\":\"[PERSON_1] lives here\"}]}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\
+             \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(body.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "stream": true,
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            served.contains(&format!("{SECRET} lives here")),
+            "the citation the slot path does not address was not restored: {served}"
+        );
+        assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
     }
 
     /// A detector that finds `Weber` inside `Martina Weber` at the offsets it

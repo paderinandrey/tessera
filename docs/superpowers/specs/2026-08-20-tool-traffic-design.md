@@ -641,6 +641,18 @@ in the direction it was chosen for — a field no slot addresses would otherwise
 travel exactly as the caller wrote it — and the follow-up for citations is to
 describe `cited_text` as a slot rather than leave the feature closed.
 
+The **response** path refuses them too, and that is a second narrowing recorded
+rather than assumed: a response block now carries a closed list of fields as
+well as of types, so a populated `citations` is a 502 where it used to be a 200
+with the gateway's own placeholder inside `cited_text`. The refusal cannot fire
+on traffic this gateway accepted — no request the allowlist admits can enable
+citations — so its cost falls only on a provider answering in a shape we did not
+ask for, where the alternative was handing the placeholder to the client. The
+`"citations": null` Anthropic sends on **every** response text block is admitted,
+because a list that omitted the key would refuse every well-formed response.
+Describing `cited_text` as a slot is one change across three sites: the request
+allowlist, the response dispatch, and the response field list.
+
 **Masking tool definitions degrades tool selection, measurably.** The decision
 above accepted this in principle; here is the number. Ten real Claude Code tool
 definitions, containing no personal data whatsoever, yield **thirteen spans** —

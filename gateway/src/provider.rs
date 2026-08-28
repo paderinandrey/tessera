@@ -299,7 +299,8 @@ fn reject_streamed_tools(
 /// the code did not have, and prose is what failed each time, so the answer is
 /// a value the code consumes instead of a sentence the next person reads.
 ///
-/// The six answers, and every one of them is an answer somebody actually gave:
+/// The seven answers, and every one of them is an answer somebody actually
+/// gave:
 ///
 /// - `Described` — a slot addresses it, so masking reads the value and it is
 ///   not raw egress. `description`, `input_schema`, `parameters`, `arguments`,
@@ -331,9 +332,16 @@ fn reject_streamed_tools(
 ///   checks it. Explicitly null passes: an SDK serializing its default is not
 ///   a request to use the field, the same reading `tools`, `thinking`,
 ///   `logprobs`, `audio` and `content` already get.
+/// - `Nothing` — the provider *always sends this key*, and no slot addresses
+///   what it can carry, so the only admissible values are the ones that carry
+///   nothing: explicitly null, or an empty list. Anything else refuses. This is
+///   the answer for a field this gateway cannot restore but cannot simply leave
+///   off the list either, because leaving it off would refuse every well-formed
+///   response. `logprobs_carry_nothing` is the same reading, written for one
+///   field before there was a variant for it.
 /// - `Object` — a nested allowlist, read by this same function.
 ///
-/// A seventh answer is not on this list on purpose: there is no "forwarded, and
+/// An eighth answer is not on this list on purpose: there is no "forwarded, and
 /// nobody has looked at it". A key with no answer does not go on a list.
 /// Three of these carry a payload and three do not, and the split is not a
 /// stylistic one: a payload here has to be something the *checking* reads.
@@ -355,6 +363,8 @@ enum Admits {
     /// A value from the provider's own vocabulary that this gateway cannot
     /// enumerate, held to the grammar every one of them is written in.
     Token,
+    /// Nothing this gateway can restore — so nothing is what it admits.
+    Nothing,
     /// The nested allowlist, and what to call it when it refuses.
     Object(&'static str, &'static [Field]),
 }
@@ -411,6 +421,16 @@ impl Field {
         Field {
             key,
             admits: Admits::Token,
+        }
+    }
+    /// The `follow_up` is the name of the work that turns this refusal back
+    /// into a working feature. It is not stored, for the reason `elsewhere`'s
+    /// `check` is not stored; requiring it is what stops an entry meaning
+    /// "refused, and nobody intends to do anything about it".
+    const fn nothing(key: &'static str, _follow_up: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Nothing,
         }
     }
     const fn object(key: &'static str, what: &'static str, fields: &'static [Field]) -> Self {
@@ -716,6 +736,14 @@ fn known_value(
             }
             _ => Err(refuse()),
         },
+        // Null is already `Ok` above; an empty list carries as little, and
+        // `logprobs_carry_nothing` reads both the same way for the same reason.
+        // A populated one is the whole hazard: `citations[].cited_text` is
+        // quoted source material this gateway cannot restore.
+        Admits::Nothing => match value {
+            Value::Array(items) if items.is_empty() => Ok(()),
+            _ => Err(refuse()),
+        },
         // The nested list names itself, so a bad `cache_control` says
         // `cache_control field` wherever it was reached from.
         Admits::Object(nested, fields) => known_fields(value, fields, nested, provider),
@@ -900,25 +928,22 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
 /// citations nothing, and the alternative is forwarding quoted documents
 /// unmasked.
 ///
-/// **What this list does not do is keep the response path safe.** That claim
-/// was here, and it was too strong. `Anthropic::response_pointers` hands the
-/// client every field of a block that the block's *type* does not define,
-/// exactly as the provider wrote it — `citations[].cited_text` included — so a
-/// response carrying citations returns the gateway's own placeholders to the
-/// caller. What was offered as the reason nothing arrives that way was this
-/// list: no request it admits can enable citations. **That is an argument about
-/// citations, and it covered a second hazard it was never about** — a block
-/// arriving in a shape we did not expect, which needs no feature enabled at
-/// all. That one is closed now, in `response_pointers`, by reading the block's
-/// type before its fields; it was a `{"type": "tool_use", "text": ...}` block
-/// handing the client an unrestored `input`.
+/// **This list never kept the response path safe, and it was twice claimed to.**
+/// The claim was that no request it admits can enable citations, so nothing can
+/// come back carrying them. That is an argument about citations, and it covered
+/// two hazards it was never about: a block arriving in a shape we did not
+/// expect, and a field the block's type does not define being forwarded to the
+/// client exactly as the provider wrote it. Both are closed now, and neither is
+/// closed *here* — `response_pointers` reads the block's type first, and
+/// `anthropic_response_block_fields` is that path's own closed list, derived
+/// from Anthropic's response shape rather than from this one.
 ///
-/// What remains true, stated as a residual rather than as a guarantee: nothing
-/// in `response_pointers` restores an undescribed field, and no request this
-/// list admits can enable citations today. The recorded follow-up — describe
-/// `cited_text` as a slot rather than leave the feature closed — has to land on
-/// both paths in one change, because the request-side half alone would start
-/// producing responses whose `cited_text` the response side does not restore.
+/// The two lists are siblings, not copies. `cache_control` is on every list
+/// here and on neither of those; `citations` is refused outright here and
+/// admitted there in the null form Anthropic sends on every text block. The
+/// citations follow-up — describe `cited_text` as a slot rather than leave the
+/// feature closed — still has to land on all three sites in one change: this
+/// list, that dispatch, and that list.
 ///
 /// An empty slice means a type this function does not know. Those are left to
 /// the dispatch below, which refuses them for being unrecognized rather than
@@ -976,6 +1001,71 @@ fn content_block_fields(kind: &str) -> &'static [Field] {
         "audio" => &AUDIO,
         "tool_use" => &TOOL_USE,
         "tool_result" => &TOOL_RESULT,
+        _ => &[],
+    }
+}
+
+/// Fields a block **in Anthropic's response** may carry, by block type — the
+/// other half of `content_block_fields`, and deliberately not the same lists.
+///
+/// A request block is an object the caller fills in; a response block is what
+/// the model produced. So these are derived from Anthropic's published response
+/// shape rather than mirrored from the request side, and they differ in both
+/// directions:
+///
+/// - `cache_control` is on every request list and on neither of these. It is a
+///   caching directive the *caller* attaches to content it sends; Anthropic's
+///   response blocks do not carry one. Admitting it here would be this file
+///   describing a field the provider never sends, which is the same defect as
+///   failing to describe one it does.
+/// - `citations` is on neither request list — the request path refuses a block
+///   carrying it — and it **has to be here**, because Anthropic documents it as
+///   required and nullable on a response `text` block: every text block carries
+///   `"citations": null`, so a list that omitted the key would refuse every
+///   well-formed response this gateway has ever served (measured: `{"type":
+///   "text", "text": "...", "citations": null}` is a 200 today, and stays one).
+///   `Admits::Nothing` is that distinction — the key is admitted, and only in
+///   the forms that carry no text.
+///
+/// **What this refuses that used to be forwarded:** a populated `citations`,
+/// whose `cited_text` is quoted source material carrying this gateway's own
+/// placeholders. `{"cited_text": "[PERSON_1] lives here"}` reached the client
+/// verbatim (measured, at 6f013b9, in what the client received). The
+/// alternative to refusing was handing over the placeholder, which is the
+/// failure restoration exists to prevent; and the refusal cannot fire on
+/// traffic this gateway admitted, because the request-side allowlist refuses
+/// every block that can enable citations. **Refusing is not the finished
+/// feature**: describing `cited_text` as a slot — on the request allowlist,
+/// this dispatch, and this list, in one change — is what turns it back into
+/// one. Until then the `Nothing` entry is where that debt is recorded.
+///
+/// An empty slice means a type this function does not know, left to the
+/// dispatch in `response_pointers`, which refuses it for being unreadable.
+fn anthropic_response_block_fields(kind: &str) -> &'static [Field] {
+    /// As `content_block_fields`' `TYPE`: `kind` *is* this string, and two
+    /// checks on one value drift.
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `kind` that chose this arm");
+    const TEXT: [Field; 3] = [
+        TYPE,
+        Field::described("text"),
+        Field::nothing(
+            "citations",
+            "describing `cited_text` as a slot on both paths",
+        ),
+    ];
+    // `id` and `name` are dispatch here as on the request side, with one
+    // difference worth stating: the model chose these strings, not the caller.
+    // The type check is what stops a structured value travelling unscanned;
+    // the characters are forwarded as the model wrote them, deliberately.
+    const TOOL_USE: [Field; 4] = [
+        TYPE,
+        Field::dispatch("id"),
+        Field::dispatch("name"),
+        Field::described("input"),
+    ];
+    match kind {
+        "text" => &TEXT,
+        "tool_use" => &TOOL_USE,
         _ => &[],
     }
 }
@@ -1521,14 +1611,31 @@ impl Provider for Anthropic {
             // does. The same reading has to apply to a provider. A refusal
             // upstream of here is not a guard here.
             //
-            // What is still true, and belongs in the citations follow-up
-            // rather than in an argument for this ordering: a field the block's
-            // type does not define is forwarded to the client exactly as the
-            // provider wrote it, `citations[].cited_text` included. Dispatching
-            // on the type does not close that; describing `cited_text` as a
-            // slot on both paths does.
-            match block.get("type").and_then(Value::as_str) {
-                Some("text") => match block.get("text") {
+            // The type dispatch was half the fix and the comment used to say
+            // so: a field the type does *not* define was still forwarded to the
+            // client exactly as the provider wrote it. The other half is below
+            // — a closed field list per type, `content_block_fields`' rule on
+            // the path it had not reached either. `citations[].cited_text` was
+            // the live case: `{"cited_text": "[PERSON_1] lives here"}` reached
+            // the client verbatim (measured, at 6f013b9).
+            //
+            // Refusing rather than forwarding is the same policy the `_` arm
+            // below already applied to an unknown *type*; applying it to an
+            // unknown *field* is that policy on the rest of its surface. It
+            // spends the caller's tokens before it fires — and it can only fire
+            // on a response no request this gateway accepted could have asked
+            // for, since the request-side allowlist refuses every block that
+            // can enable citations. Zero cost on correct traffic, and on
+            // incorrect traffic the alternative is the placeholder.
+            let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+            // Checked before the dispatch, so a block is refused for what it
+            // carries as readily as for what it is — `content_pointers`' order.
+            let allowed = anthropic_response_block_fields(kind);
+            if !allowed.is_empty() {
+                known_fields(block, allowed, "response content block field", "anthropic")?;
+            }
+            match kind {
+                "text" => match block.get("text") {
                     Some(Value::String(_)) => {
                         pointers.push(Slot::text(format!("/content/{index}/text")));
                     }
@@ -1540,7 +1647,7 @@ impl Provider for Anthropic {
                 // A tool_use block's arguments carry the placeholders we
                 // issued, and the client executes them. Its `id` and `name`
                 // are dispatch and are left exactly as the model wrote them.
-                Some("tool_use") => {
+                "tool_use" => {
                     if block.get("input").is_some() {
                         pointers.push(Slot::Json {
                             pointer: format!("/content/{index}/input"),
@@ -1765,6 +1872,14 @@ mod tests {
                 content_block_fields("tool_result"),
             ),
             (
+                "anthropic_response_block_fields(text)",
+                anthropic_response_block_fields("text"),
+            ),
+            (
+                "anthropic_response_block_fields(tool_use)",
+                anthropic_response_block_fields("tool_use"),
+            ),
+            (
                 "anthropic_tool_choice_fields(auto)",
                 anthropic_tool_choice_fields("auto"),
             ),
@@ -1807,7 +1922,8 @@ mod tests {
                     | Admits::Bool
                     | Admits::Token
                     | Admits::Elsewhere
-                    | Admits::Unscanned => {}
+                    | Admits::Unscanned
+                    | Admits::Nothing => {}
                     Admits::OneOf(values) => assert!(
                         !values.is_empty(),
                         "{list}/{} admits one of nothing, which is a refusal \
@@ -1861,9 +1977,10 @@ mod tests {
             }
         }
         assert_eq!(
-            dispatch, 10,
-            "each of these is a caller-chosen string this gateway forwards on purpose, so \
-             adding one is a decision and not a discovery"
+            dispatch, 12,
+            "each of these is a string this gateway forwards on purpose — the caller's on a \
+             request, the model's on a response — so adding one is a decision and not a \
+             discovery"
         );
     }
 
@@ -3698,18 +3815,43 @@ mod tests {
         //
         // The direction matters. On the request path an unread field leaks to
         // a provider; here it hands a placeholder to a client that acts on it.
+        //
+        // **This fixture changed answer when the closed field list landed, and
+        // the change is the point.** `text` is not a field a `tool_use` block
+        // defines, and the list runs before the dispatch — so the block is now
+        // refused rather than described-by-type-and-forwarded. Refusing is the
+        // stricter answer to the same question and the client is no worse off:
+        // it received the restored path before and receives a 502 now, and in
+        // neither case a placeholder. The variant here is `Unsupported`;
+        // `as_response_error` at the one call site re-blames it to `Response`,
+        // which is the 502 the proxy test measures.
         let mixed = json!({"content": [
             {"type": "tool_use", "id": "t1", "name": "read_file", "text": "ok",
              "input": {"path": "/home/[PERSON_1]/notes.txt"}}
         ]});
-        assert_eq!(
-            Anthropic.response_pointers(&mixed).unwrap(),
-            vec![Slot::Json {
-                pointer: "/content/0/input".to_owned(),
-                embedded: false,
-                shape: Shape::Instance,
-            }],
-            "the block's type says which field is restored, not whichever field is present"
+        assert!(
+            matches!(
+                Anthropic.response_pointers(&mixed),
+                Err(ShapeError::Unsupported("anthropic", _))
+            ),
+            "a field the block's type does not define is refused, not forwarded"
+        );
+
+        // The ordering itself still needs a fixture the list cannot answer for,
+        // or reverting `type`-before-`text` would break nothing a test can see.
+        // A type this gateway does not know gets an empty list and no field
+        // check, so the dispatch is the only thing standing between the client
+        // and an unrestored `thinking` — exactly the shape the ordering fix was
+        // for, one block type over.
+        let unknown = json!({"content": [
+            {"type": "thinking", "text": "ok", "thinking": "[PERSON_1] wrote it"}
+        ]});
+        assert!(
+            matches!(
+                Anthropic.response_pointers(&unknown),
+                Err(ShapeError::Response("anthropic"))
+            ),
+            "a block carrying a `text` is still read by its type first"
         );
 
         // A block with no type is one we cannot read, and the refusal that was
