@@ -302,7 +302,11 @@ The type is checked before the call now, so the same refusal costs nothing. What
 the tools the **caller** runs — `bash_*`, `text_editor_*`, `computer_*`, `memory_*` — whose
 results come back as the ordinary `tool_result` the caller sends, and a version of one of
 those is admitted the day Anthropic ships it, so the coding-agent category is unaffected.
-(`computer_*` is admitted by type and still refused by field, for its display dimensions.)
+The fields a definition may carry are read **per type**, because they differ per type:
+`computer_*` carries the display Anthropic documents as required (`display_width_px`,
+`display_height_px`, and optionally `display_number` and `enable_zoom`) and
+`text_editor_*` carries `max_characters`, each checked as a number, and each refused on a
+type that does not define it.
 Describing those response blocks is the follow-up; refusing is not the finished feature. Anthropic's **`mcp_servers`** is refused for a sharper
 version of the same reason: it grants the model tools this gateway never described, so
 their calls and results arrive shaped by a server it cannot account for — and it carries

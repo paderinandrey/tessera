@@ -328,10 +328,19 @@ fn reject_streamed_tools(
 ///   `UNSCANNED_PART_TYPES` is that policy and images are that content; the
 ///   entry exists so the exception is visible where the field is admitted
 ///   rather than only in the README.
-/// - `Bool`, `OneOf`, `ToolType` — the provider constrains the value, so this
-///   checks it. Explicitly null passes: an SDK serializing its default is not
-///   a request to use the field, the same reading `tools`, `thinking`,
+/// - `Bool`, `Number`, `OneOf` — the provider constrains the value's *shape*,
+///   so this checks it. Explicitly null passes: an SDK serializing its default
+///   is not a request to use the field, the same reading `tools`, `thinking`,
 ///   `logprobs`, `audio` and `content` already get.
+///
+///   `Number` is the weakest of the three and says so at the entry: what it
+///   closes is prose or a structured value travelling under a numeric key —
+///   `"display_width_px": "Martina Weber"` — and what it leaves open is a
+///   number the caller chose, which is the residual `Dispatch` carries one
+///   type over. Neither the documented minimums nor integer-ness are checked
+///   here: those are Anthropic's own validation, this gateway keeping a second
+///   copy of them would be a copy to keep in step, and a bound of `>= 1`
+///   closes nothing a number can carry.
 /// - `Nothing` — the provider *always sends this key*, and no slot addresses
 ///   what it can carry, so the only admissible values are the ones that carry
 ///   nothing: explicitly null, or an empty list. Anything else refuses. This is
@@ -358,18 +367,11 @@ enum Admits {
     Elsewhere,
     Unscanned,
     Bool,
+    /// A JSON number, and nothing about which number. See `Admits`' own doc
+    /// for what that closes and what it leaves open.
+    Number,
     /// One of the strings the provider defines for this field.
     OneOf(&'static [&'static str]),
-    /// The name of a tool the *provider* defines rather than the caller. The
-    /// admissible ones are the undated names, plus every dated member of the
-    /// named families — `family_YYYYMMDD`, the form every one of them is
-    /// published in. The families are what lets the next version of a tool
-    /// this gateway can serve be admitted the day it ships; the date shape is
-    /// what stops the family names being a prefix anyone can extend.
-    ToolType {
-        undated: &'static [&'static str],
-        families: &'static [&'static str],
-    },
     /// Nothing this gateway can restore — so nothing is what it admits.
     Nothing,
     /// The nested allowlist, and what to call it when it refuses.
@@ -418,20 +420,16 @@ impl Field {
             admits: Admits::Bool,
         }
     }
+    const fn number(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Number,
+        }
+    }
     const fn one_of(key: &'static str, values: &'static [&'static str]) -> Self {
         Field {
             key,
             admits: Admits::OneOf(values),
-        }
-    }
-    const fn tool_type(
-        key: &'static str,
-        undated: &'static [&'static str],
-        families: &'static [&'static str],
-    ) -> Self {
-        Field {
-            key,
-            admits: Admits::ToolType { undated, families },
         }
     }
     /// The `follow_up` is the name of the work that turns this refusal back
@@ -478,8 +476,8 @@ const ANTHROPIC_UNDATED_TOOL_TYPES: [&str; 1] = ["custom"];
 ///   it. Measured at `6a06391`: a request enabling `code_execution_20250522`
 ///   reached the upstream (one call) and the caller got a 502.
 ///
-/// So the type is checked here, before the call, and a refusal that costs
-/// nothing replaces a refusal that costs a turn. **This is a capability lost
+/// So the type is checked by `anthropic_tool_definition_fields`, before the
+/// call, and a refusal that costs nothing replaces a refusal that costs a turn. **This is a capability lost
 /// rather than a channel closed** — a bare server tool used to pass this gate
 /// — and it belongs with the citations refusal and OpenAI's `allowed_tools`
 /// refusal in the account of what this slice traded away. The follow-up is
@@ -489,9 +487,17 @@ const ANTHROPIC_UNDATED_TOOL_TYPES: [&str; 1] = ["custom"];
 /// not as a prefix, and `bash_code_execution_20250825` is why: it is the code
 /// execution tool's own bash, run by Anthropic, and a `starts_with("bash_")`
 /// reading would have admitted it on the strength of a name.
+///
+/// **Adding a family here is half the work.** The other half is the arm in
+/// `anthropic_tool_definition_fields` that says which fields its definitions
+/// may carry; without one the family is refused, because a family admitted
+/// here and refused there is precisely the state `computer_*` spent a round in.
 const ANTHROPIC_CLIENT_TOOL_FAMILIES: [&str; 4] = ["bash", "text_editor", "computer", "memory"];
 
-/// Fields a tool definition may carry that this gateway can account for.
+/// Fields a tool definition may carry that this gateway can account for, **by
+/// the tool's `type`** — the shape `content_block_fields` and
+/// `anthropic_response_block_fields` already have, for the same reason: the
+/// fields a definition may carry are not one list, they are one list per tool.
 ///
 /// Anything else is refused, because a tool definition is an object the caller
 /// fills in and a field no slot addresses is forwarded exactly as it came.
@@ -499,33 +505,127 @@ const ANTHROPIC_CLIENT_TOOL_FAMILIES: [&str; 4] = ["bash", "text_editor", "compu
 /// `web_search_20250305` carries `user_location: {city, region, country,
 /// timezone}`, and `city` is a LOCATION in this gateway's own vocabulary.
 ///
-/// `type` names a tool Anthropic defines, and which ones are admissible is
-/// `ANTHROPIC_CLIENT_TOOL_FAMILIES`' argument: the ones the *caller* runs, whose
-/// results arrive in shapes this gateway already describes. A version of one of
-/// those is admitted the day Anthropic ships it, because the entry names the
-/// family and the date shape rather than a list of today's strings — which is
-/// the coding-agent traffic this slice's ledger records as unaffected.
+/// **This was one shared list, and the cost of that was a family admitted by
+/// type and refused by field.** Anthropic documents `display_width_px` and
+/// `display_height_px` as *required* on a `computer_*` definition, and neither
+/// was on the shared list — so the round that admitted the `computer_*` family
+/// by type, arguing correctly that the caller runs it, delivered nothing: every
+/// definition a computer-use client actually sends was a 400 one layer up
+/// (measured: `{"type": "computer_20250124", "name": "computer",
+/// "display_width_px": 1024, "display_height_px": 768, "display_number": 1}` →
+/// 400, upstream never called). `text_editor_20250728`'s `max_characters` was
+/// the same defect in a second family, found by reading the documentation for
+/// all four rather than the review comment for one.
 ///
-/// It was `Token` until a `type` naming a server tool was found to pass here and
-/// cost the caller a turn (that finding is written out beside the families). The
-/// residual `Token` left behind — `martina_weber` passing on the strength of
-/// being lowercase — is closed by the same change, since `martina_weber` names
-/// no family and carries no date.
-const ANTHROPIC_TOOL_DEFINITION_FIELDS: [Field; 5] = [
-    Field::dispatch("name"),
-    Field::described("description"),
-    Field::described("input_schema"),
-    Field::tool_type(
-        "type",
-        &ANTHROPIC_UNDATED_TOOL_TYPES,
-        &ANTHROPIC_CLIENT_TOOL_FAMILIES,
-    ),
-    Field::object(
+/// Which types are admissible at all is `ANTHROPIC_CLIENT_TOOL_FAMILIES`'
+/// argument: the ones the *caller* runs, whose results arrive in shapes this
+/// gateway already describes. A version of one of those is admitted the day
+/// Anthropic ships it, because the guard below names the family and the date
+/// shape rather than a list of today's strings — which is the coding-agent
+/// traffic this slice's ledger records as unaffected.
+///
+/// **A family on that list with no arm here is refused, not admitted with the
+/// wrong fields.** That is this function's whole structural claim: the defect
+/// above was a family admitted by one gate and refused by another, and the
+/// fifth family somebody adds to the constant cannot repeat it — the arms are
+/// exhaustive, `every_client_tool_family_selects_a_list` fails until an arm
+/// exists, and writing the arm is where its own fields get decided.
+///
+/// `description` and `input_schema` are on every list, including the lists for
+/// tools whose schema Anthropic defines and whose published shape has neither.
+/// A definition carrying them is malformed and Anthropic refuses it — but
+/// refusing it *here* would be this gateway enforcing the provider's schema on
+/// two fields it already masks, and a described field is never the channel this
+/// allowlist exists to close.
+fn anthropic_tool_definition_fields(definition: &Value) -> Result<&'static [Field], ShapeError> {
+    /// The tool's own `type`, decided by the dispatch below: it is what
+    /// selected this list, so a second check here would be the same check
+    /// written twice, and two checks on one value drift. This is what
+    /// `Admits::ToolType` was for one round; the grammar it held is now the
+    /// `match` below, where the answer is a list of fields rather than a bool.
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `type` that chose this list");
+    const NAME: Field = Field::dispatch("name");
+    const DESCRIPTION: Field = Field::described("description");
+    const INPUT_SCHEMA: Field = Field::described("input_schema");
+    const CACHE_CONTROL: Field = Field::object(
         "cache_control",
         "cache_control field",
         &ANTHROPIC_CACHE_CONTROL_FIELDS,
-    ),
-];
+    );
+    /// A tool the caller defines, and the tools Anthropic defines that carry
+    /// no field of their own: `bash_*` and `memory_*` are a `type` and a
+    /// `name` and nothing else.
+    const BARE: [Field; 5] = [TYPE, NAME, DESCRIPTION, INPUT_SCHEMA, CACHE_CONTROL];
+    /// `max_characters` caps what a `view` returns. Anthropic defines it on
+    /// `text_editor_20250728` and later; it is admitted on every version of
+    /// the family, because refusing it on an older one would be this gateway
+    /// keeping a per-version compatibility matrix — the provider's own answer,
+    /// which it gives with a 400 — and the value is a number either way.
+    const TEXT_EDITOR: [Field; 6] = [
+        TYPE,
+        NAME,
+        DESCRIPTION,
+        INPUT_SCHEMA,
+        CACHE_CONTROL,
+        Field::number("max_characters"),
+    ];
+    /// The display the caller runs the tool against. `display_width_px` and
+    /// `display_height_px` are **required** on every published `computer_*`
+    /// version, `display_number` is the optional X11 display, and
+    /// `enable_zoom` arrived with `computer_20251124`; the last two are
+    /// admitted on every version for `max_characters`' reason. None of the
+    /// four is addressed by a slot, so each is checked here or forwarded
+    /// unread.
+    const COMPUTER: [Field; 9] = [
+        TYPE,
+        NAME,
+        DESCRIPTION,
+        INPUT_SCHEMA,
+        CACHE_CONTROL,
+        Field::number("display_width_px"),
+        Field::number("display_height_px"),
+        Field::number("display_number"),
+        Field::boolean("enable_zoom"),
+    ];
+    let refuse = || ShapeError::Unsupported("anthropic", "tool definition field");
+    let kind = match definition.get("type") {
+        // No `type` at all is how most SDKs spell a custom tool, and an
+        // explicit null is one serializing that default.
+        None | Some(Value::Null) => ANTHROPIC_UNDATED_TOOL_TYPES[0],
+        Some(Value::String(kind)) => kind,
+        // A `type` that is not a string names no tool. `known_tool_choice`
+        // maps its missing discriminant to the empty string and lets the empty
+        // list refuse; that cannot be done here, because the empty string is a
+        // *valid* tool definition — the custom one — so an object would select
+        // the custom list and travel whole.
+        Some(_) => return Err(refuse()),
+    };
+    if ANTHROPIC_UNDATED_TOOL_TYPES.contains(&kind) {
+        return Ok(&BARE);
+    }
+    // `family_YYYYMMDD`, matched against the segment before the **last**
+    // underscore so `bash_code_execution_20250825` asks after the family
+    // `bash_code_execution` and is refused, and with a date of eight digits and
+    // nothing else so a family name is not a prefix a caller can extend.
+    let Some((family, date)) = kind.rsplit_once('_') else {
+        return Err(refuse());
+    };
+    if date.len() != 8
+        || !date.bytes().all(|byte| byte.is_ascii_digit())
+        || !ANTHROPIC_CLIENT_TOOL_FAMILIES.contains(&family)
+    {
+        return Err(refuse());
+    }
+    match family {
+        "bash" | "memory" => Ok(&BARE),
+        "text_editor" => Ok(&TEXT_EDITOR),
+        "computer" => Ok(&COMPUTER),
+        // A family this gateway serves and whose fields nobody has decided.
+        // Refusing is the answer that cannot ship a capability it does not
+        // have; deciding the fields is the work that makes it one.
+        _ => Err(refuse()),
+    }
+}
 
 /// The only object this gateway allowlists without describing it, so it is the
 /// one place the allowlist rule had to be applied to a field's *contents*
@@ -746,29 +846,6 @@ fn known_fields(
     Ok(())
 }
 
-/// One of the provider's undated tool names, or a dated member of one of the
-/// families — `family_YYYYMMDD`, the only form Anthropic has published a tool
-/// type in.
-///
-/// The family is the segment before the **last** underscore rather than a
-/// prefix, so `bash_code_execution_20250825` asks after the family
-/// `bash_code_execution` and is refused, while `bash_20250124` asks after
-/// `bash` and is admitted. The date is eight digits and nothing else, so a
-/// family name is not a prefix a caller can extend into a value of their own.
-fn names_an_admissible_tool(text: &str, undated: &[&str], families: &[&str]) -> bool {
-    if undated.contains(&text) {
-        return true;
-    }
-    match text.rsplit_once('_') {
-        Some((family, date)) => {
-            families.contains(&family)
-                && date.len() == 8
-                && date.bytes().all(|byte| byte.is_ascii_digit())
-        }
-        None => false,
-    }
-}
-
 /// The value half. One refusal for both halves — `Unsupported(provider, what)`
 /// — because they are one refusal: this list admits a key *and* a shape, and
 /// what reaches the upstream if either goes unchecked is the same bytes. The
@@ -792,12 +869,10 @@ fn known_value(
         // The type, and nothing about the characters. See `Admits::Dispatch`.
         Admits::Dispatch => value.as_str().map(|_| ()).ok_or_else(refuse),
         Admits::Bool => value.as_bool().map(|_| ()).ok_or_else(refuse),
+        // The shape and nothing about the value. See `Admits::Number`.
+        Admits::Number => value.is_number().then_some(()).ok_or_else(refuse),
         Admits::OneOf(values) => match value.as_str() {
             Some(text) if values.contains(&text) => Ok(()),
-            _ => Err(refuse()),
-        },
-        Admits::ToolType { undated, families } => match value.as_str() {
-            Some(text) if names_an_admissible_tool(text, undated, families) => Ok(()),
             _ => Err(refuse()),
         },
         // Null is already `Ok` above; an empty list carries as little, and
@@ -1585,11 +1660,16 @@ impl Provider for Anthropic {
         if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
             let tools = tools.as_array().ok_or(ShapeError::Request("anthropic"))?;
             for (index, definition) in tools.iter().enumerate() {
+                // The list is chosen by the tool's own `type`, so the type is
+                // read before the fields it decides. That ordering is the
+                // whole of the dependency: `anthropic_tool_definition_fields`
+                // refuses a type it cannot serve, and `known_fields` below
+                // refuses a field the type does not define.
                 tool_definition_slots(
                     &format!("/tools/{index}"),
                     definition,
                     "input_schema",
-                    &ANTHROPIC_TOOL_DEFINITION_FIELDS,
+                    anthropic_tool_definition_fields(definition)?,
                     "anthropic",
                     &mut pointers,
                 )?;
@@ -1889,11 +1969,39 @@ mod tests {
         lists
     }
 
+    /// The tool definition list for one `type`, for the enumeration above and
+    /// the family guard below. Panics on a type this gateway refuses, which is
+    /// what both callers want: they name types it serves.
+    fn definition_fields(kind: &str) -> &'static [Field] {
+        anthropic_tool_definition_fields(&json!({"type": kind}))
+            .unwrap_or_else(|_| panic!("{kind} names a tool this gateway serves"))
+    }
+
     fn every_named_allowlist() -> Vec<(&'static str, &'static [Field])> {
         vec![
+            // One entry per tool type, because that is what the lists are now.
+            // A type missing here is a list this test does not read, which is
+            // why `every_client_tool_family_selects_a_list` reads the families
+            // from the constant rather than from this hand-written vec.
             (
-                "ANTHROPIC_TOOL_DEFINITION_FIELDS",
-                &ANTHROPIC_TOOL_DEFINITION_FIELDS[..],
+                "anthropic_tool_definition_fields(custom)",
+                definition_fields("custom"),
+            ),
+            (
+                "anthropic_tool_definition_fields(bash_20250124)",
+                definition_fields("bash_20250124"),
+            ),
+            (
+                "anthropic_tool_definition_fields(text_editor_20250728)",
+                definition_fields("text_editor_20250728"),
+            ),
+            (
+                "anthropic_tool_definition_fields(computer_20251124)",
+                definition_fields("computer_20251124"),
+            ),
+            (
+                "anthropic_tool_definition_fields(memory_20250818)",
+                definition_fields("memory_20250818"),
             ),
             (
                 "ANTHROPIC_CACHE_CONTROL_FIELDS",
@@ -1984,6 +2092,7 @@ mod tests {
                     Admits::Described
                     | Admits::Dispatch
                     | Admits::Bool
+                    | Admits::Number
                     | Admits::Elsewhere
                     | Admits::Unscanned
                     | Admits::Nothing => {}
@@ -1991,15 +2100,6 @@ mod tests {
                         !values.is_empty(),
                         "{list}/{} admits one of nothing, which is a refusal \
                          written as an allowlist",
-                        field.key
-                    ),
-                    // The families are the half that admits a version nobody
-                    // has seen. Without one this entry is a `OneOf` spelled the
-                    // long way, and the next dated tool it should serve refuses.
-                    Admits::ToolType { families, .. } => assert!(
-                        !families.is_empty(),
-                        "{list}/{} names no family, so it refuses the next \
-                         version of every tool it admits",
                         field.key
                     ),
                     Admits::Object(what, nested) => {
@@ -2049,10 +2149,12 @@ mod tests {
             }
         }
         assert_eq!(
-            dispatch, 12,
+            dispatch, 16,
             "each of these is a string this gateway forwards on purpose — the caller's on a \
              request, the model's on a response — so adding one is a decision and not a \
-             discovery"
+             discovery. It counts entries and not distinct keys, so splitting one list into \
+             several — the tool definition's five, each carrying `name` — moves it too; that \
+             is a re-read of the entries and not a new channel"
         );
     }
 
@@ -2818,10 +2920,18 @@ mod tests {
         }
         // Every client-executed type Anthropic has published, and a dated
         // version of each family that it has not. **This half is the whole
-        // reason the entry names families rather than values**: the ledger
+        // reason the check names families rather than values**: the ledger
         // records the coding-agent category as unaffected by this slice, and a
         // list of today's strings would refuse the next `bash_*` on the day it
         // shipped.
+        //
+        // Each is built as `documented_definition` builds it — the definition
+        // Anthropic's own documentation shows for that type, not a `type` and
+        // a `name`. That distinction is not cosmetic: for three rounds this
+        // loop passed with `{"name": "t", "type": "computer_20250124"}` while
+        // every definition a real client sends was a 400, because a type-and-
+        // name definition is what a review comment looks like and not what a
+        // caller writes.
         for kind in [
             "custom",
             "bash_20241022",
@@ -2839,14 +2949,196 @@ mod tests {
             "computer_20991231",
             "memory_20991231",
         ] {
+            let definition = documented_definition(kind);
             let body = json!({
                 "model": "claude",
                 "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"name": "t", "type": kind}]
+                "tools": [definition.clone()]
             });
             assert!(
                 Anthropic.request_pointers(&body).is_ok(),
-                "a tool the caller runs was refused for its type: {kind}"
+                "a tool the caller runs was refused: {definition}"
+            );
+        }
+    }
+
+    /// The definition Anthropic's documentation shows for a tool type, with
+    /// every field that documentation defines for it. The `computer_*` and
+    /// `text_editor_*` entries are the ones that were refused before this
+    /// round; the rest are here so one helper builds every family and the next
+    /// one added has an obvious place to be written down.
+    fn documented_definition(kind: &str) -> Value {
+        let mut definition = json!({"type": kind});
+        let object = definition.as_object_mut().expect("an object");
+        let family = kind.rsplit_once('_').map_or(kind, |(family, _)| family);
+        let name = match family {
+            "computer" => "computer",
+            "bash" => "bash",
+            "memory" => "memory",
+            "text_editor" if kind == "text_editor_20241022" => "str_replace_editor",
+            "text_editor" => "str_replace_based_edit_tool",
+            // A custom tool is the caller's, so its name and schema are too.
+            _ => {
+                object.insert("input_schema".to_owned(), json!({"type": "object"}));
+                "get_weather"
+            }
+        };
+        object.insert("name".to_owned(), json!(name));
+        if family == "computer" {
+            // Required on every published version, and the reason this round
+            // exists: a definition without them is not one Anthropic accepts.
+            object.insert("display_width_px".to_owned(), json!(1024));
+            object.insert("display_height_px".to_owned(), json!(768));
+            object.insert("display_number".to_owned(), json!(1));
+        }
+        if kind == "computer_20251124" {
+            object.insert("enable_zoom".to_owned(), json!(true));
+        }
+        if kind == "text_editor_20250728" {
+            object.insert("max_characters".to_owned(), json!(10_000));
+        }
+        definition
+    }
+
+    #[test]
+    fn a_computer_use_definition_is_served_with_the_fields_its_type_requires() {
+        // The round's own finding. `computer_*` was admitted by type on the
+        // argument — correct, and established from the documentation — that the
+        // caller runs it and answers with an ordinary `tool_result`. The field
+        // allowlist then refused every definition that carries the display
+        // Anthropic documents as **required**, so the admission delivered
+        // nothing: measured at `2e4da2a`, the definition below was a 400 with
+        // the upstream never called.
+        //
+        // The second half is what makes the list per type rather than shared:
+        // a `bash_*` definition carrying a display is malformed, and admitting
+        // these four fields everywhere would have served that too.
+        for kind in [
+            "computer_20241022",
+            "computer_20250124",
+            "computer_20251124",
+        ] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [documented_definition(kind)]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a computer-use request Anthropic documents was refused: {kind}"
+            );
+        }
+        for (kind, field) in [
+            ("bash_20250124", "display_width_px"),
+            ("memory_20250818", "display_height_px"),
+            ("text_editor_20250728", "display_number"),
+            ("custom", "enable_zoom"),
+            ("bash_20250124", "max_characters"),
+        ] {
+            let mut definition = documented_definition(kind);
+            definition[field] = json!(1024);
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [definition]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported(
+                        "anthropic",
+                        "tool definition field"
+                    ))
+                ),
+                "{field} was admitted on {kind}, which does not define it: {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_field_that_is_not_a_number_is_refused_rather_than_forwarded() {
+        // `is_error` and `strict` one type over. None of these four is
+        // addressed by a slot, so a value nothing checks is a value nothing
+        // masks: `"display_width_px": "Martina Weber"` would reach Anthropic
+        // exactly as it came.
+        for field in [
+            "display_width_px",
+            "display_height_px",
+            "display_number",
+            "max_characters",
+        ] {
+            let kind = if field == "max_characters" {
+                "text_editor_20250728"
+            } else {
+                "computer_20250124"
+            };
+            for value in [
+                json!("Martina Weber"),
+                json!({"owner": "Weber"}),
+                json!([768]),
+            ] {
+                let mut definition = documented_definition(kind);
+                definition[field] = value.clone();
+                let body = json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [definition]
+                });
+                assert!(
+                    matches!(
+                        Anthropic.request_pointers(&body),
+                        Err(ShapeError::Unsupported(
+                            "anthropic",
+                            "tool definition field"
+                        ))
+                    ),
+                    "a {field} that is not a number travelled whole: {value} -> {:?}",
+                    Anthropic.request_pointers(&body)
+                );
+            }
+            // What Anthropic defines here, and the null five other fields on
+            // this branch already read as an SDK serializing its default.
+            for value in [json!(1024), json!(0), json!(1024.0), json!(null)] {
+                let mut definition = documented_definition(kind);
+                definition[field] = value.clone();
+                let body = json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [definition]
+                });
+                assert!(
+                    Anthropic.request_pointers(&body).is_ok(),
+                    "a {field} Anthropic defines was refused: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_client_tool_family_selects_a_list() {
+        // The structural half of this round, and the thing that stops it
+        // happening a third time. `ANTHROPIC_CLIENT_TOOL_FAMILIES` is the line
+        // between the tools the caller runs and the ones Anthropic runs; a
+        // family added to it whose fields nobody decided is exactly the state
+        // `computer_*` was in — admitted by type, refused by field, with the
+        // code claiming a capability it did not have. The `match` refuses such
+        // a family, and this fails until somebody writes its arm.
+        for family in ANTHROPIC_CLIENT_TOOL_FAMILIES {
+            let kind = format!("{family}_20250124");
+            let fields = anthropic_tool_definition_fields(&json!({"type": kind}));
+            assert!(
+                fields.is_ok(),
+                "{family} is on the client-executed list and selects no fields, so every \
+                 definition of it is refused"
+            );
+        }
+        // And the other direction: a family nobody has decided about is
+        // refused rather than served the bare list.
+        for kind in ["browser_20260801", "computer_toolset_20260801"] {
+            assert!(
+                anthropic_tool_definition_fields(&json!({"type": kind})).is_err(),
+                "{kind} was admitted with fields nobody chose for it"
             );
         }
     }

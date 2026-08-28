@@ -235,11 +235,12 @@ provider constrains it, so this checks it), `Object` (a nested list). There is
 deliberately no answer meaning "forwarded, and nobody has looked at it": a key
 with no answer does not go on a list.
 
-`ToolType` is the one that admits rather than enumerates, and what it admits is
-a judgement rather than a grammar. Anthropic's tool names are dated —
+A tool definition's `type` is the one that admits rather than enumerates, and
+what it admits is a judgement rather than a grammar. Anthropic's tool names are
+dated —
 `text_editor_20250124`, `web_search_20250305` — so a list of today's values
 refuses the next `bash_*` the day it ships, which is the coding-agent traffic
-this slice exists to serve; the entry names the *families* and the date shape
+this slice exists to serve; the check names the *families* and the date shape
 instead. Which families is the whole of it: a tool the **caller** runs
 (`bash`, `text_editor`, `computer`, `memory`) is answered with the ordinary
 `tool_use`/`tool_result` pair this gateway already describes, while a tool
@@ -250,6 +251,28 @@ model had run. The family is matched against the segment before the last
 underscore rather than as a prefix, which is what keeps
 `bash_code_execution_20250825` — Anthropic's bash, not the caller's — on the
 refusing side.
+
+The `type` is also what **selects the field list**, the way a content block's
+type already does, because the fields a definition may carry differ per tool:
+`computer_*` carries a display Anthropic documents as required, `text_editor_*`
+carries `max_characters`, and `bash_*` and `memory_*` carry neither. One shared
+list is what made the `computer_*` admission worthless for a round — the family
+passed the type check and every real definition of it failed the field check —
+so the arms are exhaustive and a family with no arm is refused rather than
+served the wrong list.
+
+### Why a required number is `Number` and not a range
+
+`display_width_px` is a number, and this checks that it is one. It does not
+check Anthropic's documented minimum, or that it is an integer, or that the
+required ones are present. The reason is what the check is *for*: an
+allowlisted key whose value nobody reads is an unmasked egress channel, and
+what travels through a numeric key is prose or a structured value — which
+`Number` refuses. A minimum of `1` refuses nothing that could carry a name, and
+maintaining it would be this gateway keeping a second copy of the provider's
+schema, to be kept in step with it. The residual is stated where the variant is
+defined: a number the caller chose still travels, exactly as a `Dispatch`
+string does.
 
 ### Why `Dispatch` is a string, and why that is not the argument it looked like
 
@@ -642,10 +665,11 @@ server-executed tool.** A `text` block carrying `citations` is refused on the
 request path, and clients echo assistant turns back as history, so a
 conversation that used citations refuses on its next turn. Anthropic's own
 server tools were refused only *partly*, and that is the part this records as a
-cost: `computer_*` (display dimensions) and `web_search_*` (a `user_location`
-whose `city` is a `LOCATION` in this vocabulary) carry configuration the field
-allowlist has no rule for and were refused with it, but the same tools declared
-bare — name and type and nothing else — passed. They then came back as
+cost: `web_search_*` carries a `user_location` whose `city` is a `LOCATION` in
+this vocabulary, the field allowlist has no rule for it, and it was refused with
+it — but the same tool declared bare, name and type and nothing else, passed.
+`computer_*` was refused the same way, for the display its own documentation
+makes required; that one is now served, because the fields are read per type. They then came back as
 `server_tool_use` and a result block the response path refuses, so a well-formed
 request spent the caller's tokens and lost its answer. The `type` entry decides
 it before the call now: the client-executed families pass, everything else
