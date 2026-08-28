@@ -531,6 +531,10 @@ const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
 /// stated under a keyword not on this list is masked, which breaks the schema
 /// rather than leaking anything. That is the way round this walk chooses
 /// everywhere else, and this arm is the one place it did not.
+///
+/// Membership is necessary and not sufficient. A property name is a string, so
+/// `descend_into` reads the value as well: only a string, or an array of
+/// strings, is names. Anything else under one of these is data.
 const SCHEMA_NAME_INSTANCE_KEYWORDS: [&str; 4] = ["const", "default", "enum", "examples"];
 
 /// What the walk does with one field of an object, given the shape it is in.
@@ -538,11 +542,15 @@ const SCHEMA_NAME_INSTANCE_KEYWORDS: [&str; 4] = ["const", "default", "enum", "e
 /// a field one of them skipped and the other did not would silently put a
 /// masked string somewhere it does not belong.
 ///
-/// The `value` is here for one keyword. Every other rule reads the key alone,
-/// which works while a keyword means one thing — and draft-07's `dependencies`
-/// does not: per key it holds either an array of property names or a subschema,
-/// and only its type says which. A list of names cannot express that, so the
-/// decision has to be able to look.
+/// The `value` is here for the keywords whose meaning depends on it. Most rules
+/// read the key alone, which works while a keyword means one thing — and two of
+/// them do not. Draft-07's `dependencies` holds, per key, either an array of
+/// property names or a subschema, and only its type says which. Under
+/// `propertyNames`, `SCHEMA_NAME_INSTANCE_KEYWORDS` state *names*, and a name is
+/// a string: an `examples` holding an object there states no name at all, so
+/// skipping it from the key alone forwarded `{"propertyNames": {"examples":
+/// [{"owner": "Martina Weber"}]}}` verbatim. A list of names cannot express
+/// either rule, so the decision has to be able to look.
 fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
     // The two schema shapes share one body rather than one re-implementing the
     // other minus a few arms. `NameSchema` differs from `Schema` in exactly one
@@ -589,7 +597,31 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         // an `x-note` under `propertyNames` verbatim while masking the
         // `description` beside it: the same inversion `SCHEMA_INSTANCE_KEYWORDS`
         // was deleted for, in the one shape that deletion did not reach.
-        key if names && SCHEMA_NAME_INSTANCE_KEYWORDS.contains(&key) => None,
+        //
+        // **And the keyword is not the whole of it: a name is a string.** The
+        // arm decided from the key alone, so `{"propertyNames": {"examples":
+        // [{"owner": "Martina Weber"}]}}` skipped an entire object subtree that
+        // states no property name anywhere — a legal annotation, and `Weber`
+        // reached the provider verbatim (measured, at 200). `dependencies` is
+        // the precedent: a keyword whose meaning turns on its value's type
+        // needs a rule per value, not a verdict per key.
+        //
+        // A string is a name. An array **of strings** is names — that is
+        // `enum`'s and `examples`' shape, and every member of it is a name. An
+        // object, or an array holding anything that is not a string, is not a
+        // name and never was, so it is scanned as the client's data. Scanning
+        // rather than refusing, because the value is malformed against
+        // `propertyNames` and *some* client will write it: being wrong here
+        // then costs an over-masked schema the caller can see, which is the
+        // direction this walk chooses everywhere. Over-masking reaches the
+        // strings that genuinely are names inside a mixed array too — they are
+        // masked with the rest, and a schema the caller can see broken is the
+        // cheaper of the two mistakes.
+        key if names && SCHEMA_NAME_INSTANCE_KEYWORDS.contains(&key) => match value {
+            Value::String(_) => None,
+            Value::Array(items) if items.iter().all(Value::is_string) => None,
+            _ => Some(Shape::Instance),
+        },
         // Everything else: `enum` and `default` outside `propertyNames`,
         // `example`, `x-whatever`, and any keyword written after this line. It
         // holds an instance, and an instance is the client's data.
@@ -1818,6 +1850,68 @@ mod tests {
         assert_eq!(
             rebuilt["propertyNames"]["examples"],
             json!(["billing_address"])
+        );
+    }
+
+    #[test]
+    fn a_name_keyword_under_property_names_states_a_name_only_when_it_holds_strings() {
+        // The second keyword whose meaning is in its value, and the same
+        // lesson `dependencies` taught. `SCHEMA_NAME_INSTANCE_KEYWORDS` decided
+        // from the key alone, so an `examples` holding an object skipped the
+        // whole subtree — a legal annotation that states no property name
+        // anywhere, and `Weber` reached the provider verbatim (measured through
+        // the proxy, at 200).
+        //
+        // A property name is a string. So: a string is a name, an array of
+        // strings is names, and everything else is the client's data.
+        let schema = json!({
+            "propertyNames": {
+                "const": "billing_address",
+                "enum": ["credit_card", "billing_address"],
+                "default": "billing_address",
+                "examples": [{"owner": "Martina Weber"}]
+            }
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Martina Weber".to_owned())],
+            "a structured value under a name keyword is not a name and is scanned"
+        );
+        let rebuilt = replace_text_leaves(&schema, &["MASKED".to_owned()], Shape::Schema).unwrap();
+        assert_eq!(
+            rebuilt["propertyNames"]["examples"][0]["owner"], "MASKED",
+            "and it is masked in place, with its keys untouched"
+        );
+        // The three that do state names are still skipped, whole.
+        assert_eq!(rebuilt["propertyNames"]["const"], "billing_address");
+        assert_eq!(
+            rebuilt["propertyNames"]["enum"],
+            json!(["credit_card", "billing_address"])
+        );
+        assert_eq!(rebuilt["propertyNames"]["default"], "billing_address");
+    }
+
+    #[test]
+    fn a_mixed_array_under_a_name_keyword_is_scanned_whole() {
+        // The judgement call, pinned so that changing it is a decision. An
+        // array holding anything that is not a string is not a list of property
+        // names, so it is scanned — *including* the strings in it that would
+        // have been names. Over-masking a schema the caller can see is the
+        // cheaper of the two mistakes, and it is the direction this walk
+        // chooses everywhere else.
+        //
+        // A number in there is a leaf too, which is what puts it in front of
+        // the numeric refusal rather than past it.
+        let schema = json!({
+            "propertyNames": {"enum": ["billing_address", {"owner": "Martina Weber"}, 42]}
+        });
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![
+                Leaf::Text("billing_address".to_owned()),
+                Leaf::Text("Martina Weber".to_owned()),
+                Leaf::Number("42".to_owned()),
+            ]
         );
     }
 

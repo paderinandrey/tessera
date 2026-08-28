@@ -243,6 +243,12 @@ an unrecognized content-block type, or a field beside the ones each tool structu
 described by, is refused rather than forwarded. That is deliberately the expensive
 direction: a field no slot addresses would travel to the provider exactly as the caller
 wrote it, so a provider feature shipped tomorrow refuses here instead of leaking through.
+**The allowlist admits a shape and not only a key**, which is the other half of that and
+was the later half: every entry records why admitting it is safe, and a field the provider
+constrains to a boolean, an enum or a fixed literal has that value checked. `"strict":
+"Martina Weber"`, `"is_error": "Martina Weber"` and `cache_control: {"type": "Martina
+Weber"}` were each admitted by a list and each reached the provider verbatim, under
+comments that stated the shapes correctly.
 
 **That closure is scoped to the tool structures, and the body and the message levels have
 no allowlist at all.** It is true of a tool definition, a tool call, a tool result and a
@@ -269,9 +275,12 @@ their calls and results arrive shaped by a server it cannot account for — and 
 the caller's own `authorization_token` besides. A **number that carries personal data** is
 refused rather than masked, because replacing `4111111111111111` with `[CREDIT_CARD_1]`
 turns a JSON number into a string and a schema that declared a number may reject it; that
-refusal fires only on the eight deterministic identifiers, the ones the detector decides
-from the value itself, since an NER label on a bare digit run is a judgement about meaning
-where there is no meaning to judge — a number an NER label alone finds is forwarded. And a
+refusal steps aside for exactly one thing: a span carrying one of the fourteen NER types,
+since an NER label on a bare digit run is a judgement about meaning where there is no
+meaning to judge, so a number those labels alone find is forwarded. The eight deterministic
+identifiers refuse, and so does a type in **neither** half — a label this gateway does not
+recognize is a detector reporting personal data of a kind nobody here can weigh, which is
+not the same thing as a label known to be ungrounded on digits. And a
 request whose tool structures exceed `max_tool_chars` or `max_tool_calls` is refused before
 the detector is called at all.
 

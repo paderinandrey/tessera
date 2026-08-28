@@ -124,12 +124,19 @@ the schema promised a number, answers with one, and restoration then hands the
 client the wrong type.
 
 Numeric leaves are therefore rendered as text, detected, and the request is
-refused when a span of a **deterministic** type is found — one of
-`identifiers.yaml`'s eight, which the detector decides from the value itself.
-Types stay as the client wrote them, and the cost is stated plainly: an agent
-sending a card number as a JSON number gets a refusal with no way around it.
+refused for any span found in one — **except** a span carrying one of the
+fourteen types the NER layer labels. That exemption is the whole of the
+narrowing, and it is written as a hole in the refusal rather than as the refusal
+itself, because the argument for it is an argument about what those fourteen
+labels mean. `identifiers.yaml`'s eight refuse. A type in neither half — a
+version-skewed, misconfigured or compromised detector reporting a name no
+catalog declares — refuses too: *a label known to be ungrounded on digits is not
+the same thing as a label nobody can weigh at all*, and on a string leaf such a
+span has always masked, as `[REDACTED_1]`. Types stay as the client wrote them,
+and the cost is stated plainly: an agent sending a card number as a JSON number
+gets a refusal with no way around it.
 
-**Why only those eight, and not all twenty-two.** The first implementation
+**Why the fourteen are exempt, and not all twenty-two.** The first implementation
 refused on any span at all, and the measurement that changed it was taken
 against the running detector: `"9007199254740991\n\n9007199254740991"` comes
 back labelled `PERSON` at 0.723. That number is `Number.MAX_SAFE_INTEGER`, and
@@ -164,6 +171,9 @@ The partition is structure rather than a comment: `mapping::DETERMINISTIC_TYPES`
 is held to `identifiers.yaml` exactly, and `ENTITY_TYPES` minus it to `ner.yaml`
 exactly, by `scripts/check_entity_types.py`. A ninth identifier fails that check
 instead of landing silently on the side of the predicate that does not refuse.
+The predicate reads both constants and writes out neither list, so the exempt
+fourteen are derived from the two things that check holds to the catalogs rather
+than from a third array nothing holds to anything.
 
 **What this does not cover, since an earlier draft of this document claimed
 otherwise.** The refusal is only as wide as the vocabulary, and `ENTITY_TYPES`
@@ -202,6 +212,35 @@ different field, not a new one.
 Extending the existing rule keeps one policy for images rather than two. It
 inherits that rule's hole knowingly, and narrowing it belongs to a decision
 about images in general rather than to this slice.
+
+### Why an allowlist entry carries a shape and not only a name
+
+An allowlist admits a **key**. Nothing read the value under it, and a field
+whose shape the provider constrains — a boolean, an enum, a fixed literal — is
+an unmasked egress channel until something checks that value. Three of them
+shipped: `"strict": "Martina Weber"` reached OpenAI, `"is_error": "Martina
+Weber"` reached Anthropic, and `cache_control: {"type": "Martina Weber"}`
+reached Anthropic through a list added *to check `cache_control`*, which checked
+its keys. Each was written by somebody who knew the shape and wrote it in a
+comment beside the entry.
+
+Three found in one review pass is evidence about the population, so the answer
+is not three checks. Every entry now carries **why admitting that key is safe**,
+as a value the code consumes: `Described` (a slot addresses it), `Dispatch` (a
+free identifier the caller chooses and the protocol routes on, argued above),
+`Elsewhere` (a named check at the use site decides it), `Unscanned` (forwarded
+whole under the images-and-audio policy), `Bool` / `OneOf` / `Token` (the
+provider constrains it, so this checks it), `Object` (a nested list). There is
+deliberately no answer meaning "forwarded, and nobody has looked at it": a key
+with no answer does not go on a list.
+
+`Token` is the one that admits rather than enumerates. Anthropic's tool `type`
+names a server tool and the names are dated — `text_editor_20250124`,
+`web_search_20250305` — so a list of values refuses the next `bash_*` the day it
+ships, which is the coding-agent traffic this slice exists to serve. The grammar
+is closed even though the vocabulary is not, so `Token` holds it to that. It
+**narrows the channel rather than closing it** — `martina_weber` still passes —
+and that residual is the one `name` already carries as dispatch.
 
 ## Shape
 
@@ -383,8 +422,8 @@ Issue #28's chunking has no such luxury.
 ## Errors
 
 Every failure is a refusal, and the vocabulary is the existing one. A document
-past the depth or node bound, a numeric leaf carrying a span of one of the eight
-deterministic types, a content block whose shape this gateway does not
+past the depth or node bound, a numeric leaf carrying a span of any type but the
+fourteen NER ones, a content block whose shape this gateway does not
 understand, a tool field it has no rule for, `mcp_servers`, tool structures
 summing past either bound, and tool traffic arriving with `stream: true` are all
 refused before the upstream call.
@@ -504,10 +543,14 @@ telephone entity, so nothing detects it — in tool arguments or in ordinary tex
 See the numeric-leaf section; closing it is detection-quality work, like issue
 #20.
 
-**A number an NER label alone finds is forwarded.** Only the eight deterministic
-types refuse a numeric leaf, so a name or a place written as a JSON number goes
-through. That is deliberate and argued in the numeric-leaf section, with the
-measurement on both sides of it.
+**A number an NER label alone finds is forwarded.** A numeric leaf is exempted
+by the fourteen NER types and by nothing else, so a name or a place written as a
+JSON number goes through. That is deliberate and argued in the numeric-leaf
+section, with the measurement on both sides of it. The exemption is written as a
+hole in the refusal rather than as the refusal itself: the eight deterministic
+types refuse, and so does a type in neither half of the vocabulary, because the
+argument for the exemption is an argument about what those fourteen labels
+*mean* and says nothing about a name no catalog declares.
 
 **A large tool result is refused, not served slowly.** See **Latency**, and
 issue #28, which exists to raise this ceiling.

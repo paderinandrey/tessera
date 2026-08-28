@@ -376,12 +376,25 @@ async fn mask_all(
                 // refusing the request, and which one a span produces is the
                 // question the rest of this comment answers.
                 //
-                // **Only a type the detector decides from the digits refuses.**
-                // `DETERMINISTIC_TYPES` is `identifiers.yaml`'s eight — CH_AVS,
-                // CREDIT_CARD, the two German tax numbers, EMAIL, FR_NIF,
-                // FR_NIR, IBAN — and a span of one of those in a numeric leaf
-                // refuses. An NER label on the same leaf does not; the request
-                // is forwarded with the number in it.
+                // **Only a known NER type forwards; everything else refuses.**
+                // The exemption is written as a hole in the refusal rather than
+                // as the refusal itself, and the difference is the whole of it:
+                // a span whose type is in `ENTITY_TYPES` and not in
+                // `DETERMINISTIC_TYPES` — one of `ner.yaml`'s fourteen — leaves
+                // the number alone; a span of one of `identifiers.yaml`'s eight
+                // refuses; and a span of a type in **neither** half refuses too.
+                //
+                // *A label we know to be ungrounded on digits is not the same
+                // thing as a label we know nothing about.* The argument below
+                // licenses exempting the fourteen, because it is an argument
+                // about what those fourteen mean. It licenses nothing about a
+                // name no catalog declares: a version-skewed, misconfigured or
+                // compromised detector saying "there is personal data here, of
+                // a kind you do not recognise" is a thing to fail closed on.
+                // The asymmetry is what gave this away — on a *string* leaf an
+                // unknown type has always masked, as `REDACTED_n`, with a
+                // `tracing::warn!` beside it, so the same span was honoured for
+                // a string and discarded for a number.
                 //
                 // The reason is what the two halves of the vocabulary are
                 // evidence of. A catalog hit is grounded in the value:
@@ -421,7 +434,12 @@ async fn mask_all(
                 // It stays: the set is "what the detector decides
                 // deterministically", and narrowing it to the subset someone
                 // judged capable of being numeric is the hand-maintained list
-                // this branch has corrected five times.
+                // this branch has corrected five times. For the same reason the
+                // exemption is derived from the two constants rather than
+                // written out as a third array of fourteen names — those two
+                // are what `scripts/check_entity_types.py` holds to the
+                // catalogs, and a list nothing holds to anything is the
+                // failure this predicate is being corrected for.
                 //
                 // The gap that remains is the vocabulary's, not the predicate's:
                 // there is no telephone entity in either catalog, so a phone
@@ -439,7 +457,9 @@ async fn mask_all(
                 for (leaf, spans) in leaves.iter().zip(&per_leaf) {
                     if matches!(leaf, mapping::Leaf::Number(_))
                         && spans.iter().any(|span| {
-                            mapping::DETERMINISTIC_TYPES.contains(&span.entity_type.as_str())
+                            let entity_type = span.entity_type.as_str();
+                            !mapping::ENTITY_TYPES.contains(&entity_type)
+                                || mapping::DETERMINISTIC_TYPES.contains(&entity_type)
                         })
                     {
                         return Err(ProxyError::NumericPersonalData);
@@ -1377,6 +1397,125 @@ mod tests {
             limit.is_number(),
             "and it arrives as a number, not a string"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_entity_type_on_a_number_refuses_the_request() {
+        // The exemption is for the fourteen NER types we know, not for every
+        // type that is not one of the eight. A version-skewed, misconfigured or
+        // compromised detector returning a name in neither catalog is saying
+        // "personal data, of a kind you do not recognise", and on a *string*
+        // leaf that has always been honoured — the value masks as
+        // `REDACTED_n`. On a numeric leaf the same span was ignored and the
+        // number reached the upstream verbatim (measured, at 200).
+        //
+        // The number is the document's only leaf, so a fixed span cannot land
+        // anywhere but on it.
+        let detector = detector_returning(json!([
+            {"entity_type": "MADE_UP_BY_A_SKEWED_DETECTOR", "start": 0, "end": 16}
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "pay",
+                     "input": {"card": 4_111_111_111_111_111u64}}
+                ]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "and the number never left the process"
+        );
+        assert_eq!(journal(&path)[0]["error"], "tool_numeric_personal_data");
+        assert!(
+            !returned.contains("MADE_UP"),
+            "the type is the untrusted string this refusal exists to keep out \
+             of anything we write down: {returned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_structured_value_under_a_name_keyword_reaches_the_detector() {
+        // C2 end to end. Under `propertyNames`, `examples` states example
+        // property *names* — strings — and the arm skipped the whole subtree
+        // from the key alone, so an object there was never shown to the
+        // detector and reached the upstream verbatim. Measured before the fix:
+        // the detector saw `{"text":"hi"}` and nothing else, and the upstream
+        // received `{"owner":"Martina Weber"}`.
+        //
+        // The tool carries no `description`, so the schema is the only document
+        // and its only leaf is the one under test — the span cannot land
+        // anywhere else.
+        let detector = detector_finding_martina().await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "input_schema": {
+                    "propertyNames": {"examples": [{"owner": "Martina Weber"}]}
+                }}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let asked: Vec<Value> = detector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert!(
+            asked.iter().any(|body| body["text"] == "Martina Weber"),
+            "the value was never shown to the detector: {asked:?}"
+        );
+        let sent = sent_to(&upstream).await;
+        assert_eq!(
+            sent["tools"][0]["input_schema"]["propertyNames"]["examples"][0]["owner"],
+            "Martina [PERSON_1]",
+            "and it must not reach the provider as the client wrote it"
+        );
+    }
+
+    /// A detector that finds `Weber` inside `Martina Weber` at the offsets it
+    /// sits at when that string is a document's only leaf, and nothing in any
+    /// other text. Separate from `detector_finding_weber`, whose span is fixed
+    /// at 0..5 and would land on `Marti`.
+    async fn detector_finding_martina() -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(body_string_contains("Martina Weber"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": [{"entity_type": "PERSON", "start": 8, "end": 13,
+                           "confidence": 1.0, "recognizer": "ner:fake",
+                           "tier": 2, "boosted": false}],
+                "layers_run": ["ner"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["ner"]})),
+            )
+            .mount(&server)
+            .await;
+        server
     }
 
     #[tokio::test]

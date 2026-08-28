@@ -268,22 +268,164 @@ fn reject_streamed_tools(
     Ok(())
 }
 
+/// Why one key is safe to admit — the question every allowlist entry below has
+/// to answer, asked by the type rather than by a comment.
+///
+/// **An allowlist admitted a key.** Nothing read the value under it, so a field
+/// whose shape the provider constrains was an unmasked egress channel with a
+/// comment beside it saying it could not be: `"strict": "Martina Weber"`
+/// reached OpenAI, `"is_error": "Martina Weber"` reached Anthropic, and
+/// `cache_control: {"type": "Martina Weber"}` reached Anthropic through a list
+/// added one commit earlier *to check `cache_control`* — which checked its keys.
+/// All three were written by someone who knew the shape and wrote it down in
+/// prose. That is the third time on this branch a comment asserted a property
+/// the code did not have, and prose is what failed each time, so the answer is
+/// a value the code consumes instead of a sentence the next person reads.
+///
+/// The six answers, and every one of them is an answer somebody actually gave:
+///
+/// - `Described` — a slot addresses it, so masking reads the value and it is
+///   not raw egress. `description`, `input_schema`, `parameters`, `arguments`,
+///   a tool result's `content`.
+/// - `Dispatch` — a free identifier the caller chooses and the protocol routes
+///   on. Masking it breaks the call it names, so it is forwarded deliberately
+///   and its exposure is argued in the spec rather than here.
+/// - `Elsewhere` — a named check at the use site already decides this value,
+///   and naming it in the comment beside the entry is what stops a second check
+///   drifting from the first.
+/// - `Unscanned` — forwarded whole under a policy stated outside this file.
+///   `UNSCANNED_PART_TYPES` is that policy and images are that content; the
+///   entry exists so the exception is visible where the field is admitted
+///   rather than only in the README.
+/// - `Bool`, `OneOf`, `Token` — the provider constrains the value, so this
+///   checks it. Explicitly null passes: an SDK serializing its default is not
+///   a request to use the field, the same reading `tools`, `thinking`,
+///   `logprobs`, `audio` and `content` already get.
+/// - `Object` — a nested allowlist, read by this same function.
+///
+/// A seventh answer is not on this list on purpose: there is no "forwarded, and
+/// nobody has looked at it". A key with no answer does not go on a list.
+/// Three of these carry a payload and three do not, and the split is not a
+/// stylistic one: a payload here has to be something the *checking* reads.
+/// `Elsewhere` and `Unscanned` were written carrying the name of the check and
+/// of the policy, and nothing outside a test could ever read either — a comment
+/// with a type on it, which is the failure this whole enum exists to correct,
+/// reproduced one level up. So the pointer to the check lives in the comment
+/// beside the entry, where a comment belongs, and the variant carries only the
+/// answer the author had to choose.
+#[derive(Debug, Clone, Copy)]
+enum Admits {
+    Described,
+    Dispatch,
+    Elsewhere,
+    Unscanned,
+    Bool,
+    /// One of the strings the provider defines for this field.
+    OneOf(&'static [&'static str]),
+    /// A value from the provider's own vocabulary that this gateway cannot
+    /// enumerate, held to the grammar every one of them is written in.
+    Token,
+    /// The nested allowlist, and what to call it when it refuses.
+    Object(&'static str, &'static [Field]),
+}
+
+/// One entry of an allowlist: a key, and why admitting it is safe.
+#[derive(Debug, Clone, Copy)]
+struct Field {
+    key: &'static str,
+    admits: Admits,
+}
+
+impl Field {
+    const fn described(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Described,
+        }
+    }
+    const fn dispatch(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Dispatch,
+        }
+    }
+    /// The `check` is the name of the thing that decides this value. It is
+    /// not stored — nothing outside a test could read it — but it is required,
+    /// so that choosing this answer means naming the check at the entry.
+    const fn elsewhere(key: &'static str, _check: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Elsewhere,
+        }
+    }
+    /// As `elsewhere`, with the policy the field is forwarded whole under.
+    const fn unscanned(key: &'static str, _policy: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Unscanned,
+        }
+    }
+    const fn boolean(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Bool,
+        }
+    }
+    const fn one_of(key: &'static str, values: &'static [&'static str]) -> Self {
+        Field {
+            key,
+            admits: Admits::OneOf(values),
+        }
+    }
+    const fn token(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Token,
+        }
+    }
+    const fn object(key: &'static str, what: &'static str, fields: &'static [Field]) -> Self {
+        Field {
+            key,
+            admits: Admits::Object(what, fields),
+        }
+    }
+}
+
+/// The longest a `Token` may be. Anthropic documents its tool names as at most
+/// 128 characters and its tool types are shorter still; the bound is here so
+/// that "a value from the provider's vocabulary" cannot also mean "a paragraph
+/// in the provider's vocabulary".
+const MAX_TOKEN: usize = 128;
+
 /// Fields a tool definition may carry that this gateway can account for.
-/// `name` is dispatch and `type` names a server tool; `cache_control` is
-/// checked against its own allowlist below rather than assumed. `description`
-/// and the schema are described as slots.
 ///
 /// Anything else is refused, because a tool definition is an object the caller
 /// fills in and a field no slot addresses is forwarded exactly as it came.
 /// Anthropic's own server tools are why this is not theoretical:
 /// `web_search_20250305` carries `user_location: {city, region, country,
 /// timezone}`, and `city` is a LOCATION in this gateway's own vocabulary.
-const ANTHROPIC_TOOL_DEFINITION_FIELDS: [&str; 5] = [
-    "name",
-    "description",
-    "input_schema",
-    "type",
-    "cache_control",
+///
+/// `type` names a server tool, and it is the one field here whose admissible
+/// values this gateway cannot write down. They are dated —
+/// `text_editor_20250124`, `web_search_20250305` — so a list of them refuses
+/// the next version of `bash_*` the day Anthropic ships it, which is the
+/// coding-agent traffic this gateway exists to serve, and it would be a
+/// hand-maintained list of strings held to nothing. What *is* closed is the
+/// grammar: every type Anthropic has published is lowercase letters, digits and
+/// underscores. `Token` holds it to that. **It narrows the channel rather than
+/// closing it** — `martina_weber` still passes — and that residual is exactly
+/// the one `name` already carries as dispatch, which is the argument for
+/// stopping here rather than a reason it is not a channel.
+const ANTHROPIC_TOOL_DEFINITION_FIELDS: [Field; 5] = [
+    Field::dispatch("name"),
+    Field::described("description"),
+    Field::described("input_schema"),
+    Field::token("type"),
+    Field::object(
+        "cache_control",
+        "cache_control field",
+        &ANTHROPIC_CACHE_CONTROL_FIELDS,
+    ),
 ];
 
 /// The only object this gateway allowlists without describing it, so it is the
@@ -292,43 +434,56 @@ const ANTHROPIC_TOOL_DEFINITION_FIELDS: [&str; 5] = [
 /// "`cache_control` is `{"type": "ephemeral"}` and carries nothing of the
 /// caller's" — and that assertion was false: `{"type": "ephemeral", "note":
 /// "Weber"}` reached the upstream verbatim on both a content block and a tool
-/// definition. An assertion in a comment is not a guarantee; this list is.
+/// definition.
 ///
-/// `ttl` is on it because Anthropic defines it — extended cache lifetimes are
-/// `{"type": "ephemeral", "ttl": "1h"}` — and it holds one of two spellings the
-/// provider defines, not the caller's text. Anything else is refused, for the
-/// same reason every other allowlist here refuses: a field no slot addresses
-/// is forwarded exactly as it came.
-const ANTHROPIC_CACHE_CONTROL_FIELDS: [&str; 2] = ["type", "ttl"];
-
-/// `cache_control` wherever it is allowlisted — a tool definition or any
-/// content block. One function because the field is one field: six sites
-/// allowing it and one checking it is how the gap opened.
-fn known_cache_control(value: &Value, provider: &'static str) -> Result<(), ShapeError> {
-    match value.get("cache_control") {
-        None | Some(Value::Null) => Ok(()),
-        Some(cache_control) => known_fields(
-            cache_control,
-            &ANTHROPIC_CACHE_CONTROL_FIELDS,
-            "cache_control field",
-            provider,
-        ),
-    }
-}
+/// **Then the list that replaced the comment overclaimed in the same way**, and
+/// in the sentence correcting it: it admitted the two key names and read
+/// neither value, so `{"type": "Martina Weber"}` and `{"type": "ephemeral",
+/// "ttl": {"owner": "Weber"}}` both reached the upstream verbatim (measured, at
+/// 200). Anthropic defines `ephemeral` and nothing else, and `5m` or `1h` and
+/// nothing else, so those are what these admit — the whole field is provider
+/// vocabulary with no room in it for the caller's text.
+const ANTHROPIC_CACHE_CONTROL_FIELDS: [Field; 2] = [
+    Field::one_of("type", &["ephemeral"]),
+    Field::one_of("ttl", &["5m", "1h"]),
+];
 
 /// OpenAI wraps a definition: `{"type": "function", "function": {...}}`. The
 /// wrapper is checked as its own object because a field beside `function` — a
 /// vendor extension, a `custom` payload — would otherwise travel exactly as it
-/// came. `strict` on the inner object is a boolean and carries nothing of the
-/// caller's; `name` is dispatch.
-const OPENAI_TOOL_WRAPPER_FIELDS: [&str; 2] = ["type", "function"];
-const OPENAI_TOOL_DEFINITION_FIELDS: [&str; 4] = ["name", "description", "parameters", "strict"];
+/// came.
+///
+/// `strict` is a boolean, and until this list said so nothing checked it:
+/// `"strict": "Martina Weber"` reached OpenAI verbatim (measured, at 200) under
+/// a comment that read "`strict` on the inner object is a boolean and carries
+/// nothing of the caller's". It is a boolean; nothing made it one.
+const OPENAI_TOOL_WRAPPER_FIELDS: [Field; 2] = [
+    Field::elsewhere(
+        "type",
+        "the `type != \"function\"` refusal at the call site",
+    ),
+    Field::described("function"),
+];
+const OPENAI_TOOL_DEFINITION_FIELDS: [Field; 4] = [
+    Field::dispatch("name"),
+    Field::described("description"),
+    Field::described("parameters"),
+    Field::boolean("strict"),
+];
 
 /// A tool call the client echoes back, and the function inside it. The
 /// arguments live here, so a field beside them is the one place an added key
-/// walks a document past the masker. `id`, `type` and `name` are dispatch.
-const OPENAI_TOOL_CALL_FIELDS: [&str; 3] = ["id", "type", "function"];
-const OPENAI_TOOL_CALL_FUNCTION_FIELDS: [&str; 2] = ["name", "arguments"];
+/// walks a document past the masker. `id` and `name` are dispatch.
+const OPENAI_TOOL_CALL_FIELDS: [Field; 3] = [
+    Field::dispatch("id"),
+    Field::elsewhere(
+        "type",
+        "the `type != \"function\"` refusal in this function",
+    ),
+    Field::described("function"),
+];
+const OPENAI_TOOL_CALL_FUNCTION_FIELDS: [Field; 2] =
+    [Field::dispatch("name"), Field::described("arguments")];
 
 /// A `role: "tool"` message is OpenAI's shape of a tool result, and OpenAI
 /// defines exactly these three fields on it. `name` is deliberately absent:
@@ -337,27 +492,78 @@ const OPENAI_TOOL_CALL_FUNCTION_FIELDS: [&str; 2] = ["name", "arguments"];
 /// name the call it answers is broken with no way to learn why. Refusing costs
 /// nothing that worked before this slice, since the whole message was refused
 /// for its `tool_call_id`.
-const OPENAI_TOOL_MESSAGE_FIELDS: [&str; 3] = ["role", "content", "tool_call_id"];
+const OPENAI_TOOL_MESSAGE_FIELDS: [Field; 3] = [
+    Field::elsewhere("role", "the `role == \"tool\"` test that selects this list"),
+    Field::described("content"),
+    Field::dispatch("tool_call_id"),
+];
 
-/// An object every field of which this gateway can account for. A field outside
-/// the list is refused rather than forwarded, because a field no slot addresses
-/// travels to the provider exactly as it came — which is the whole reason any
-/// of these lists are allowlists rather than denylists.
+/// An object every field of which this gateway can account for, checked against
+/// both halves of the entry: the key is on the list, and the value is the shape
+/// the entry admits. A field outside the list is refused rather than forwarded,
+/// because a field no slot addresses travels to the provider exactly as it came
+/// — which is the whole reason any of these lists are allowlists rather than
+/// denylists — and a value outside the shape travels the same way for the same
+/// reason.
 fn known_fields(
     value: &Value,
-    allowed: &[&'static str],
+    allowed: &[Field],
     what: &'static str,
     provider: &'static str,
 ) -> Result<(), ShapeError> {
     // Not an object means no fields to describe and a value that would travel
     // whole: `"tools": ["Martina Weber"]` produced no slot and no refusal.
     let fields = value.as_object().ok_or(ShapeError::Request(provider))?;
-    for key in fields.keys() {
-        if !allowed.contains(&key.as_str()) {
+    for (key, held) in fields {
+        let Some(field) = allowed.iter().find(|field| field.key == key.as_str()) else {
             return Err(ShapeError::Unsupported(provider, what));
-        }
+        };
+        known_value(held, field.admits, what, provider)?;
     }
     Ok(())
+}
+
+/// The value half. One refusal for both halves — `Unsupported(provider, what)`
+/// — because they are one refusal: this list admits a key *and* a shape, and
+/// what reaches the upstream if either goes unchecked is the same bytes. The
+/// message reads "uses {what}, which this gateway does not mask yet; it is
+/// refused rather than forwarded", which is as true of a value nothing here
+/// masks as of a key nothing here describes.
+fn known_value(
+    value: &Value,
+    admits: Admits,
+    what: &'static str,
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    let refuse = || ShapeError::Unsupported(provider, what);
+    match admits {
+        Admits::Described | Admits::Dispatch | Admits::Elsewhere | Admits::Unscanned => Ok(()),
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use the field — the reading five other fields on this branch get.
+        // Placed before the checks so each of them is about a value that is
+        // actually there.
+        _ if value.is_null() => Ok(()),
+        Admits::Bool => value.as_bool().map(|_| ()).ok_or_else(refuse),
+        Admits::OneOf(values) => match value.as_str() {
+            Some(text) if values.contains(&text) => Ok(()),
+            _ => Err(refuse()),
+        },
+        Admits::Token => match value.as_str() {
+            Some(text)
+                if !text.is_empty()
+                    && text.len() <= MAX_TOKEN
+                    && text.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                    }) =>
+            {
+                Ok(())
+            }
+            _ => Err(refuse()),
+        },
+        // The nested list names itself, so a bad `cache_control` says
+        // `cache_control field` wherever it was reached from.
+        Admits::Object(nested, fields) => known_fields(value, fields, nested, provider),
+    }
 }
 
 /// The same shape failure, re-blamed at the response.
@@ -392,12 +598,11 @@ fn tool_definition_slots(
     prefix: &str,
     definition: &Value,
     schema_field: &str,
-    allowed: &[&'static str],
+    allowed: &[Field],
     provider: &'static str,
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
     known_fields(definition, allowed, "tool definition field", provider)?;
-    known_cache_control(definition, provider)?;
     // Present but not a string cannot be masked, so it is refused rather than
     // forwarded as it is — the rule `identifier_pointer` already applies to
     // `/user` and `/name`, which this once did not.
@@ -525,10 +730,10 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
 }
 
 /// Fields a content block may carry that this gateway can account for, by block
-/// type. `type` names the block; the rest are either described as slots or are
-/// dispatch this gateway deliberately leaves alone — a `tool_use_id`, an
-/// `is_error` flag, a `cache_control` whose own fields are allowlisted by
-/// `known_cache_control` rather than assumed.
+/// type. Every entry says why it is safe to admit, and `Admits` is where that
+/// vocabulary is explained. `is_error` is the field that made the point: it was
+/// admitted as a flag whose shape a comment asserted, and `"is_error": "Martina
+/// Weber"` reached Anthropic verbatim (measured, at 200).
 ///
 /// The rule `ANTHROPIC_TOOL_DEFINITION_FIELDS` applies to tool definitions,
 /// one layer up: a block is an object the caller fills in, and a field no slot
@@ -554,21 +759,59 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
 /// An empty slice means a type this function does not know. Those are left to
 /// the dispatch below, which refuses them for being unrecognized rather than
 /// for their fields.
-fn content_block_fields(kind: &str) -> &'static [&'static str] {
+fn content_block_fields(kind: &str) -> &'static [Field] {
+    /// The block's own `type`, decided by the dispatch that chose this arm:
+    /// `kind` *is* that string, so a second check here would be the same check
+    /// written twice, and two checks on one value drift.
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `kind` that chose this arm");
+    const CACHE_CONTROL: Field = Field::object(
+        "cache_control",
+        "cache_control field",
+        &ANTHROPIC_CACHE_CONTROL_FIELDS,
+    );
+    /// The images-and-audio policy: `UNSCANNED_PART_TYPES` names these block
+    /// types, and their payload — a base64 `source`, a URL, an audio blob —
+    /// is forwarded whole. Written as an entry rather than left implicit so
+    /// that the one exception to "nothing unmasked is forwarded" is visible at
+    /// the field it applies to.
+    const UNSCANNED: &str = "the images-and-audio policy at `UNSCANNED_PART_TYPES`";
+    // Named rather than written into the match arms because a `&[..]` of
+    // `const fn` calls is not promoted to `'static` and cannot be returned.
+    const TEXT: [Field; 3] = [TYPE, Field::described("text"), CACHE_CONTROL];
+    const IMAGE: [Field; 3] = [TYPE, Field::unscanned("source", UNSCANNED), CACHE_CONTROL];
+    const IMAGE_URL: [Field; 3] = [
+        TYPE,
+        Field::unscanned("image_url", UNSCANNED),
+        CACHE_CONTROL,
+    ];
+    const INPUT_AUDIO: [Field; 3] = [
+        TYPE,
+        Field::unscanned("input_audio", UNSCANNED),
+        CACHE_CONTROL,
+    ];
+    const AUDIO: [Field; 3] = [TYPE, Field::unscanned("audio", UNSCANNED), CACHE_CONTROL];
+    const TOOL_USE: [Field; 5] = [
+        TYPE,
+        Field::dispatch("id"),
+        Field::dispatch("name"),
+        Field::described("input"),
+        CACHE_CONTROL,
+    ];
+    const TOOL_RESULT: [Field; 5] = [
+        TYPE,
+        Field::dispatch("tool_use_id"),
+        Field::described("content"),
+        Field::boolean("is_error"),
+        CACHE_CONTROL,
+    ];
     match kind {
-        "text" => &["type", "text", "cache_control"],
-        "image" => &["type", "source", "cache_control"],
-        "image_url" => &["type", "image_url", "cache_control"],
-        "input_audio" => &["type", "input_audio", "cache_control"],
-        "audio" => &["type", "audio", "cache_control"],
-        "tool_use" => &["type", "id", "name", "input", "cache_control"],
-        "tool_result" => &[
-            "type",
-            "tool_use_id",
-            "content",
-            "is_error",
-            "cache_control",
-        ],
+        "text" => &TEXT,
+        "image" => &IMAGE,
+        "image_url" => &IMAGE_URL,
+        "input_audio" => &INPUT_AUDIO,
+        "audio" => &AUDIO,
+        "tool_use" => &TOOL_USE,
+        "tool_result" => &TOOL_RESULT,
         _ => &[],
     }
 }
@@ -627,15 +870,11 @@ fn content_pointers_at(
                 // it carries as readily as for what it is.
                 let allowed = content_block_fields(kind);
                 if !allowed.is_empty() {
-                    let fields = part.as_object().ok_or(ShapeError::Request(provider))?;
-                    for field in fields.keys() {
-                        if !allowed.contains(&field.as_str()) {
-                            return Err(ShapeError::Unsupported(provider, "content block field"));
-                        }
-                    }
-                    // Every block type this function knows allows
-                    // `cache_control`, so one check here covers all of them.
-                    known_cache_control(part, provider)?;
+                    // Both halves of every entry: the key is on the list, and
+                    // the value is the shape the entry admits. `cache_control`
+                    // is an entry like any other now, so the six sites that
+                    // allow it and the one that checked it are one site.
+                    known_fields(part, allowed, "content block field", provider)?;
                 }
                 match kind {
                     "text" => {
@@ -1235,6 +1474,115 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// **Every allowlist in this file, in one place.** Codex found three
+    /// constrained-but-unchecked fields in a single pass, which is evidence
+    /// about the population and not about those three, so the answer was to
+    /// enumerate the population rather than patch its known members. This is
+    /// that enumeration, and it is a function rather than a comment so that the
+    /// classification each entry carries is *read* — `Elsewhere` and
+    /// `Unscanned` exist to name the check and the policy behind an admitted
+    /// key, and a payload nothing reads is a comment with a type on it.
+    ///
+    /// A list added and not put here is still checked at its own call site;
+    /// what it loses is this test's insistence that each of its entries has an
+    /// answer. Add it.
+    fn every_allowlist() -> Vec<(&'static str, &'static [Field])> {
+        vec![
+            (
+                "ANTHROPIC_TOOL_DEFINITION_FIELDS",
+                &ANTHROPIC_TOOL_DEFINITION_FIELDS[..],
+            ),
+            (
+                "ANTHROPIC_CACHE_CONTROL_FIELDS",
+                &ANTHROPIC_CACHE_CONTROL_FIELDS[..],
+            ),
+            (
+                "OPENAI_TOOL_WRAPPER_FIELDS",
+                &OPENAI_TOOL_WRAPPER_FIELDS[..],
+            ),
+            (
+                "OPENAI_TOOL_DEFINITION_FIELDS",
+                &OPENAI_TOOL_DEFINITION_FIELDS[..],
+            ),
+            ("OPENAI_TOOL_CALL_FIELDS", &OPENAI_TOOL_CALL_FIELDS[..]),
+            (
+                "OPENAI_TOOL_CALL_FUNCTION_FIELDS",
+                &OPENAI_TOOL_CALL_FUNCTION_FIELDS[..],
+            ),
+            (
+                "OPENAI_TOOL_MESSAGE_FIELDS",
+                &OPENAI_TOOL_MESSAGE_FIELDS[..],
+            ),
+            ("content_block_fields(text)", content_block_fields("text")),
+            ("content_block_fields(image)", content_block_fields("image")),
+            (
+                "content_block_fields(image_url)",
+                content_block_fields("image_url"),
+            ),
+            (
+                "content_block_fields(input_audio)",
+                content_block_fields("input_audio"),
+            ),
+            ("content_block_fields(audio)", content_block_fields("audio")),
+            (
+                "content_block_fields(tool_use)",
+                content_block_fields("tool_use"),
+            ),
+            (
+                "content_block_fields(tool_result)",
+                content_block_fields("tool_result"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_allowlisted_field_says_why_it_is_safe_to_admit() {
+        // The class this round exists to end: an allowlist admits a key, and a
+        // field whose shape the provider constrains is an unmasked egress
+        // channel until something checks its value. `Admits` makes the answer a
+        // value the code consumes; this makes the answer say something.
+        for (list, fields) in every_allowlist() {
+            assert!(!fields.is_empty(), "{list} admits nothing");
+            for field in fields {
+                assert!(!field.key.is_empty(), "{list} has a nameless entry");
+                match field.admits {
+                    Admits::Described
+                    | Admits::Dispatch
+                    | Admits::Bool
+                    | Admits::Token
+                    | Admits::Elsewhere
+                    | Admits::Unscanned => {}
+                    Admits::OneOf(values) => assert!(
+                        !values.is_empty(),
+                        "{list}/{} admits one of nothing, which is a refusal \
+                         written as an allowlist",
+                        field.key
+                    ),
+                    Admits::Object(what, nested) => {
+                        assert!(!what.is_empty() && !nested.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_allowlist_admits_a_key_twice() {
+        // Two entries for one key means the second is dead and the first is
+        // whichever `find` reaches — so a `Bool` shadowed by a `Dispatch` would
+        // check nothing while reading as though it did. The same defect
+        // `check_entity_types.py` grew a duplicate check for one round ago.
+        for (list, fields) in every_allowlist() {
+            for (index, field) in fields.iter().enumerate() {
+                assert!(
+                    !fields[..index].iter().any(|other| other.key == field.key),
+                    "{list} admits {} twice",
+                    field.key
+                );
+            }
+        }
+    }
+
     // Unwraps `stream_slots`' `TextSlot` results, for the streamed-event tests.
     fn pointers(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
         slots
@@ -1797,6 +2145,185 @@ mod tests {
             assert!(
                 Anthropic.request_pointers(&body).is_ok(),
                 "a cache_control Anthropic defines was refused: {cache_control}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_controls_values_are_checked_and_not_only_its_keys() {
+        // The list above replaced a comment that asserted the shape, and then
+        // overclaimed in the same way: it admitted the two key names and read
+        // neither value, so both of these reached the upstream verbatim
+        // (measured, at 200). Anthropic defines `ephemeral`, and `5m` or `1h`,
+        // and nothing else — there is no room in this field for the caller's
+        // text, which is what makes checking it free.
+        for cache_control in [
+            json!({"type": "Martina Weber"}),
+            json!({"type": "ephemeral", "ttl": {"owner": "Weber"}}),
+            json!({"type": "ephemeral", "ttl": "Martina Weber"}),
+            json!({"type": ["ephemeral"]}),
+        ] {
+            for body in [
+                json!({
+                    "model": "claude",
+                    "tools": [{"name": "t", "input_schema": {"type": "object"},
+                               "cache_control": cache_control}],
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "hi", "cache_control": cache_control}]}]
+                }),
+            ] {
+                assert!(
+                    matches!(
+                        Anthropic.request_pointers(&body),
+                        Err(ShapeError::Unsupported("anthropic", "cache_control field"))
+                    ),
+                    "a value no slot addresses travelled whole: {cache_control} -> {:?}",
+                    Anthropic.request_pointers(&body)
+                );
+            }
+        }
+        // And a null is an SDK serializing its default, not a request to cache.
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": null}]}]
+        });
+        assert!(Anthropic.request_pointers(&body).is_ok());
+    }
+
+    #[test]
+    fn a_non_boolean_strict_is_refused_rather_than_forwarded() {
+        // `strict` is a boolean, and the comment above the list said so while
+        // nothing made it one: `"strict": "Martina Weber"` reached OpenAI
+        // verbatim (measured, at 200). `tool_definition_slots` scans
+        // `description` and `parameters`, so no slot ever looked at this field.
+        for strict in [json!("Martina Weber"), json!({"owner": "Weber"}), json!(1)] {
+            let body = json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function",
+                           "function": {"name": "t", "strict": strict}}]
+            });
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Unsupported("openai", "tool definition field"))
+                ),
+                "a non-boolean strict travelled whole: {strict} -> {:?}",
+                OpenAi.request_pointers(&body)
+            );
+        }
+        // Both booleans, and a null, are what OpenAI defines here.
+        for strict in [json!(true), json!(false), json!(null)] {
+            let body = json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function",
+                           "function": {"name": "t", "strict": strict}}]
+            });
+            assert!(
+                OpenAi.request_pointers(&body).is_ok(),
+                "a strict OpenAI defines was refused: {strict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_is_error_is_refused_rather_than_forwarded() {
+        // The same shape one provider over. A `tool_result`'s recursive scan
+        // visits `content` and nothing else, so `"is_error": "Martina Weber"`
+        // reached Anthropic verbatim (measured, at 200) under a list that
+        // admitted the key and a comment that called it a flag.
+        for is_error in [json!("Martina Weber"), json!({"owner": "Weber"})] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "ok", "is_error": is_error}]}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported("anthropic", "content block field"))
+                ),
+                "a non-boolean is_error travelled whole: {is_error} -> {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+        for is_error in [json!(true), json!(false), json!(null)] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "ok", "is_error": is_error}]}]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "an is_error Anthropic defines was refused: {is_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_type_outside_the_providers_grammar_is_refused() {
+        // The fourth field of the class, found by sweeping the lists rather
+        // than reported: `type` on an Anthropic tool definition was admitted
+        // and never read, so `"type": "Martina Weber"` reached the upstream
+        // verbatim (measured, at 200). It is the one `type` in this file that
+        // nothing checked — OpenAI's wrapper and call both refuse anything but
+        // `function`, and a content block's type chooses its own allowlist.
+        //
+        // What it is held to is the grammar rather than a list of values, and
+        // the second half of this test is why: the dated server-tool types are
+        // not enumerable here without refusing the next one Anthropic ships.
+        for kind in [
+            json!("Martina Weber"),
+            json!("Weber, Martina"),
+            json!({"type": "custom"}),
+            json!(""),
+            json!("a".repeat(MAX_TOKEN + 1)),
+        ] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "type": kind, "input_schema": {"type": "object"}}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported(
+                        "anthropic",
+                        "tool definition field"
+                    ))
+                ),
+                "a tool type carrying prose travelled whole: {kind} -> {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+        // Every tool type Anthropic has published, and the ones it has not.
+        // **This is a narrowing of nothing**: a bare server tool passed the
+        // definition gate before this check and still does. What it stops is
+        // prose, not a version.
+        for kind in [
+            "custom",
+            "bash_20250124",
+            "text_editor_20250124",
+            "computer_20250124",
+            "web_search_20250305",
+            "code_execution_20250522",
+        ] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "type": kind}]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a bare server tool was refused for its type: {kind}"
             );
         }
     }
