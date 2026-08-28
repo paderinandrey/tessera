@@ -227,7 +227,8 @@ comment beside the entry.
 Three found in one review pass is evidence about the population, so the answer
 is not three checks. Every entry now carries **why admitting that key is safe**,
 as a value the code consumes: `Described` (a slot addresses it), `Dispatch` (a
-free identifier the caller chooses and the protocol routes on, argued above),
+free identifier the caller chooses and the protocol routes on, argued above,
+**and a string**),
 `Elsewhere` (a named check at the use site decides it), `Unscanned` (forwarded
 whole under the images-and-audio policy), `Bool` / `OneOf` / `Token` (the
 provider constrains it, so this checks it), `Object` (a nested list). There is
@@ -241,6 +242,61 @@ ships, which is the coding-agent traffic this slice exists to serve. The grammar
 is closed even though the vocabulary is not, so `Token` holds it to that. It
 **narrows the channel rather than closing it** — `martina_weber` still passes —
 and that residual is the one `name` already carries as dispatch.
+
+### Why `Dispatch` is a string, and why that is not the argument it looked like
+
+The argument for leaving dispatch alone was that the published grammars —
+`^[a-zA-Z0-9_-]{1,128}$` on Anthropic, the same at 64 on OpenAI — refuse
+characters real clients use: MCP and others spell tool names with `.` and `/`,
+so tightening the grammar refuses working traffic. That argument is about the
+**character set**. It says nothing about the **type**, and `Dispatch` shared
+`known_value`'s first arm with `Described`, `Elsewhere` and `Unscanned` — an
+arm that is `Ok(())`. So `{"name": {"owner": "Martina Weber"}}` on a tool
+definition was admitted, scanned by nothing and forwarded verbatim (measured, at
+200). A structured value has no characters for the argument about characters to
+be about.
+
+Requiring a string costs nothing: every one of the ten dispatch fields is a
+string in both providers' own definitions. The permissive grammar stays exactly
+as permissive. **What it does not close, and this has to keep being said:**
+`"name": "Martina Weber"` still forwards — that is what dispatch means. But the
+residual is now *a string the caller chose*, which is a smaller and more precise
+claim than the one the variant was making.
+
+### Why `tool_choice` is described, and how it went unchecked
+
+`tool_choice` is the one tool field admitted by **absence from a denylist**
+rather than by presence on an allowlist. The sweep that gave every allowlist
+entry a reason it was safe to admit covered the allowlists; a field on no list
+is invisible to it, and what `tool_choice` was admitted on was a comment beside
+the denylists arguing about its `name`. The name is dispatch and the argument
+holds; everything around it travelled unchecked, so `{"type": "auto", "note":
+"Martina Weber"}` reached both providers verbatim (measured, at 200).
+
+Both providers publish a closed shape. Anthropic has four objects and no bare
+string: `none` alone, `auto` and `any` with `disable_parallel_tool_use`, `tool`
+with that and a `name`. OpenAI has the bare modes `none` / `auto` / `required`,
+**or** an object — `{"type": "function", "function": {"name": …}}` or `{"type":
+"custom", "custom": {"name": …}}`.
+
+That union is the part `Admits` does not express, and it does not need to. A
+body field is on no allowlist — `Admits` answers *why is this key on this list
+safe*, and there is no list at body level for `tool_choice` to be an entry of —
+so the union lives at the use site beside `logprobs`, `audio` and `thinking`,
+which are the other body fields a named check decides. Each *object* below the
+union is a `Field` list read by the same `known_fields` as everything else, and
+which list is chosen by dispatching on `type`, exactly as `content_block_fields`
+does. Bending a string-or-object union into `Admits::Object` would have needed a
+variant meaning "or", and one answer per entry is the whole of the enum's shape.
+
+**Refused rather than described:** OpenAI's `{"type": "allowed_tools",
+"allowed_tools": {"mode": …, "tools": […]}}`. Its `tools` are tool definitions,
+and describing a tool definition is `tool_definition_slots`' job — it produces
+slots, masks the prose and charges the tool bounds. A second, name-only reading
+of a tool definition here would be a second answer to a question this file
+already answers, and two answers to one question in this file have drifted
+twice. This **narrows behaviour** for a client using `allowed_tools`: it was a
+200 and is now a 400. Describing it is a slice, not a fix.
 
 ## Shape
 
@@ -291,12 +347,15 @@ as content blocks when it is a list.
 role `tool` as ordinary text.
 
 **Excluded, each because it is dispatch rather than prose:** tool names, schema
-property names, `tool_call_id`, and `tool_choice`'s selector. Keys are never
-masked by construction — the walk touches values only — so property names need
-no special handling; the others are values and are excluded by name, which is a
-list, and is therefore written next to the reason it is allowed to be one: these
-four are matched by the *client* against strings it authored, so masking one
-breaks dispatch rather than protecting anything.
+property names, `tool_call_id`, and `tool_choice`'s selector — meaning the
+selector's *name string* and not the object holding it, which is checked like
+any other shape. Keys are never masked by construction — the walk touches values
+only — so property names need no special handling; the others are values and are
+excluded by name, which is a list, and is therefore written next to the reason
+it is allowed to be one: these four are matched by the *client* against strings
+it authored, so masking one breaks dispatch rather than protecting anything.
+Each of them is a string, and that much *is* checked: see "Why `Dispatch` is a
+string" above.
 
 ### Restoration
 

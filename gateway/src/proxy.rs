@@ -4930,4 +4930,147 @@ mod tests {
         let journal = std::fs::read_to_string(&path).expect("readable");
         assert!(journal.is_empty(), "health wrote to the journal: {journal}");
     }
+
+    #[tokio::test]
+    async fn a_structured_dispatch_value_never_reaches_the_upstream() {
+        // D1 end to end. `Admits::Dispatch` shared `known_value`'s first arm
+        // with `Described`, `Elsewhere` and `Unscanned`, and that arm is
+        // `Ok(())`, so a structured value under a dispatch field was admitted,
+        // scanned by nothing and forwarded verbatim. Measured before the fix:
+        //
+        //   status=200 upstream saw: {"messages":[{"content":"hi","role":"user"}],
+        //   "model":"claude","tools":[{"input_schema":{"type":"object"},
+        //   "name":{"owner":"Martina Weber"}}]}
+        //
+        // The argument for leaving dispatch alone was about the character set.
+        // An object has no characters for it to be about.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": {"owner": "Martina Weber"},
+                           "input_schema": {"type": "object"}}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "and the name never left the process"
+        );
+        assert!(
+            !returned.contains("Weber"),
+            "the refusal must not repeat what it refused: {returned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_choice_field_no_slot_addresses_never_reaches_the_upstream() {
+        // D2 end to end. `tool_choice` is admitted by *absence from a denylist*
+        // rather than by presence on an allowlist, which is why the sweep over
+        // the allowlists could not see it. Measured before the fix:
+        //
+        //   status=200 upstream saw: {..., "tool_choice":{"note":"Martina Weber",
+        //   "type":"auto"}, "tools":[{"input_schema":{"type":"object"},"name":"t"}]}
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "auto", "note": "Martina Weber"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "and the note never left the process"
+        );
+        assert!(
+            !returned.contains("Weber"),
+            "the refusal must not repeat what it refused: {returned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_openai_tool_choice_field_no_slot_addresses_never_reaches_the_upstream() {
+        // The same hole on the other provider, and the shape OpenAI's
+        // `tool_choice` has that Anthropic's does not — the value is either a
+        // bare mode string or an object — is why this check lives at the use
+        // site rather than in `Admits`. Measured before the fix:
+        //
+        //   status=200 upstream saw: {..., "tool_choice":{"function":{"name":"t"},
+        //   "note":"Martina Weber","type":"function"}, ...}
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+                "tool_choice": {"type": "function", "note": "Martina Weber",
+                                "function": {"name": "t"}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{returned}");
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "and the note never left the process"
+        );
+        assert!(
+            !returned.contains("Weber"),
+            "the refusal must not repeat what it refused: {returned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_mode_string_still_forces_a_tool_on_openai() {
+        // The other direction, and the one a new check breaks silently:
+        // `"tool_choice": "required"` is a legal value OpenAI publishes and
+        // Anthropic does not. A shape check written for the object form alone
+        // would refuse a working request, which is the failure mode the whole
+        // branch has been avoiding on the other side.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+                "tool_choice": "required"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["tool_choice"],
+            json!("required"),
+            "and it reached the upstream unchanged"
+        );
+    }
 }

@@ -184,7 +184,11 @@ tool definition's description and the whole of its schema — `enum` members, `d
 `title`, `examples`, not `description` alone — a tool call's arguments, and a tool result.
 Names are not. A tool's name, a schema property name and a `tool_call_id` are the client's
 own dispatch, matched against strings it authored, so masking one breaks the call and
-leaves the client no way to learn why. Arguments are walked as JSON and only string leaves
+leaves the client no way to learn why. What is required of them is that they be *strings*:
+the argument for leaving the characters alone is an argument about the character set, and
+a structured value has no characters — `{"name": {"owner": "Martina Weber"}}` was admitted
+and forwarded verbatim until the type was checked. So the residual a name carries is a
+string the caller chose, which is smaller than "whatever the caller put under `name`". Arguments are walked as JSON and only string leaves
 are touched, so the masker never sees a brace or a quote and cannot hand back a document
 the client fails to parse — and a tool call in a response is restored before the client
 executes it, the one place here where a failed restoration would be a wrong action rather
@@ -248,7 +252,14 @@ was the later half: every entry records why admitting it is safe, and a field th
 constrains to a boolean, an enum or a fixed literal has that value checked. `"strict":
 "Martina Weber"`, `"is_error": "Martina Weber"` and `cache_control: {"type": "Martina
 Weber"}` were each admitted by a list and each reached the provider verbatim, under
-comments that stated the shapes correctly.
+comments that stated the shapes correctly. **A field can also be admitted by not being
+refused**, which is the case the allowlist rule does not cover: `tool_choice` and OpenAI's
+`parallel_tool_calls` are body fields, and there is no allowlist at body level for them to
+be entries of, so they were admitted by absence from the denylists and read by nothing.
+Both are described now — each provider's published `tool_choice` shapes, and a boolean —
+with one exception stated plainly: OpenAI's newer `tool_choice: {"type": "allowed_tools",
+…}` nests tool definitions this gateway does not describe there, and is refused rather
+than forwarded, which is a 400 where there used to be a 200.
 
 **That closure is scoped to the tool structures, and the body and the message levels have
 no allowlist at all.** It is true of a tool definition, a tool call, a tool result and a
