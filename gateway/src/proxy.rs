@@ -1489,6 +1489,173 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_structured_value_under_an_identifier_keyword_reaches_the_detector() {
+        // The same shape as the test above, on the arm four lines up from the
+        // one that test fixed. `required` holds an array of property names; an
+        // object under it states no name anywhere, and the arm skipped it from
+        // the key alone. Measured before the fix: the detector saw
+        // `{"text":"hi"}` and nothing else, and the upstream received
+        // `{"required":{"owner":"Martina Weber"}}`.
+        let detector = detector_finding_martina().await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "input_schema": {
+                    "type": "object",
+                    "required": {"owner": "Martina Weber"}
+                }}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let asked: Vec<Value> = detector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert!(
+            asked.iter().any(|body| body["text"] == "Martina Weber"),
+            "the value was never shown to the detector: {asked:?}"
+        );
+        assert_eq!(
+            sent_to(&upstream).await["tools"][0]["input_schema"]["required"]["owner"],
+            "Martina [PERSON_1]",
+            "and it must not reach the provider as the client wrote it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dependency_array_holding_an_object_reaches_the_detector() {
+        // The arm the audit found rather than the one Codex reported.
+        // `dependencies`' array half is `dependentRequired` under its old
+        // spelling — property names, every one of them — and the arm skipped
+        // an array for being an array. Measured before the fix: the detector
+        // saw `{"text":"hi"}` and nothing else.
+        let detector = detector_finding_martina().await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "input_schema": {
+                    "type": "object",
+                    "dependencies": {"card": [{"owner": "Martina Weber"}]}
+                }}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let asked: Vec<Value> = detector
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert!(
+            asked.iter().any(|body| body["text"] == "Martina Weber"),
+            "the value was never shown to the detector: {asked:?}"
+        );
+        assert_eq!(
+            sent_to(&upstream).await["tools"][0]["input_schema"]["dependencies"]["card"][0]
+                ["owner"],
+            "Martina [PERSON_1]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_id_on_a_non_tool_message_never_reaches_the_upstream() {
+        // The allowlist carrying `tool_call_id` is selected by `role ==
+        // "tool"`, and the denylist that runs for every message does not carry
+        // it — so on a user message nothing asked, and the object travelled.
+        // Measured at 8b6061d: 200, with `"tool_call_id":{"owner":"Martina
+        // Weber"}` in the egress.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+        )
+        .await;
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "refused means the upstream is never called"
+        );
+
+        // And the message that defines the field still works, which is why the
+        // refusal cannot live on the denylist that runs for every message.
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+        )
+        .await;
+        let (status, returned) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["messages"][0]["tool_call_id"],
+            "call_1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_tool_use_block_carrying_a_text_field_has_its_input_restored() {
+        // The response half, and the half of the promise that is not about the
+        // provider: this is a placeholder reaching a client that *acts on it*.
+        // The `text` check ran before the `type` check, so a block carrying
+        // both pushed the text slot and skipped the block — `input` was never
+        // restored and the client opened `/home/[PERSON_1]/notes.txt`.
+        // Measured at 8b6061d, in what the client received.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "read_file",
+                                "text": "ok",
+                                "input": {"path": "/home/[PERSON_1]/notes.txt"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("/home/Weber/notes.txt"),
+            "the arguments the client executes were not restored: {body}"
+        );
+        assert!(
+            !body.contains("PERSON_1"),
+            "a placeholder reached the client: {body}"
+        );
+    }
+
     /// A detector that finds `Weber` inside `Martina Weber` at the offsets it
     /// sits at when that string is a document's only leaf, and nothing in any
     /// other text. Separate from `detector_finding_weber`, whose span is fixed

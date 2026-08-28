@@ -437,25 +437,103 @@ pub enum Shape {
 /// it. `propertyNames` is *not* on this list even though part of it is dispatch,
 /// because only part of it is — see `Shape::NameSchema`, which is what a keyword
 /// gets when it needs a rule rather than a verdict.
-const SCHEMA_IDENTIFIER_KEYWORDS: [&str; 14] = [
-    "$anchor",
-    "$dynamicAnchor",
-    "$dynamicRef",
-    "$id",
-    "$ref",
-    "$schema",
-    "contentEncoding",
-    "contentMediaType",
-    "dependentRequired",
-    "format",
+///
+/// **Membership is necessary and not sufficient**, the same sentence
+/// `SCHEMA_NAME_INSTANCE_KEYWORDS` carries and for the same reason: each entry
+/// pairs its keyword with the shape that keyword's value has when it holds
+/// identifiers, and `descend_into` skips the value only if it has that shape.
+/// Consulted from the key alone, this list copied `{"required": {"owner":
+/// "Martina Weber"}}` into the egress untouched (measured, at 200).
+const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier); 14] = [
+    ("$anchor", Identifier::Name),
+    ("$dynamicAnchor", Identifier::Name),
+    ("$dynamicRef", Identifier::Name),
+    ("$id", Identifier::Name),
+    ("$ref", Identifier::Name),
+    ("$schema", Identifier::Name),
+    ("contentEncoding", Identifier::Name),
+    ("contentMediaType", Identifier::Name),
+    ("dependentRequired", Identifier::NamesPerName),
+    ("format", Identifier::Name),
     // draft-04 spelled `$id` this way. A schema written to that draft is
     // still a schema a client may send, and a masked base URI breaks every
     // `$ref` that resolves against it.
-    "id",
-    "pattern",
-    "required",
-    "type",
+    ("id", Identifier::Name),
+    ("pattern", Identifier::Name),
+    ("required", Identifier::Names),
+    ("type", Identifier::NameOrNames),
 ];
+
+fn identifier_keyword(key: &str) -> Option<Identifier> {
+    SCHEMA_IDENTIFIER_KEYWORDS
+        .iter()
+        .find(|(keyword, _)| *keyword == key)
+        .map(|(_, shape)| *shape)
+}
+
+/// The shape an identifier keyword's value takes when it really does hold
+/// identifiers.
+///
+/// **One rule does not cover all fourteen, and the rule loose enough to try
+/// leaks.** A union admitting every keyword's shape at once — a string, an
+/// array of strings, or an object of arrays of strings — would skip `{"$ref":
+/// {"note": ["Martina Weber"]}}`, where the strings are the caller's prose and
+/// no `$ref` was ever stated. So each keyword is held to the shape its own
+/// draft defines. Being wrong then costs an over-masked schema the caller can
+/// see, which is the direction this walk chooses everywhere; the other way
+/// round costs a value nothing looked at.
+///
+/// What this does *not* narrow, and deliberately: a property genuinely named
+/// `Martina Weber` is still skipped under `required`, because it is a name and
+/// names are the caller's dispatch. That residual is the one the walk has
+/// always had — keys are never masked — and it is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Identifier {
+    /// One identifier: a string, and nothing else. `$ref`, `$id`, `format`,
+    /// `pattern` and the rest of the URI-and-token keywords.
+    Name,
+    /// A string *or* an array of strings — `type`'s published union, and the
+    /// shape a name-stating instance keyword takes under `propertyNames`.
+    NameOrNames,
+    /// An array of property names: `required`.
+    Names,
+    /// An object mapping a property name to an array of property names:
+    /// `dependentRequired`, and draft-07's `dependencies` where its value is
+    /// the array half.
+    NamesPerName,
+}
+
+impl Identifier {
+    /// Whether `value` is the shape this keyword takes when it holds
+    /// identifiers. Anything else is malformed against the keyword's own draft,
+    /// so it states no identifier at all and is the client's data like every
+    /// other unrecognized value here.
+    fn holds(self, value: &Value) -> bool {
+        match self {
+            Identifier::Name => value.is_string(),
+            Identifier::NameOrNames => value.is_string() || is_name_list(value),
+            Identifier::Names => is_name_list(value),
+            Identifier::NamesPerName => value
+                .as_object()
+                .is_some_and(|fields| fields.values().all(is_name_list)),
+        }
+    }
+}
+
+/// A list of property names: an array, every element of which is a string.
+///
+/// One spelling, read by every arm that asks. The question was answered three
+/// separate times in `descend_into` — once per arm, each by whoever was looking
+/// at the arm that had just leaked — and **two of the three answers were
+/// wrong**. `dependencies` accepted any array whatever, so `{"dependencies":
+/// {"a": [{"owner": "Martina Weber"}]}}` skipped an object subtree (measured,
+/// at 200); `SCHEMA_IDENTIFIER_KEYWORDS` asked nothing about the value at all.
+/// A shared predicate cannot be right in one arm and wrong in the next.
+fn is_name_list(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().all(Value::is_string))
+}
 
 /// Keywords whose values are subschemas — the ones under which schema keywords
 /// go on meaning what they mean.
@@ -568,9 +646,17 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         // names, every one of them, so the whole array is skipped. The object
         // half is `dependentSchemas`, an ordinary subschema. Anything else is
         // malformed, and scanning is the safe way to be wrong.
+        //
+        // **Every one of them, which is what this arm did not check.** It
+        // skipped an array for being an array, so `{"dependencies": {"a":
+        // [{"owner": "Martina Weber"}]}}` — an array holding an object, which
+        // states no property name anywhere — travelled whole (measured, at
+        // 200). This arm was written to answer a keyword whose meaning depends
+        // on its value's type and then asked only half the question about that
+        // type. `is_name_list` is the shared answer.
         Shape::DependencyMap => {
             return match value {
-                Value::Array(_) => None,
+                value if is_name_list(value) => None,
                 Value::Object(_) => Some(Shape::Schema),
                 _ => Some(Shape::Instance),
             }
@@ -578,11 +664,24 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         Shape::Schema => false,
         Shape::NameSchema => true,
     };
+    let identifier = identifier_keyword(key);
     match key {
         "propertyNames" => Some(Shape::NameSchema),
         "dependencies" => Some(Shape::DependencyMap),
         key if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
-        key if SCHEMA_IDENTIFIER_KEYWORDS.contains(&key) => None,
+        // An identifier keyword holding what that keyword's own draft says it
+        // holds. The key names a shape and the value has to be it: `required`
+        // is an array of strings, `type` a string or an array of them, `$ref`
+        // a string. See `Identifier`.
+        _ if identifier.is_some_and(|shape| shape.holds(value)) => None,
+        // On the list, and holding something the keyword does not define. It
+        // states no identifier, so it is the client's data and is scanned —
+        // the third arm of this match to reach that conclusion, after
+        // `dependencies` and the name-instance arm below. Scanned rather than
+        // refused for the reason the name-instance arm gives: `descend_into`
+        // has no refusal channel, and a malformed annotation costs an
+        // over-masked schema the caller can see.
+        _ if identifier.is_some() => Some(Shape::Instance),
         // Prose either way. Under `propertyNames` the values are names, but a
         // description of them is still a sentence.
         key if SCHEMA_ANNOTATION_KEYWORDS.contains(&key) => Some(Shape::Instance),
@@ -617,11 +716,17 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         // strings that genuinely are names inside a mixed array too — they are
         // masked with the rest, and a schema the caller can see broken is the
         // cheaper of the two mistakes.
-        key if names && SCHEMA_NAME_INSTANCE_KEYWORDS.contains(&key) => match value {
-            Value::String(_) => None,
-            Value::Array(items) if items.iter().all(Value::is_string) => None,
-            _ => Some(Shape::Instance),
-        },
+        key if names && SCHEMA_NAME_INSTANCE_KEYWORDS.contains(&key) => {
+            // The same question the identifier arms ask, so the same
+            // predicate: a name is a string, and a list of names is an array
+            // of them. Written out here once and answered differently three
+            // lines up is how two of these arms came to disagree.
+            if Identifier::NameOrNames.holds(value) {
+                None
+            } else {
+                Some(Shape::Instance)
+            }
+        }
         // Everything else: `enum` and `default` outside `propertyNames`,
         // `example`, `x-whatever`, and any keyword written after this line. It
         // holds an instance, and an instance is the client's data.
@@ -1889,6 +1994,132 @@ mod tests {
             json!(["credit_card", "billing_address"])
         );
         assert_eq!(rebuilt["propertyNames"]["default"], "billing_address");
+    }
+
+    #[test]
+    fn an_identifier_keyword_states_an_identifier_only_when_its_value_has_that_shape() {
+        // The third arm of this one `match` to be corrected for deciding from
+        // the key alone, and the third occurrence of one mistake.
+        // `dependencies` got a per-value rule, `SCHEMA_NAME_INSTANCE_KEYWORDS`
+        // got one the round after — and this list sat four lines above the arm
+        // that was fixed and was not touched, twice. `{"required": {"owner":
+        // "Martina Weber"}}` states no property name anywhere and reached the
+        // provider verbatim (measured through the proxy, at 200).
+        let malformed = json!({
+            "type": {"owner": "Martina Weber"},
+            "required": {"owner": "Elif Yilmaz"},
+            "$ref": ["Sofia Rossi"],
+            "dependentRequired": {"a": {"owner": "Jan Novak"}}
+        });
+        assert_eq!(
+            json_leaves(&malformed, Shape::Schema).unwrap(),
+            vec![
+                Leaf::Text("Sofia Rossi".to_owned()),
+                Leaf::Text("Jan Novak".to_owned()),
+                Leaf::Text("Elif Yilmaz".to_owned()),
+                Leaf::Text("Martina Weber".to_owned()),
+            ],
+            "a value the keyword does not define states no identifier and is scanned"
+        );
+
+        // And the keywords go on meaning what they mean: an identifier the
+        // keyword really does define is the caller's dispatch, skipped whole.
+        // `required: ["Martina Weber"]` is in here deliberately — a property
+        // genuinely named that way is a name, and masking it would break the
+        // schema. That residual is unchanged by this fix.
+        let well_formed = json!({
+            "type": ["object", "null"],
+            "required": ["Martina Weber"],
+            "$ref": "#/$defs/Person",
+            "dependentRequired": {"card": ["billing_address"]},
+            "pattern": "^Martina Weber$",
+            "format": "email"
+        });
+        assert!(json_leaves(&well_formed, Shape::Schema).unwrap().is_empty());
+
+        // Each keyword is held to *its own* shape and not to the union of the
+        // four, and this is where that is pinned. The population guard below
+        // drives every keyword with the value its own classification names, so
+        // it cannot see a keyword classified too *loosely* — `required` read
+        // as `NameOrNames` would skip a bare string and every assertion in
+        // that guard would still pass (measured: the mutation ran green). The
+        // distinctions come one by one from the drafts instead.
+        for (keyword, wrong_shape) in [
+            // An array of names, never a bare name.
+            ("required", json!("billing_address")),
+            // A map of names to lists, never a bare list.
+            ("dependentRequired", json!(["billing_address"])),
+            // One string, never a list of them.
+            ("$ref", json!(["#/$defs/Person"])),
+            // A string or a list of strings, never a map.
+            ("type", json!({"card": ["billing_address"]})),
+        ] {
+            let document = Value::Object([(keyword.to_owned(), wrong_shape)].into_iter().collect());
+            assert_eq!(
+                json_leaves(&document, Shape::Schema).unwrap().len(),
+                1,
+                "{keyword} skipped a shape another keyword on the list defines, not its own"
+            );
+        }
+    }
+
+    #[test]
+    fn every_identifier_keyword_is_held_to_the_shape_its_draft_defines() {
+        // The population rather than a case, which is what the last three
+        // rounds of this branch keep proving is the difference between fixing
+        // an instance and ending a class. Each keyword is driven with a value
+        // its own draft defines and with one no keyword on this list defines;
+        // the first must be skipped and the second must be scanned. A keyword
+        // added here cannot compile without a shape, and one given the wrong
+        // shape fails on one half or the other.
+        for (keyword, shape) in SCHEMA_IDENTIFIER_KEYWORDS {
+            let defined = match shape {
+                Identifier::Name => json!("an-identifier"),
+                Identifier::NameOrNames => json!(["object", "null"]),
+                Identifier::Names => json!(["billing_address"]),
+                Identifier::NamesPerName => json!({"card": ["billing_address"]}),
+            };
+            let document =
+                |value: Value| Value::Object([(keyword.to_owned(), value)].into_iter().collect());
+            assert!(
+                json_leaves(&document(defined), Shape::Schema)
+                    .unwrap()
+                    .is_empty(),
+                "{keyword} scanned a value its own draft defines, which over-masks a valid schema"
+            );
+            // The one shape no keyword on this list defines, and the shape
+            // Codex sent: an object whose values are the caller's prose.
+            assert_eq!(
+                json_leaves(&document(json!({"owner": "Martina Weber"})), Shape::Schema).unwrap(),
+                vec![Leaf::Text("Martina Weber".to_owned())],
+                "{keyword} skipped a subtree nothing scans"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_list_states_names_only_when_every_member_is_a_string() {
+        // Found by auditing the arms rather than by being shown the leak.
+        // `dependencies`' array half was the *first* arm here to get a
+        // per-value rule, and it asked only whether the value was an array —
+        // half of the question its own comment poses. An array holding an
+        // object states no property name anywhere, and it was skipped whole
+        // (measured through the proxy, at 200).
+        let schema = json!({"dependencies": {
+            "card": ["billing_address", "owner"],
+            "owner": [{"name": "Martina Weber"}]
+        }});
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Martina Weber".to_owned())]
+        );
+        let rebuilt = replace_text_leaves(&schema, &["MASKED".to_owned()], Shape::Schema).unwrap();
+        assert_eq!(rebuilt["dependencies"]["owner"][0]["name"], "MASKED");
+        assert_eq!(
+            rebuilt["dependencies"]["card"],
+            json!(["billing_address", "owner"]),
+            "and a real list of property names is still skipped whole"
+        );
     }
 
     #[test]

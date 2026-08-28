@@ -528,6 +528,30 @@ const OPENAI_TOOL_MESSAGE_FIELDS: [Field; 3] = [
     Field::dispatch("tool_call_id"),
 ];
 
+/// The other half of the list above, and it has to exist because the list above
+/// is selected by a role.
+///
+/// `tool_call_id` is defined on a `role: "tool"` message and nowhere else, so
+/// on any other role it is a field this gateway describes nowhere — and a field
+/// no slot addresses is forwarded exactly as it came. `{"role": "user",
+/// "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}` reached the
+/// upstream with the object in it (measured, at 200).
+///
+/// **This was a refusal before this slice.** The whole message used to be
+/// refused for carrying `tool_call_id` at all; giving the tool role an
+/// allowlist admitted the field there and, by being selected on the role,
+/// stopped asking about it everywhere else. It went into the ledger as cosmetic
+/// on the grounds that the field is an identifier. The value need not be one.
+///
+/// It cannot go on `OPENAI_MESSAGE_TOOL_FIELDS`, which runs for every message
+/// and would refuse the tool message this field belongs to. So it is refused in
+/// the arm the role dispatch already has: one `if`, both halves of one rule —
+/// the field is admitted exactly where the shape that defines it governs, and
+/// refused exactly where it does not. Anthropic has no twin to keep symmetrical
+/// here: its `tool_use_id` lives on a `tool_result` content block, where
+/// `content_block_fields` governs it by the block's own type.
+const OPENAI_NON_TOOL_MESSAGE_FIELDS: [&str; 1] = ["tool_call_id"];
+
 /// `tool_choice` forces or forbids a call. Which fields are legal depends on
 /// its `type`, so this dispatches on that string to pick a list exactly as
 /// `content_block_fields` does, and for the same reason: one flat list would
@@ -876,17 +900,25 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
 /// citations nothing, and the alternative is forwarding quoted documents
 /// unmasked.
 ///
-/// **Closing this list is also what keeps the response path safe, and that is a
-/// coupling rather than a guard.** `Anthropic::response_pointers` restores a
-/// `text` block's `text` and hands the client every other field of that block
-/// unrestored, `citations[].cited_text` included — so a response carrying
-/// citations would return the gateway's own placeholders to the caller. Nothing
-/// in that function stops it. What stops it is here: no request this list
-/// admits can enable citations, so no accepted request can produce such a
-/// response. The recorded follow-up — describe `cited_text` as a slot rather
-/// than leave the feature closed — opens that hole the day it lands if it is
-/// done on this path alone. Citations are one change across both paths, or the
-/// response path is closed first.
+/// **What this list does not do is keep the response path safe.** That claim
+/// was here, and it was too strong. `Anthropic::response_pointers` hands the
+/// client every field of a block that the block's *type* does not define,
+/// exactly as the provider wrote it — `citations[].cited_text` included — so a
+/// response carrying citations returns the gateway's own placeholders to the
+/// caller. What was offered as the reason nothing arrives that way was this
+/// list: no request it admits can enable citations. **That is an argument about
+/// citations, and it covered a second hazard it was never about** — a block
+/// arriving in a shape we did not expect, which needs no feature enabled at
+/// all. That one is closed now, in `response_pointers`, by reading the block's
+/// type before its fields; it was a `{"type": "tool_use", "text": ...}` block
+/// handing the client an unrestored `input`.
+///
+/// What remains true, stated as a residual rather than as a guarantee: nothing
+/// in `response_pointers` restores an undescribed field, and no request this
+/// list admits can enable citations today. The recorded follow-up — describe
+/// `cited_text` as a slot rather than leave the feature closed — has to land on
+/// both paths in one change, because the request-side half alone would start
+/// producing responses whose `cited_text` the response side does not restore.
 ///
 /// An empty slice means a type this function does not know. Those are left to
 /// the dispatch below, which refuses them for being unrecognized rather than
@@ -1190,6 +1222,12 @@ impl Provider for OpenAi {
                     "tool message field",
                     "openai",
                 )?;
+            } else {
+                // The same rule read the other way round: a field the tool
+                // shape defines is refused on a message that is not one. See
+                // `OPENAI_NON_TOOL_MESSAGE_FIELDS` — the allowlist above being
+                // chosen by the role is exactly what stopped anything asking.
+                reject_tool_fields(message, &OPENAI_NON_TOOL_MESSAGE_FIELDS, "openai")?;
             }
             identifier_pointer(
                 message,
@@ -1462,44 +1500,62 @@ impl Provider for Anthropic {
             .ok_or(ShapeError::Response("anthropic"))?;
         let mut pointers = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
-            // This reads `text` before `type` and applies no field allowlist —
-            // the pattern the request path was corrected for, still here. A
-            // `text` block carrying a populated `citations` array would have
-            // its `text` restored and its `cited_text` handed to the client
-            // with the gateway's own placeholders still in it (measured:
-            // `"cited_text":"[PERSON_1] lives here"`).
+            // `type` first, always — `content_pointers`' rule, on the path it
+            // had not reached. A block's type is what says which of its fields
+            // carry text; reading `text` before the type meant any block
+            // carrying one was described by that alone, and every other field
+            // in it went back to the client unrestored. `{"type": "tool_use",
+            // "text": "ok", "input": {"path": "/home/[PERSON_1]/notes.txt"}}`
+            // pushed the text slot and skipped the block, so `input` was never
+            // restored and **the client read that path as a real argument**
+            // (measured: the client received the placeholder).
             //
-            // **It is unreachable, and what makes it unreachable is one
-            // direction earlier, not anything here.** `content_block_fields`
-            // refuses every request block that can enable citations, so no
-            // accepted request produces such a response. That is a coupling
-            // between two functions and not a guard in this one: nothing below
-            // would catch it, and a comment is not a guarantee. Describing
-            // `cited_text` as a slot on the request path — the follow-up this
-            // branch recorded — makes this reachable the day it lands unless
-            // this path is closed in the same change.
-            if block.get("text").and_then(Value::as_str).is_some() {
-                pointers.push(Slot::text(format!("/content/{index}/text")));
-                continue;
-            }
-            // A tool_use block's arguments carry the placeholders we issued,
-            // and the client executes them: unrestored, it would open
-            // `/home/[PERSON_1]/notes.txt`. Its `id` and `name` are dispatch
-            // and are left exactly as the model wrote them.
-            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                if block.get("input").is_some() {
-                    pointers.push(Slot::Json {
-                        pointer: format!("/content/{index}/input"),
-                        embedded: false,
-                        shape: Shape::Instance,
-                    });
+            // This comment used to argue the hazard away: the request-side
+            // allowlist refuses every block that can enable citations, so
+            // nothing could arrive shaped like that. **That argument is about
+            // citations and this is not a citation.** It needs only a provider
+            // returning a block shaped differently from the one we expect — a
+            // new field, a malformed body, a bad day upstream — and this
+            // gateway's threat model already says in writing that a *detector*
+            // may misbehave, with a whole `REDACTED` mechanism for when it
+            // does. The same reading has to apply to a provider. A refusal
+            // upstream of here is not a guard here.
+            //
+            // What is still true, and belongs in the citations follow-up
+            // rather than in an argument for this ordering: a field the block's
+            // type does not define is forwarded to the client exactly as the
+            // provider wrote it, `citations[].cited_text` included. Dispatching
+            // on the type does not close that; describing `cited_text` as a
+            // slot on both paths does.
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => match block.get("text") {
+                    Some(Value::String(_)) => {
+                        pointers.push(Slot::text(format!("/content/{index}/text")));
+                    }
+                    // Present but not a string cannot be restored, and a block
+                    // typed `text` with no readable text is not one we can
+                    // hand on — the same refusal the request path makes.
+                    _ => return Err(ShapeError::Response("anthropic")),
+                },
+                // A tool_use block's arguments carry the placeholders we
+                // issued, and the client executes them. Its `id` and `name`
+                // are dispatch and are left exactly as the model wrote them.
+                Some("tool_use") => {
+                    if block.get("input").is_some() {
+                        pointers.push(Slot::Json {
+                            pointer: format!("/content/{index}/input"),
+                            embedded: false,
+                            shape: Shape::Instance,
+                        });
+                    }
                 }
-                continue;
+                // Any other block — including one with no type at all — is one
+                // we cannot read. Handing a placeholder to the client is the
+                // failure restoration exists to prevent, so an unreadable block
+                // refuses the response. This arm was already here and already
+                // said so; what it did not do was run before `text`.
+                _ => return Err(ShapeError::Response("anthropic")),
             }
-            // Any other block is one we cannot read. Handing a placeholder to
-            // the client is the failure restoration exists to prevent, so an
-            // unreadable block refuses the response.
-            return Err(ShapeError::Response("anthropic"));
         }
         Ok(pointers)
     }
@@ -3251,6 +3307,50 @@ mod tests {
     }
 
     #[test]
+    fn openai_a_tool_call_id_outside_a_tool_message_is_refused() {
+        // The allowlist that admits `tool_call_id` is chosen by `role ==
+        // "tool"`, so on any other role nothing asked about the field at all —
+        // and `OPENAI_MESSAGE_TOOL_FIELDS`, which runs for every message, does
+        // not carry it. This slice deleted the refusal that used to cover it:
+        // before the tool message had an allowlist, the whole message was
+        // refused for carrying `tool_call_id` on any role.
+        for role in ["user", "assistant", "system", "developer", "function"] {
+            let smuggled = json!({"model": "gpt", "messages": [
+                {"role": role, "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}
+            ]});
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&smuggled),
+                    Err(ShapeError::Unsupported("openai", "tool_call_id"))
+                ),
+                "{role} carried a tool_call_id no slot addresses: {:?}",
+                OpenAi.request_pointers(&smuggled)
+            );
+        }
+
+        // The field the rule is about, where it belongs: still admitted, still
+        // dispatch, still no slot. Refusing it here would refuse every tool
+        // result OpenAI clients send.
+        let legitimate = json!({"model": "gpt", "messages": [
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
+        ]});
+        let slots = OpenAi.request_pointers(&legitimate).expect("a tool result");
+        assert!(
+            !slots
+                .iter()
+                .any(|slot| slot.pointer().contains("tool_call_id")),
+            "a dispatch identifier is never described: {slots:?}"
+        );
+
+        // Null is an SDK serializing its default, the reading five other
+        // fields on this branch already get.
+        assert!(OpenAi
+            .request_pointers(&json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi", "tool_call_id": null}]}))
+            .is_ok());
+    }
+
+    #[test]
     fn openai_still_refuses_the_tool_fields_it_does_not_describe() {
         // `functions` and `function_call` are the deprecated shape of all of
         // this: `functions` carries descriptions and schemas, and an assistant
@@ -3586,6 +3686,46 @@ mod tests {
             ],
             "the id and the name are dispatch and are not described"
         );
+    }
+
+    #[test]
+    fn an_anthropic_response_block_is_read_by_its_type_before_its_fields() {
+        // The request path's rule — `type` first, always — arriving on the
+        // response path, where the same defect had survived. A block carrying
+        // both a `text` and an `input` was described by the `text` alone and
+        // `continue`d, so the arguments the client executes were never
+        // restored: it opened `/home/[PERSON_1]/notes.txt`.
+        //
+        // The direction matters. On the request path an unread field leaks to
+        // a provider; here it hands a placeholder to a client that acts on it.
+        let mixed = json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "read_file", "text": "ok",
+             "input": {"path": "/home/[PERSON_1]/notes.txt"}}
+        ]});
+        assert_eq!(
+            Anthropic.response_pointers(&mixed).unwrap(),
+            vec![Slot::Json {
+                pointer: "/content/0/input".to_owned(),
+                embedded: false,
+                shape: Shape::Instance,
+            }],
+            "the block's type says which field is restored, not whichever field is present"
+        );
+
+        // A block with no type is one we cannot read, and the refusal that was
+        // already at the bottom of this function now runs for it: reading
+        // `text` first meant a typeless block carrying one was described and
+        // every other field of it forwarded unrestored.
+        let typeless = json!({"content": [{"text": "Hallo [PERSON_1]"}]});
+        assert!(matches!(
+            Anthropic.response_pointers(&typeless),
+            Err(ShapeError::Response("anthropic"))
+        ));
+
+        // And a block typed `text` whose `text` cannot be restored is refused
+        // rather than dropped, the same reading the request path gives it.
+        let unreadable = json!({"content": [{"type": "text", "text": ["Hallo"]}]});
+        assert!(Anthropic.response_pointers(&unreadable).is_err());
     }
 
     #[test]

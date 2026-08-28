@@ -338,6 +338,21 @@ would have forwarded `default`, `const`, `enum`, `examples`, `title` and
 to scan is the mistake this codebase has now made four times; the walk scans
 every string value and the exclusions are named instead.
 
+**An exclusion names a keyword *and* a shape, which is the same correction the
+tool allowlists took and it arrived later here.** A keyword is excluded because
+of what it holds — `required` holds property names, `type` holds a type name —
+so consulting the list from the key alone excludes whatever the value happens to
+be. `{"required": {"owner": "Martina Weber"}}` states no property name anywhere
+and was copied into the egress untouched. Three arms of one `match` made that
+mistake and each was corrected separately, on three different rounds:
+`dependencies`, the name-stating keywords under `propertyNames`, and the
+fourteen identifier keywords. They ask one shared question now — a name is a
+string, a list of names is an array of them — and each identifier keyword is
+held to the shape its own draft defines rather than to the union of the four,
+because the union admits `{"$ref": {"note": ["Martina Weber"]}}`. A value that
+is not the shape is not an identifier, so it is the client's data and is
+scanned; the cost of being wrong is an over-masked schema the caller can see.
+
 **Anthropic.** `tools[].description` and `input_schema` as a whole;
 `tool_use.input` as `Json`; `tool_result.content` as text when it is a string and
 as content blocks when it is a list.

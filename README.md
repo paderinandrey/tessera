@@ -223,9 +223,16 @@ this gateway scans is forwarded unmasked. No error body or log line carries the 
 text.
 
 Restoration is narrower than that, and the difference is measured rather than assumed.
-Anthropic's response path is a closed list — a block it cannot read refuses the response
-rather than handing a placeholder over — and OpenAI's is not: it restores a choice's
-`content` and forwards every other field of the message as the provider sent it. A
+Anthropic's response path is a closed list of block *types* — a block whose type it cannot
+read refuses the response rather than handing a placeholder over — and OpenAI's is not: it
+restores a choice's `content` and forwards every other field of the message as the provider
+sent it. Two qualifications on the Anthropic half, both of them measured. The type check
+ran *second* until recently, after a check for a `text` field, so a block carrying a `text`
+never reached the closed list at all: `{"type": "tool_use", "text": "ok", "input": {...}}`
+had its text described and its arguments forwarded unrestored, which is a placeholder
+reaching a client that *executes* it. And the list is closed on the type only — a field the
+block's type does not define is still handed over as the provider wrote it, which is what
+`citations[].cited_text` would be if the request path ever admitted citations. A
 `refusal`, which any OpenAI refusal populates, and an `annotations[].url_citation.title`
 both reach the client **with this gateway's own placeholder in them**. That is the one
 direction the design is not yet closed in, and closing it means closing the list rather
@@ -259,7 +266,14 @@ be entries of, so they were admitted by absence from the denylists and read by n
 Both are described now — each provider's published `tool_choice` shapes, and a boolean —
 with one exception stated plainly: OpenAI's newer `tool_choice: {"type": "allowed_tools",
 …}` nests tool definitions this gateway does not describe there, and is refused rather
-than forwarded, which is a 400 where there used to be a 200.
+than forwarded, which is a 400 where there used to be a 200. **And a field can be admitted
+by an allowlist that something else selects**, which is the third way and the narrowest:
+OpenAI's `tool_call_id` is on the allowlist for a `role: "tool"` message, that allowlist is
+chosen by the role, and the denylist running for every message did not carry the field — so
+`{"role": "user", "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}` was
+addressed by nothing and forwarded. It is refused on every other role now, in the same
+`if` that selects the allowlist, because a denylist entry would refuse the tool message the
+field belongs to.
 
 **That closure is scoped to the tool structures, and the body and the message levels have
 no allowlist at all.** It is true of a tool definition, a tool call, a tool result and a
