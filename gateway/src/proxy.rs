@@ -1720,6 +1720,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tool_argument_key_naming_no_token_of_ours_is_served() {
+        // Codex's P2, in what the client receives. `is_placeholder` trimmed
+        // every bracket, so a legitimate `[[PERSON_1]]` — a shape a templating
+        // client can plausibly produce — was judged a token this gateway had
+        // issued and the whole response was refused (measured at `6a06391`:
+        // 502, "upstream response uses a placeholder as a property name").
+        // Nothing of ours is in it, so there is nothing to refuse.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "fill",
+                                "input": {"[[ROW_1]]": "Hallo [PERSON_1]"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("[[ROW_1]]"), "the key was not served: {body}");
+        assert!(
+            body.contains("Hallo Weber"),
+            "the value under it was not restored: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_argument_key_carrying_our_token_is_still_refused() {
+        // The trap the fix above had to avoid. The same key shape, in a session
+        // that issued `[PERSON_1]` for a real name, carries that token inside
+        // it — and a key is never restored, so serving it hands the client this
+        // gateway's own placeholder.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "fill",
+                                "input": {"[[PERSON_1]]": "x"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !body.contains("PERSON_1"),
+            "a placeholder reached the client: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_executed_tool_is_refused_before_the_upstream_is_called() {
+        // The refusal direction, measured on what it costs. A bare server tool
+        // — `{"name": "t", "type": "code_execution_20250522"}` — passed the
+        // definition gate at `6a06391`, and Anthropic answers such a request
+        // with `server_tool_use` and a result block the response path does not
+        // describe. So the request was forwarded, the model ran, the tokens
+        // were spent, and the caller received a 502 (measured: one upstream
+        // call, then `upstream response is not in the expected anthropic
+        // shape`).
+        //
+        // The upstream mock answers 200 with the documented server-tool shape,
+        // so the assertion that matters is the one about `received_requests`:
+        // the refusal fires *before* the call, not after it.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "code_execution",
+                 "input": {"code": "print(1)"}},
+                {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": {"type": "bash_code_execution_result", "stdout": "1",
+                             "stderr": "", "return_code": 0}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let (status, body) = call(
+            state,
+            "/v1/messages",
+            json!({"model": "claude",
+                   "messages": [{"role": "user", "content": "Weber schreibt"}],
+                   "tools": [{"name": "code_execution", "type": "code_execution_20250522"}]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a tool this gateway cannot serve the answer to is the caller's to \
+             drop, and 502 would blame the upstream for it: {body}"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("the mock records requests")
+                .is_empty(),
+            "the refusal cost the caller a turn: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_executed_tool_still_reaches_the_upstream() {
+        // The other half, and the one the ledger cares about: `bash_*` and
+        // `text_editor_*` are answered with an ordinary `tool_use` the caller
+        // runs, so nothing new arrives on the response path and the
+        // coding-agent category is unaffected. Without this the refusal above
+        // could be widened to everything and no test would notice.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "bash",
+                                "input": {"command": "grep -r Weber ."}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude",
+                   "messages": [{"role": "user", "content": "Weber schreibt"}],
+                   "tools": [{"name": "bash", "type": "bash_20250124"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("grep -r Weber ."),
+            "the arguments were not restored: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_null_citations_every_text_block_carries_is_served() {
         // The other half of the same list, and the reason `citations` is *on*
         // it rather than left off. Anthropic documents `citations` as required

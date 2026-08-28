@@ -328,7 +328,7 @@ fn reject_streamed_tools(
 ///   `UNSCANNED_PART_TYPES` is that policy and images are that content; the
 ///   entry exists so the exception is visible where the field is admitted
 ///   rather than only in the README.
-/// - `Bool`, `OneOf`, `Token` — the provider constrains the value, so this
+/// - `Bool`, `OneOf`, `ToolType` — the provider constrains the value, so this
 ///   checks it. Explicitly null passes: an SDK serializing its default is not
 ///   a request to use the field, the same reading `tools`, `thinking`,
 ///   `logprobs`, `audio` and `content` already get.
@@ -360,9 +360,16 @@ enum Admits {
     Bool,
     /// One of the strings the provider defines for this field.
     OneOf(&'static [&'static str]),
-    /// A value from the provider's own vocabulary that this gateway cannot
-    /// enumerate, held to the grammar every one of them is written in.
-    Token,
+    /// The name of a tool the *provider* defines rather than the caller. The
+    /// admissible ones are the undated names, plus every dated member of the
+    /// named families — `family_YYYYMMDD`, the form every one of them is
+    /// published in. The families are what lets the next version of a tool
+    /// this gateway can serve be admitted the day it ships; the date shape is
+    /// what stops the family names being a prefix anyone can extend.
+    ToolType {
+        undated: &'static [&'static str],
+        families: &'static [&'static str],
+    },
     /// Nothing this gateway can restore — so nothing is what it admits.
     Nothing,
     /// The nested allowlist, and what to call it when it refuses.
@@ -417,10 +424,14 @@ impl Field {
             admits: Admits::OneOf(values),
         }
     }
-    const fn token(key: &'static str) -> Self {
+    const fn tool_type(
+        key: &'static str,
+        undated: &'static [&'static str],
+        families: &'static [&'static str],
+    ) -> Self {
         Field {
             key,
-            admits: Admits::Token,
+            admits: Admits::ToolType { undated, families },
         }
     }
     /// The `follow_up` is the name of the work that turns this refusal back
@@ -441,11 +452,44 @@ impl Field {
     }
 }
 
-/// The longest a `Token` may be. Anthropic documents its tool names as at most
-/// 128 characters and its tool types are shorter still; the bound is here so
-/// that "a value from the provider's vocabulary" cannot also mean "a paragraph
-/// in the provider's vocabulary".
-const MAX_TOKEN: usize = 128;
+/// The tool types Anthropic publishes that carry no date: a plain custom tool,
+/// which some SDKs spell explicitly and most leave off entirely.
+const ANTHROPIC_UNDATED_TOOL_TYPES: [&str; 1] = ["custom"];
+
+/// The families of Anthropic-defined tool whose results **the caller sends
+/// back**, and the reason this list is a line rather than a preference.
+///
+/// Anthropic's own tools split in two, and the split is about who runs them:
+///
+/// - a **client-executed** tool — `bash`, `text_editor`, `computer`, `memory` —
+///   is described by Anthropic and run by the caller. The model asks for it
+///   with an ordinary `tool_use` block and the caller answers with an ordinary
+///   `tool_result`. Nothing new appears on either path: these are the shapes
+///   this gateway already describes, which is why this slice's ledger records
+///   the coding-agent category as unaffected by it.
+/// - a **server-executed** tool — `web_search`, `web_fetch`, `code_execution`,
+///   `tool_search_tool_regex`, `tool_search_tool_bm25`, `advisor` — is run by
+///   Anthropic. The response carries `server_tool_use` and a result block of
+///   the tool's own (`web_search_tool_result`, `bash_code_execution_tool_result`
+///   and so on), and `Anthropic::response_pointers` describes none of them. It
+///   refuses the block, which is the right answer to a shape that could carry
+///   this gateway's placeholders back to a client unrestored — but it fires
+///   *after* the upstream call. The model has run and the caller has paid for
+///   it. Measured at `6a06391`: a request enabling `code_execution_20250522`
+///   reached the upstream (one call) and the caller got a 502.
+///
+/// So the type is checked here, before the call, and a refusal that costs
+/// nothing replaces a refusal that costs a turn. **This is a capability lost
+/// rather than a channel closed** — a bare server tool used to pass this gate
+/// — and it belongs with the citations refusal and OpenAI's `allowed_tools`
+/// refusal in the account of what this slice traded away. The follow-up is
+/// describing those response blocks, not keeping the request refused.
+///
+/// The families are matched against the segment before the **last** underscore,
+/// not as a prefix, and `bash_code_execution_20250825` is why: it is the code
+/// execution tool's own bash, run by Anthropic, and a `starts_with("bash_")`
+/// reading would have admitted it on the strength of a name.
+const ANTHROPIC_CLIENT_TOOL_FAMILIES: [&str; 4] = ["bash", "text_editor", "computer", "memory"];
 
 /// Fields a tool definition may carry that this gateway can account for.
 ///
@@ -455,22 +499,27 @@ const MAX_TOKEN: usize = 128;
 /// `web_search_20250305` carries `user_location: {city, region, country,
 /// timezone}`, and `city` is a LOCATION in this gateway's own vocabulary.
 ///
-/// `type` names a server tool, and it is the one field here whose admissible
-/// values this gateway cannot write down. They are dated —
-/// `text_editor_20250124`, `web_search_20250305` — so a list of them refuses
-/// the next version of `bash_*` the day Anthropic ships it, which is the
-/// coding-agent traffic this gateway exists to serve, and it would be a
-/// hand-maintained list of strings held to nothing. What *is* closed is the
-/// grammar: every type Anthropic has published is lowercase letters, digits and
-/// underscores. `Token` holds it to that. **It narrows the channel rather than
-/// closing it** — `martina_weber` still passes — and that residual is exactly
-/// the one `name` already carries as dispatch, which is the argument for
-/// stopping here rather than a reason it is not a channel.
+/// `type` names a tool Anthropic defines, and which ones are admissible is
+/// `ANTHROPIC_CLIENT_TOOL_FAMILIES`' argument: the ones the *caller* runs, whose
+/// results arrive in shapes this gateway already describes. A version of one of
+/// those is admitted the day Anthropic ships it, because the entry names the
+/// family and the date shape rather than a list of today's strings — which is
+/// the coding-agent traffic this slice's ledger records as unaffected.
+///
+/// It was `Token` until a `type` naming a server tool was found to pass here and
+/// cost the caller a turn (that finding is written out beside the families). The
+/// residual `Token` left behind — `martina_weber` passing on the strength of
+/// being lowercase — is closed by the same change, since `martina_weber` names
+/// no family and carries no date.
 const ANTHROPIC_TOOL_DEFINITION_FIELDS: [Field; 5] = [
     Field::dispatch("name"),
     Field::described("description"),
     Field::described("input_schema"),
-    Field::token("type"),
+    Field::tool_type(
+        "type",
+        &ANTHROPIC_UNDATED_TOOL_TYPES,
+        &ANTHROPIC_CLIENT_TOOL_FAMILIES,
+    ),
     Field::object(
         "cache_control",
         "cache_control field",
@@ -697,6 +746,29 @@ fn known_fields(
     Ok(())
 }
 
+/// One of the provider's undated tool names, or a dated member of one of the
+/// families — `family_YYYYMMDD`, the only form Anthropic has published a tool
+/// type in.
+///
+/// The family is the segment before the **last** underscore rather than a
+/// prefix, so `bash_code_execution_20250825` asks after the family
+/// `bash_code_execution` and is refused, while `bash_20250124` asks after
+/// `bash` and is admitted. The date is eight digits and nothing else, so a
+/// family name is not a prefix a caller can extend into a value of their own.
+fn names_an_admissible_tool(text: &str, undated: &[&str], families: &[&str]) -> bool {
+    if undated.contains(&text) {
+        return true;
+    }
+    match text.rsplit_once('_') {
+        Some((family, date)) => {
+            families.contains(&family)
+                && date.len() == 8
+                && date.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// The value half. One refusal for both halves — `Unsupported(provider, what)`
 /// — because they are one refusal: this list admits a key *and* a shape, and
 /// what reaches the upstream if either goes unchecked is the same bytes. The
@@ -724,16 +796,8 @@ fn known_value(
             Some(text) if values.contains(&text) => Ok(()),
             _ => Err(refuse()),
         },
-        Admits::Token => match value.as_str() {
-            Some(text)
-                if !text.is_empty()
-                    && text.len() <= MAX_TOKEN
-                    && text.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
-                    }) =>
-            {
-                Ok(())
-            }
+        Admits::ToolType { undated, families } => match value.as_str() {
+            Some(text) if names_an_admissible_tool(text, undated, families) => Ok(()),
             _ => Err(refuse()),
         },
         // Null is already `Ok` above; an empty list carries as little, and
@@ -1920,7 +1984,6 @@ mod tests {
                     Admits::Described
                     | Admits::Dispatch
                     | Admits::Bool
-                    | Admits::Token
                     | Admits::Elsewhere
                     | Admits::Unscanned
                     | Admits::Nothing => {}
@@ -1928,6 +1991,15 @@ mod tests {
                         !values.is_empty(),
                         "{list}/{} admits one of nothing, which is a refusal \
                          written as an allowlist",
+                        field.key
+                    ),
+                    // The families are the half that admits a version nobody
+                    // has seen. Without one this entry is a `OneOf` spelled the
+                    // long way, and the next dated tool it should serve refuses.
+                    Admits::ToolType { families, .. } => assert!(
+                        !families.is_empty(),
+                        "{list}/{} names no family, so it refuses the next \
+                         version of every tool it admits",
                         field.key
                     ),
                     Admits::Object(what, nested) => {
@@ -2687,23 +2759,45 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_type_outside_the_providers_grammar_is_refused() {
-        // The fourth field of the class, found by sweeping the lists rather
-        // than reported: `type` on an Anthropic tool definition was admitted
-        // and never read, so `"type": "Martina Weber"` reached the upstream
-        // verbatim (measured, at 200). It is the one `type` in this file that
-        // nothing checked — OpenAI's wrapper and call both refuse anything but
-        // `function`, and a content block's type chooses its own allowlist.
+    fn a_tool_type_naming_anything_but_a_client_executed_tool_is_refused() {
+        // Two findings, one entry. The first was the fourth field of round 1's
+        // class, found by sweeping the lists: `type` on an Anthropic tool
+        // definition was admitted and never read, so `"type": "Martina Weber"`
+        // reached the upstream verbatim (measured, at 200).
         //
-        // What it is held to is the grammar rather than a list of values, and
-        // the second half of this test is why: the dated server-tool types are
-        // not enumerable here without refusing the next one Anthropic ships.
+        // The second is why this test changed answer. The grammar that closed
+        // the first — lowercase, digits, underscores — admitted every **server**
+        // tool too, and a server tool is answered with `server_tool_use` and a
+        // result block `Anthropic::response_pointers` does not describe. So the
+        // request passed, the model ran, and the caller got a 502 for a turn
+        // they paid for (measured at `6a06391`: one upstream call, then 502).
+        // What is admitted here is now the client-executed families, whose
+        // results come back as the ordinary `tool_result` the caller sends.
         for kind in [
             json!("Martina Weber"),
             json!("Weber, Martina"),
             json!({"type": "custom"}),
             json!(""),
-            json!("a".repeat(MAX_TOKEN + 1)),
+            // Every server-executed type Anthropic has published. Each of these
+            // was a 200 here and a 502 after the model had run.
+            json!("web_search_20250305"),
+            json!("web_search_20260209"),
+            json!("web_fetch_20260209"),
+            json!("code_execution_20250522"),
+            json!("code_execution_20260521"),
+            json!("tool_search_tool_regex_20251119"),
+            json!("advisor_20260301"),
+            // The code execution tool's own bash and editor. They are run by
+            // Anthropic, and a family read as a prefix would have admitted them.
+            json!("bash_code_execution_20250825"),
+            json!("text_editor_code_execution_20250825"),
+            // A family this gateway serves, without the date that makes it a
+            // version — so the family names are not a prefix to build on.
+            json!("bash"),
+            json!("bash_"),
+            json!("bash_2025012"),
+            json!("bash_20250124x"),
+            json!("bash_martina_weber"),
         ] {
             let body = json!({
                 "model": "claude",
@@ -2718,21 +2812,32 @@ mod tests {
                         "tool definition field"
                     ))
                 ),
-                "a tool type carrying prose travelled whole: {kind} -> {:?}",
+                "a tool this gateway cannot serve was admitted: {kind} -> {:?}",
                 Anthropic.request_pointers(&body)
             );
         }
-        // Every tool type Anthropic has published, and the ones it has not.
-        // **This is a narrowing of nothing**: a bare server tool passed the
-        // definition gate before this check and still does. What it stops is
-        // prose, not a version.
+        // Every client-executed type Anthropic has published, and a dated
+        // version of each family that it has not. **This half is the whole
+        // reason the entry names families rather than values**: the ledger
+        // records the coding-agent category as unaffected by this slice, and a
+        // list of today's strings would refuse the next `bash_*` on the day it
+        // shipped.
         for kind in [
             "custom",
+            "bash_20241022",
             "bash_20250124",
+            "text_editor_20241022",
             "text_editor_20250124",
+            "text_editor_20250429",
+            "text_editor_20250728",
+            "computer_20241022",
             "computer_20250124",
-            "web_search_20250305",
-            "code_execution_20250522",
+            "computer_20251124",
+            "memory_20250818",
+            "bash_20991231",
+            "text_editor_20991231",
+            "computer_20991231",
+            "memory_20991231",
         ] {
             let body = json!({
                 "model": "claude",
@@ -2741,7 +2846,7 @@ mod tests {
             });
             assert!(
                 Anthropic.request_pointers(&body).is_ok(),
-                "a bare server tool was refused for its type: {kind}"
+                "a tool the caller runs was refused for its type: {kind}"
             );
         }
     }

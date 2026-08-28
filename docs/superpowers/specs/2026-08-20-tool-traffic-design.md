@@ -230,18 +230,26 @@ as a value the code consumes: `Described` (a slot addresses it), `Dispatch` (a
 free identifier the caller chooses and the protocol routes on, argued above,
 **and a string**),
 `Elsewhere` (a named check at the use site decides it), `Unscanned` (forwarded
-whole under the images-and-audio policy), `Bool` / `OneOf` / `Token` (the
+whole under the images-and-audio policy), `Bool` / `OneOf` / `ToolType` (the
 provider constrains it, so this checks it), `Object` (a nested list). There is
 deliberately no answer meaning "forwarded, and nobody has looked at it": a key
 with no answer does not go on a list.
 
-`Token` is the one that admits rather than enumerates. Anthropic's tool `type`
-names a server tool and the names are dated — `text_editor_20250124`,
-`web_search_20250305` — so a list of values refuses the next `bash_*` the day it
-ships, which is the coding-agent traffic this slice exists to serve. The grammar
-is closed even though the vocabulary is not, so `Token` holds it to that. It
-**narrows the channel rather than closing it** — `martina_weber` still passes —
-and that residual is the one `name` already carries as dispatch.
+`ToolType` is the one that admits rather than enumerates, and what it admits is
+a judgement rather than a grammar. Anthropic's tool names are dated —
+`text_editor_20250124`, `web_search_20250305` — so a list of today's values
+refuses the next `bash_*` the day it ships, which is the coding-agent traffic
+this slice exists to serve; the entry names the *families* and the date shape
+instead. Which families is the whole of it: a tool the **caller** runs
+(`bash`, `text_editor`, `computer`, `memory`) is answered with the ordinary
+`tool_use`/`tool_result` pair this gateway already describes, while a tool
+**Anthropic** runs (`web_search`, `web_fetch`, `code_execution`, the tool-search
+tools, the advisor) is answered with `server_tool_use` and a result block it
+describes nowhere. Admitting the second kind bought the caller a 502 after the
+model had run. The family is matched against the segment before the last
+underscore rather than as a prefix, which is what keeps
+`bash_code_execution_20250825` — Anthropic's bash, not the caller's — on the
+refusing side.
 
 ### Why `Dispatch` is a string, and why that is not the argument it looked like
 
@@ -629,17 +637,23 @@ argument for the exemption is an argument about what those fourteen labels
 **A large tool result is refused, not served slowly.** See **Latency**, and
 issue #28, which exists to raise this ceiling.
 
-**The closed allowlist refuses citations and two of Anthropic's server tools.**
-A `text` block carrying `citations` is refused on the request path, and clients
-echo assistant turns back as history, so a conversation that used citations
-refuses on its next turn. `computer_*` (display dimensions) and `web_search_*`
-(a `user_location` whose `city` is a `LOCATION` in this vocabulary) carry
-configuration the allowlist has no rule for and are refused with it;
-`text_editor_*` and `bash_*` declare a name and a type and nothing else, so they
-pass and the coding-agent category is unaffected. This is the allowlist working
-in the direction it was chosen for — a field no slot addresses would otherwise
-travel exactly as the caller wrote it — and the follow-up for citations is to
-describe `cited_text` as a slot rather than leave the feature closed.
+**The closed allowlist refuses citations, and the tool `type` refuses every
+server-executed tool.** A `text` block carrying `citations` is refused on the
+request path, and clients echo assistant turns back as history, so a
+conversation that used citations refuses on its next turn. Anthropic's own
+server tools were refused only *partly*, and that is the part this records as a
+cost: `computer_*` (display dimensions) and `web_search_*` (a `user_location`
+whose `city` is a `LOCATION` in this vocabulary) carry configuration the field
+allowlist has no rule for and were refused with it, but the same tools declared
+bare — name and type and nothing else — passed. They then came back as
+`server_tool_use` and a result block the response path refuses, so a well-formed
+request spent the caller's tokens and lost its answer. The `type` entry decides
+it before the call now: the client-executed families pass, everything else
+refuses, and the coding-agent category is still unaffected. This is the
+allowlist working in the direction it was chosen for — a field no slot addresses
+would otherwise travel exactly as the caller wrote it — and the follow-up for
+both is the same: describe the response blocks rather than leave the features
+closed.
 
 The **response** path refuses them too, and that is a second narrowing recorded
 rather than assumed: a response block now carries a closed list of fields as

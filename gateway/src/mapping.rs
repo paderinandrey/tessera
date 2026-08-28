@@ -240,20 +240,11 @@ impl Mapping {
     /// Map every placeholder-shaped token already present to itself, so it is
     /// never issued for a detected value and an echo restores unchanged.
     fn reserve_literals(&mut self, text: &str) {
-        let mut rest = text;
-        while let Some(open) = rest.find('[') {
-            let from_open = &rest[open..];
-            let Some(close) = from_open.find(']') else {
-                return;
-            };
-            let candidate = &from_open[..=close];
-            if is_placeholder(candidate) {
+        for piece in pieces(text) {
+            if let Piece::Placeholder(candidate) = piece {
                 self.by_placeholder
                     .entry(candidate.to_owned())
                     .or_insert_with(|| candidate.to_owned());
-                rest = &from_open[close + 1..];
-            } else {
-                rest = &from_open[1..];
             }
         }
     }
@@ -329,7 +320,7 @@ impl Mapping {
                         // tool reads its argument from; leaving it puts our own
                         // token in the client's hands. Both change dispatch, so
                         // neither is served.
-                        if key.starts_with('[') && key.ends_with(']') && is_placeholder(key) {
+                        if self.key_is_unserveable(key) {
                             return Err(MappingError::PlaceholderKey(key.clone()));
                         }
                         Ok((key.clone(), self.restore_value(item)?))
@@ -340,33 +331,63 @@ impl Mapping {
         })
     }
 
+    /// Whether this property name is one the client cannot be given.
+    ///
+    /// Two questions wear the same brackets here, and the reason this is one
+    /// function with two arms rather than one rule is that they have different
+    /// answers.
+    ///
+    /// **A key that *is* a placeholder is refused whatever this session
+    /// issued.** That is the recorded ruling and it is unchanged: neither
+    /// answer serves the client, because restoring renames the property their
+    /// tool reads its argument from and leaving it hands them our token as a
+    /// property name — and conditioning the refusal on our own map would make
+    /// the status code report which numbers this session has issued.
+    ///
+    /// **A key that merely *carries* one is refused only when the token is
+    /// ours.** Nothing is renamed in that case — a substring was never going to
+    /// be restored — so the only thing that can go wrong is one of our tokens
+    /// leaving inside somebody else's key, and that question has an exact
+    /// answer: present in `by_placeholder`, mapped to something other than
+    /// itself. A caller's own literal is self-mapped by `reserve_literals` and
+    /// is theirs to have back, which is what the second half of the test rules
+    /// out.
+    ///
+    /// The containment arm is the trap in the obvious fix, and it is why the
+    /// tightening of `is_placeholder` could not be shipped on its own.
+    /// `[[PERSON_1]]` is no longer a placeholder, so a shape-only check now
+    /// serves it — with `[PERSON_1]` inside it, in a session that issued
+    /// `[PERSON_1]` for a real name. That is the failure restoration exists to
+    /// prevent, arrived at by fixing a false refusal. It also closes a case
+    /// nothing covered before: `owner[PERSON_1]` begins with no bracket, so the
+    /// old check never looked at it and it was forwarded whole.
+    fn key_is_unserveable(&self, key: &str) -> bool {
+        if is_placeholder(key) {
+            return true;
+        }
+        pieces(key).any(|piece| match piece {
+            Piece::Placeholder(candidate) => self
+                .by_placeholder
+                .get(candidate)
+                .is_some_and(|value| value != candidate),
+            Piece::Text(_) => false,
+        })
+    }
+
     pub fn restore(&self, text: &str) -> Result<String, MappingError> {
         let mut result = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(open) = rest.find('[') {
-            let (before, from_open) = rest.split_at(open);
-            result.push_str(before);
-            let Some(close) = from_open.find(']') else {
-                result.push_str(from_open);
-                return Ok(result);
-            };
-            let candidate = &from_open[..=close];
-            if is_placeholder(candidate) {
-                let value = self
-                    .by_placeholder
-                    .get(candidate)
-                    .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
-                result.push_str(value);
-                rest = &from_open[close + 1..];
-            } else {
-                // Not a placeholder: consume only this bracket and keep looking.
-                // Swallowing the whole candidate would step over a real
-                // placeholder nested inside it, as in "[see [PERSON_1]]".
-                result.push('[');
-                rest = &from_open[1..];
+        for piece in pieces(text) {
+            match piece {
+                Piece::Text(run) => result.push_str(run),
+                Piece::Placeholder(candidate) => {
+                    let value = self
+                        .by_placeholder
+                        .get(candidate)
+                        .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
+                    result.push_str(value);
+                }
             }
         }
-        result.push_str(rest);
         Ok(result)
     }
 }
@@ -1003,9 +1024,80 @@ pub fn check_spans(text: &str, spans: &[Span]) -> Result<(), MappingError> {
     Ok(())
 }
 
-/// `[TYPE_N]`: upper-case type, underscore, digits.
+/// One step of a walk over a string: a run of ordinary characters, or a token
+/// shaped like one this gateway issues.
+#[derive(Debug, PartialEq, Eq)]
+enum Piece<'a> {
+    Text(&'a str),
+    Placeholder(&'a str),
+}
+
+/// The one reading of *where the placeholders in this string are*.
+///
+/// Three callers ask it — `reserve_literals` on the way up, `restore` on the way
+/// back, and `key_carries_an_issued_placeholder` — and they have to agree. They
+/// were three copies of the same loop, and a copy is where the answers drift:
+/// what one reserves the other must find. The `[` that begins nothing is
+/// consumed one byte at a time rather than skipped to its `]`, because
+/// swallowing the whole run would step over a real placeholder nested inside
+/// it, as in `[see [PERSON_1]]`.
+struct Pieces<'a> {
+    rest: &'a str,
+}
+
+fn pieces(text: &str) -> Pieces<'_> {
+    Pieces { rest: text }
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = Piece<'a>;
+
+    fn next(&mut self) -> Option<Piece<'a>> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let Some(open) = self.rest.find('[') else {
+            return Some(Piece::Text(std::mem::take(&mut self.rest)));
+        };
+        if open > 0 {
+            let (before, from_open) = self.rest.split_at(open);
+            self.rest = from_open;
+            return Some(Piece::Text(before));
+        }
+        // An opening bracket with no closing one closes nothing: the rest of
+        // the string is ordinary text.
+        let Some(close) = self.rest.find(']') else {
+            return Some(Piece::Text(std::mem::take(&mut self.rest)));
+        };
+        let candidate = &self.rest[..=close];
+        if is_placeholder(candidate) {
+            self.rest = &self.rest[close + 1..];
+            Some(Piece::Placeholder(candidate))
+        } else {
+            self.rest = &self.rest[1..];
+            Some(Piece::Text("["))
+        }
+    }
+}
+
+/// `[TYPE_N]`: **one** opening bracket, upper-case type, underscore, digits,
+/// **one** closing bracket.
+///
+/// The counting is the finding. This trimmed *every* leading `[` and *every*
+/// trailing `]`, so `[[PERSON_1]]` — and, through the walk above, the
+/// `[[PERSON_1]` it is read as — were judged tokens this gateway had issued.
+/// At the key check that was a 502 on a legitimate property name; in `restore`
+/// it was a 502 on text carrying a placeholder inside brackets, because the
+/// candidate was taken as a token, looked up, and found in no mapping. Both
+/// measured at `6a06391`. A placeholder this gateway issues has exactly one
+/// bracket at each end, so that is what is read.
 fn is_placeholder(candidate: &str) -> bool {
-    let inner = candidate.trim_start_matches('[').trim_end_matches(']');
+    let Some(inner) = candidate
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
     let Some((entity_type, number)) = inner.rsplit_once('_') else {
         return false;
     };
@@ -2507,6 +2599,125 @@ mod tests {
                 .restore_value(&json!({"PERSON_1": "x", "[not a placeholder]": "y"}))
                 .unwrap(),
             json!({"PERSON_1": "x", "[not a placeholder]": "y"})
+        );
+    }
+
+    #[test]
+    fn a_bracket_pair_is_counted_rather_than_trimmed() {
+        // `is_placeholder` trimmed every leading `[` and every trailing `]`, so
+        // `[[PERSON_1]]` and the `[[PERSON_1]` the walk reads it as were both
+        // judged tokens this gateway had issued. One bracket at each end is
+        // what it issues, so one is what is read.
+        assert!(is_placeholder("[PERSON_1]"));
+        assert!(is_placeholder("[REDACTED_12]"));
+        assert!(!is_placeholder("[[PERSON_1]]"));
+        assert!(!is_placeholder("[[PERSON_1]"));
+        assert!(!is_placeholder("[PERSON_1]]"));
+        assert!(!is_placeholder("PERSON_1"));
+    }
+
+    #[test]
+    fn a_placeholder_nested_in_brackets_is_found_rather_than_stepped_over() {
+        // The `[` that begins nothing is consumed one byte at a time so a real
+        // placeholder inside it is still found — the rule the walk's own
+        // comment always stated, and which the loose reading defeated for the
+        // one case it most obviously covers. `[[PERSON_1]]` restored to
+        // nothing: the candidate `[[PERSON_1]` was taken for a token, looked
+        // up, found in no mapping, and the whole response refused (measured at
+        // `6a06391`: 502, "no mapping for a placeholder in the upstream
+        // response").
+        let mut mapping = Mapping::new();
+        assert_eq!(
+            mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap(),
+            "[PERSON_1]"
+        );
+        assert_eq!(mapping.restore("[[PERSON_1]]").unwrap(), "[Weber]");
+        assert_eq!(mapping.restore("[see [PERSON_1]]").unwrap(), "[see Weber]");
+        assert_eq!(mapping.restore("[PERSON_1]").unwrap(), "Weber");
+        // An opening bracket that closes nothing closes nothing.
+        assert_eq!(mapping.restore("[PERSON_1").unwrap(), "[PERSON_1");
+    }
+
+    #[test]
+    fn a_literal_nested_in_brackets_is_reserved_by_the_same_reading() {
+        // `reserve_literals` and `restore` walk the same string and must agree
+        // about where the tokens in it are: what one reserves the other has to
+        // find. Under the loose reading the caller's own `[[PERSON_1]]`
+        // reserved `[[PERSON_1]` and left the token inside it free to be issued
+        // for somebody's name.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask("[[PERSON_1]] Weber", &[span("PERSON", 13, 18)])
+            .unwrap();
+        assert_eq!(
+            masked, "[[PERSON_1]] [PERSON_2]",
+            "the literal's own number was issued for a detected value"
+        );
+        assert_eq!(
+            mapping.restore(&masked).unwrap(),
+            "[[PERSON_1]] Weber",
+            "the caller's literal came back as something else"
+        );
+    }
+
+    #[test]
+    fn a_key_carrying_a_token_this_session_issued_is_refused() {
+        // The trap in the P2's obvious fix. `[[PERSON_1]]` stopped being a
+        // placeholder when the brackets were counted, so an exact-match check
+        // serves it — carrying `[PERSON_1]`, which this session issued for a
+        // real name, to the client. Restoration exists to prevent exactly that.
+        let mut mapping = Mapping::new();
+        assert_eq!(
+            mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap(),
+            "[PERSON_1]"
+        );
+        for key in ["[[PERSON_1]]", "owner[PERSON_1]", "a [PERSON_1] b"] {
+            assert!(
+                matches!(
+                    mapping.restore_value(&json!({key: "x"})),
+                    Err(MappingError::PlaceholderKey(_))
+                ),
+                "a key carried our own token to the client: {key} -> {:?}",
+                mapping.restore_value(&json!({key: "x"}))
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_carrying_no_token_of_ours_is_served() {
+        // Codex's P2. `[[PERSON_1]]` could never equal a token this gateway
+        // issued, and the shape-only reading refused it anyway — a 502 on a
+        // legitimate property name, which a templating client can plausibly
+        // spell `[[ROW_1]]`. Nothing is renamed by serving it and nothing of
+        // ours leaves in it.
+        let mut mapping = Mapping::new();
+        assert_eq!(
+            mapping.mask("Weber", &[span("PERSON", 0, 5)]).unwrap(),
+            "[PERSON_1]"
+        );
+        let served = json!({"[[ROW_1]]": "x", "[[PERSON_2]]": "y", "owner[ROW_1]": "z"});
+        assert_eq!(
+            mapping.restore_value(&served).unwrap(),
+            served,
+            "a key naming nothing this session issued was refused"
+        );
+    }
+
+    #[test]
+    fn a_key_carrying_the_callers_own_literal_is_served() {
+        // `reserve_literals` maps a caller's literal to itself, so it is in
+        // `by_placeholder` — and refusing on presence alone would refuse the
+        // caller their own text back. The token has to be one we issued *for a
+        // value*, which is what the self-mapping is not.
+        let mut mapping = Mapping::new();
+        let masked = mapping
+            .mask("[[ROW_1]] and Weber", &[span("PERSON", 14, 19)])
+            .unwrap();
+        assert_eq!(masked, "[[ROW_1]] and [PERSON_1]");
+        assert_eq!(
+            mapping.restore_value(&json!({"[[ROW_1]]": "x"})).unwrap(),
+            json!({"[[ROW_1]]": "x"}),
+            "the caller's own literal came back as a refusal"
         );
     }
 

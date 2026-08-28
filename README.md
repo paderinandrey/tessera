@@ -292,11 +292,18 @@ around them is not.
 It is also what closes two things a caller may miss. Anthropic's **citations** are refused
 on the request path — a `text` block may carry `cited_text`, which is quoted source
 material, and clients echo assistant turns back as history, so a conversation that used
-citations refuses on its next turn. And the server tools that carry configuration of their
-own go with them: `computer_*` for its display dimensions, `web_search_*` for a
-`user_location` whose `city` is a `LOCATION` in this gateway's own vocabulary.
-`text_editor_*` and `bash_*` declare nothing but a name and a type, so they pass and the
-coding-agent category is unaffected. Anthropic's **`mcp_servers`** is refused for a sharper
+citations refuses on its next turn. And **every tool Anthropic runs itself** goes with
+them — `web_search_*`, `web_fetch_*`, `code_execution_*`, the tool-search tools, the
+advisor — because the answer to one is a `server_tool_use` block and a result block of the
+tool's own, and this gateway describes neither. It used to refuse those *after* the model
+had run: a bare `{"name": "t", "type": "code_execution_20250522"}` passed the definition
+gate, the request was forwarded, the tokens were spent, and the caller received a 502.
+The type is checked before the call now, so the same refusal costs nothing. What passes is
+the tools the **caller** runs — `bash_*`, `text_editor_*`, `computer_*`, `memory_*` — whose
+results come back as the ordinary `tool_result` the caller sends, and a version of one of
+those is admitted the day Anthropic ships it, so the coding-agent category is unaffected.
+(`computer_*` is admitted by type and still refused by field, for its display dimensions.)
+Describing those response blocks is the follow-up; refusing is not the finished feature. Anthropic's **`mcp_servers`** is refused for a sharper
 version of the same reason: it grants the model tools this gateway never described, so
 their calls and results arrive shaped by a server it cannot account for — and it carries
 the caller's own `authorization_token` besides. A **number that carries personal data** is
