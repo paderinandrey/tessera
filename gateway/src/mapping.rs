@@ -197,6 +197,15 @@ impl Mapping {
         // A placeholder-shaped token already in the caller's text would be
         // indistinguishable from one we issue. Mapping it to itself reserves
         // the number and makes an echo restore to exactly what was sent.
+        //
+        // This reserves what *this* text holds, which is everything a single
+        // `mask` can see and not enough on its own: a request masks many
+        // strings, and a literal in the second collides with a number the
+        // first was already given. `proxy::mask_all` reserves across every
+        // string in the request before it masks any of them, so inside a
+        // request this call finds its own literals already reserved. It stays
+        // because `mask` is called on its own too, and a caller masking one
+        // text must not have to know about the wider pass to be correct.
         self.reserve_literals(text);
 
         let mut result = String::with_capacity(text.len());
@@ -239,7 +248,15 @@ impl Mapping {
 
     /// Map every placeholder-shaped token already present to itself, so it is
     /// never issued for a detected value and an echo restores unchanged.
-    fn reserve_literals(&mut self, text: &str) {
+    ///
+    /// `or_insert` is deliberate, and it is also the limit of what this can
+    /// do: it yields to whoever holds the key already. A literal that reaches
+    /// this *after* its number was issued for a detected value is therefore
+    /// not reserved, and the provider's echo of the caller's own text restores
+    /// to that value. Reserving ahead of every allocation is the caller's job,
+    /// and `proxy::mask_all` does it for a whole request. Across turns nothing
+    /// can do it: the allocation happened before the literal existed.
+    pub fn reserve_literals(&mut self, text: &str) {
         for piece in pieces(text) {
             if let Piece::Placeholder(candidate) = piece {
                 self.by_placeholder

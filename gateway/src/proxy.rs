@@ -263,6 +263,64 @@ async fn mask_all(
     let mut masked = body.clone();
     let mut total = 0usize;
     let mut distinct: HashSet<(String, String)> = HashSet::new();
+    // **Every literal in the request, reserved before the first allocation.**
+    // `Mapping::mask` reserves the text it is handed, which is one string; the
+    // collision is between two. With `{"a": "Martina Weber", "z":
+    // "[PERSON_1]"}` leaf `a` is allocated `[PERSON_1]` first, and
+    // `reserve_literals` then finds the key taken and cannot map the caller's
+    // own literal to itself — so the provider's echo of it restores to
+    // `Martina Weber`, in a tool argument the client's agent may execute.
+    // Measured at `a1ccd3d`, before this pass existed: the client received
+    // `{"z": "Martina Weber"}` for a `z` it had written as `[PERSON_1]`, and
+    // the upstream saw *both* leaves as the same token — the two strings had
+    // already stopped being distinguishable on the way up.
+    //
+    // **Slots, not leaves.** Every `Slot::Text` masks too, so a plain message
+    // ahead of a document takes the number the document's literal needed, and
+    // a document ahead of a `tool_result` does the same to it. Two loops over
+    // the same slots is the price, and it is walking only: no detector call is
+    // made here.
+    //
+    // **A document is read as text, not walked.** Reservation is not masking:
+    // it renames nothing and only claims a number, so it has no business
+    // knowing which positions are data. Serializing and scanning covers the
+    // positions the walk deliberately skips — a key, and a schema identifier
+    // such as `{"required": ["[PERSON_1]"]}`, both of which are forwarded
+    // verbatim and so can have their number issued to somebody's name behind
+    // their back. Measured with the leaf walk here instead: the schema above
+    // sent `Martina Weber` up as `[PERSON_1]` and the client got her name back
+    // in a tool argument. Reading `Shape::Instance` leaves instead would cover
+    // the identifiers and not the keys, and would refuse besides — `walk`
+    // counts only the nodes it descends into, so an `Instance` reading of a
+    // schema can reach `MAX_JSON_NODES` where the `Schema` reading `handle`
+    // charged did not, and a pass that only claims numbers must never refuse a
+    // request the masking pass would have served.
+    //
+    // JSON's own brackets forge nothing: `["[PERSON_1]"]` scans as the
+    // candidate `["[PERSON_1]`, which the grammar rejects, and the walk then
+    // advances one byte and finds the token inside — the rule `pieces` already
+    // exists for. No quote, comma or colon can sit inside `[TYPE_N]`.
+    //
+    // **A session outlives a request, and this pass does not.** A literal the
+    // caller writes on turn three against a number issued on turn one is not
+    // reachable from here in any order — the allocation happened before the
+    // literal existed — and it restores to that turn's value. Measured, not
+    // fixed, and recorded rather than papered over.
+    for slot in slots {
+        match slot {
+            Slot::Text { pointer, .. } => {
+                mapping.reserve_literals(&read_pointer(body, pointer)?);
+            }
+            Slot::Json {
+                pointer,
+                embedded,
+                shape: _,
+            } => {
+                let document = read_document(body, pointer, *embedded, provider)?;
+                mapping.reserve_literals(&document.to_string());
+            }
+        }
+    }
     for slot in slots {
         match slot {
             Slot::Text { pointer, .. } => {
@@ -1716,6 +1774,192 @@ mod tests {
         assert!(
             !body.contains("PERSON_1"),
             "a placeholder reached the client: {body}"
+        );
+    }
+
+    /// A detector that finds `Martina Weber` where it occurs and nothing
+    /// anywhere else, so a text slot and a document slot in one request get
+    /// different answers. `detector_finding_weber` cannot serve these: its span
+    /// is five characters and these need thirteen.
+    async fn detector_finding_martina_weber() -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(body_string_contains("Martina"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": [{"entity_type": "PERSON", "start": 0, "end": 13,
+                           "confidence": 1.0, "recognizer": "ner:fake",
+                           "tier": 2, "boosted": false}],
+                "layers_run": ["deterministic"]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_literal_in_a_later_leaf_keeps_the_number_an_earlier_leaf_would_have_taken() {
+        // Codex's P2, in what the client receives. `mask` reserves the text it
+        // is handed, so leaf `a` was allocated `[PERSON_1]` before leaf `z`'s
+        // literal was ever looked at, and `or_insert` could not then map that
+        // literal to itself. Measured at `a1ccd3d`: the client got
+        // `{"z": "Martina Weber"}` for a `z` it wrote as `[PERSON_1]` — a value
+        // it never sent, in an argument its own tool is about to act on.
+        let detector = detector_finding_martina_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "f",
+                                "input": {"z": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f",
+                 "input": {"a": "Martina Weber", "z": "[PERSON_1]"}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("[PERSON_1]") && !body.contains("Martina Weber"),
+            "the caller's own literal came back as somebody else's name: {body}"
+        );
+        // The other half of the same defect, and the earlier one: with the
+        // literal unreserved both leaves went up as `[PERSON_1]`, so the model
+        // was shown one token standing for two different strings.
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(
+            sent.contains(r#""a":"[PERSON_2]""#) && sent.contains(r#""z":"[PERSON_1]""#),
+            "the detected value and the caller's literal were sent as one token: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_in_a_later_slot_keeps_its_number_from_an_earlier_slots_value() {
+        // Wider than the finding as Codex wrote it, which was about two leaves
+        // of one document. `mask_all` loops over *slots* and every `Slot::Text`
+        // masks, so an ordinary message can take the number a later document's
+        // literal needed — no tool document is required on the side that
+        // allocates. This is what makes the reservation a pass over the whole
+        // request rather than a pass over one document's leaves.
+        let detector = detector_finding_martina_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "f",
+                                "input": {"z": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [
+                {"role": "user", "content": "Martina Weber"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f",
+                     "input": {"z": "[PERSON_1]"}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("[PERSON_1]") && !body.contains("Martina Weber"),
+            "the caller's own literal came back as somebody else's name: {body}"
+        );
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(
+            sent.contains(r#""content":"[PERSON_2]""#),
+            "the message's name took the number the document's literal held: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_in_a_plain_message_keeps_its_number_from_a_documents_value() {
+        // The other direction of the same widening, and the one that decides
+        // whether the reservation pass reads text slots at all. Here the
+        // document allocates and the *message* holds the literal, so a pass
+        // that walked only documents would leave `[PERSON_1]` unreserved and
+        // hand the client back a name for the token it wrote. Prose is masked
+        // by the same `mask`, so it collides by the same mechanism.
+        let detector = detector_finding_martina_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "f",
+                                "input": {"z": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f",
+                     "input": {"a": "Martina Weber"}}]},
+                {"role": "user", "content": "[PERSON_1]"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("[PERSON_1]") && !body.contains("Martina Weber"),
+            "the caller's own literal came back as somebody else's name: {body}"
+        );
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(
+            sent.contains(r#""a":"[PERSON_2]""#),
+            "the document's name took the number the message's literal held: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_in_a_position_nothing_masks_still_keeps_its_number() {
+        // Wider again, and the reason the reservation reads a document as text
+        // rather than walking its leaves. `required` names properties, so
+        // `json_leaves` skips it and masking must: rewriting it would leave the
+        // provider a schema requiring a property that does not exist. Skipped
+        // by masking is not the same as free to reissue — the identifier is
+        // forwarded verbatim, so the model sees `[PERSON_1]` twice, once as the
+        // caller wrote it and once standing for a name. Measured with a leaf
+        // walk here: `Martina Weber` went up as `[PERSON_1]` and came back as
+        // the value of a tool argument the caller had written as its own token.
+        // A placeholder-shaped object *key* is the same case and the same fix.
+        let detector = detector_finding_martina_weber().await;
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "tool_use", "id": "t1", "name": "f",
+                                "input": {"z": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude",
+                   "messages": [{"role": "user", "content": "Martina Weber"}],
+                   "tools": [{"name": "f", "description": "d", "input_schema":
+                       {"type": "object", "required": ["[PERSON_1]"],
+                        "properties": {}}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("[PERSON_1]") && !body.contains("Martina Weber"),
+            "the caller's own literal came back as somebody else's name: {body}"
+        );
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(
+            sent.contains(r#""content":"[PERSON_2]""#)
+                && sent.contains(r#""required":["[PERSON_1]"]"#),
+            "the identifier was masked, or its number was reissued: {sent}"
         );
     }
 
