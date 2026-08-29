@@ -578,6 +578,22 @@ Both counts describe *this* request. Two turns of a session carrying identical
 traffic write identical lines, and what the session bought across them — the
 same value keeping the same number — leaves no trace here.
 
+**Whose fault the line says it was.** `error` names the failure, not the party,
+and a 502 can mean either the provider or this gateway — so the classes that
+mean *a defect here* are worth knowing by name: `shape_pointer` (a pointer this
+gateway produced did not resolve in a body it had already walked),
+`mapping_unknown_placeholder`, `mapping_bad_span`, `mapping_mask_mismatch` and
+`mapping_placeholder_key`. `shape_response` and `upstream_failed` are the
+provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
+`mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
+`tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
+`session_disabled` and `session_no_credential` are the caller's;
+`detector_transport`, `detector_status`, `session_saturated` and
+`audit_write_failed` are this deployment's own machinery rather than anybody's
+mistake. A run of the first group is worth a page; a run of the second is worth
+a look at the provider's status. Every class this gateway can write appears in
+one of those four groups, and a test holds this paragraph to the code.
+
 `result` is one of `completed`,
 `refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
 defaults to on drop — in practice, a client that disconnects while a stream is

@@ -116,13 +116,27 @@ impl ProxyError {
     /// Matched with no `_` arm anywhere, over `ShapeError`, `DetectorError`,
     /// `MappingError` and `SessionError` as well as over this enum's own
     /// variants. `Shape(_)` used to collapse the last two of five, and it cost
-    /// more than tidiness twice over: `Response` and `Pointer` shared one class,
-    /// so an auditor reading a run of 502s could not tell a body the upstream
-    /// sent from a pointer this gateway produced — a defect here rather than
-    /// there — and a new variant would have compiled, taking a correct status
-    /// from `status()` and a wrong class from this function, silently. Measured
-    /// at `41eb85e` with a probe variant: one compile error, in `status()`, and
-    /// none here.
+    /// more than tidiness twice over.
+    ///
+    /// **`shape_response` blamed the provider for a defect of ours.** `status()`
+    /// puts `ShapeError::Pointer` in the arm it describes as "this gateway's own
+    /// internal defects", and it is: all four sites that raise it —
+    /// `read_pointer`, `write_pointer`, `read_document`, `write_document` — are
+    /// a pointer *this gateway produced* failing to resolve in a body it has
+    /// already walked. The wildcard recorded that as `shape_response`, which is
+    /// the class for a body the upstream sent, so the one line an auditor has
+    /// pointed at the provider for a bug that is here. Two of those four sites
+    /// arrived with this slice (`c230fb8`), and tool slots are where the gateway
+    /// builds the most pointers of its own, so the population grew at the same
+    /// time. `README.md` names which classes mean a defect here rather than
+    /// there, because the prefix cannot: `shape_request` is the caller's body,
+    /// `shape_response` the provider's, and `shape_pointer` neither.
+    ///
+    /// **And a new variant would have compiled**, taking a correct status from
+    /// `status()` and a wrong class from this function, silently. Measured at
+    /// `41eb85e` with a probe variant: one compile error, in `status()`, and
+    /// none here. With the wildcard gone the same probe gives three, the third
+    /// in `StreamError::audit_class`.
     fn audit_class(&self) -> &'static str {
         match self {
             ProxyError::Shape(ShapeError::Request(_)) => "shape_request",
@@ -6404,6 +6418,65 @@ mod tests {
         assert_eq!(line["texts"], 3, "one message and two descriptions: {line}");
     }
 
+    #[tokio::test]
+    async fn a_schema_of_identifiers_alone_is_a_document_nobody_scanned() {
+        // M1's realistic shape, and the reason it is graded above a naming
+        // quibble: a schema made only of identifier-valued keywords —
+        // `$schema`, `$id`, `$ref`, `type`, `required`, which the last three
+        // rounds made a *common* shape rather than a contrived one — has no
+        // leaves at all. `json_leaves` yields nothing, no detector call is
+        // made, and the schema is forwarded verbatim.
+        //
+        // Measured with the old count in place: `texts: 2` against **one**
+        // detector call. The evidence disagreed with the detector's own
+        // traffic, which is the same class of defect as a forwarded numeric
+        // leaf journalled as a masking.
+        //
+        // Driven through the session branch deliberately. Both branches of
+        // `handle` build their line from the same `Detected`, and this is the
+        // one that used to be able to differ.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/lookup.json",
+            "$ref": "#/$defs/Query",
+            "type": "object",
+            "required": ["query"]
+        });
+        let (status, returned) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hallo"}],
+                "tools": [{"name": "lookup", "input_schema": schema.clone()}]
+            }),
+            &[("x-api-key", "sk-tenant"), (SESSION_HEADER, "chat-1")],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["tools"][0]["input_schema"],
+            schema,
+            "the premise: nothing in this schema is data, so nothing is masked"
+        );
+        let calls = detector.received_requests().await.unwrap().len();
+        assert_eq!(calls, 1, "the message, and nothing for the schema");
+        let line = &journal(&path)[0];
+        assert_eq!(
+            line["documents"], 0,
+            "a document that made no detector call is not evidence of a scan: {line}"
+        );
+        assert_eq!(
+            line["texts"].as_u64().expect("a count") + line["documents"].as_u64().expect("a count"),
+            calls as u64,
+            "the journal and the detector's own traffic disagree: {line}"
+        );
+    }
+
     #[test]
     fn a_shape_failure_of_the_upstream_is_not_one_of_our_own() {
         // I3. `Shape(_)` collapsed `Response` and `Pointer` into one class, so
@@ -6422,6 +6495,39 @@ mod tests {
         );
     }
 
+    /// Every error this gateway can write a class for. One list, used by the
+    /// two tests below: a variant added to any of the wrapped enums already
+    /// fails to compile in `audit_class`, and this is what makes it also fail
+    /// to be *documented* and to be distinct.
+    fn every_audit_class() -> Vec<&'static str> {
+        vec![
+            ProxyError::Shape(ShapeError::Request("messages")).audit_class(),
+            ProxyError::Shape(ShapeError::Response("choices")).audit_class(),
+            ProxyError::Shape(ShapeError::Pointer("/a".to_owned())).audit_class(),
+            ProxyError::Shape(ShapeError::Unsupported("openai", "logprobs")).audit_class(),
+            ProxyError::Shape(ShapeError::MalformedDocument("openai", "/a".to_owned()))
+                .audit_class(),
+            ProxyError::Detector(DetectorError::Transport("refused".to_owned())).audit_class(),
+            ProxyError::Detector(DetectorError::Status(503)).audit_class(),
+            ProxyError::Mapping(MappingError::Unknown("[PERSON_1]".to_owned())).audit_class(),
+            ProxyError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
+            ProxyError::Mapping(MappingError::TooDeep).audit_class(),
+            ProxyError::Mapping(MappingError::TooLarge).audit_class(),
+            ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
+            ProxyError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+            ProxyError::Upstream("reset".to_owned()).audit_class(),
+            ProxyError::Session(SessionError::BadId).audit_class(),
+            ProxyError::Session(SessionError::Disabled).audit_class(),
+            ProxyError::Session(SessionError::NoCredential("authorization")).audit_class(),
+            ProxyError::Session(SessionError::Saturated).audit_class(),
+            ProxyError::Audit(crate::audit::AuditError::Unavailable).audit_class(),
+            ProxyError::ToolTooLarge.audit_class(),
+            ProxyError::TooManyToolCalls.audit_class(),
+            ProxyError::NumericPersonalData.audit_class(),
+        ]
+    }
+
     #[test]
     fn every_error_this_gateway_records_has_a_class_of_its_own() {
         // The other half of I3, and what makes the wildcard's absence visible
@@ -6430,22 +6536,8 @@ mod tests {
         // `status()`. This asserts the consequence — no two errors that mean
         // different things share a word — because a compile error cannot be
         // asserted from inside the crate that must compile.
-        let classes = [
-            ProxyError::Shape(ShapeError::Request("messages")).audit_class(),
-            ProxyError::Shape(ShapeError::Response("choices")).audit_class(),
-            ProxyError::Shape(ShapeError::Pointer("/a".to_owned())).audit_class(),
-            ProxyError::Shape(ShapeError::Unsupported("openai", "logprobs")).audit_class(),
-            ProxyError::Shape(ShapeError::MalformedDocument("openai", "/a".to_owned()))
-                .audit_class(),
-            ProxyError::Mapping(MappingError::Unknown("[PERSON_1]".to_owned())).audit_class(),
-            ProxyError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
-            ProxyError::Mapping(MappingError::TooDeep).audit_class(),
-            ProxyError::Mapping(MappingError::TooLarge).audit_class(),
-            ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
-            ProxyError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
-                .audit_class(),
-        ];
-        let mut seen: Vec<&str> = classes.to_vec();
+        let classes = every_audit_class();
+        let mut seen = classes.clone();
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
@@ -6453,5 +6545,26 @@ mod tests {
             classes.len(),
             "two errors an auditor must tell apart are one word: {classes:?}"
         );
+    }
+
+    #[test]
+    fn every_class_the_journal_can_write_is_documented_as_whose_fault_it_is() {
+        // `shape_pointer` is a defect in this gateway and `shape_response` is
+        // the provider's, and the prefix they share says neither — which is how
+        // the wildcard managed to blame the provider for our own pointer for as
+        // long as it did. `README.md` names the four groups, and a paragraph
+        // nobody checks is how this branch has been wrong seven times, so this
+        // is the check.
+        let readme = include_str!("../../README.md");
+        let (_, audit_section) = readme.split_once("### Audit").expect("the audit section");
+        let audit_section = audit_section
+            .split_once("\n## ")
+            .map_or(audit_section, |(section, _)| section);
+        for class in every_audit_class() {
+            assert!(
+                audit_section.contains(&format!("`{class}`")),
+                "the journal can write `{class}` and the README does not say whose fault it is"
+            );
+        }
     }
 }
