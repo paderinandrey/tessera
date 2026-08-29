@@ -5663,4 +5663,74 @@ mod tests {
             "a real applicator's identifiers are still identifiers"
         );
     }
+
+    #[tokio::test]
+    async fn a_partially_checked_identifier_reaches_the_detector_at_the_boundary() {
+        // **Round 9, and all three are inside round 8's own fix.** That round
+        // asked "does the document state the thing the rule exempts" of the
+        // container and then of the contents, and checked the contents
+        // *partially*: a prefix (`contentMediaType`'s essence, with the
+        // parameters named as unread in its own report), a union too wide
+        // (`$dynamicAnchor` given 2019-09's grammar, from a draft that does not
+        // define the keyword), and an argument asserted rather than measured
+        // (`pattern`, on "every string is a valid regex" — `Martina Weber(` is
+        // an unterminated group and ECMA-262 rejects it).
+        //
+        // Each pair below is the leak and the control it must not break, and
+        // the controls are the point: a check stricter than the draft masks a
+        // working schema, visibly, at the caller.
+        let detector = detector_finding_weber().await;
+        for (leaked, control, note) in [
+            (
+                json!({"pattern": "Weber("}),
+                json!({"pattern": "^Weber$"}),
+                "a regular expression has to close its groups, and one that spells a \
+                 person out is still the caller's own expression",
+            ),
+            (
+                json!({"contentMediaType": "text/plain; Weber"}),
+                json!({"contentMediaType": "text/plain; charset=Weber"}),
+                "a media type's parameters are `token=value`, and a bare word is neither \
+                 half of one",
+            ),
+            (
+                json!({"$dynamicAnchor": "Weber:node"}),
+                json!({"$anchor": "Weber:node"}),
+                "2019-09 permits `:` in an anchor and 2020-12 does not, and only 2020-12 \
+                 defines `$dynamicAnchor` at all",
+            ),
+        ] {
+            let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+            let (status, returned) = call(
+                state(&detector, &upstream),
+                "/v1/messages",
+                json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                       "tools": [{"name": "t", "input_schema": leaked}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{returned}");
+            let sent = sent_to(&upstream).await["tools"][0]["input_schema"].clone();
+            assert!(
+                sent.to_string().contains("[PERSON_1]"),
+                "{note}: the value was never shown to the detector, {sent}"
+            );
+
+            // The other direction, and the one that costs a working client if
+            // it is got wrong.
+            let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+            let (status, returned) = call(
+                state(&detector, &upstream),
+                "/v1/messages",
+                json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                       "tools": [{"name": "t", "input_schema": control.clone()}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{returned}");
+            assert_eq!(
+                sent_to(&upstream).await["tools"][0]["input_schema"],
+                control,
+                "{note}: a valid schema was masked, which breaks a client that was working"
+            );
+        }
+    }
 }

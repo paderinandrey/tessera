@@ -391,15 +391,34 @@ permits seven values for `type` and that is none of them, so the document states
 no type. The fourteen keywords are three kinds and not fourteen of one: `type`
 is a **closed vocabulary**; `$ref`, `$id`, `id`, `$schema` and `$dynamicRef` are
 URI-references, `$anchor` and `$dynamicAnchor` have a published pattern,
-`contentMediaType` is a media type and `format` and `contentEncoding` are bare
-tokens naming an attribute out of an extensible registry — all **grammars**;
-and `required`, `dependentRequired` and `pattern` hold **the caller's own
-vocabulary**, property names and a regular expression, which are arbitrary by
-definition and get no content check at all. Tightening that third kind would
-mask a schema's real property names, which is a working client broken rather
-than a leak closed. The grammars are read only where the draft is unambiguous:
+`contentMediaType` is a media type down to its RFC 2045 parameters, `pattern` is
+a regular expression and `format` and `contentEncoding` are bare tokens naming
+an attribute out of an extensible registry — all **grammars**; and `required`
+and `dependentRequired` hold **the caller's own vocabulary**, property names,
+which are arbitrary by definition and get no content check at all. Tightening
+that third kind would mask a schema's real property names, which is a working
+client broken rather than a leak closed.
+
+**And a keyword's grammar is not settled by asking what the grammar is; the
+second question is which drafts define the keyword at all.** `$anchor` is
+defined by 2019-09 and by 2020-12, which publish different patterns, so its
+check is their union — a client may send either draft. `$dynamicAnchor` was
+given the same union and is defined by 2020-12 alone, so the union gave it a
+spelling no draft ever published, and 2019-09's permits `:`. That was
+`Martina:Weber` walking through. Only the first question had been asked, of any
+entry.
+
+The grammars are read only where the draft is unambiguous, and each therefore
+carries a residual that is named where the check is rather than left implicit:
 a URI-reference is checked for whitespace and control characters and nothing
-else, because real OpenAPI documents put `{petId}` in a `$ref`.
+else, because real OpenAPI documents put `{petId}` in a `$ref`; a media type's
+quoted-string parameter value is arbitrary text by RFC 2045's own definition and
+is accepted whole; and a `pattern` is checked for *structure* — a group that
+closes, a class that closes, a backslash with something to escape — rather than
+parsed, because the parser in reach (`regex-syntax`) rejects lookaround and
+backreferences that ECMA-262 and JSON Schema both permit, and validating with it
+would mask working schemas. A check stricter than the draft is a worse mistake
+here than the hole it closes, because the caller sees it break.
 
 **And a keyword that grants schema semantics is the same rule one layer out,
 which took two more rounds to see.** The audit that closed the arms above rested

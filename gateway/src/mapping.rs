@@ -474,9 +474,50 @@ pub enum Shape {
 /// have to *be*, and the fourteen do not answer that the same way — see
 /// `Content`, where the three kinds and the reason the third one checks
 /// nothing are written out.
+///
+/// **And "what grammar does this keyword have" is not the same question as "in
+/// which drafts does it exist at all".** Only the first was asked when the
+/// third column was added, and the second is what `$dynamicAnchor` needed: it
+/// was given the *union* of 2019-09's and 2020-12's anchor patterns, on the
+/// argument — correct for `$anchor` — that a client may send either draft. But
+/// 2020-12 introduced `$dynamicAnchor` and no earlier draft has it, so there is
+/// no second spelling it could legitimately be written in, and 2019-09's
+/// pattern permits `:`. `Martina:Weber` was skipped (measured, at 200). Every
+/// entry has now been asked the second question:
+///
+/// | Keyword | Defined by | Verdict |
+/// |---|---|---|
+/// | `$ref`, `format`, `pattern`, `required`, `type` | 04 through 2020-12 | one rule, published unchanged by all of them |
+/// | `$schema` | 04 through 2020-12 | an *absolute* URI in all of them; checked as a URI-reference, which is looser than every draft — the recorded residual, unchanged |
+/// | `$id` | 06 through 2020-12 | a URI-reference in all of them; 06 and 07 permit a fragment and 2019-09 forbids a non-empty one, so the check is the looser of the two |
+/// | `id` | draft-04's spelling of `$id`, and nothing later | one draft, one rule |
+/// | `contentEncoding`, `contentMediaType` | 07, 2019-09, 2020-12 | one rule in all three |
+/// | `dependentRequired` | 2019-09, 2020-12 | one rule, and it is the caller's own vocabulary either way |
+/// | `$anchor` | 2019-09, 2020-12 | **two drafts, two patterns — the union is right here** |
+/// | `$dynamicAnchor`, `$dynamicRef` | 2020-12 only | **one draft, so one grammar.** `$dynamicAnchor` was the leak |
+///
+/// Two entries are looser than the drafts on purpose and both are recorded
+/// where the looseness is: draft-03 spelled `required` as a boolean on the
+/// property's own schema, which `Identifier::Names` rejects as no name list —
+/// a bare `true` carries no text, so nothing leaks and nothing over-masks; and
+/// draft-03 published an eighth type name, `any`, which 04 dropped. A draft-03
+/// `{"type": "any"}` is now scanned, and `any` is not a person, so the cost is
+/// a detector call. Widening a genuinely closed vocabulary for a draft nobody
+/// sends is the trade this list exists to refuse.
 const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 14] = [
+    // Two drafts define it and they publish different patterns, so the check
+    // is the union of the two — see `Content::Anchor`. `$dynamicAnchor` below
+    // is the same shape of keyword and *not* the same answer, for a reason
+    // that is about the drafts rather than about the grammar.
     ("$anchor", Identifier::Name, Content::Anchor),
-    ("$dynamicAnchor", Identifier::Name, Content::Anchor),
+    // **One draft defines it, so there is one grammar it can be written in.**
+    // 2020-12 introduced `$dynamicAnchor` and no earlier draft has it; a union
+    // with 2019-09's pattern gives it a spelling no draft ever published, and
+    // 2019-09's permits `:`, so `Martina:Weber` was skipped (measured, at 200).
+    ("$dynamicAnchor", Identifier::Name, Content::DynamicAnchor),
+    // 2020-12 too, and 2019-09's nearest analogue is a different keyword
+    // (`$recursiveRef`, whose value must be `"#"`) that is not on this list.
+    // One draft, one grammar, and 2020-12 says URI-reference.
     ("$dynamicRef", Identifier::Name, Content::UriReference),
     ("$id", Identifier::Name, Content::UriReference),
     ("$ref", Identifier::Name, Content::UriReference),
@@ -495,8 +536,13 @@ const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 14] = [
     // still a schema a client may send, and a masked base URI breaks every
     // `$ref` that resolves against it.
     ("id", Identifier::Name, Content::UriReference),
-    // A regular expression, and every string is one. See `Content::Arbitrary`.
-    ("pattern", Identifier::Name, Content::Arbitrary),
+    // An ECMA-262 regular expression. Round 8 put this on `Content::Arbitrary`
+    // on the argument that every string is a valid one; `Martina Weber(` is an
+    // unterminated group and ECMA-262 rejects it, so the argument was false and
+    // the value was skipped (measured, at 200). What is checked is structure
+    // only — see `Content::RegularExpression` for why a parser is the wrong
+    // instrument here and what that leaves open.
+    ("pattern", Identifier::Name, Content::RegularExpression),
     ("required", Identifier::Names, Content::Arbitrary),
     ("type", Identifier::NameOrNames, Content::TypeName),
 ];
@@ -584,14 +630,43 @@ impl Identifier {
 /// - **a closed vocabulary** — `type`, and only `type`. The seven names are
 ///   published by every draft and extended by none.
 /// - **a grammar** — `$ref`, `$id`, `id`, `$schema` and `$dynamicRef` are
-///   URI-references; `$anchor` and `$dynamicAnchor` have a published pattern;
-///   `contentMediaType` is a media type; `format` and `contentEncoding` are
-///   bare tokens naming an attribute out of an extensible registry.
+///   URI-references; `$anchor` and `$dynamicAnchor` have a published pattern,
+///   and *not the same one*, because they are not published by the same set of
+///   drafts; `contentMediaType` is a media type down to its parameters;
+///   `format` and `contentEncoding` are bare tokens naming an attribute out of
+///   an extensible registry; `pattern` is a regular expression, checked for
+///   structure only.
 /// - **the caller's own vocabulary** — `required` and `dependentRequired` hold
-///   *property names*, and `pattern` holds a regular expression that may be a
-///   literal. Nothing about the characters is knowable, and a check invented
-///   here would mask the schema's real property names. `Content::Arbitrary` is
-///   that answer written down rather than left as an omission.
+///   *property names*. Nothing about the characters is knowable, and a check
+///   invented here would mask the schema's real property names.
+///   `Content::Arbitrary` is that answer written down rather than left as an
+///   omission. It is **two** keywords; `pattern` was a third until the argument
+///   putting it there — "every string is a valid regex" — turned out to be
+///   false.
+///
+/// **Every one of these carries a residual, and this comment says what each one
+/// is rather than reading as though the checks are complete.** Two rounds
+/// running, a comment claiming completeness is what let the next finding
+/// through: round 7's said the container was the check, round 8's said the
+/// contents were. The three kinds fail differently and it is worth naming how.
+///
+/// - The **vocabulary** has no residual and is the only kind that does not.
+///   Seven names, published by every draft, extended by none.
+/// - A **grammar** is checked to wherever its own draft stops being
+///   unambiguous, and never past it, because a check stricter than the draft
+///   masks a valid schema and breaks a working caller — visibly, at the call.
+///   So a URI-reference is read for whitespace and control characters and not
+///   for RFC 3986's other exclusions; `$schema` is not required to be
+///   absolute; `format` and `contentEncoding` share one token rule because
+///   neither registry closes; a `contentMediaType` parameter whose value is a
+///   *quoted string* is arbitrary text by RFC 2045's own definition and is
+///   accepted whole; and `pattern` is checked for structure and not parsed.
+///   Each of those is a string that states no identifier and is forwarded
+///   anyway, and each is named at its variant with the reason.
+/// - The **caller's own vocabulary** is a residual end to end and always was:
+///   `{"required": ["Martina Weber"]}` reaches the provider verbatim, because a
+///   property name is dispatch and masking it breaks the schema it names. That
+///   is the branch's recorded position and no round has changed it.
 ///
 /// A mismatch is scanned as an instance, as every neighbouring arm does:
 /// `descend_into` has no refusal channel, and an over-masked *malformed* schema
@@ -627,13 +702,43 @@ enum Content {
     /// does not enforce either, which is the mistake this branch has already
     /// made once this week.
     UriReference,
-    /// 2019-09's `^[A-Za-z][-A-Za-z0-9.:_]*$` and 2020-12's
-    /// `^[A-Za-z_][-A-Za-z0-9._]*$`, as their union: a client may send either
-    /// draft, so a string satisfying either one is an anchor.
+    /// `$anchor`, and only `$anchor`: 2019-09's `^[A-Za-z][-A-Za-z0-9.:_]*$`
+    /// and 2020-12's `^[A-Za-z_][-A-Za-z0-9._]*$`, as their **union**. Both
+    /// drafts define the keyword and a client may send either, so a string
+    /// satisfying either pattern is an anchor and refusing one would break a
+    /// schema written to the older draft.
     Anchor,
-    /// A media type — `type/subtype`, with RFC 2045 parameters after a `;`.
-    /// The essence is what is checked; the parameters may hold spaces
-    /// (`text/plain; charset=utf-8`) and hold no name.
+    /// `$dynamicAnchor`: 2020-12's `^[A-Za-z_][-A-Za-z0-9._]*$` **alone**.
+    ///
+    /// The same shape of keyword as `$anchor` and deliberately not the same
+    /// check, because the union's argument is about *drafts* and not about
+    /// grammars. 2020-12 introduced `$dynamicAnchor`; no earlier draft has it,
+    /// so a value written in 2019-09's spelling is not a schema anyone could
+    /// have written to a draft that defines the keyword. 2019-09's pattern
+    /// permits `:` and 2020-12's does not, which is the whole of the
+    /// difference and is exactly what `Martina:Weber` walked through.
+    DynamicAnchor,
+    /// A media type: `type/subtype`, and after each `;` an RFC 2045
+    /// `attribute=value` where the attribute is a token and the value is a
+    /// token or a quoted string.
+    ///
+    /// **The parameters are read, and the round that wrote this check said in
+    /// as many words that they were not.** `text/plain; Martina Weber` passed
+    /// on the strength of its essence and forwarded the rest unscanned
+    /// (measured, at 200). `Martina Weber` is neither a token nor a
+    /// quoted-string value and states no parameter, so the value states no
+    /// media type and is scanned whole — the essence masked with it, which is
+    /// the all-or-nothing ruling `Content::stated_by` already makes for
+    /// `type`'s union and for the same reason.
+    ///
+    /// **Residual: a well-formed quoted string is arbitrary text and is
+    /// accepted.** `text/plain; name="Martina Weber"` states a media type by
+    /// RFC 2045 — a quoted string exists precisely so a value may hold spaces
+    /// and tspecials — and it is forwarded. There is no channel here to hand
+    /// back one substring of a leaf, so closing it would mean scanning the
+    /// whole value, essence included, for every `boundary="..."` a real client
+    /// sends. Recorded rather than closed, and it is a decision a later round
+    /// can overturn as a decision.
     MediaType,
     /// A bare token: an attribute name out of a registry the drafts publish
     /// and explicitly allow implementations to extend, so **membership is not
@@ -643,8 +748,50 @@ enum Content {
     /// one token, and a value with a space in it names no format attribute in
     /// any implementation.
     Token,
+    /// An ECMA-262 regular expression, checked for **structure only**:
+    /// balanced `(`/`)`, a closed `[`…`]`, and no trailing lone backslash.
+    ///
+    /// **The instrument was the whole of the work here, and the obvious one is
+    /// wrong.** A check too strict masks a *valid* pattern, and a masked
+    /// `pattern` breaks a schema that was correct, visibly, at the caller. So
+    /// before validating, what the validator accepts has to be established:
+    ///
+    /// - `regex-syntax`, the parser under the `regex` crate, **rejects legal
+    ///   ECMA-262**. Measured, not assumed: it refuses `(?=Martina)Weber` and
+    ///   `(?<=Weber)Martina` ("look-around … is not supported"), `(Martina) \1`
+    ///   ("backreferences are not supported"), `a{` and `[]` — five kinds of
+    ///   pattern that a browser compiles and that JSON Schema permits, because
+    ///   the drafts define `pattern` as ECMA-262 and not as Rust's dialect.
+    ///   Validating with it would mask all five.
+    /// - It is also not a dependency of this crate. `regex` is in the lock file
+    ///   only as a transitive dev-dependency of `wiremock`, so using it means
+    ///   adding a runtime dependency — which would need its own argument even
+    ///   if the dialect matched, and the dialect does not.
+    ///
+    /// So the check is the part that is invalid in **every** dialect there is,
+    /// ECMA-262 included, and nothing beyond it. Where the dialects disagree
+    /// about `[`…`]` — ECMA-262 closes the class at the first `]`, so `[]` is
+    /// the empty class, while POSIX and Rust read that `]` as a literal member
+    /// — the reading taken is ECMA-262's, which is both the draft's own and the
+    /// more permissive of the two about termination.
+    ///
+    /// **Residual, and it is real: a pattern invalid for a subtler reason still
+    /// forwards its contents.** `*Martina Weber` (a quantifier with nothing to
+    /// repeat) and `[z-a]Martina Weber` (a reversed class range) are rejected
+    /// by ECMA-262 and accepted here. Closing those needs a parser that accepts
+    /// ECMA-262 and rejects nothing else, and no such parser is in this tree.
+    /// The check is deliberately incomplete, and this sentence is the part of
+    /// it that must not be dropped.
+    ///
+    /// And separately from the residual, unchanged and by design: a pattern
+    /// that is perfectly valid and spells a person out — `^Martina Weber$` —
+    /// is a regular expression the caller wrote and is forwarded. That is not
+    /// a gap in this check; it is the same position `required` holds.
+    RegularExpression,
     /// A string the caller chose, and there is nothing to check. The third
-    /// kind, and the one that must stay this way.
+    /// kind, and the one that must stay this way. **Two keywords** — `required`
+    /// and `dependentRequired`, both holding property names. `pattern` was a
+    /// third until its argument was measured and failed.
     Arbitrary,
 }
 
@@ -695,25 +842,177 @@ impl Content {
             // current document, which is how a recursive `$ref` is spelled —
             // and it carries nothing either way.
             Content::UriReference => !text.chars().any(|c| c.is_whitespace() || c.is_control()),
-            Content::Anchor => {
-                let mut characters = text.chars();
-                characters
-                    .next()
-                    .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-                    && characters
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_'))
+            Content::Anchor => is_anchor_2019_09(text) || is_anchor_2020_12(text),
+            Content::DynamicAnchor => is_anchor_2020_12(text),
+            Content::MediaType => {
+                let (essence, parameters) = match text.split_once(';') {
+                    Some((essence, parameters)) => (essence, Some(parameters)),
+                    None => (text, None),
+                };
+                essence
+                    .split_once('/')
+                    .is_some_and(|(kind, subtype)| is_media_token(kind) && is_media_token(subtype))
+                    && parameters.is_none_or(states_media_parameters)
             }
-            Content::MediaType => text
-                .split(';')
-                .next()
-                .and_then(|essence| essence.split_once('/'))
-                .is_some_and(|(kind, subtype)| {
-                    is_token(kind) && is_token(subtype) && !subtype.contains('/')
-                }),
             Content::Token => is_token(text),
+            Content::RegularExpression => states_regular_expression(text),
             Content::Arbitrary => true,
         }
     }
+}
+
+/// 2019-09's anchor pattern, `^[A-Za-z][-A-Za-z0-9.:_]*$`. The `:` is the
+/// character 2020-12 dropped, and `$anchor` is the only keyword that may still
+/// be written this way.
+fn is_anchor_2019_09(text: &str) -> bool {
+    let mut characters = text.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_'))
+}
+
+/// 2020-12's `anchorString`, `^[A-Za-z_][-A-Za-z0-9._]*$`. Both `$anchor` and
+/// `$dynamicAnchor` reference it in that draft's meta-schema; `$dynamicAnchor`
+/// exists in no other draft, so for that keyword this is the whole rule.
+fn is_anchor_2020_12(text: &str) -> bool {
+    let mut characters = text.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// RFC 2045's `token`: non-empty US-ASCII with no space, no control character
+/// and none of the tspecials.
+///
+/// Stricter than the `is_token` inside `states`, and about a different thing:
+/// that one is a *format attribute* name out of an open registry, where the
+/// only rule anyone can name is "one word". This one has a grammar published
+/// with the character set spelled out, so it is checked against the character
+/// set.
+fn is_media_token(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|c| {
+            c.is_ascii()
+                && !c.is_ascii_whitespace()
+                && !c.is_control()
+                && !matches!(
+                    c,
+                    '(' | ')'
+                        | '<'
+                        | '>'
+                        | '@'
+                        | ','
+                        | ';'
+                        | ':'
+                        | '\\'
+                        | '"'
+                        | '/'
+                        | '['
+                        | ']'
+                        | '?'
+                        | '='
+                )
+        })
+}
+
+/// Whether everything after a media type's first `;` is RFC 2045's parameter
+/// section: `attribute=value` pairs separated by `;`, the attribute a token and
+/// the value a token or a quoted string.
+///
+/// Surrounding whitespace is trimmed at each boundary, because RFC 822's
+/// folding rules put it there and every real client writes `text/plain;
+/// charset=utf-8` with the space after the `;`.
+fn states_media_parameters(parameters: &str) -> bool {
+    let mut rest = parameters;
+    loop {
+        // The attribute runs to the `=`. A parameter with no `=` in it at all
+        // is the leak this function exists for: `text/plain; Martina Weber`.
+        let Some((attribute, after)) = rest.split_once('=') else {
+            return false;
+        };
+        if !is_media_token(attribute.trim()) {
+            return false;
+        }
+        let after = after.trim_start();
+        rest = match after.strip_prefix('"') {
+            // A quoted string ends at the first `"` that is not escaped; `\`
+            // escapes the character after it, which is how a quote gets in.
+            Some(quoted) => {
+                let mut characters = quoted.char_indices();
+                loop {
+                    match characters.next() {
+                        Some((_, '\\')) => {
+                            if characters.next().is_none() {
+                                return false;
+                            }
+                        }
+                        Some((at, '"')) => break &quoted[at + 1..],
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            }
+            // A token value ends where the next parameter begins, or at the
+            // end of the string.
+            None => {
+                let end = after.find(';').unwrap_or(after.len());
+                if !is_media_token(after[..end].trim()) {
+                    return false;
+                }
+                &after[end..]
+            }
+        };
+        // What follows a value is either the `;` that starts the next
+        // parameter or the end of the media type. Anything else — trailing
+        // text after a closing quote, say — states no parameter.
+        let remainder = rest.trim_start();
+        match remainder.strip_prefix(';') {
+            Some(next) => rest = next,
+            None => return remainder.is_empty(),
+        }
+    }
+}
+
+/// Whether `text` is *structurally* a regular expression.
+///
+/// Three rules, and they are the ones every regex dialect agrees on — see
+/// `Content::RegularExpression` for why the check stops here and what it
+/// therefore lets through. A group has to close, a character class has to
+/// close, and a backslash has to have something to escape.
+fn states_regular_expression(text: &str) -> bool {
+    let mut characters = text.chars();
+    let mut depth = 0usize;
+    let mut in_class = false;
+    while let Some(character) = characters.next() {
+        match character {
+            // A backslash escapes the next character everywhere — inside a
+            // class and outside one — and a trailing lone backslash has
+            // nothing to escape, which no dialect accepts.
+            '\\' => {
+                if characters.next().is_none() {
+                    return false;
+                }
+            }
+            // Inside a class, `(`, `)` and `[` are literal and `]` closes.
+            // ECMA-262 closes at the *first* `]`, which makes `[]` the empty
+            // class where POSIX and Rust read an unterminated one — the
+            // draft's own reading, and the one that cannot mask a pattern the
+            // draft calls valid.
+            _ if in_class => in_class = character != ']',
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => {
+                let Some(outer) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = outer;
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && !in_class
 }
 
 /// A list of property names: an array, every element of which is a string.
@@ -2474,20 +2773,36 @@ mod tests {
             // widening the third kind is an edit to this line.
             assert_eq!(
                 content == Content::Arbitrary,
-                ["dependentRequired", "pattern", "required"].contains(&keyword),
+                ["dependentRequired", "required"].contains(&keyword),
                 "{keyword} is classified as holding a string the caller chose, and only \
-                 property names and a regular expression are"
+                 property names are"
             );
             // One string that really is an identifier of this kind, out of the
-            // draft that publishes the kind.
-            let stated = match content {
-                Content::TypeName => "object",
-                Content::UriReference => "#/$defs/Person",
-                Content::Anchor => "person",
-                Content::MediaType => "application/json",
-                Content::Token => "base64",
-                Content::Arbitrary => "billing_address",
+            // draft that publishes the kind — and one that is an identifier of
+            // no kind at all, which is the half round 8 added and the half
+            // this round had to make per-content. `Martina Weber` was that
+            // string for every keyword, and it stopped being one when
+            // `pattern` moved off `Arbitrary`: a person's name is a perfectly
+            // well-formed regular expression matching that literal, so the
+            // near-miss for a regular expression has to be a *structural*
+            // one. `None` means "nothing a caller can write fails this check",
+            // and only the caller's own vocabulary may answer that.
+            let (stated, unstated) = match content {
+                Content::TypeName => ("object", Some("Martina Weber")),
+                Content::UriReference => ("#/$defs/Person", Some("Martina Weber")),
+                Content::Anchor => ("person", Some("Martina Weber")),
+                Content::DynamicAnchor => ("person", Some("Martina Weber")),
+                Content::MediaType => ("application/json", Some("Martina Weber")),
+                Content::Token => ("base64", Some("Martina Weber")),
+                Content::RegularExpression => ("^Martina Weber$", Some("Martina Weber(")),
+                Content::Arbitrary => ("billing_address", None),
             };
+            assert_eq!(
+                unstated.is_none(),
+                content == Content::Arbitrary,
+                "{keyword}: only the caller's own vocabulary may have no near-miss, and \
+                 every other kind must be driven with one"
+            );
             let of_shape = |name: &str| match shape {
                 Identifier::Name => json!(name),
                 Identifier::NameOrNames | Identifier::Names => json!([name]),
@@ -2504,20 +2819,19 @@ mod tests {
             // The content half. Same container, and a string that is an
             // identifier of no kind at all — which is what `{"type": "Martina
             // Weber"}` was, skipped on the strength of being a string.
-            let unstated =
-                json_leaves(&document(of_shape("Martina Weber")), Shape::Schema).unwrap();
-            if content == Content::Arbitrary {
-                assert!(
-                    unstated.is_empty(),
+            match unstated {
+                Some(unstated) => assert_eq!(
+                    json_leaves(&document(of_shape(unstated)), Shape::Schema).unwrap(),
+                    vec![Leaf::Text(unstated.to_owned())],
+                    "{keyword} skipped a string that states no identifier of its kind"
+                ),
+                None => assert!(
+                    json_leaves(&document(of_shape("Martina Weber")), Shape::Schema)
+                        .unwrap()
+                        .is_empty(),
                     "{keyword} masked a string the caller chose, which breaks a schema that \
                      was correct"
-                );
-            } else {
-                assert_eq!(
-                    unstated,
-                    vec![Leaf::Text("Martina Weber".to_owned())],
-                    "{keyword} skipped a string that states no identifier of its kind"
-                );
+                ),
             }
             // The one shape no keyword on this list defines, and the shape
             // Codex sent: an object whose values are the caller's prose.
@@ -2593,10 +2907,48 @@ mod tests {
             json!({"contentMediaType": "Weber"}),
             // And exactly one slash — the subtype is a token too.
             json!({"contentMediaType": "text/plain/Weber"}),
+            // A parameter is `token=value`, and a bare word is neither half of
+            // one. This is the boundary the essence check cannot see, and the
+            // round that wrote the essence check said so in its own report.
+            json!({"contentMediaType": "text/plain; Martina Weber"}),
+            // The attribute is a token too, so a space inside it states no
+            // parameter even when the `=` is there.
+            json!({"contentMediaType": "text/plain; Martina Weber=1"}),
+            // And a quoted string has to close.
+            json!({"contentMediaType": "text/plain; name=\"Martina Weber"}),
+            // **Found by mutation, and it is the same blind spot round 8
+            // found once already.** Emptying the *value* check down to
+            // "non-empty" left all 464 green: every other case here is caught
+            // by the attribute half or by the essence, so nothing was asking
+            // the value half anything. An unquoted value is a token, and a
+            // token has no space in it — quoting is what a value with a space
+            // needs, and the quoted form beside it in
+            // `a_grammar_admits_what_clients_actually_write` is the control.
+            json!({"contentMediaType": "text/plain; name=Martina Weber"}),
+            // The same half at the end of the value, where the next parameter
+            // would start: text after a closing quote states no parameter.
+            json!({"contentMediaType": "text/plain; name=\"utf 8\" Martina Weber"}),
             // The anchor pattern starts at a letter or an underscore.
             json!({"$anchor": "1Weber"}),
             // ...and continues in a character class that has no slash in it.
             json!({"$dynamicAnchor": "Weber/Martina"}),
+            // **The one character the two anchor drafts disagree about.**
+            // 2019-09 permits `:` and 2020-12 does not, and `$dynamicAnchor`
+            // exists only in 2020-12, so this is the boundary that separates
+            // the two keywords. `$anchor` with the same string is a control in
+            // `a_grammar_admits_what_clients_actually_write` — the pair is the
+            // whole of H3.
+            json!({"$dynamicAnchor": "Martina:Weber"}),
+            // A group has to close. `Martina Weber` is a valid regular
+            // expression and this is not, which is the sentence round 8 got
+            // backwards.
+            json!({"pattern": "Martina Weber("}),
+            // A stray `)` is invalid in ECMA-262 too, Annex B included.
+            json!({"pattern": "Martina Weber)"}),
+            // A character class has to close.
+            json!({"pattern": "[Martina Weber"}),
+            // And a backslash has to have something to escape.
+            json!({"pattern": "Martina Weber\\"}),
             // The seven type names are lowercase, and the drafts are
             // case-sensitive about them.
             json!({"type": "Object"}),
@@ -2647,10 +2999,50 @@ mod tests {
             // publishes the pattern.
             json!({"id": "https://example.invalid/schemas/person.json"}),
             json!({"$anchor": "person_1"}),
-            json!({"$dynamicAnchor": "node.left:1"}),
+            // **This line read `{"$dynamicAnchor": "node.left:1"}` and it was
+            // wrong.** It was written to pin the union as a *client-facing*
+            // rule — an anchor written to 2019-09 must not be masked — and the
+            // union is right for `$anchor`, which both drafts define. It is
+            // not right for `$dynamicAnchor`, which only 2020-12 defines: a
+            // `:` in one is not an older draft's spelling, it is no spelling
+            // at all, and this assertion is what let `Martina:Weber` past.
+            // Kept, moved to the keyword whose drafts earn it, and given the
+            // 2020-12 form beside it so the pair still says what the line was
+            // for.
+            json!({"$anchor": "node.left:1"}),
+            json!({"$dynamicAnchor": "node.left_1"}),
             // The empty URI-reference: the current document, which is how a
             // schema refers to itself.
             json!({"$ref": ""}),
+            // A media type's parameters, which are read now and were not
+            // before. All three of these are RFC 2045 and all three are
+            // written by real clients: a token value, a quoted one holding
+            // the space that is the whole reason quoting exists, and two
+            // parameters in a row.
+            json!({"contentMediaType": "text/plain; charset=\"utf 8\""}),
+            json!({"contentMediaType": "multipart/form-data; boundary=abc; charset=utf-8"}),
+            json!({"contentMediaType": "application/vnd.api+json; profile=\"a b\""}),
+            // A regular expression the `regex` crate refuses and ECMA-262
+            // accepts. Lookaround and backreferences are the reason this check
+            // is structural rather than a parse: `regex-syntax` rejects both
+            // (measured), and JSON Schema defines `pattern` as ECMA-262.
+            json!({"pattern": "(?=Martina)Weber"}),
+            json!({"pattern": "(?<=Weber)Martina"}),
+            json!({"pattern": "(Martina) \\1"}),
+            // And the dialects that disagree about brackets and braces: `[^]]`
+            // is the ECMA-262 empty negated class then a literal `]`, and `a{`
+            // is a literal brace. Rust's parser rejects `a{` and reads `[^]]`
+            // as a different expression; neither may be masked.
+            json!({"pattern": "[^]]+"}),
+            json!({"pattern": "Martina Weber{"}),
+            // The escapes, inside a class and out of it.
+            json!({"pattern": "Martina Weber\\("}),
+            json!({"pattern": "[\\]]Martina"}),
+            json!({"pattern": "[()]Martina"}),
+            // And a pattern that spells a person out, which is valid, is the
+            // caller's own regular expression, and is forwarded. Unchanged by
+            // this round and stated so that changing it is a decision.
+            json!({"pattern": "^Martina Weber$"}),
         ] {
             assert!(
                 json_leaves(&schema, Shape::Schema).unwrap().is_empty(),

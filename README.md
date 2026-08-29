@@ -186,10 +186,19 @@ A schema keyword's value is left alone only where the keyword really states an i
 which is a question about the string and not only about its container: `{"type": "Martina
 Weber"}` names none of JSON Schema's seven types, so it states no type and is masked like
 any other value the walk does not recognize, inside a well-formed `allOf` or out of one.
-The keywords holding the caller's *own* vocabulary — `required` and `dependentRequired`,
-which hold property names, and `pattern`, which holds a regular expression — are exempt
-from that check, because there is nothing to check them against and a rule invented for
-them would mask a schema that was correct.
+The check runs to wherever the keyword's own draft stops being unambiguous and no further,
+because one stricter than the draft breaks a working schema at the caller: a media type is
+read down to its RFC 2045 parameters, so `"text/plain; Martina Weber"` states no parameter
+and is masked while `"text/plain; charset=utf-8"` is left alone; `$dynamicAnchor` is held
+to 2020-12's pattern alone, because 2020-12 is the only draft that defines the keyword,
+while `$anchor` keeps the union of both drafts that do; and a `pattern` is checked for
+structure — a group that closes, a class that closes, a backslash with something to escape
+— rather than parsed, because the parsers available here reject lookaround and
+backreferences that ECMA-262 and JSON Schema both allow. Each of those leaves a residual,
+and each residual is named where the check is. Only the keywords holding the caller's *own*
+vocabulary — `required` and `dependentRequired`, which hold property names — are exempt
+entirely, because there is nothing to check them against and a rule invented for them would
+mask a schema that was correct.
 
 Names are not. A tool's name, a schema property name and a `tool_call_id` are the client's
 own dispatch, matched against strings it authored, so masking one breaks the call and
