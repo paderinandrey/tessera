@@ -384,6 +384,23 @@ because the union admits `{"$ref": {"note": ["Martina Weber"]}}`. A value that
 is not the shape is not an identifier, so it is the client's data and is
 scanned; the cost of being wrong is an over-masked schema the caller can see.
 
+**A shape is the container, and the same question has to be asked of what is
+inside it.** `{"type": "Martina Weber"}` is a string where `type` takes a
+string, so the shape check passes and the name travelled unread. JSON Schema
+permits seven values for `type` and that is none of them, so the document states
+no type. The fourteen keywords are three kinds and not fourteen of one: `type`
+is a **closed vocabulary**; `$ref`, `$id`, `id`, `$schema` and `$dynamicRef` are
+URI-references, `$anchor` and `$dynamicAnchor` have a published pattern,
+`contentMediaType` is a media type and `format` and `contentEncoding` are bare
+tokens naming an attribute out of an extensible registry — all **grammars**;
+and `required`, `dependentRequired` and `pattern` hold **the caller's own
+vocabulary**, property names and a regular expression, which are arbitrary by
+definition and get no content check at all. Tightening that third kind would
+mask a schema's real property names, which is a working client broken rather
+than a leak closed. The grammars are read only where the draft is unambiguous:
+a URI-reference is checked for whitespace and control characters and nothing
+else, because real OpenAPI documents put `{petId}` in a `$ref`.
+
 **And a keyword that grants schema semantics is the same rule one layer out,
 which took two more rounds to see.** The audit that closed the arms above rested
 on "an arm can only leak if it can return `None` — an arm that always returns

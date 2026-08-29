@@ -465,32 +465,57 @@ pub enum Shape {
 /// identifiers, and `descend_into` skips the value only if it has that shape.
 /// Consulted from the key alone, this list copied `{"required": {"owner":
 /// "Martina Weber"}}` into the egress untouched (measured, at 200).
-const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier); 14] = [
-    ("$anchor", Identifier::Name),
-    ("$dynamicAnchor", Identifier::Name),
-    ("$dynamicRef", Identifier::Name),
-    ("$id", Identifier::Name),
-    ("$ref", Identifier::Name),
-    ("$schema", Identifier::Name),
-    ("contentEncoding", Identifier::Name),
-    ("contentMediaType", Identifier::Name),
-    ("dependentRequired", Identifier::NamesPerName),
-    ("format", Identifier::Name),
+///
+/// **And a shape is necessary and not sufficient either**, which is the third
+/// column. The shape is the *container* — a string, an array of them, a map of
+/// them — and a container is not an identifier: `{"type": "Martina Weber"}` is
+/// a string where `type` takes a string, and JSON Schema publishes exactly
+/// seven values it may be. So each entry also names what the strings inside it
+/// have to *be*, and the fourteen do not answer that the same way — see
+/// `Content`, where the three kinds and the reason the third one checks
+/// nothing are written out.
+const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 14] = [
+    ("$anchor", Identifier::Name, Content::Anchor),
+    ("$dynamicAnchor", Identifier::Name, Content::Anchor),
+    ("$dynamicRef", Identifier::Name, Content::UriReference),
+    ("$id", Identifier::Name, Content::UriReference),
+    ("$ref", Identifier::Name, Content::UriReference),
+    ("$schema", Identifier::Name, Content::UriReference),
+    ("contentEncoding", Identifier::Name, Content::Token),
+    ("contentMediaType", Identifier::Name, Content::MediaType),
+    // Property names, both of them — the caller's own vocabulary, and the one
+    // kind of identifier there is nothing to check. See `Content::Arbitrary`.
+    (
+        "dependentRequired",
+        Identifier::NamesPerName,
+        Content::Arbitrary,
+    ),
+    ("format", Identifier::Name, Content::Token),
     // draft-04 spelled `$id` this way. A schema written to that draft is
     // still a schema a client may send, and a masked base URI breaks every
     // `$ref` that resolves against it.
-    ("id", Identifier::Name),
-    ("pattern", Identifier::Name),
-    ("required", Identifier::Names),
-    ("type", Identifier::NameOrNames),
+    ("id", Identifier::Name, Content::UriReference),
+    // A regular expression, and every string is one. See `Content::Arbitrary`.
+    ("pattern", Identifier::Name, Content::Arbitrary),
+    ("required", Identifier::Names, Content::Arbitrary),
+    ("type", Identifier::NameOrNames, Content::TypeName),
 ];
 
-fn identifier_keyword(key: &str) -> Option<Identifier> {
+fn identifier_keyword(key: &str) -> Option<(Identifier, Content)> {
     SCHEMA_IDENTIFIER_KEYWORDS
         .iter()
-        .find(|(keyword, _)| *keyword == key)
-        .map(|(_, shape)| *shape)
+        .find(|(keyword, _, _)| *keyword == key)
+        .map(|(_, shape, content)| (*shape, *content))
 }
+
+/// The seven values JSON Schema permits for `type`, and there is no eighth.
+///
+/// Closed by the specification in a way almost nothing else on this branch is:
+/// every draft from 04 to 2020-12 publishes the same list, and a document
+/// stating anything else states no type at all.
+const JSON_SCHEMA_TYPE_NAMES: [&str; 7] = [
+    "array", "boolean", "integer", "null", "number", "object", "string",
+];
 
 /// The shape an identifier keyword's value takes when it really does hold
 /// identifiers.
@@ -537,6 +562,156 @@ impl Identifier {
             Identifier::NamesPerName => value
                 .as_object()
                 .is_some_and(|fields| fields.values().all(is_name_list)),
+        }
+    }
+}
+
+/// What an identifier keyword's strings have to *be* for the keyword to have
+/// stated an identifier.
+///
+/// `Identifier` is the container and this is what is in it, and the round that
+/// added the container stopped one level short. Its own sentence was the right
+/// one — "does this document *state* the thing the rule exempts" — and it asked
+/// it of the container only: `{"type": "Martina Weber"}` is a string where
+/// `type` takes a string, so the container check passes and the name went to
+/// the provider unread (measured, at 200). JSON Schema permits seven values for
+/// `type`. `Martina Weber` is not one, so that document states no type, and the
+/// bytes are the caller's data like any other unrecognized value here.
+///
+/// **The fourteen keywords are three kinds, not fourteen of one**, and the
+/// third kind is why this enum has a variant that checks nothing:
+///
+/// - **a closed vocabulary** — `type`, and only `type`. The seven names are
+///   published by every draft and extended by none.
+/// - **a grammar** — `$ref`, `$id`, `id`, `$schema` and `$dynamicRef` are
+///   URI-references; `$anchor` and `$dynamicAnchor` have a published pattern;
+///   `contentMediaType` is a media type; `format` and `contentEncoding` are
+///   bare tokens naming an attribute out of an extensible registry.
+/// - **the caller's own vocabulary** — `required` and `dependentRequired` hold
+///   *property names*, and `pattern` holds a regular expression that may be a
+///   literal. Nothing about the characters is knowable, and a check invented
+///   here would mask the schema's real property names. `Content::Arbitrary` is
+///   that answer written down rather than left as an omission.
+///
+/// A mismatch is scanned as an instance, as every neighbouring arm does:
+/// `descend_into` has no refusal channel, and an over-masked *malformed* schema
+/// is a cost the caller can see. That is what makes the grammars safe to be
+/// strict about and would not make a *vocabulary* safe to invent for the third
+/// kind — over-masking a real property name breaks a schema that was correct.
+///
+/// **The other two exemptions were asked the same question and the answer is
+/// no.** `descend_into` returns `None` in exactly three places, and the other
+/// two are `Shape::DependencyMap`'s array half and the name-instance arm under
+/// `propertyNames`. Both exempt *property names* — the third kind — so their
+/// container check is the whole check available, and inventing a grammar for
+/// either would mask the schema's own property names. `SCHEMA_ANNOTATION_KEYWORDS`
+/// and every remaining arm grant `Shape::Instance`, which skips nothing, so
+/// there is no content for a check to be about. One level out in `provider.rs`,
+/// `Admits::OneOf` already reads the value against the provider's published
+/// set, and `Admits::Dispatch` is the third kind again with the argument
+/// written at the variant: MCP tool names carry `.` and `/`, so the permissive
+/// grammar is load-bearing, and a name is forwarded because it is dispatch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Content {
+    /// One of `JSON_SCHEMA_TYPE_NAMES`.
+    TypeName,
+    /// RFC 3986's URI-reference, checked at the one place there is no
+    /// judgement: a URI-reference contains no whitespace and no control
+    /// character, ever, in any draft.
+    ///
+    /// **And checked nowhere else, on purpose.** RFC 3986 also excludes
+    /// `<>"{}|\^` and the backtick, and real OpenAPI documents put a path
+    /// template in a `$ref` — `#/paths/~1pets~1{petId}/get` — which is
+    /// technically un-encoded and is what a widely used generator emits.
+    /// Masking one would break a working client to enforce a rule the provider
+    /// does not enforce either, which is the mistake this branch has already
+    /// made once this week.
+    UriReference,
+    /// 2019-09's `^[A-Za-z][-A-Za-z0-9.:_]*$` and 2020-12's
+    /// `^[A-Za-z_][-A-Za-z0-9._]*$`, as their union: a client may send either
+    /// draft, so a string satisfying either one is an anchor.
+    Anchor,
+    /// A media type — `type/subtype`, with RFC 2045 parameters after a `;`.
+    /// The essence is what is checked; the parameters may hold spaces
+    /// (`text/plain; charset=utf-8`) and hold no name.
+    MediaType,
+    /// A bare token: an attribute name out of a registry the drafts publish
+    /// and explicitly allow implementations to extend, so **membership is not
+    /// the check** — `uuid` was a custom format before it was a registered
+    /// one, and refusing tomorrow's would break the client that defined it.
+    /// What every published name and every custom convention share is being
+    /// one token, and a value with a space in it names no format attribute in
+    /// any implementation.
+    Token,
+    /// A string the caller chose, and there is nothing to check. The third
+    /// kind, and the one that must stay this way.
+    Arbitrary,
+}
+
+impl Content {
+    /// Whether every identifier in `value` is one.
+    ///
+    /// Recursive, and it may be: the container check has already run, so the
+    /// strings in `value` are exactly the identifiers the keyword states — one
+    /// of them for `Name`, an array of them for `Names`, an object of arrays
+    /// for `NamesPerName`. Anything else cannot be here, and if it somehow is,
+    /// `false` scans it.
+    ///
+    /// **All of them, not any.** `{"type": ["object", "Martina Weber"]}` states
+    /// one type name and one thing that is not, and the array is scanned whole
+    /// — `object` included. Masking a real type name inside a malformed union
+    /// breaks a schema the caller can see, which is the cheaper of the two
+    /// mistakes and is the ruling `a_mixed_array_under_a_name_keyword_is_scanned_whole`
+    /// already made for the same shape.
+    ///
+    /// **The object arm cannot decide anything today, and is kept anyway.**
+    /// `NamesPerName` is `dependentRequired`'s container and nothing else's,
+    /// and `dependentRequired` holds property names, so the arm always reaches
+    /// `Content::Arbitrary` and always says yes. Emptying it to `true` leaves
+    /// the suite green (measured). It stays because it is the arm that stays
+    /// *correct* if a keyword pairing that container with a grammar is ever
+    /// added — the recursion is the general answer, and a per-container answer
+    /// is what this walk has had to correct twice. `Content` is asked about it
+    /// directly in `a_grammar_is_checked_where_its_own_draft_puts_the_boundary`
+    /// so that the arm is covered rather than merely unreachable.
+    fn stated_by(self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => self.states(text),
+            Value::Array(items) => items.iter().all(|item| self.stated_by(item)),
+            Value::Object(fields) => fields.values().all(|field| self.stated_by(field)),
+            _ => false,
+        }
+    }
+
+    fn states(self, text: &str) -> bool {
+        /// Non-empty, and no whitespace or control character. The one thing a
+        /// token cannot contain whatever registry it comes from.
+        fn is_token(text: &str) -> bool {
+            !text.is_empty() && !text.chars().any(|c| c.is_whitespace() || c.is_control())
+        }
+        match self {
+            Content::TypeName => JSON_SCHEMA_TYPE_NAMES.contains(&text),
+            // The empty string is a legal URI-reference — it points at the
+            // current document, which is how a recursive `$ref` is spelled —
+            // and it carries nothing either way.
+            Content::UriReference => !text.chars().any(|c| c.is_whitespace() || c.is_control()),
+            Content::Anchor => {
+                let mut characters = text.chars();
+                characters
+                    .next()
+                    .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                    && characters
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_'))
+            }
+            Content::MediaType => text
+                .split(';')
+                .next()
+                .and_then(|essence| essence.split_once('/'))
+                .is_some_and(|(kind, subtype)| {
+                    is_token(kind) && is_token(subtype) && !subtype.contains('/')
+                }),
+            Content::Token => is_token(text),
+            Content::Arbitrary => true,
         }
     }
 }
@@ -795,7 +970,21 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         // holds. The key names a shape and the value has to be it: `required`
         // is an array of strings, `type` a string or an array of them, `$ref`
         // a string. See `Identifier`.
-        _ if identifier.is_some_and(|shape| shape.holds(value)) => None,
+        //
+        // **And the strings in it have to be identifiers of that kind.** The
+        // shape is the container, and the same question this match asks of
+        // containers four arms up is a question about contents too: `{"type":
+        // "Martina Weber"}` is a string where `type` takes a string, and
+        // states no type, because JSON Schema publishes seven type names and
+        // that is not one of them (measured, at 200 — and pinned as correct by
+        // a test this branch wrote). `Content` is the second half, and its
+        // third kind — property names, a regular expression — checks nothing,
+        // deliberately.
+        _ if identifier
+            .is_some_and(|(shape, content)| shape.holds(value) && content.stated_by(value)) =>
+        {
+            None
+        }
         // On the list, and holding something the keyword does not define. It
         // states no identifier, so it is the client's data and is scanned —
         // the third arm of this match to reach that conclusion, after
@@ -2071,7 +2260,11 @@ mod tests {
             "items": {"required": ["Weber"], "description": "one"},
             "allOf": [{"$ref": "#/definitions/Weber"}],
             "if": {"required": ["Schmidt"]},
-            "not": {"type": "Zurich"},
+            // A real type name, because after this round it has to be one:
+            // `Zurich` stood here and is not one of the seven, so it stated no
+            // type and is scanned like any other string. The keyword is still
+            // read as structure, which is what this test is about.
+            "not": {"type": "string", "required": ["Zurich"]},
             "additionalProperties": {"required": ["Meier"]}
         });
         assert_eq!(
@@ -2272,21 +2465,60 @@ mod tests {
         // the first must be skipped and the second must be scanned. A keyword
         // added here cannot compile without a shape, and one given the wrong
         // shape fails on one half or the other.
-        for (keyword, shape) in SCHEMA_IDENTIFIER_KEYWORDS {
-            let defined = match shape {
-                Identifier::Name => json!("an-identifier"),
-                Identifier::NameOrNames => json!(["object", "null"]),
-                Identifier::Names => json!(["billing_address"]),
-                Identifier::NamesPerName => json!({"card": ["billing_address"]}),
+        for (keyword, shape, content) in SCHEMA_IDENTIFIER_KEYWORDS {
+            // **Round 3's useful negative, in the column this round added.**
+            // The content half below asserts that an `Arbitrary` keyword
+            // *skips* a person's name, so a keyword loosened to `Arbitrary`
+            // passes both halves and its grammar quietly stops being checked.
+            // The three that hold a string the caller chose are named here, so
+            // widening the third kind is an edit to this line.
+            assert_eq!(
+                content == Content::Arbitrary,
+                ["dependentRequired", "pattern", "required"].contains(&keyword),
+                "{keyword} is classified as holding a string the caller chose, and only \
+                 property names and a regular expression are"
+            );
+            // One string that really is an identifier of this kind, out of the
+            // draft that publishes the kind.
+            let stated = match content {
+                Content::TypeName => "object",
+                Content::UriReference => "#/$defs/Person",
+                Content::Anchor => "person",
+                Content::MediaType => "application/json",
+                Content::Token => "base64",
+                Content::Arbitrary => "billing_address",
+            };
+            let of_shape = |name: &str| match shape {
+                Identifier::Name => json!(name),
+                Identifier::NameOrNames | Identifier::Names => json!([name]),
+                Identifier::NamesPerName => json!({ "card": [name] }),
             };
             let document =
                 |value: Value| Value::Object([(keyword.to_owned(), value)].into_iter().collect());
             assert!(
-                json_leaves(&document(defined), Shape::Schema)
+                json_leaves(&document(of_shape(stated)), Shape::Schema)
                     .unwrap()
                     .is_empty(),
                 "{keyword} scanned a value its own draft defines, which over-masks a valid schema"
             );
+            // The content half. Same container, and a string that is an
+            // identifier of no kind at all — which is what `{"type": "Martina
+            // Weber"}` was, skipped on the strength of being a string.
+            let unstated =
+                json_leaves(&document(of_shape("Martina Weber")), Shape::Schema).unwrap();
+            if content == Content::Arbitrary {
+                assert!(
+                    unstated.is_empty(),
+                    "{keyword} masked a string the caller chose, which breaks a schema that \
+                     was correct"
+                );
+            } else {
+                assert_eq!(
+                    unstated,
+                    vec![Leaf::Text("Martina Weber".to_owned())],
+                    "{keyword} skipped a string that states no identifier of its kind"
+                );
+            }
             // The one shape no keyword on this list defines, and the shape
             // Codex sent: an object whose values are the caller's prose.
             assert_eq!(
@@ -2320,6 +2552,111 @@ mod tests {
             json!(["billing_address", "owner"]),
             "and a real list of property names is still skipped whole"
         );
+    }
+
+    #[test]
+    fn a_type_union_states_types_only_when_every_member_is_one() {
+        // `type`'s array form is a union, and one member that names no type
+        // means the array states no union. Scanned whole, `object` with it —
+        // the same ruling `a_mixed_array_under_a_name_keyword_is_scanned_whole`
+        // makes for a list of property names, and for the same reason: an
+        // over-masked malformed schema is the mistake the caller can see.
+        let schema = json!({"type": ["object", "Martina Weber"]});
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![
+                Leaf::Text("object".to_owned()),
+                Leaf::Text("Martina Weber".to_owned()),
+            ],
+            "a union with a non-type in it states no union"
+        );
+        assert!(
+            json_leaves(&json!({"type": ["object", "null"]}), Shape::Schema)
+                .unwrap()
+                .is_empty(),
+            "and a real union is still a union"
+        );
+    }
+
+    #[test]
+    fn a_grammar_is_checked_where_its_own_draft_puts_the_boundary() {
+        // **Found by mutation, and it is the guard's blind spot.** The
+        // population guard drives every keyword with one string — a person's
+        // name — and a person's name has a space in it, so *every* grammar
+        // here rejects it for the same reason. Emptying `contentMediaType`'s
+        // check down to "one token" left all 463 tests green: the `type/subtype`
+        // half was doing real work and nothing was asking it to. So each
+        // grammar gets a near-miss that only that grammar can catch.
+        for schema in [
+            // A media type is two tokens with a slash between them. One token
+            // is a word, and `Weber` is a word.
+            json!({"contentMediaType": "Weber"}),
+            // And exactly one slash — the subtype is a token too.
+            json!({"contentMediaType": "text/plain/Weber"}),
+            // The anchor pattern starts at a letter or an underscore.
+            json!({"$anchor": "1Weber"}),
+            // ...and continues in a character class that has no slash in it.
+            json!({"$dynamicAnchor": "Weber/Martina"}),
+            // The seven type names are lowercase, and the drafts are
+            // case-sensitive about them.
+            json!({"type": "Object"}),
+            // A token is non-empty. An empty `format` names no format.
+            json!({"format": ""}),
+            // A URI-reference has no control character in it either, which is
+            // the half of that rule a space does not reach.
+            json!({"$ref": "#/defs/Weber\u{7f}"}),
+        ] {
+            assert!(
+                !json_leaves(&schema, Shape::Schema).unwrap().is_empty(),
+                "a string that is no identifier of this keyword's kind was skipped: {schema}"
+            );
+        }
+        // The map container, asked of `Content` directly because no keyword
+        // reaches it with a grammar: `dependentRequired` is the only keyword
+        // whose value is a map of lists and it holds property names, so the
+        // recursion's object arm always lands on `Arbitrary` and always says
+        // yes. Emptying that arm to `true` leaves every other test green
+        // (measured). This is what makes it a covered backstop rather than an
+        // unreachable one.
+        assert!(
+            !Content::TypeName.stated_by(&json!({"card": ["Martina Weber"]})),
+            "the recursion has to reach the strings inside a map, whatever container a \
+             later keyword pairs with a grammar"
+        );
+        assert!(Content::TypeName.stated_by(&json!({"card": ["object"]})));
+    }
+
+    #[test]
+    fn a_grammar_admits_what_clients_actually_write() {
+        // The other direction, which is the one this branch has already been
+        // wrong in once this week: a content check tighter than the drafts
+        // masks a valid schema and breaks a working client. Each of these is a
+        // real thing a real generator emits, and none of them may be scanned.
+        for schema in [
+            // RFC 3986 excludes `{` and `}` from a URI-reference, and every
+            // OpenAPI document that references a templated path contains
+            // them. The check reads whitespace and control characters only.
+            json!({"$ref": "#/paths/~1pets~1{petId}/get"}),
+            // A media type carries RFC 2045 parameters, and a parameter holds
+            // a space. Only the essence is read.
+            json!({"contentMediaType": "text/plain; charset=utf-8"}),
+            // `format` is an extensible registry, so membership is not the
+            // check: a format nobody has registered is still a format.
+            json!({"format": "x-weber-account-id"}),
+            // draft-04's `$id`, and an anchor written to either draft that
+            // publishes the pattern.
+            json!({"id": "https://example.invalid/schemas/person.json"}),
+            json!({"$anchor": "person_1"}),
+            json!({"$dynamicAnchor": "node.left:1"}),
+            // The empty URI-reference: the current document, which is how a
+            // schema refers to itself.
+            json!({"$ref": ""}),
+        ] {
+            assert!(
+                json_leaves(&schema, Shape::Schema).unwrap().is_empty(),
+                "a valid schema was masked, which breaks a client that was working: {schema}"
+            );
+        }
     }
 
     #[test]
@@ -2364,13 +2701,24 @@ mod tests {
             vec![Leaf::Text("Martina Weber".to_owned())],
             "an object is not an allOf, so nothing in it states a type"
         );
-        // The well-formed twin, unchanged: inside a real `allOf` a real `type`
-        // is a type name, and masking it would break the schema. The two lines
-        // together are the fix — the leak closes and the residual stays.
-        let well_formed = json!({"allOf": [{"type": "Martina Weber"}]});
+        // The well-formed twin, **corrected one round later and this is the
+        // point of the round**. It read `{"allOf": [{"type": "Martina
+        // Weber"}]}` and asserted the name was skipped, under a sentence
+        // saying a real applicator states what its draft says it states. The
+        // applicator was real; the type name was not. `Martina Weber` is not
+        // one of the seven, so a well-formed `allOf` around it changes nothing
+        // — the document still states no type.
+        let well_formed = json!({"allOf": [{"required": ["Martina Weber"]}]});
         assert!(
             json_leaves(&well_formed, Shape::Schema).unwrap().is_empty(),
-            "a real applicator still states what its draft says it states"
+            "a real applicator still states what its draft says it states, and a property \
+             name is one of those things"
+        );
+        let stating_no_type = json!({"allOf": [{"type": "Martina Weber"}]});
+        assert_eq!(
+            json_leaves(&stating_no_type, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Martina Weber".to_owned())],
+            "a real container does not make its contents an identifier"
         );
         // The same mistake the other way round, which the brief's example does
         // not reach: `not` is a single schema and was given an array.

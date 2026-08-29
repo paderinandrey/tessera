@@ -182,6 +182,15 @@ error keeps its own status and body so a rate limit still reads as a rate limit.
 Tool traffic is masked on the buffered path, for both providers and in both directions: a
 tool definition's description and the whole of its schema — `enum` members, `default`,
 `title`, `examples`, not `description` alone — a tool call's arguments, and a tool result.
+A schema keyword's value is left alone only where the keyword really states an identifier,
+which is a question about the string and not only about its container: `{"type": "Martina
+Weber"}` names none of JSON Schema's seven types, so it states no type and is masked like
+any other value the walk does not recognize, inside a well-formed `allOf` or out of one.
+The keywords holding the caller's *own* vocabulary — `required` and `dependentRequired`,
+which hold property names, and `pattern`, which holds a regular expression — are exempt
+from that check, because there is nothing to check them against and a rule invented for
+them would mask a schema that was correct.
+
 Names are not. A tool's name, a schema property name and a `tool_call_id` are the client's
 own dispatch, matched against strings it authored, so masking one breaks the call and
 leaves the client no way to learn why. What is required of them is that they be *strings*:

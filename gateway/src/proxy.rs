@@ -5619,8 +5619,14 @@ mod tests {
             "the value was never shown to the detector"
         );
 
-        // The well-formed twin, which must stay skipped: inside a real `allOf`
-        // a real `type` is a type name, and masking it breaks the schema.
+        // **The half this round corrected.** It read `{"allOf": [{"type":
+        // "Martina Weber"}]}` and asserted the name reached the provider
+        // verbatim, under the comment "a real applicator's identifiers are
+        // still identifiers". The applicator is real and the identifier is
+        // not: JSON Schema permits seven values for `type` and this is none of
+        // them, so the document states no type and the container it sits in
+        // cannot make it one. Codex found the leak by reading the test that
+        // asserted it.
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (status, returned) = call(
             state(&detector, &upstream),
@@ -5632,6 +5638,27 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{returned}");
         assert_eq!(
             sent_to(&upstream).await["tools"][0]["input_schema"]["allOf"][0]["type"],
+            "Martina [PERSON_1]",
+            "a well-formed container does not make its contents an identifier"
+        );
+
+        // And the twin that is still worth pinning, which is what the sentence
+        // above was reaching for: a real applicator holding a real identifier.
+        // `required` holds property names, the caller chooses those freely, and
+        // one that reads like a person's name is dispatch and is forwarded —
+        // this branch's recorded position, unchanged by this round.
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (status, returned) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                   "tools": [{"name": "t", "input_schema":
+                              {"allOf": [{"required": ["Martina Weber"], "type": "object"}]}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["tools"][0]["input_schema"]["allOf"][0]["required"][0],
             "Martina Weber",
             "a real applicator's identifiers are still identifiers"
         );
