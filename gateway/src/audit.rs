@@ -462,40 +462,63 @@ struct State {
 
 /// What detection found in one request, and what became of it.
 ///
-/// A struct rather than six positional arguments, four of them `usize`: two
+/// A struct rather than six positional arguments, five of them `usize`: two
 /// counts transposed at a call site produce a journal line that parses, that
 /// reconciles against nothing, and that no test asserting on a response body
 /// could see. The fields are the journal's own vocabulary, so they are named
 /// here rather than assembled from a tuple at the call site.
 ///
-/// **Every finding is counted exactly once, in exactly one of three states.**
-/// A *finding* is one distinct (type, value) pair the detector reported, which
-/// is what `types` counts per type; `spans` counts occurrences and is the
-/// larger number. Of those findings, `redacted` went to the provider under a
-/// placeholder carrying some other name, `forwarded` went verbatim, and the
-/// rest went under the name `types` gives them. That partition is what lets an
-/// auditor read a line against the traffic: `types` naming `WEBER` with
-/// `redacted` and `forwarded` both zero says the provider received
-/// `[WEBER_1]`, and nothing else does.
+/// **Two units, and the partition is over the smaller one.** A *finding* is one
+/// distinct (type, value) pair the detector reported, and `types` counts
+/// findings per type. An *occurrence* is one span; `spans` counts occurrences
+/// and is never the smaller of the two — a value found twice under one name is
+/// one finding and two spans. `redacted` and `forwarded` count **occurrences**,
+/// so they are commensurable with `spans` and not with `types`: every
+/// occurrence is in exactly one of three states, and `spans - redacted -
+/// forwarded` is the third — the ordinary one, where the provider received
+/// `[TYPE_n]` under the name `types` gives it.
+///
+/// **A finding cannot carry the partition, and that is not a preference.** One
+/// value can occupy a numeric leaf, where `proxy::mask_all` forwards it, and a
+/// string leaf, where it is masked; one value can also be forwarded in a number
+/// and masked under *another* type's name in a string. Its fate is a set, not a
+/// state, and counters over sets do not partition. Counting per finding made a
+/// line say the provider had received the digits *instead of* the placeholder
+/// when it had received both.
+///
+/// What an auditor may still read off one line: `redacted` and `forwarded` both
+/// zero says every name in `types` reached the provider as `[TYPE_n]`, and
+/// nothing else does. A mixed fate cannot make that sentence false, because a
+/// mixed finding puts a count in one of the two fields and the sentence
+/// declines to speak.
 #[derive(Debug, Default)]
 pub struct Detected {
-    /// Texts the detector was shown — one call each.
+    /// Texts this request asked a detection for — one each.
+    ///
+    /// *Asked for*, not *called*: a text already seen under the same credential
+    /// is served from the detection cache and reaches no detector, so two
+    /// identical messages are two here and one call. Measured, at 200: `texts:
+    /// 2` against one request at the detector's door.
     pub texts: usize,
-    /// Tool documents the detector was shown — one call each, however many
-    /// leaves the document holds. A document holding **no** leaves is not
-    /// counted here, because no call was made and nothing about it was
-    /// scanned: counting it as a text is what let a document the detector
-    /// never saw read, in the evidence, exactly like one it did.
+    /// Tool documents this request asked a detection for — one each, however
+    /// many leaves the document holds, and served from the cache on a repeat
+    /// exactly as `texts` is. A document holding **no** leaves is not counted
+    /// here, because nothing about it was scanned and nothing was asked of
+    /// anybody: counting it as a text is what let a document the detector never
+    /// saw read, in the evidence, exactly like one it did.
     pub documents: usize,
     /// Occurrences the detector reported, across every call.
     pub spans: usize,
     /// Distinct values per type, as the **detector** named them. Not as the
     /// provider received them — `redacted` and `forwarded` are what say that.
     pub types: BTreeMap<String, usize>,
-    /// Findings the provider received under a placeholder that does not carry
-    /// the detector's own name for them.
+    /// Occurrences the provider received under a placeholder that does not
+    /// carry the detector's own name for them. Occurrences, so that a value
+    /// masked three times is three of these and the line's own `spans` accounts
+    /// for it; every masked occurrence of one value carries the same
+    /// placeholder, so the count is exact.
     pub redacted: usize,
-    /// Findings the provider received verbatim, because this gateway
+    /// Occurrences the provider received verbatim, because this gateway
     /// deliberately declined to mask them: a span on a numeric leaf of a tool
     /// document, where a placeholder would change the field's type. The
     /// forwarding is a decision made in `proxy::mask_all` and argued there;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -249,13 +249,22 @@ impl AppState {
     }
 }
 
-/// The distinct values one text contributed, folded into the caller's set.
+/// One text's occurrences, tallied per distinct (type, value) into the
+/// caller's map.
 ///
 /// A free function so both slot kinds count the same way: inlined twice they
 /// would drift, and the counts are what the journal reports about the request.
-/// The values themselves live in that set only long enough to be counted and
+/// The values themselves live in that map only long enough to be counted and
 /// never leave `mask_all`.
-fn count_distinct(text: &str, spans: &[Span], distinct: &mut HashSet<(String, String)>) {
+///
+/// **The keys are the findings and the counts are the occurrences**, because
+/// the journal reports both and they answer different questions: `types` is
+/// how many distinct values were found under a name, and `redacted` and
+/// `forwarded` are how many *occurrences* met each fate. One value can meet
+/// two fates in one request — masked in a string leaf, forwarded in a numeric
+/// one — so a fate cannot be a property of the finding, and counting fates
+/// per key was a partition over an object that does not have exactly one.
+fn count_occurrences(text: &str, spans: &[Span], found: &mut HashMap<(String, String), usize>) {
     // The `Vec<char>` is a copy of the whole text, and a conversation
     // history is many texts: it is built only when there is a span to
     // address into it.
@@ -267,7 +276,9 @@ fn count_distinct(text: &str, spans: &[Span], distinct: &mut HashSet<(String, St
         // Offsets are in characters, and a span the mapping would
         // reject is counted only if it addresses real text.
         if let Some(value) = characters.get(span.start..span.end) {
-            distinct.insert((span.entity_type.clone(), value.iter().collect()));
+            *found
+                .entry((span.entity_type.clone(), value.iter().collect()))
+                .or_default() += 1;
         }
     }
 }
@@ -296,18 +307,31 @@ async fn mask_all(
 ) -> Result<(Value, Detected), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
-    let mut distinct: HashSet<(String, String)> = HashSet::new();
-    // Findings on a numeric leaf, which this gateway deliberately forwards
+    let mut found: HashMap<(String, String), usize> = HashMap::new();
+    // Occurrences on a numeric leaf, which this gateway deliberately forwards
     // rather than masking — see the long comment at the exemption below. They
     // are collected structurally, from the leaf the span landed in, rather than
     // inferred at the end from "no placeholder was issued for this value": a
     // value that is both a number here and a string somewhere else in the same
-    // request has a placeholder *and* went out verbatim, and the journal should
-    // say the digits left.
-    let mut forwarded: HashSet<(String, String)> = HashSet::new();
-    // What the detector was actually shown, which is not the same as what the
-    // request holds: a `Slot::Json` is one call however many leaves it has, and
-    // no call at all when it has none.
+    // request has a placeholder *and* went out verbatim, and the journal has to
+    // say both. Keyed like `found` and counted the same way, so the two are
+    // subtractable: what this map does not hold of a finding's occurrences is
+    // exactly what was masked.
+    let mut forwarded: HashMap<(String, String), usize> = HashMap::new();
+    // What this request asked a detection for, which is not the same as what
+    // the request holds: a `Slot::Json` asks one detection however many leaves
+    // it has, and asks none at all when it has none.
+    //
+    // Nor is it the same as what the *detector* was shown. Both counters sit
+    // beside `detect`, which answers a repeat text under the same credential
+    // from the detection cache without a call, so two identical messages are
+    // `texts: 2` against one request at the detector's door — measured, and
+    // pinned by `two_texts_the_cache_answers_once_are_two_detections_asked_for`.
+    // The README says "detections asked for" for this reason, and it was
+    // corrected to say it. Three sentences written in the same commit were not:
+    // this comment and the two field docs in `audit::Detected` all said "one
+    // detector call", and so did the README's own paragraph two sentences
+    // earlier. The cache that falsified one falsified all four.
     let mut texts = 0usize;
     let mut documents = 0usize;
     // **Every literal in the request, reserved before the first allocation.**
@@ -375,7 +399,7 @@ async fn mask_all(
                 let spans = detector.detect(&text, credential).await?;
                 texts += 1;
                 total += spans.len();
-                count_distinct(&text, &spans, &mut distinct);
+                count_occurrences(&text, &spans, &mut found);
                 write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
             }
             // A document's string leaves are detected one at a time and put
@@ -444,7 +468,7 @@ async fn mask_all(
                     // reported them, before any rebasing — the values are the
                     // same either way and this cannot disagree with `split`
                     // about which leaf they fell in.
-                    count_distinct(joined.text(), &spans, &mut distinct);
+                    count_occurrences(joined.text(), &spans, &mut found);
                     // Bounds and ordering checked against the text the detector
                     // actually saw, where "past the end" still means something.
                     // After rebasing, an out-of-range span could land plausibly
@@ -581,10 +605,18 @@ async fn mask_all(
                     // was never masked at all. The exemption is deliberate; the
                     // evidence claiming a pseudonymization that did not happen
                     // was not.
+                    //
+                    // **Counted per occurrence, not per value.** The same
+                    // digits in two numeric leaves are two occurrences
+                    // forwarded, and the same digits in a numeric leaf and a
+                    // string leaf are one of each — which is the case that made
+                    // this a count of occurrences rather than of findings.
                     let characters: Vec<char> = number.chars().collect();
                     for span in spans {
                         if let Some(value) = characters.get(span.start..span.end) {
-                            forwarded.insert((span.entity_type.clone(), value.iter().collect()));
+                            *forwarded
+                                .entry((span.entity_type.clone(), value.iter().collect()))
+                                .or_default() += 1;
                         }
                     }
                 }
@@ -602,12 +634,32 @@ async fn mask_all(
             }
         }
     }
-    // **One pass, three questions, one answer each.** Every finding — one
-    // distinct (type, value) pair the detector reported anywhere in this
-    // request — is named in `types`, and is then in exactly one of three
-    // states: forwarded verbatim, masked under a name that is not the one
-    // `types` gives it, or masked under that name. The third is the ordinary
-    // case and is not counted, because it is what remains.
+    // **One pass, two counts, and a partition over occurrences.** Every
+    // finding — one distinct (type, value) pair the detector reported anywhere
+    // in this request — is named in `types`. Every *occurrence* of one is in
+    // exactly one of three states: forwarded verbatim, masked under a name that
+    // is not the one `types` gives it, or masked under that name. The third is
+    // the ordinary case and is not counted, because `spans` counts occurrences
+    // and it is what remains.
+    //
+    // **Why the partition is over occurrences and not over findings.** A
+    // finding does not have one fate. The same value can occupy a numeric leaf,
+    // where the exemption above forwards it, and a string leaf, where it is
+    // masked — a `maximum` and a `description` holding the same number is the
+    // ordinary shape of it, and `9007199254740991` sits twice in this repo's
+    // own tool payload. Counting fates per finding made one line say the
+    // provider had received the digits *instead of* the placeholder when it had
+    // received both, and no third counter fixes that: a finding can be
+    // forwarded and *also* masked under another type's name, so "mixed" is not
+    // one state either. An occurrence has exactly one fate by construction —
+    // `Joined::split` puts every span in exactly one leaf, and a leaf is either
+    // masked or forwarded whole — so that is the object the counters partition.
+    //
+    // **Why one `named_as` decides all of a finding's masked occurrences.** The
+    // mapping is keyed by value, so every masked occurrence of one value
+    // carries the same placeholder whatever span found it. The fate of a masked
+    // occurrence is therefore a function of (type, value) alone, and the
+    // multiplication below is exact rather than an estimate.
     //
     // **Why this is asked here and not read off the mapping.**
     // `Mapping::redacted_count` counts *allocations*: `placeholder_for` returns
@@ -622,13 +674,20 @@ async fn mask_all(
     let mut types: BTreeMap<String, usize> = BTreeMap::new();
     let mut redacted = 0usize;
     let mut forwarded_count = 0usize;
-    for finding in &distinct {
+    for (finding, occurrences) in &found {
         let (entity_type, value) = finding;
         *types.entry(entity_type.clone()).or_default() += 1;
-        if forwarded.contains(finding) {
-            forwarded_count += 1;
-        } else if !mapping.named_as(value, entity_type) {
-            redacted += 1;
+        let verbatim = forwarded.get(finding).copied().unwrap_or(0);
+        forwarded_count += verbatim;
+        // What the exemption did not forward, the masking loop masked: both
+        // maps are filled from the spans of the same detector calls, and
+        // `split` gives each of those spans to exactly one leaf. The saturation
+        // is unreachable for that reason; if it were ever reached it would
+        // under-report `redacted` rather than panic on an evidence line, and
+        // `a_line_accounts_for_every_span_it_reports` is what would notice.
+        let masked_here = occurrences.saturating_sub(verbatim);
+        if masked_here > 0 && !mapping.named_as(value, entity_type) {
+            redacted += masked_here;
         }
     }
     if mapping.redacted_count() > 0 {
@@ -1226,6 +1285,47 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
             .collect()
+    }
+
+    /// The third arm of the line's partition, computed the way an auditor
+    /// holding the line and nothing else has to compute it: the occurrences
+    /// that reached the provider under the name `types` gives them are the ones
+    /// neither counter claims. It is not a field, because it is the ordinary
+    /// case and a line that reported it would be reporting `spans` twice.
+    fn residual(line: &Value) -> u64 {
+        let count = |name: &str| line[name].as_u64().expect("a count");
+        count("spans") - count("redacted") - count("forwarded")
+    }
+
+    /// A detector that reports the given spans over any text holding
+    /// `Number.MAX_SAFE_INTEGER`, and nothing over anything else.
+    ///
+    /// The spans are offsets into one document's *joined* leaves, so every
+    /// other text in the request — a message, a tool description — has to come
+    /// back empty rather than have those offsets applied to it.
+    async fn detector_finding_the_max_safe_integer(spans: Value) -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(body_string_contains("9007199254740991"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": spans,
+                "layers_run": ["deterministic", "ner"],
+                "version": "test-version"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": [],
+                "layers_run": ["deterministic", "ner"],
+                "version": "test-version"
+            })))
+            .mount(&server)
+            .await;
+        server
     }
 
     fn session_headers<'a>(credential: &'a str, id: &'a str) -> [(&'a str, &'a str); 2] {
@@ -6368,7 +6468,246 @@ mod tests {
         );
         assert_eq!(
             line["redacted"], 0,
-            "forwarded and redacted are different fates and each finding has one: {line}"
+            "forwarded and redacted are different fates and each occurrence has one: {line}"
+        );
+        // The message above said "each *finding* has one" when this test was
+        // written, and round 2 of this review is the counterexample: a value
+        // that is a number in one leaf and a string in another has both fates
+        // at once. Corrected here rather than deleted — the request this test
+        // drives has one occurrence, so its numbers are the same under either
+        // reading, and what was wrong was the sentence.
+    }
+
+    #[tokio::test]
+    async fn a_value_forwarded_in_one_leaf_and_masked_in_another_is_counted_as_both() {
+        // The partition used to be over findings, and a finding does not have
+        // one fate. `9007199254740991` is `Number.MAX_SAFE_INTEGER`, and this
+        // repo's own tool payload writes it twice, as the `maximum` of `limit`
+        // and of `offset`; a `description` that states the bound holds the same
+        // characters as prose. So one value, three occurrences: two numeric
+        // leaves the exemption forwards, one string leaf masked as
+        // `[PERSON_1]`. Measured before the fix, at 200:
+        //
+        //   {"documents":1,"forwarded":1,"redacted":0,"spans":3,"texts":1,
+        //    "types":{"PERSON":1}}
+        //
+        // Read against the partition that line documented — one finding, in
+        // exactly one of three states, and `forwarded` names it — it says the
+        // provider received the digits and no `[PERSON_1]`. It received both,
+        // and its arithmetic left two occurrences claiming to be placeholders
+        // when one was.
+        let detector = detector_finding_the_max_safe_integer(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 16, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "PERSON", "start": 18, "end": 34, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "PERSON", "start": 36, "end": 52, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hallo"}],
+                "tools": [{"name": "page", "input_schema": {
+                    "type": "object",
+                    "description": "9007199254740991",
+                    "properties": {
+                        "limit": {"type": "integer", "maximum": 9_007_199_254_740_991u64},
+                        "offset": {"type": "integer", "maximum": 9_007_199_254_740_991u64},
+                    }
+                }}]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let schema = sent_to(&upstream).await["tools"][0]["input_schema"].clone();
+        assert_eq!(
+            schema["description"], "[PERSON_1]",
+            "the premise: the string leaf went up under its own name: {schema}"
+        );
+        assert_eq!(
+            schema["properties"]["offset"]["maximum"],
+            json!(9_007_199_254_740_991u64),
+            "the premise: the numeric leaves went up verbatim: {schema}"
+        );
+        let line = &journal(&path)[0];
+        assert_eq!(line["spans"], 3, "three occurrences of one value: {line}");
+        assert_eq!(line["types"]["PERSON"], 1, "one finding, under one name");
+        assert_eq!(
+            line["forwarded"], 2,
+            "both numeric occurrences went verbatim and the line counts \
+             occurrences, not values: {line}"
+        );
+        assert_eq!(
+            line["redacted"], 0,
+            "no occurrence went up under a name that was not its own: {line}"
+        );
+        assert_eq!(
+            residual(line),
+            1,
+            "exactly one occurrence reached the provider as [PERSON_1], and a \
+             line claiming two would be claiming a masking of the digits: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_forwarded_in_one_leaf_can_be_redacted_in_another() {
+        // Why a single "mixed" counter would not have been the fix. A finding's
+        // fate is not one of {forwarded, named} plus a "both" — it is any
+        // non-empty *subset* of three states, and this is the third pairing:
+        // `ORG` takes the value's placeholder first, so the `PERSON` span on
+        // the string leaf is masked under a name that is not `PERSON`, while
+        // the `PERSON` span on the numeric leaf is forwarded. One counter
+        // called "mixed" would read the same here as in the test above, and an
+        // auditor could not tell the line where `[PERSON_1]` reached the
+        // provider from the line where `[ORG_1]` and bare digits did.
+        //
+        // Measured before the fix, at 200: {"forwarded":1,"redacted":0,
+        // "spans":3,"types":{"ORG":1,"PERSON":1}} — the redacted occurrence
+        // missing from the evidence entirely.
+        let detector = detector_finding_the_max_safe_integer(json!([
+            {"entity_type": "ORG", "start": 0, "end": 16, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "PERSON", "start": 18, "end": 34, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "PERSON", "start": 36, "end": 52, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hallo"}],
+                "tools": [{"name": "page", "input_schema": {
+                    "type": "object",
+                    "description": "9007199254740991",
+                    "properties": {"limit": {"type": "integer",
+                                             "description": "9007199254740991",
+                                             "maximum": 9_007_199_254_740_991u64}}
+                }}]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let schema = sent_to(&upstream).await["tools"][0]["input_schema"].clone();
+        assert_eq!(
+            schema["properties"]["limit"]["description"], "[ORG_1]",
+            "the premise: the PERSON span was masked under ORG's placeholder: {schema}"
+        );
+        let line = &journal(&path)[0];
+        assert_eq!(line["spans"], 3, "three occurrences: {line}");
+        assert_eq!(
+            line["forwarded"], 1,
+            "the numeric occurrence went verbatim: {line}"
+        );
+        assert_eq!(
+            line["redacted"], 1,
+            "a forwarded value can also be masked under another name, and the \
+             line has to say so: {line}"
+        );
+        assert_eq!(
+            residual(line),
+            1,
+            "one occurrence, the first, went up under the name it was found \
+             under: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_texts_the_cache_answers_once_are_two_detections_asked_for() {
+        // The sweep's own finding. `texts` and `documents` were documented in
+        // three places as counts of *detector calls*, beside a README sentence
+        // that had been corrected to "detections asked for" in the same commit
+        // because the cache falsifies the stronger claim. This is the request
+        // that falsifies it: one credential, two identical messages, two texts
+        // in the evidence and one request at the detector's door.
+        let detector = detector_returning_expecting(json!([]), Some(1)).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "wer"},
+                                {"role": "user", "content": "wer"}]}),
+            &session_headers("sk-tenant", "chat-1"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let line = &journal(&path)[0];
+        assert_eq!(
+            line["texts"], 2,
+            "the request asked for two detections, whoever served them: {line}"
+        );
+        assert_eq!(
+            detector.received_requests().await.expect("recorded").len(),
+            1,
+            "the premise: the cache answered the second one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_accounts_for_every_span_it_reports() {
+        // `redacted` counting findings and `spans` counting occurrences left
+        // the two incommensurable: a value masked three times as `[REDACTED_1]`
+        // reported `spans: 3, redacted: 1`, and the other two occurrences were
+        // in no state at all. They are three now, and the line's own arithmetic
+        // closes.
+        let detector = detector_returning(json!([
+            {"entity_type": "WEBER", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "WEBER", "start": 10, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "WEBER", "start": 20, "end": 25, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber und Weber und Weber"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let sent = sent_to(&upstream).await.to_string();
+        assert!(
+            sent.contains("[REDACTED_1] und [REDACTED_1] und [REDACTED_1]"),
+            "the premise: three occurrences, none under the detector's own name: {sent}"
+        );
+        let line = &journal(&path)[0];
+        assert_eq!(line["spans"], 3);
+        assert_eq!(line["types"]["unvalidated"], 1, "one finding: {line}");
+        assert_eq!(
+            line["redacted"], 3,
+            "three occurrences reached the provider under a name that was not \
+             the detector's: {line}"
+        );
+        assert_eq!(
+            residual(line),
+            0,
+            "nothing went up under the name it was found under: {line}"
         );
     }
 

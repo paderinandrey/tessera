@@ -542,12 +542,13 @@ vocabulary rather than formatted from a message, so no expression in the writer
 could interpolate submitted text.
 
 **What the detector was shown.** `texts` counts texts and `documents` counts
-tool documents; each is one detector call, whatever the number of leaves the
+tool documents; each is one detection, whatever the number of leaves the
 document holds. A document holding no leaves at all — `{}`, or one whose every
 field is a boolean — is counted in neither, because nothing about it was
 scanned. `texts + documents` is therefore exactly the number of detections this
 request asked for — served by the detector, or from its cache when the same text
-has already been seen under the same credential.
+has already been seen under the same credential. Two identical messages are two
+detections and one call, so these are not a count of the detector's traffic.
 
 **What it found.** `types` counts distinct values per type, as the *detector*
 named them, and `spans` counts occurrences; the gap between them is a value
@@ -560,19 +561,32 @@ arrived from outside the perimeter and a name is a place a value can hide.
 Seeing that key means the detector and the gateway disagree about what a type
 is; the gateway also says so in its own log.
 
-**What the provider received.** Every finding — one distinct value under one
-type name — is in exactly one of three states, and two of them are counted.
-`redacted` counts the findings the provider received under a placeholder that
+**What the provider received.** Every *occurrence* — one span, the unit `spans`
+counts — is in exactly one of three states, and two of them are counted.
+`redacted` counts the occurrences the provider received under a placeholder that
 does **not** carry the detector's name for them: usually because the type was
 not one this gateway declares, so the value went up as `[REDACTED_n]`, and also
 when the value was already carrying a placeholder issued for another type,
 whether earlier in this request or in an earlier turn of the session.
-`forwarded` counts the findings the provider received verbatim: a span on a
+`forwarded` counts the occurrences the provider received verbatim: a span on a
 numeric leaf of a tool document, which this gateway deliberately does not mask,
 because a placeholder there would change the field from a number to a string.
-Whatever is left went up under the name `types` gives it. So a line naming
-`PERSON` with `redacted` and `forwarded` both zero says the provider received
-`[PERSON_1]`, and it is the only line that says so.
+`spans − redacted − forwarded` is what is left, and it went up under the name
+`types` gives it. So a line whose `redacted` and `forwarded` are both zero says
+the provider received `[PERSON_1]` for every `PERSON` it names, and it is the
+only line that says so.
+
+These two count occurrences and not findings, so they compare with `spans` and
+not with `types` — a value masked three times is three of them. That is not
+bookkeeping taste: one value can be **both** forwarded and masked in one
+request, because the same number can be a `maximum` and appear in a
+`description` beside it. Its fate is a pair of fates, so a per-value counter
+would have to choose one and say the other did not happen; the earlier version
+of this field did, and a line read `types: {"PERSON": 1}, forwarded: 1,
+redacted: 0` for a request in which the provider received `[PERSON_1]` as well
+as the digits. A span lands in exactly one leaf and a leaf is masked or
+forwarded whole, so an occurrence has exactly one fate and the three numbers
+account for the line.
 
 Both counts describe *this* request. Two turns of a session carrying identical
 traffic write identical lines, and what the session bought across them — the
