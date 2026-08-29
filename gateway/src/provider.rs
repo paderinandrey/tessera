@@ -129,7 +129,80 @@ pub struct Anthropic;
 /// this list and are not refused either — `content_pointers` describes them,
 /// because their arguments and results are exactly the text this gateway
 /// exists to mask.
+///
+/// This says what a block type *costs* once it is admitted, not *where* it may
+/// appear. `admissible_block_types` is the second question and it is per
+/// provider and per position; this list is read after that one.
 const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "audio"];
+
+/// Where a `content` array sits. With the provider it decides which block types
+/// are legal in it — a question `content_pointers` did not ask.
+///
+/// **The fourth provider-or-context asymmetry on this branch, and they have all
+/// failed the same way:** one list serving callers that need different answers,
+/// with a comment somewhere saying they are the same. `content_pointers` is
+/// shared by two providers and four positions, and it admitted every block type
+/// in all of them. So an OpenAI message carried an Anthropic `tool_use`, whose
+/// `name` is dispatch and therefore unscanned, and `Martina Weber` reached
+/// OpenAI in it (measured, at 200 — and refused outright before this slice).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Position {
+    /// A message's `content`.
+    Message,
+    /// Anthropic's top-level `system`.
+    System,
+    /// A `tool_result` block's own `content`, reached by recursion.
+    ToolResult,
+}
+
+/// The block types a provider defines in a position, read from each provider's
+/// published shape rather than from what the walk happens to understand.
+///
+/// An empty slice refuses everything, which is the answer for a position a
+/// provider does not have at all.
+fn admissible_block_types(provider: &str, position: Position) -> &'static [&'static str] {
+    /// OpenAI's chat-completions content part union. `image` is Anthropic's
+    /// spelling and was never legal here; `tool_use` and `tool_result` are
+    /// Anthropic block types, and OpenAI represents a call through `tool_calls`
+    /// and a result through a `role: "tool"` message. Not narrowed per role —
+    /// see the note on the function's tests: role scoping would refuse an
+    /// assistant turn a client echoes back, and it closes no channel, because
+    /// after this list no OpenAI block type has a dispatch field at all.
+    ///
+    /// `file` and `refusal` are legal parts OpenAI defines and this gateway
+    /// refuses, before this change and after it. Neither is this round's doing
+    /// and both are recorded as capabilities not delivered.
+    const OPENAI_MESSAGE: [&str; 4] = ["audio", "image_url", "input_audio", "text"];
+    /// Anthropic's request block types, restricted to the ones this gateway
+    /// reads. `document`, `thinking`, `redacted_thinking`, `search_result`,
+    /// `server_tool_use`, the five `*_tool_result` families and
+    /// `container_upload` are legal Anthropic blocks that were already refused
+    /// for having no arm; they are unchanged here.
+    const ANTHROPIC_MESSAGE: [&str; 4] = ["image", "text", "tool_result", "tool_use"];
+    /// **Read, not assumed.** Anthropic's `system` is `string | TextBlockParam[]`
+    /// — an array of *text blocks* and nothing else. It admitted tool blocks,
+    /// which system content does not carry in any provider.
+    const ANTHROPIC_SYSTEM: [&str; 1] = ["text"];
+    /// A `tool_result`'s own content, which the recursion reaches. **Neither
+    /// Codex nor the brief named this position.** Anthropic documents
+    /// `text`, `image`, `search_result`, `document`, `tool_reference` and
+    /// `browser_state` here — and never `tool_use` or `tool_result`, both of
+    /// which the shared list admitted, so a `tool_use` nested inside a result
+    /// leaked its `name` exactly as the OpenAI case does. The last four are
+    /// refused for having no arm, as they are one level up.
+    const ANTHROPIC_TOOL_RESULT: [&str; 2] = ["image", "text"];
+    match (provider, position) {
+        ("openai", Position::Message) => &OPENAI_MESSAGE,
+        ("anthropic", Position::Message) => &ANTHROPIC_MESSAGE,
+        ("anthropic", Position::System) => &ANTHROPIC_SYSTEM,
+        ("anthropic", Position::ToolResult) => &ANTHROPIC_TOOL_RESULT,
+        // OpenAI has neither a `system` content array nor a `tool_result`
+        // block, so neither position exists for it and neither is reachable —
+        // the second only because `tool_result` is off the list above, which is
+        // the coupling `every_reachable_position_admits_something` pins.
+        _ => &[],
+    }
+}
 
 /// Tool fields a provider still has no slots for. A request that uses one is
 /// refused rather than forwarded, because forwarding it would send arbitrary
@@ -1229,15 +1302,17 @@ fn content_pointers(
     prefix: &str,
     content: &Value,
     provider: &'static str,
+    position: Position,
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
-    content_pointers_at(prefix, content, provider, 0, out)
+    content_pointers_at(prefix, content, provider, position, 0, out)
 }
 
 fn content_pointers_at(
     prefix: &str,
     content: &Value,
     provider: &'static str,
+    position: Position,
     depth: usize,
     out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
@@ -1259,6 +1334,14 @@ fn content_pointers_at(
                 // block with no type cannot be read at all, so it falls to the
                 // refusal below with everything else we do not understand.
                 let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+                // *Where* before *what*: a block type this walk can read is
+                // still refused in a position its provider does not define it
+                // in. Asked first because the field list below is chosen by the
+                // type alone and would otherwise wave through an Anthropic
+                // `tool_use` sent to OpenAI, or a tool block in `system`.
+                if !admissible_block_types(provider, position).contains(&kind) {
+                    return Err(ShapeError::Request(provider));
+                }
                 // Checked before the dispatch, so a block is refused for what
                 // it carries as readily as for what it is.
                 let allowed = content_block_fields(kind);
@@ -1305,6 +1388,11 @@ fn content_pointers_at(
                                 &format!("{prefix}/{index}/content"),
                                 content,
                                 provider,
+                                // The position changes with the frame: a
+                                // result's content is not a message's, and the
+                                // recursion carrying `Message` down is what let
+                                // a `tool_use` nest inside a `tool_result`.
+                                Position::ToolResult,
                                 depth + 1,
                                 out,
                             )?;
@@ -1479,6 +1567,7 @@ impl Provider for OpenAi {
                     &format!("/messages/{index}/content"),
                     content,
                     "openai",
+                    Position::Message,
                     &mut pointers,
                 )?;
                 // A tool message's content is a tool result — the OpenAI shape
@@ -1527,6 +1616,15 @@ impl Provider for OpenAi {
                     &format!("/choices/{index}/message/content"),
                     content,
                     "openai",
+                    // The response side gets the request side's list rather
+                    // than the narrower one a model's own output takes. A
+                    // well-formed chat-completions response carries `content`
+                    // as a string, so the array branch is unreachable on
+                    // documented traffic and a narrower list would only ever
+                    // fire on a compatible endpoint doing something else —
+                    // after the caller's tokens were spent. Round 4's citations
+                    // lesson, applied the cautious way round.
+                    Position::Message,
                     &mut pointers,
                 )?;
             }
@@ -1704,7 +1802,13 @@ impl Provider for Anthropic {
         // not say where the text was, and refused: `{"system": null}` was a 400
         // (measured) for a body carrying no system prompt at all.
         if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
-            content_pointers("/system", system, "anthropic", &mut pointers)?;
+            content_pointers(
+                "/system",
+                system,
+                "anthropic",
+                Position::System,
+                &mut pointers,
+            )?;
         }
         for (index, message) in messages.iter().enumerate() {
             require_scannable_message(message, &["content"], "anthropic")?;
@@ -1714,6 +1818,7 @@ impl Provider for Anthropic {
                     &format!("/messages/{index}/content"),
                     content,
                     "anthropic",
+                    Position::Message,
                     &mut pointers,
                 )?;
             }
@@ -2661,33 +2766,43 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_result_nested_past_the_walks_bound_is_refused() {
-        // The recursion this slice introduced. Bounded here rather than left to
-        // the parser: a document deep enough to exhaust the stack ends the
-        // process and every live session mapping with it.
-        let too_deep = json!({
+    fn a_tool_result_nested_inside_a_tool_result_is_refused_one_frame_in() {
+        // **This test asserted the opposite until round 7, and the answer it
+        // asserted was a leak.** It drove `nested_tool_results(70)` into the
+        // depth bound and `(60)` to the leaf, which required a `tool_result`
+        // inside a `tool_result` to be admissible sixty times over. Anthropic's
+        // `ToolResultBlockParam.content` admits `text`, `image`,
+        // `search_result`, `document`, `tool_reference` and `browser_state` —
+        // never `tool_result`, and never `tool_use`, whose `name` is dispatch
+        // and travelled unscanned from inside a result (measured, at 200).
+        //
+        // So the position rule refuses the second frame, and the depth bound
+        // below it now has no reachable input: `content_pointers_at` recurses
+        // only for `tool_result`, and `Position::ToolResult` does not admit
+        // one. **The bound is kept and this is the test that says why** — it is
+        // the guard that stays correct if a position set ever re-admits
+        // nesting, and a stack exhausted by a caller's document ends the
+        // process and every live session mapping with it. An unreachable
+        // backstop is worth its lines here; an unrecorded one is not.
+        let nested = json!({
             "model": "claude",
-            "messages": [{"role": "user", "content": nested_tool_results(70)}]
+            "messages": [{"role": "user", "content": nested_tool_results(2)}]
         });
         assert!(
             matches!(
-                Anthropic.request_pointers(&too_deep),
-                Err(ShapeError::Unsupported(
-                    "anthropic",
-                    "tool results nested deeper than this gateway walks"
-                ))
+                Anthropic.request_pointers(&nested),
+                Err(ShapeError::Request("anthropic"))
             ),
-            "the walk recursed as deep as the caller asked: {:?}",
-            Anthropic.request_pointers(&too_deep)
+            "a result inside a result is not a shape Anthropic defines: {:?}",
+            Anthropic.request_pointers(&nested)
         );
-        // And a nest within the bound is still read to the bottom.
-        let within = json!({
+        // One frame is the whole of what the recursion serves, and it still
+        // serves it: a result's own content read to its leaf.
+        let one = json!({
             "model": "claude",
-            "messages": [{"role": "user", "content": nested_tool_results(60)}]
+            "messages": [{"role": "user", "content": nested_tool_results(1)}]
         });
-        let slots = Anthropic
-            .request_pointers(&within)
-            .expect("within the bound");
+        let slots = Anthropic.request_pointers(&one).expect("one frame");
         assert_eq!(slots.len(), 1, "the leaf is described once: {slots:?}");
     }
 
@@ -3465,15 +3580,211 @@ mod tests {
     }
 
     #[test]
+    fn an_openai_message_carries_no_anthropic_tool_block() {
+        // `content_pointers` is shared by two providers, and the block types it
+        // admitted were scoped to neither. So an OpenAI message could carry an
+        // Anthropic-shaped `tool_use`, whose `name` is dispatch and therefore
+        // never scanned, and `Martina Weber` reached OpenAI in it (measured
+        // through the proxy, at 200). **Before this slice that block was
+        // refused** — the sharing is what removed the refusal.
+        //
+        // OpenAI represents a call through `tool_calls` on the message and a
+        // result through a `role: "tool"` message; neither is a content part.
+        for block in [
+            json!({"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}),
+            json!({"type": "tool_result", "tool_use_id": "Martina Weber", "content": "ok"}),
+            // Anthropic's spelling of an image, which OpenAI has never taken.
+            json!({"type": "image", "source": {"type": "base64", "data": "AA"}}),
+        ] {
+            let body = json!({"messages": [{"role": "user", "content": [block.clone()]}]});
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Request("openai"))
+                ),
+                "an Anthropic block reached an OpenAI request: {block}"
+            );
+            // And the same block on the provider that defines it is unchanged,
+            // which is the half that makes this scoping rather than refusing.
+            if block["type"] != "tool_result" {
+                let body = json!({"messages": [{"role": "user", "content": [block.clone()]}]});
+                assert!(
+                    Anthropic.request_pointers(&body).is_ok(),
+                    "the block is legal where it is defined: {block}"
+                );
+            }
+        }
+        // OpenAI's own parts still pass, including the tool message whose
+        // content is an array of text parts.
+        let openai = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "http://x"}},
+                {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "ok"}]}
+        ]});
+        assert!(OpenAi.request_pointers(&openai).is_ok());
+    }
+
+    #[test]
+    fn anthropic_system_content_is_text_and_nothing_else() {
+        // Read rather than assumed: Anthropic's `system` is `string |
+        // TextBlockParam[]`, an array of text blocks. The shared walk admitted
+        // every block type there, so a tool block in a system prompt carried
+        // its `name` to the provider unscanned (measured, at 200) — and an
+        // image block was accepted into a field that has never taken one.
+        for block in [
+            json!({"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}),
+            json!({"type": "image", "source": {"type": "base64", "data": "AA"}}),
+            json!({"type": "tool_result", "tool_use_id": "t1", "content": "ok"}),
+        ] {
+            let body = json!({
+                "system": [block.clone()],
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Request("anthropic"))
+                ),
+                "system content is not a message's: {block}"
+            );
+        }
+        // Both published spellings of a system prompt still work, and a text
+        // block in one is still described.
+        let blocks = json!({
+            "system": [{"type": "text", "text": "you are a bot"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&blocks).unwrap(),
+            vec![text("/system/0/text"), text("/messages/0/content")],
+        );
+        let bare = json!({
+            "system": "you are a bot",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&bare).unwrap(),
+            vec![text("/system"), text("/messages/0/content")],
+        );
+    }
+
+    #[test]
+    fn a_tool_results_content_carries_no_tool_block() {
+        // **The position neither the review nor the brief named.** The
+        // recursion passed the message's own admissible set down into a
+        // result's content, so a `tool_use` nested inside a `tool_result`
+        // carried its `name` unscanned to Anthropic (measured, at 200).
+        // Anthropic documents this position as `text`, `image`,
+        // `search_result`, `document`, `tool_reference` and `browser_state`;
+        // the last four have no arm here and were already refused.
+        let nested = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}
+            ]}
+        ]}]});
+        assert!(
+            matches!(
+                Anthropic.request_pointers(&nested),
+                Err(ShapeError::Request("anthropic"))
+            ),
+            "a tool call inside a tool result: {:?}",
+            Anthropic.request_pointers(&nested)
+        );
+        // What the position does admit, unchanged — this is the traffic the
+        // recursion exists for.
+        let served = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image", "source": {"type": "base64", "data": "AA"}}
+            ]}
+        ]}]});
+        assert_eq!(
+            Anthropic.request_pointers(&served).unwrap(),
+            vec![tool_text("/messages/0/content/0/content/0/text")],
+        );
+    }
+
+    #[test]
+    fn every_block_type_this_walk_reads_is_admissible_somewhere() {
+        // The structural half, and the guard against the next asymmetry. Two
+        // couplings, both of which held silently wrong until this round:
+        //
+        // 1. A type admitted in a position must be one `content_block_fields`
+        //    can read, or the position promises a block the dispatch refuses.
+        // 2. A type `content_block_fields` reads must be admissible in some
+        //    position, or the fields were written for traffic that cannot
+        //    arrive — the state `computer_*` was in one layer up, and the
+        //    reason round 6 exists.
+        const POSITIONS: [(&str, Position); 6] = [
+            ("openai", Position::Message),
+            ("openai", Position::System),
+            ("openai", Position::ToolResult),
+            ("anthropic", Position::Message),
+            ("anthropic", Position::System),
+            ("anthropic", Position::ToolResult),
+        ];
+        const READABLE: [&str; 7] = [
+            "audio",
+            "image",
+            "image_url",
+            "input_audio",
+            "text",
+            "tool_result",
+            "tool_use",
+        ];
+        for (provider, position) in POSITIONS {
+            for kind in admissible_block_types(provider, position) {
+                assert!(
+                    !content_block_fields(kind).is_empty(),
+                    "{provider}/{position:?} admits {kind}, which the dispatch cannot read"
+                );
+            }
+        }
+        for kind in READABLE {
+            assert!(
+                !content_block_fields(kind).is_empty(),
+                "{kind} is listed here as readable and is not"
+            );
+            assert!(
+                POSITIONS.iter().any(|(provider, position)| {
+                    admissible_block_types(provider, *position).contains(&kind)
+                }),
+                "{kind} has a field list and no position admits it"
+            );
+        }
+        // The positions OpenAI does not have refuse everything rather than
+        // falling back to a list. `Position::ToolResult` is unreachable for
+        // OpenAI only because `tool_result` is off its message list, and this
+        // is the line that makes that coupling a decision.
+        for position in [Position::System, Position::ToolResult] {
+            assert!(
+                admissible_block_types("openai", position).is_empty(),
+                "OpenAI has no {position:?} content and was given a list for it"
+            );
+        }
+    }
+
+    #[test]
     fn a_tool_result_part_is_understood_rather_than_refused() {
         // The positive half of the test above: `tool_result` moved from the
-        // refused side to the described side, and both halves say so together.
-        // `content_pointers` is shared, so it moved for both providers at once.
+        // refused side to the described side.
         //
         // The result recurses through `content_pointers` itself, so a bare
         // string and a list of blocks are one case, and an image inside a
         // result inherits the policy images already have — asserted here rather
         // than argued, since it is the reason the recursion exists.
+        //
+        // **The sentence that used to stand here was the bug.** It read
+        // "`content_pointers` is shared, so it moved for both providers at
+        // once", and the loop below ran the identical body through *both*
+        // providers and asserted the identical answer. OpenAI has no
+        // `tool_result` block — a result is a `role: "tool"` message there —
+        // so what this pinned was an Anthropic block type being admitted into
+        // an OpenAI request. The fourth asymmetry on this branch, and the
+        // fourth to be written down as a similarity first.
         let body = json!({"messages": [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t1", "content": "Martina Weber"},
             {"type": "tool_result", "tool_use_id": "t2", "content": [
@@ -3481,19 +3792,22 @@ mod tests {
                 {"type": "image", "source": {"type": "base64", "data": "..."}}
             ]}
         ]}]});
-        for described in [
-            OpenAi.request_pointers(&body).unwrap(),
+        assert_eq!(
             Anthropic.request_pointers(&body).unwrap(),
-        ] {
-            assert_eq!(
-                described,
-                vec![
-                    tool_text("/messages/0/content/0/content"),
-                    tool_text("/messages/0/content/1/content/0/text"),
-                ],
-                "the image is unscanned and the tool_use_id is dispatch"
-            );
-        }
+            vec![
+                tool_text("/messages/0/content/0/content"),
+                tool_text("/messages/0/content/1/content/0/text"),
+            ],
+            "the image is unscanned and the tool_use_id is dispatch"
+        );
+        assert!(
+            matches!(
+                OpenAi.request_pointers(&body),
+                Err(ShapeError::Request("openai"))
+            ),
+            "the same body is not an OpenAI request: {:?}",
+            OpenAi.request_pointers(&body)
+        );
     }
 
     #[test]

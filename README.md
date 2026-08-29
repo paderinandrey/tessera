@@ -258,7 +258,13 @@ direction: a field no slot addresses would travel to the provider exactly as the
 wrote it, so a provider feature shipped tomorrow refuses here instead of leaking through.
 **The allowlist admits a shape and not only a key**, which is the other half of that and
 was the later half: every entry records why admitting it is safe, and a field the provider
-constrains to a boolean, an enum or a fixed literal has that value checked. `"strict":
+constrains to a boolean, an enum or a fixed literal has that value checked. **And a block
+type is admitted in a position, not in general** — the later half again, one layer out:
+the same walk reads OpenAI's message content, Anthropic's message content, Anthropic's
+`system` and a `tool_result`'s own content, and it admitted every block type in all four.
+An Anthropic `tool_use` therefore rode in an OpenAI message with its `name` — dispatch, so
+scanned by nothing — and tool blocks were accepted in a `system` prompt that takes text
+blocks only. Each position now carries the set its provider publishes for it. `"strict":
 "Martina Weber"`, `"is_error": "Martina Weber"` and `cache_control: {"type": "Martina
 Weber"}` were each admitted by a list and each reached the provider verbatim, under
 comments that stated the shapes correctly. **A field can also be admitted by not being

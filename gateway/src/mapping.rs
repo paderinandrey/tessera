@@ -571,23 +571,102 @@ fn is_name_list(value: &Value) -> bool {
 /// keywords hold subschemas is closed by the specification. Miss one and every
 /// `required` below it is masked — a broken schema rather than a leak, which is
 /// the way round to be wrong.
-const SCHEMA_APPLICATOR_KEYWORDS: [&str; 15] = [
-    "additionalItems",
-    "additionalProperties",
-    "allOf",
-    "anyOf",
-    "contains",
-    "contentSchema",
-    "else",
-    "if",
-    "items",
-    "not",
-    "oneOf",
-    "prefixItems",
-    "then",
-    "unevaluatedItems",
-    "unevaluatedProperties",
+///
+/// **Membership is necessary and not sufficient** — the third list to carry
+/// that sentence, and the one that proves why the *other* half of round 3's
+/// audit criterion was needed. This arm can only return `Some`, so the audit
+/// read it as unable to leak; but *which shape* it returns decides which skip
+/// rules apply below it, and `Shape::Schema` is not a promise to scan, it is a
+/// promise to apply schema rules. Consulted from the key alone, `{"allOf":
+/// {"type": "Martina Weber"}}` — an object where the draft says array — was
+/// granted schema semantics anyway, and `type`'s value was skipped one level
+/// down as a type name (measured, at 200). So each keyword is paired with the
+/// container its own draft defines, and a value that is not that container
+/// states no schema structure and is the client's data.
+const SCHEMA_APPLICATOR_KEYWORDS: [(&str, Container); 15] = [
+    ("additionalItems", Container::Schema),
+    ("additionalProperties", Container::Schema),
+    ("allOf", Container::SchemaArray),
+    ("anyOf", Container::SchemaArray),
+    ("contains", Container::Schema),
+    ("contentSchema", Container::Schema),
+    ("else", Container::Schema),
+    ("if", Container::Schema),
+    // The one keyword on this list that publishes both containers, and it is
+    // not a looseness we chose: draft-04 through draft-07 give `items` a tuple
+    // form — an array of schemas, one per position — and 2020-12 moved that
+    // spelling to `prefixItems` and made `items` a single schema. A client may
+    // send either draft, so both are the keyword's own shape. Handled per value
+    // the way `dependencies` is, and for the same reason.
+    ("items", Container::SchemaOrSchemaArray),
+    ("not", Container::Schema),
+    ("oneOf", Container::SchemaArray),
+    ("prefixItems", Container::SchemaArray),
+    ("then", Container::Schema),
+    ("unevaluatedItems", Container::Schema),
+    ("unevaluatedProperties", Container::Schema),
 ];
+
+fn applicator_keyword(key: &str) -> Option<Container> {
+    SCHEMA_APPLICATOR_KEYWORDS
+        .iter()
+        .find(|(keyword, _)| *keyword == key)
+        .map(|(_, container)| *container)
+}
+
+/// The container a schema keyword's value takes when the keyword really does
+/// govern schema structure.
+///
+/// The sibling of `Identifier`, one layer out. `Identifier` asks whether a
+/// value *states* an identifier; this asks whether a value is the thing the
+/// keyword's rules are *about*. Both exist because a keyword's meaning is a
+/// pair — a name and a shape — and reading only the name grants a rule to
+/// whatever the caller happened to write.
+///
+/// A mismatch is scanned as an instance rather than refused, which is the
+/// answer `dependencies`, the identifier arms and the name-instance arm all
+/// already give: `descend_into` returns `Option<Shape>` and has no refusal
+/// channel, and an over-masked malformed schema is a cost the caller can see.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Container {
+    /// One schema. An object — or, draft-06 onward, a boolean, which is a
+    /// schema with no children and so nothing to skip.
+    Schema,
+    /// An array of schemas: `allOf`, `anyOf`, `oneOf`, `prefixItems`.
+    SchemaArray,
+    /// Either, both published for the same keyword by different drafts.
+    SchemaOrSchemaArray,
+    /// An object whose *keys* the keyword's own rule reads as names the caller
+    /// chose: `properties`, `$defs`, `patternProperties`, `dependentSchemas`
+    /// and draft-07's `dependencies`. Never a boolean — these are maps, not
+    /// schemas.
+    Map,
+}
+
+impl Container {
+    /// Whether `value` is the container this keyword governs. Anything else is
+    /// malformed against the keyword's own draft, so the keyword states no
+    /// schema structure there and the value is the client's data.
+    fn holds(self, value: &Value) -> bool {
+        /// A schema is an object, or a boolean from draft-06 on. A boolean
+        /// carries no leaf and no key, so admitting it changes nothing the walk
+        /// can see; it is here because refusing it would call a valid schema
+        /// malformed.
+        fn is_schema(value: &Value) -> bool {
+            value.is_object() || value.is_boolean()
+        }
+        match self {
+            Container::Schema => is_schema(value),
+            Container::SchemaArray => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(is_schema)),
+            Container::SchemaOrSchemaArray => {
+                Container::Schema.holds(value) || Container::SchemaArray.holds(value)
+            }
+            Container::Map => value.is_object(),
+        }
+    }
+}
 
 /// Keywords holding prose about a schema rather than a value it constrains.
 ///
@@ -686,10 +765,32 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         Shape::NameSchema => true,
     };
     let identifier = identifier_keyword(key);
+    let applicator = applicator_keyword(key);
     match key {
-        "propertyNames" => Some(Shape::NameSchema),
-        "dependencies" => Some(Shape::DependencyMap),
-        key if SCHEMA_MAP_KEYWORDS.contains(&key) => Some(Shape::SchemaMap),
+        // The container check is on all three of these arms and on the
+        // applicator arm below, and it is one rule: **a keyword's schema rules
+        // apply to the container its own draft defines, and to nothing else.**
+        // Round 3's audit read every arm here for whether it could return
+        // `None`, on the ground that exemption is the only leak channel. That
+        // is half the question. An arm returning `Some(Shape::Schema)` grants
+        // the *rules*, and the rules skip things — so descending with the wrong
+        // shape is a leak channel in its own right. All four arms decided from
+        // the key alone and all four leaked (measured, at 200).
+        //
+        // `propertyNames` takes a schema. Given an array, the name-stating
+        // rules were applied inside it, and `{"propertyNames": [{"enum":
+        // ["Martina Weber"]}]}` skipped a name nothing states.
+        "propertyNames" if Container::Schema.holds(value) => Some(Shape::NameSchema),
+        // `dependencies` takes an object. Given an array, `{"dependencies":
+        // [{"a": ["Martina Weber"]}]}` reached the array half of
+        // `Shape::DependencyMap` through the elements and was skipped whole.
+        "dependencies" if Container::Map.holds(value) => Some(Shape::DependencyMap),
+        // `properties` and its siblings take objects, and the same route
+        // through an array's elements reaches their keys: `{"properties":
+        // [{"a": {"required": ["Martina Weber"]}}]}` was skipped.
+        key if SCHEMA_MAP_KEYWORDS.contains(&key) && Container::Map.holds(value) => {
+            Some(Shape::SchemaMap)
+        }
         // An identifier keyword holding what that keyword's own draft says it
         // holds. The key names a shape and the value has to be it: `required`
         // is an array of strings, `type` a string or an array of them, `$ref`
@@ -708,7 +809,14 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
         key if SCHEMA_ANNOTATION_KEYWORDS.contains(&key) => Some(Shape::Instance),
         // A subschema, so the shape carries — modifier included, because an
         // `enum` inside an `allOf` inside a `propertyNames` still lists names.
-        key if SCHEMA_APPLICATOR_KEYWORDS.contains(&key) => Some(shape),
+        //
+        // **And only when the value is the container the keyword defines.**
+        // `allOf` is an array of schemas; given an object it is not an `allOf`
+        // at all, and granting `Shape::Schema` to it let the identifier arm one
+        // level down skip `{"type": "Martina Weber"}` as a type name (measured,
+        // at 200). `not` given an array is the same mistake the other way
+        // round. `items` alone publishes both containers and gets both.
+        _ if applicator.is_some_and(|container| container.holds(value)) => Some(shape),
         // Under `propertyNames` the instances are property names, and masking
         // one breaks the schema — but only for the keywords that state a name.
         // That set is small and closed; the set of keywords holding a client's
@@ -2236,6 +2344,155 @@ mod tests {
                 Leaf::Number("42".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn an_applicator_grants_schema_rules_only_to_the_container_its_draft_defines() {
+        // **The counterexample to round 3's audit criterion.** That audit read
+        // every arm of `descend_into` for whether it could return `None`, on
+        // the stated ground that "an arm that always returns `Some` cannot
+        // leak". This arm always returns `Some`, and it leaked: `allOf` must be
+        // an *array* of schemas, and given an object it carried the schema
+        // shape into it anyway, so the identifier arm one level down skipped
+        // `type`'s value as a type name. `Martina Weber` reached the provider
+        // with nothing having looked at it (measured through the proxy, at
+        // 200). Which shape an arm returns decides which skip rules apply
+        // below it, and the skip rules are the leak.
+        let malformed = json!({"allOf": {"type": "Martina Weber"}});
+        assert_eq!(
+            json_leaves(&malformed, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Martina Weber".to_owned())],
+            "an object is not an allOf, so nothing in it states a type"
+        );
+        // The well-formed twin, unchanged: inside a real `allOf` a real `type`
+        // is a type name, and masking it would break the schema. The two lines
+        // together are the fix — the leak closes and the residual stays.
+        let well_formed = json!({"allOf": [{"type": "Martina Weber"}]});
+        assert!(
+            json_leaves(&well_formed, Shape::Schema).unwrap().is_empty(),
+            "a real applicator still states what its draft says it states"
+        );
+        // The same mistake the other way round, which the brief's example does
+        // not reach: `not` is a single schema and was given an array.
+        let inverted = json!({"not": [{"required": ["Martina Weber"]}]});
+        assert_eq!(
+            json_leaves(&inverted, Shape::Schema).unwrap(),
+            vec![Leaf::Text("Martina Weber".to_owned())],
+        );
+        // And the one keyword that publishes both containers keeps both.
+        // Draft-07 gives `items` a tuple form; refusing it would mask every
+        // property name in a draft-07 schema that uses one.
+        for tuple in [
+            json!({"items": [{"required": ["billing_address"]}]}),
+            json!({"items": {"required": ["billing_address"]}}),
+        ] {
+            assert!(
+                json_leaves(&tuple, Shape::Schema).unwrap().is_empty(),
+                "both of `items`' published containers are `items`: {tuple}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_applicator_keyword_is_held_to_the_container_its_draft_defines() {
+        // The population rather than the case, as the identifier list has. Each
+        // keyword is driven with the container its own draft defines and with
+        // the one it does not; the first must be skipped and the second must be
+        // scanned. A keyword added to the list cannot compile without a
+        // container, and one classified wrongly fails on one half or the other.
+        //
+        // The value inside is the same either way — a `required` naming
+        // `Martina Weber` — so the only thing that can move the answer is the
+        // container.
+        let inner = || json!({"required": ["Martina Weber"]});
+        for (keyword, container) in SCHEMA_APPLICATOR_KEYWORDS {
+            // **Round 3's useful negative, applied before it could bite
+            // again.** A keyword classified *too loosely* is invisible to a
+            // guard that drives each keyword with the value its own
+            // classification names: `SchemaOrSchemaArray` admits both, so both
+            // halves pass and nothing says the keyword only publishes one.
+            // `items` is the one keyword with two published containers —
+            // draft-07's tuple form and 2020-12's single schema — so being that
+            // keyword is the condition, and it is asserted rather than assumed.
+            assert_eq!(
+                container == Container::SchemaOrSchemaArray,
+                keyword == "items",
+                "{keyword} is classified as taking either container, and `items` is the only \
+                 keyword whose drafts publish both"
+            );
+            let document =
+                |value: Value| Value::Object([(keyword.to_owned(), value)].into_iter().collect());
+            let defined: Vec<Value> = match container {
+                Container::Schema => vec![inner()],
+                Container::SchemaArray => vec![json!([inner()])],
+                Container::SchemaOrSchemaArray => vec![inner(), json!([inner()])],
+                Container::Map => unreachable!("no applicator takes a map"),
+            };
+            for value in defined {
+                assert!(
+                    json_leaves(&document(value), Shape::Schema)
+                        .unwrap()
+                        .is_empty(),
+                    "{keyword} scanned a container its own draft defines, which over-masks a valid schema"
+                );
+            }
+            let undefined = match container {
+                Container::Schema => Some(json!([inner()])),
+                Container::SchemaArray => Some(inner()),
+                // Nothing is left to withhold from the keyword that takes both.
+                Container::SchemaOrSchemaArray | Container::Map => None,
+            };
+            if let Some(value) = undefined {
+                assert_eq!(
+                    json_leaves(&document(value), Shape::Schema).unwrap(),
+                    vec![Leaf::Text("Martina Weber".to_owned())],
+                    "{keyword} granted schema rules to a container it does not define"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_keyword_whose_value_is_a_map_of_names_applies_only_to_a_map() {
+        // The three arms round 3's audit listed as "left" on the criterion this
+        // round corrected. All three decide the shape from the key and all
+        // three grant rules that skip; an array reaches those rules through
+        // `walk`'s propagation into elements, which is the route none of them
+        // was read against. Each pair is the malformed container and its
+        // well-formed twin, and the twin is what says this is a fix rather than
+        // a narrowing of the schema language.
+        for (malformed, well_formed) in [
+            // Arm 6. Round 3 *recorded* this one and left it, on the argument
+            // that it skips nothing the well-formed path would not also skip.
+            // That is the argument `allOf` falsifies: the well-formed path
+            // skips a name because a name is stated, and here none is.
+            (
+                json!({"propertyNames": [{"enum": ["Martina Weber"]}]}),
+                json!({"propertyNames": {"enum": ["Martina Weber"]}}),
+            ),
+            // Arm 7 — `dependencies`, whose array half is the branch's own
+            // precedent for per-value rules, reached through an element.
+            (
+                json!({"dependencies": [{"a": ["Martina Weber"]}]}),
+                json!({"dependencies": {"a": ["Martina Weber"]}}),
+            ),
+            // Arm 8, one level deeper: `properties` as an array puts a
+            // subschema under an element's key.
+            (
+                json!({"properties": [{"a": {"required": ["Martina Weber"]}}]}),
+                json!({"properties": {"a": {"required": ["Martina Weber"]}}}),
+            ),
+        ] {
+            assert_eq!(
+                json_leaves(&malformed, Shape::Schema).unwrap(),
+                vec![Leaf::Text("Martina Weber".to_owned())],
+                "the keyword's rules were applied to a container it does not define: {malformed}"
+            );
+            assert!(
+                json_leaves(&well_formed, Shape::Schema).unwrap().is_empty(),
+                "and the container it does define is unchanged: {well_formed}"
+            );
+        }
     }
 
     #[test]

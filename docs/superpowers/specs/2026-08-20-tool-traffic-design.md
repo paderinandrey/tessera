@@ -384,6 +384,33 @@ because the union admits `{"$ref": {"note": ["Martina Weber"]}}`. A value that
 is not the shape is not an identifier, so it is the client's data and is
 scanned; the cost of being wrong is an over-masked schema the caller can see.
 
+**And a keyword that grants schema semantics is the same rule one layer out,
+which took two more rounds to see.** The audit that closed the arms above rested
+on "an arm can only leak if it can return `None` — an arm that always returns
+`Some` cannot leak". That is half the question. An arm returning
+`Some(Shape::Schema)` grants the schema *rules*, and the rules skip things: the
+applicator arm carried the schema shape into `{"allOf": {"type": "Martina
+Weber"}}` — an object where the draft says array — and the identifier arm one
+level down skipped `type`'s value as a type name. **Descending with the wrong
+shape is a leak channel in its own right.** So each keyword names its container
+as well as its shape: `allOf`, `anyOf`, `oneOf` and `prefixItems` are arrays of
+schemas, `not`, `if`, `contains` and the rest are single schemas, `items` is
+either because two drafts publish two answers, and `properties`, `$defs`,
+`patternProperties`, `dependentSchemas`, `dependencies` and `propertyNames` are
+maps. A value that is not the container states no schema structure, so it is the
+client's data and is scanned. Five arms, not three.
+
+**Content block types are per provider *and* per position, not one list.**
+`content_pointers` is shared by two providers and three positions, and admitting
+every block type everywhere let an Anthropic `tool_use` ride in an OpenAI
+message with its `name` — dispatch, so unscanned — and let tool blocks into
+Anthropic's `system`, which takes text blocks only. The sets are read from each
+provider's published shape: OpenAI's message content takes `text`, `image_url`,
+`input_audio` and `audio`; Anthropic's takes `text`, `image`, `tool_use` and
+`tool_result`; Anthropic's `system` takes `text`; and a `tool_result`'s own
+content takes `text` and `image`. A position a provider does not have admits
+nothing.
+
 **Anthropic.** `tools[].description` and `input_schema` as a whole;
 `tool_use.input` as `Json`; `tool_result.content` as text when it is a string and
 as content blocks when it is a list.

@@ -5510,4 +5510,130 @@ mod tests {
             "and it reached the upstream unchanged"
         );
     }
+
+    #[tokio::test]
+    async fn an_anthropic_tool_block_in_an_openai_message_never_reaches_the_upstream() {
+        // The end-to-end half of the provider-level test, at the only boundary
+        // that settles it: what left the process. Measured at 6f22649, this
+        // body was a 200 and `Martina Weber` was in the egress as a `tool_use`
+        // block's `name` — a dispatch field, so nothing scanned it and the
+        // detector was never shown it.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+        )
+        .await;
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": [
+                {"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}
+            ]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "refused means the upstream is never called"
+        );
+
+        // And the same block on the provider that defines it is served, which
+        // is what makes this scoping rather than a new refusal. A tool call's
+        // arguments are the traffic this slice exists to mask.
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (status, returned) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": [
+                {"type": "tool_use", "id": "x", "name": "read_file", "input": {"path": "Martina Weber"}}
+            ]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["messages"][0]["content"][0]["input"]["path"],
+            "Martina Weber",
+            "scanned, and this detector found nothing in it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_block_in_an_anthropic_system_prompt_never_reaches_the_upstream() {
+        // The context half. `system` takes text blocks and nothing else, and
+        // the shared walk admitted tool blocks there: measured at 6f22649 as a
+        // 200 with the name in the egress.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude",
+                   "system": [{"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}],
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "refused means the upstream is never called"
+        );
+
+        // A system prompt written the way Anthropic documents it still works.
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (status, returned) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude",
+                   "system": [{"type": "text", "text": "you are a bot"}],
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["system"][0]["text"],
+            "you are a bot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_applicator_is_shown_to_the_detector_and_masked() {
+        // The other P1, at the same boundary. `{"allOf": {"type": "Martina
+        // Weber"}}` is malformed — `allOf` is an array — and the arm carried
+        // the schema shape into it anyway, so `type`'s value was skipped one
+        // level down as a type name. Measured at 6f22649: 200, and the
+        // detector's only call was for `"hi"`.
+        let detector = detector_finding_martina().await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (status, returned) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                   "tools": [{"name": "t", "input_schema": {"allOf": {"type": "Martina Weber"}}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["tools"][0]["input_schema"]["allOf"]["type"],
+            "Martina [PERSON_1]",
+            "the value was never shown to the detector"
+        );
+
+        // The well-formed twin, which must stay skipped: inside a real `allOf`
+        // a real `type` is a type name, and masking it breaks the schema.
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (status, returned) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                   "tools": [{"name": "t", "input_schema": {"allOf": [{"type": "Martina Weber"}]}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["tools"][0]["input_schema"]["allOf"][0]["type"],
+            "Martina Weber",
+            "a real applicator's identifiers are still identifiers"
+        );
+    }
 }
