@@ -75,25 +75,31 @@ pub struct Config {
     /// Characters, not serialized bytes, and the distinction is the point.
     /// Detection cost scales with the text the detector reads; braces, quotes
     /// and property names are structure it never sees. On `mapping`'s real
-    /// ten-tool payload the two differ by 1.46x — 13 177 serialized against
-    /// 9 005 detected — so a bound charging serialized size charges half again
-    /// what detection costs.
+    /// ten-tool payload the two differ by 1.43x — 13 177 serialized against
+    /// 9 193 charged — so a bound charging serialized size charges nearly half
+    /// again what detection costs.
     ///
     /// **Set from measurement, at twice the measured payload.** Ten real tool
-    /// definitions cost 9 005 characters, about 900 per tool.
+    /// definitions charge 9 193 characters, about 900 per tool: 9 005 of text,
+    /// 50 of numbers, and 138 of the separators the join inserts between
+    /// leaves, every one of which the detector reads.
     /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` pins that
-    /// figure and fails if this default stops admitting it. Those ten are a
-    /// floor — a stock session carries about fifteen tools, extrapolating to
-    /// roughly 13 500 characters — so 18 000 covers a stock session with room
+    /// figure and fails if this default stops admitting twice it. Those ten are
+    /// a floor — a stock session carries about fifteen tools, extrapolating to
+    /// roughly 13 800 characters — so 20 000 covers a stock session with room
     /// for a small MCP server, and does not pretend to cover an arbitrary one.
     ///
-    /// **What that costs, stated plainly, because it is not free.** The
-    /// README's latency table is the measured source: on the machine it names
-    /// (Apple M3 Pro, 11 cores) 10 000 characters is eight to nine seconds, and
-    /// on the containerised stack the detection-cache design measured, about
-    /// fifteen. So 18 000 characters is roughly fifteen seconds native and
-    /// twenty-seven containerised — a long wait, and close enough to the edge
-    /// that slower hardware has to lower this rather than inherit it.
+    /// **What that costs, stated plainly, because it is not free — and no
+    /// figure here is derived from this ceiling.** What was measured is a
+    /// payload, not a bound: the ten-tool replay below, and what one call
+    /// costs. Turning either into "what 20 000 characters costs" means
+    /// characters over a throughput taken on texts ten to fifty times the size
+    /// of these leaves, where per-call overhead dominates and throughput barely
+    /// applies — the derivation `9f9ce70` on this branch exists to correct, and
+    /// the paragraphs below narrate. So: the wait is seconds rather than
+    /// milliseconds, it is paid on a session's first turn, and slower hardware
+    /// has to lower this rather than inherit it. Anything more precise about
+    /// this ceiling would be arithmetic wearing a measurement's clothes.
     ///
     /// Two things were offered as making that tolerable. It is the *first* turn
     /// of a session only: tool definitions are byte-identical every turn after,
@@ -104,17 +110,27 @@ pub struct Config {
     /// **Nothing bounds a request's wall clock, and the caller's patience is
     /// not ours to set.** Whatever this number permits is what the caller
     /// waits, and the caller has its own timeout that this gateway neither
-    /// sees nor controls. At thirty seconds a client is inside a figure like
-    /// the one above by a hair; at twenty it gives up first, and the failure
-    /// arrives on its side looking like an outage here. There is no cumulative
-    /// deadline anywhere on the request path that would turn that into an
-    /// honest refusal instead.
+    /// sees nor controls. A client timeout in the tens of seconds is the same
+    /// order as what these bounds permit: at thirty it is inside by a hair, at
+    /// twenty it may give up first, and the failure then arrives on its side
+    /// looking like an outage here. There is no cumulative deadline anywhere on
+    /// the request path that would turn that into an honest refusal instead.
     ///
-    /// **The containerised cost is measured, not derived.** The 77 leaves of
-    /// `mapping`'s real ten-tool payload were replayed through `/detect` in
-    /// sequence, three times, salted so nothing could be served from a cache:
-    /// **54.9 s median**, about 700 ms a leaf. That is a session's first turn
-    /// with a real tool set.
+    /// **The containerised cost is measured, not derived — and it is the cost
+    /// before batching.** The 77 leaves of `mapping`'s real ten-tool payload
+    /// were replayed through `/detect` in sequence, three times, salted so
+    /// nothing could be served from a cache: **54.9 s median**, about 700 ms a
+    /// leaf. That was a session's first turn with a real tool set, one call per
+    /// leaf.
+    ///
+    /// That measurement is what batching was built on, and it prices a cost
+    /// that no longer applies: a document's leaves are one call now, so the
+    /// same payload is 20 calls rather than 77. The 57 calls that went away
+    /// were 265–410 ms each — fifteen to twenty-three seconds of pure overhead,
+    /// derived from the two measurements either side of it. **The post-batching
+    /// wall clock has never been replayed.** Every figure for what this gateway
+    /// costs today, at this ceiling or any other, is therefore derived, and is
+    /// labelled so wherever one is quoted.
     ///
     /// Why it is quoted as a measurement rather than as arithmetic: the first
     /// version of this figure was **derived** — characters divided by a
@@ -126,24 +142,26 @@ pub struct Config {
     /// and not method. `9f9ce70` on this branch corrected exactly this mistake
     /// once already, in a different comment.
     ///
-    /// **The native figure below is still derived, and is labelled as such**
-    /// because it cannot be measured here: the host `detector/.venv` has no
-    /// `onnxruntime`, so its `/health` reports `ner: false` and it runs the
-    /// deterministic layer alone. **Derived: about 15 s**, from the README
-    /// bench's 80-character row (109 ms, per-call cost and almost nothing else,
-    /// because the price is paid per inference pass rather than per character)
-    /// plus its 1 200-character row for the marginal rate. Treat it as an
-    /// estimate until somebody runs the replay on a host with the NER extras
-    /// installed.
+    /// **The native equivalent of that replay is still derived, and is
+    /// labelled as such** because it cannot be measured here: the host
+    /// `detector/.venv` has no `onnxruntime`, so its `/health` reports
+    /// `ner: false` and it runs the deterministic layer alone. **Derived: about
+    /// 15 s**, from the README bench's 80-character row (109 ms, per-call cost
+    /// and almost nothing else, because the price is paid per inference pass
+    /// rather than per character) plus its 1 200-character row for the marginal
+    /// rate. Treat it as an estimate until somebody runs the replay on a host
+    /// with the NER extras installed.
     ///
     /// Per-call overhead is the majority of both figures — 265–410 ms of a call
     /// against the compose detector, 109 ms natively — not a rounding term.
     ///
     /// These defaults are under review on that evidence, and the number was not
     /// lowered on the strength of it: a bound below real traffic turns a long
-    /// wait into a refusal of a client that did nothing wrong. The fix is issue
-    /// #28 — one call for a document instead of one per string, which collapses
-    /// the term that dominates — and not a larger or smaller number here.
+    /// wait into a refusal of a client that did nothing wrong. One call for a
+    /// document instead of one per string was the fix for the term that
+    /// dominates, and it has landed; what is left for issue #28 is making
+    /// detection fast on a large text, which is a different problem and not a
+    /// number here.
     ///
     /// 20 000 rather than 18 000 because the headroom rule above is now
     /// asserted rather than described, and 18 000 failed it by ten characters.
