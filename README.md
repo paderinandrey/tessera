@@ -179,6 +179,48 @@ message content are masked too — OpenAI's `user` and per-message `name`, Anthr
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.
 
+Tool traffic is masked on the buffered path, for both providers and in both directions: a
+tool definition's description and the whole of its schema — `enum` members, `default`,
+`title`, `examples`, not `description` alone — a tool call's arguments, and a tool result.
+A schema keyword's value is left alone only where the keyword really states an identifier,
+which is a question about the string and not only about its container: `{"type": "Martina
+Weber"}` names none of JSON Schema's seven types, so it states no type and is masked like
+any other value the walk does not recognize, inside a well-formed `allOf` or out of one.
+The check runs to wherever the keyword's own draft stops being unambiguous and no further,
+because one stricter than the draft breaks a working schema at the caller: a media type is
+read down to its RFC 2045 parameters, so `"text/plain; Martina Weber"` states no parameter
+and is masked while `"text/plain; charset=utf-8"` is left alone; `$dynamicAnchor` is held
+to 2020-12's pattern alone, because 2020-12 is the only draft that defines the keyword,
+while `$anchor` keeps the union of both drafts that do; and a `pattern` is checked for
+structure — a group that closes, a class that closes, a backslash with something to escape
+— rather than parsed, because the parsers available here reject lookaround and
+backreferences that ECMA-262 and JSON Schema both allow. Each of those leaves a residual,
+and each residual is named where the check is. Only the keywords holding the caller's *own*
+vocabulary — `required` and `dependentRequired`, which hold property names — are exempt
+entirely, because there is nothing to check them against and a rule invented for them would
+mask a schema that was correct.
+
+Names are not. A tool's name, a schema property name and a `tool_call_id` are the client's
+own dispatch, matched against strings it authored, so masking one breaks the call and
+leaves the client no way to learn why. What is required of them is that they be *strings*:
+the argument for leaving the characters alone is an argument about the character set, and
+a structured value has no characters — `{"name": {"owner": "Martina Weber"}}` was admitted
+and forwarded verbatim until the type was checked. So the residual a name carries is a
+string the caller chose, which is smaller than "whatever the caller put under `name`". Arguments are walked as JSON and only string leaves
+are touched, so the masker never sees a brace or a quote and cannot hand back a document
+the client fails to parse — and a tool call in a response is restored before the client
+executes it, the one place here where a failed restoration would be a wrong action rather
+than a wrong display.
+
+Masking a definition costs two things, both deliberate and both visible from outside. A
+definition is prose the model reads, so a placeholder in one changes how the model chooses
+a tool: ten real Claude Code tool definitions carrying no personal data at all yield
+thirteen spans — tool names, ordinary English words in capitals, a parameter called
+`main` — and every one is masked. `[PERSON_1]` inside a tool description is this working
+rather than corruption. And definitions are scanned on a session's first turn, which is
+seconds of detector time a caller waits through once; every turn after that is free,
+because definitions are byte-identical and the detection cache serves them.
+
 Provider credentials pass through on a per-provider allowlist: `Authorization` and OpenAI's
 routing headers go to OpenAI, `x-api-key` and `anthropic-version` go to Anthropic, and
 nothing else goes anywhere. A caller holding both sets of credentials does not have one
@@ -188,15 +230,121 @@ client's. Coming back, the provider's status and its rate-limit headers are pres
 
 **Every failure refuses the request**, and refuses it *before* the upstream call wherever
 the problem is visible there. A detector that errors or exceeds its timeout; a body whose
-shape the gateway has no rule for, including tool definitions, tool traffic, Anthropic's
+shape the gateway has no rule for, including Anthropic's
 extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
 OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
 span the detector reports at a position that cannot be applied — inverted, past the end of the
 text, or overlapping another; and a placeholder in the response that no
 mapping knows — each of these ends the request. Once a stream has begun there is nothing
-left to refuse, so it ends mid-flight instead; the rule it protects is the same. Nothing
-unmasked is forwarded, and no placeholder is ever handed to the client in place of a value.
-No error body or log line carries the submitted text.
+left to refuse, so it ends mid-flight instead; the rule it protects is the same. No text
+this gateway scans is forwarded unmasked. No error body or log line carries the submitted
+text.
+
+Restoration is narrower than that, and the difference is measured rather than assumed.
+Anthropic's response path is a closed list of block *types* — a block whose type it cannot
+read refuses the response rather than handing a placeholder over — and OpenAI's is not: it
+restores a choice's `content` and forwards every other field of the message as the provider
+sent it. Two things were measured wrong on the Anthropic half and both are now closed. The
+type check ran *second*, after a check for a `text` field, so a block carrying a `text`
+never reached the closed list at all: `{"type": "tool_use", "text": "ok", "input": {...}}`
+had its text described and its arguments forwarded unrestored, which is a placeholder
+reaching a client that *executes* it. And the list was closed on the type alone, so a field
+the block's type does not define was handed over as the provider wrote it — measured, at
+200, with `citations[].cited_text` carrying `[PERSON_1]` into what the client received.
+Anthropic's response blocks now have a closed list of *fields* as well as of types, and a
+field outside it refuses the response. **OpenAI's response path has neither**: a `refusal`,
+which any OpenAI refusal populates, and an `annotations[].url_citation.title` both reach
+the client **with this gateway's own placeholder in them**. That is the one direction the
+design is not closed in, it is filed as #31, and closing it means closing the list rather
+than naming those two fields.
+
+Two things it does not scan, and both are worth knowing before you rely on the sentence
+above. **Image and audio parts are forwarded untouched**, including a screenshot inside a
+tool result, which is the same exposure through a different field rather than a new one.
+Nothing here reads pixels, so a photograph of an identity document reaches the provider as
+the client sent it. And **the body and the message levels are not allowlisted at all** —
+see below, because that is the other half of the closed-allowlist claim.
+
+Tool traffic is masked now, so what it still refuses is worth stating on its own.
+**Streamed tool calls**, which the buffered path's masking does not reach: a document
+arriving a delta at a time is not well formed until its block closes, so masking it means
+buffering the block first, which the streamed path does not do yet. A
+**tool-field shape the gateway has no rule for** — and the rule is a *closed allowlist*, so
+an unrecognized content-block type, or a field beside the ones each tool structure is
+described by, is refused rather than forwarded. That is deliberately the expensive
+direction: a field no slot addresses would travel to the provider exactly as the caller
+wrote it, so a provider feature shipped tomorrow refuses here instead of leaking through.
+**The allowlist admits a shape and not only a key**, which is the other half of that and
+was the later half: every entry records why admitting it is safe, and a field the provider
+constrains to a boolean, an enum or a fixed literal has that value checked. **And a block
+type is admitted in a position, not in general** — the later half again, one layer out:
+the same walk reads OpenAI's message content, Anthropic's message content, Anthropic's
+`system` and a `tool_result`'s own content, and it admitted every block type in all four.
+An Anthropic `tool_use` therefore rode in an OpenAI message with its `name` — dispatch, so
+scanned by nothing — and tool blocks were accepted in a `system` prompt that takes text
+blocks only. Each position now carries the set its provider publishes for it. `"strict":
+"Martina Weber"`, `"is_error": "Martina Weber"` and `cache_control: {"type": "Martina
+Weber"}` were each admitted by a list and each reached the provider verbatim, under
+comments that stated the shapes correctly. **A field can also be admitted by not being
+refused**, which is the case the allowlist rule does not cover: `tool_choice` and OpenAI's
+`parallel_tool_calls` are body fields, and there is no allowlist at body level for them to
+be entries of, so they were admitted by absence from the denylists and read by nothing.
+Both are described now — each provider's published `tool_choice` shapes, and a boolean —
+with one exception stated plainly: OpenAI's newer `tool_choice: {"type": "allowed_tools",
+…}` nests tool definitions this gateway does not describe there, and is refused rather
+than forwarded, which is a 400 where there used to be a 200. **And a field can be admitted
+by an allowlist that something else selects**, which is the third way and the narrowest:
+OpenAI's `tool_call_id` is on the allowlist for a `role: "tool"` message, that allowlist is
+chosen by the role, and the denylist running for every message did not carry the field — so
+`{"role": "user", "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}` was
+addressed by nothing and forwarded. It is refused on every other role now, in the same
+`if` that selects the allowlist, because a denylist entry would refuse the tool message the
+field belongs to.
+
+**That closure is scoped to the tool structures, and the body and the message levels have
+no allowlist at all.** It is true of a tool definition, a tool call, a tool result and a
+content block, where it was hard-won; it is false one field over. A body field this gateway
+describes no slot for travels to the provider exactly as the caller wrote it — verified for
+OpenAI's `response_format.json_schema.schema`, which is *the same artifact* as a tool's
+`parameters` (a client-authored JSON Schema whose `description`, `enum` and `default` are
+prose the model reads); `prediction.content`, the Predicted Outputs field editor clients
+fill with whole file contents; `metadata`; `stop`; a top-level `safety_identifier`; and
+Anthropic's `stop_sequences`. A field invented on a *message* travels the same way. If you
+are deciding whether to point an agent at a customer folder: the prompt, the tool
+definitions, the tool arguments and the tool results are covered, and the request envelope
+around them is not.
+It is also what closes two things a caller may miss. Anthropic's **citations** are refused
+on the request path — a `text` block may carry `cited_text`, which is quoted source
+material, and clients echo assistant turns back as history, so a conversation that used
+citations refuses on its next turn. And **every tool Anthropic runs itself** goes with
+them — `web_search_*`, `web_fetch_*`, `code_execution_*`, the tool-search tools, the
+advisor — because the answer to one is a `server_tool_use` block and a result block of the
+tool's own, and this gateway describes neither. It used to refuse those *after* the model
+had run: a bare `{"name": "t", "type": "code_execution_20250522"}` passed the definition
+gate, the request was forwarded, the tokens were spent, and the caller received a 502.
+The type is checked before the call now, so the same refusal costs nothing. What passes is
+the tools the **caller** runs — `bash_*`, `text_editor_*`, `computer_*`, `memory_*` — whose
+results come back as the ordinary `tool_result` the caller sends, and a version of one of
+those is admitted the day Anthropic ships it, so the coding-agent category is unaffected.
+The fields a definition may carry are read **per type**, because they differ per type:
+`computer_*` carries the display Anthropic documents as required (`display_width_px`,
+`display_height_px`, and optionally `display_number` and `enable_zoom`) and
+`text_editor_*` carries `max_characters`, each checked as a number, and each refused on a
+type that does not define it.
+Describing those response blocks is the follow-up; refusing is not the finished feature. Anthropic's **`mcp_servers`** is refused for a sharper
+version of the same reason: it grants the model tools this gateway never described, so
+their calls and results arrive shaped by a server it cannot account for — and it carries
+the caller's own `authorization_token` besides. A **number that carries personal data** is
+refused rather than masked, because replacing `4111111111111111` with `[CREDIT_CARD_1]`
+turns a JSON number into a string and a schema that declared a number may reject it; that
+refusal steps aside for exactly one thing: a span carrying one of the fourteen NER types,
+since an NER label on a bare digit run is a judgement about meaning where there is no
+meaning to judge, so a number those labels alone find is forwarded. The eight deterministic
+identifiers refuse, and so does a type in **neither** half — a label this gateway does not
+recognize is a detector reporting personal data of a kind nobody here can weigh, which is
+not the same thing as a label known to be ungrounded on digits. And a
+request whose tool structures exceed `max_tool_chars` or `max_tool_calls` is refused before
+the detector is called at all.
 
 Placeholders carry the type the detector reported, but only when it is one this gateway
 declares — twenty-two of them, the catalog's eight deterministic identifiers plus the
@@ -263,8 +411,12 @@ density rather than assumed: real text runs roughly 1.0 to 2.5 spans per 1 000
 characters, so the default covers prose to about 100 KB, logs to about 188 KB and source
 to 250 KB — every realistic single tool result. A detection over the cap is masked,
 restored and returned exactly like any other; it is simply not stored, so an oversized
-result never becomes a refusal, only a permanent miss. At the shipped defaults the worst
-case is about 118 MB. Unlike the session table, the cache has no idle TTL — an entry
+result never becomes a refusal, only a permanent miss. At the shipped defaults that
+arithmetic comes to about 118 MB, which is a typical case rather than a ceiling: the 46
+bytes per span were measured against real detector output, where a type name is `PERSON`
+or `IBAN`, and the cache now declines any entry carrying a span whose type name runs past
+40 bytes, so the true ceiling is nearer 200 MB — analytical, from the struct's layout,
+rather than re-measured the way the 46 bytes were. Unlike the session table, the cache has no idle TTL — an entry
 outlives its conversation and stays reachable for as long as the process runs, until the
 detector's
 version changes or the cache fills and something else is used more recently. And unlike
@@ -291,6 +443,22 @@ a deployment whose texts really are dense throughout, priced by the formula in
 `gateway/tessera.example.toml` (`entries × (264 + spans × 46)`), and recomputed there
 against the deployment's own texts.
 
+The tool structures a request newly scans have two bounds of their own, and unlike the
+cache's, exceeding either is a refusal rather than a miss: `max_tool_chars` (default
+20 000) bounds how many characters they send to the detector, and `max_tool_calls`
+(default 40) bounds how many detector round-trips they need. Both are denominated in what
+detection costs rather than in what the request weighs. A document is **one call however
+many strings are in it**, so a schema of a thousand short values is a single round-trip;
+and the characters charged are the ones the detector reads, not the braces, quotes and
+property names carrying them, which cost it nothing. Both defaults are twice a measurement
+taken on ten real Claude Code tool definitions, which charge 9 193 characters across 20
+calls. That payload is a **floor** and is stated as one: a stock session also carries tools
+the measurement did not, and an MCP server adds more, so a large enough tool payload is
+refused rather than served slowly. Issue #28 — making detection fast on a large text — is
+the work that lifts the ceiling; until it lands, the honest answer to a payload past these
+numbers is a refusal, not a wait long enough that the client's own HTTP timeout would cut
+it off anyway.
+
 A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or
 `session_idle_secs = 0` — is refused before the detector runs rather than served without
@@ -314,8 +482,15 @@ headers and fields like `id:` reach the client as the provider sent them.
 If a token turns out to have no mapping, bytes have already gone out and the request cannot
 be refused. The stream ends instead, with an `error` event naming the failure — the client
 gets a truncated answer, never a placeholder in place of a name. Streamed tool calls
-(`tool_calls`, `input_json_delta`) end the stream for the same reason they are refused on
-the buffered path: their arguments are not masked yet. Extended thinking is refused before
+(`tool_calls`, `input_json_delta`) end the stream, and no longer for the reason they once
+did — the buffered path masks tool arguments now. What it cannot do in fragments is read
+them: a document arriving a delta at a time is not well formed until its block closes, and
+a placeholder can be split across two deltas *and* land inside a half-written JSON value
+at the same time, so masking one means buffering the whole block first — which is exactly
+what the streamed path does not do yet. A request carrying tool traffic together with
+`stream: true` is therefore refused before the upstream call, where it costs no tokens,
+and a tool block the model produces inside a stream that was allowed ends that stream.
+Extended thinking is refused before
 the upstream call rather than at its first streamed block, so the refusal costs no tokens.
 
 Whatever was already restored is served before the error event, whether the stream ends
@@ -345,7 +520,7 @@ group the fields for reading; on disk each line serializes its keys in
 alphabetical order, which nothing depends on.
 
 ```json
-{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0}
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"documents":2,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0,"forwarded":0}
 {"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
@@ -361,28 +536,85 @@ That is why `tenant` and `session` appear on the outcome line as well as the
 masked one: a refusal has no masked line to join to, and the redundancy on the
 two-line case costs a few bytes.
 
-The record counts and never quotes. `types` counts distinct values per type and
-`spans` counts occurrences; the gap between them is a value named more than once
-within the same request, not anything a session did — detection runs over every
-text on every request whether or not one is attached, so the coreference a
-session buys across turns leaves no trace here. Neither the values, hashes of
-them, their offsets nor the placeholder names are written. `error` is drawn from
-a fixed vocabulary rather than formatted from a message, so no expression in the
-writer could interpolate submitted text. A type name the detector reports that
-is not a legible type — the mapping lets one through whenever the value was
-already masked earlier in the same request or in an earlier turn — is counted
-under `unvalidated` rather than written out, since the name itself came from
-outside the perimeter. Seeing that key means the detector and the gateway
-disagree about what a type is; the gateway also says so in its own log.
-`redacted` counts the values the mapping masked as `[REDACTED_n]` because their
-type was not one it declares — which `types` does not show, since it is built
-from what the detector reported and not from what the placeholder ended up
-carrying. A line naming `WEBER` and a `redacted` of 1 says the provider received
-`[REDACTED_1]`, not `[WEBER_1]`.
+The record counts and never quotes. Neither the values, hashes of them, their
+offsets nor the placeholder names are written. `error` is drawn from a fixed
+vocabulary rather than formatted from a message, so no expression in the writer
+could interpolate submitted text.
+
+**What the detector was shown.** `texts` counts texts and `documents` counts
+tool documents; each is one detection, whatever the number of leaves the
+document holds. A document holding no leaves at all — `{}`, or one whose every
+field is a boolean — is counted in neither, because nothing about it was
+scanned. `texts + documents` is therefore exactly the number of detections this
+request asked for — served by the detector, or from its cache when the same text
+has already been seen under the same credential. Two identical messages are two
+detections and one call, so these are not a count of the detector's traffic.
+
+**What it found.** `types` counts distinct values per type, as the *detector*
+named them, and `spans` counts occurrences; the gap between them is a value
+found more than once under the same name within the same request, not anything
+a session did — detection runs over every text on every request whether or not
+one is attached.
+A type name the detector reports that is not one of the twenty-two this gateway
+declares is counted under `unvalidated` rather than written out, since the name
+arrived from outside the perimeter and a name is a place a value can hide.
+Seeing that key means the detector and the gateway disagree about what a type
+is; the gateway also says so in its own log.
+
+**What the provider received.** Every *occurrence* — one span, the unit `spans`
+counts — is in exactly one of three states, and two of them are counted.
+`redacted` counts the occurrences the provider received under a placeholder that
+does **not** carry the detector's name for them: usually because the type was
+not one this gateway declares, so the value went up as `[REDACTED_n]`, and also
+when the value was already carrying a placeholder issued for another type,
+whether earlier in this request or in an earlier turn of the session.
+`forwarded` counts the occurrences the provider received verbatim: a span on a
+numeric leaf of a tool document, which this gateway deliberately does not mask,
+because a placeholder there would change the field from a number to a string.
+`spans − redacted − forwarded` is what is left, and it went up under the name
+`types` gives it. So a line whose `redacted` and `forwarded` are both zero says
+the provider received `[PERSON_1]` for every `PERSON` it names, and it is the
+only line that says so.
+
+These two count occurrences and not findings, so they compare with `spans` and
+not with `types` — a value masked three times is three of them. That is not
+bookkeeping taste: one value can be **both** forwarded and masked in one
+request, because the same number can be a `maximum` and appear in a
+`description` beside it. Its fate is a pair of fates, so a per-value counter
+would have to choose one and say the other did not happen; the earlier version
+of this field did, and a line read `types: {"PERSON": 1}, forwarded: 1,
+redacted: 0` for a request in which the provider received `[PERSON_1]` as well
+as the digits. A span lands in exactly one leaf and a leaf is masked or
+forwarded whole, so an occurrence has exactly one fate and the three numbers
+account for the line.
+
+Both counts describe *this* request. Two turns of a session carrying identical
+traffic write identical lines, and what the session bought across them — the
+same value keeping the same number — leaves no trace here.
+
+**Whose fault the line says it was.** `error` names the failure, not the party,
+and a 502 can mean either the provider or this gateway — so the classes that
+mean *a defect here* are worth knowing by name: `shape_pointer` (a pointer this
+gateway produced did not resolve in a body it had already walked),
+`mapping_unknown_placeholder`, `mapping_bad_span`, `mapping_mask_mismatch` and
+`mapping_placeholder_key`. `shape_response` and `upstream_failed` are the
+provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
+`mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
+`tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
+`session_disabled` and `session_no_credential` are the caller's;
+`detector_transport`, `detector_status`, `session_saturated` and
+`audit_write_failed` are this deployment's own machinery rather than anybody's
+mistake. A run of the first group is worth a page; a run of the second is worth
+a look at the provider's status. Every class this gateway can write appears in
+one of those four groups, and a test holds this paragraph to the code.
+
 `result` is one of `completed`,
 `refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
 defaults to on drop — in practice, a client that disconnects while a stream is
-still open, recorded as itself rather than as a success nobody observed.
+still open, recorded as itself rather than as a success nobody observed. On an
+`aborted` line `status` is `0` and is not an HTTP code: no status was ever
+observed for that request, and the field keeps the shape every other line has
+rather than claiming an outcome nobody saw.
 
 `tenant` and `session` are salted digests, never a key and never the raw session
 id — a client may well name its session after the person in it. The salt lives
@@ -555,7 +787,8 @@ stable signal and p95 as an upper bound until these run on dedicated hardware.
 ## Status
 
 Early development. The detector, the gateway — sessions, streaming, the audit
-journal — and the two-container stack above all work end to end. Not ready for
+journal, tool traffic on the buffered path — and the two-container stack above
+all work end to end. Not ready for
 production use: the gateway authenticates no caller, and nothing here has been
 run in anger.
 

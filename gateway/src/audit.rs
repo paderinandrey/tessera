@@ -1,9 +1,22 @@
-//! The audit journal: append-only JSONL evidence that a request was
-//! pseudonymized before it reached the provider.
+//! The audit journal: append-only JSONL evidence of what this gateway did to a
+//! request before it reached the provider.
+//!
+//! "Pseudonymized" is what that is on almost every line and is not what the
+//! line *says*, which is the distinction the `forwarded` count exists to keep:
+//! there is one position — a numeric leaf of a tool document — where a detected
+//! span is deliberately left in place, and a journal that could not say so
+//! recorded it identically to a masking that happened.
 //!
 //! Nothing here ever writes a submitted value, a hash of one, an offset or a
 //! placeholder name. What it writes is counts, a fixed vocabulary of error
 //! classes, and salted digests of the caller's credential and session.
+//!
+//! That sentence was false for as long as this file has existed, and the one
+//! field that made it false is the one field whose keys come from outside the
+//! perimeter: `types`. It admitted anything the detector shouted in capitals,
+//! which is a grammar a submitted value can be dressed in. It now admits
+//! twenty-two names — see `is_entity_type` — and the sentence above is a claim
+//! the code makes rather than one it asserts.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -40,13 +53,30 @@ const SALT_BYTES: usize = 32;
 /// the very thing it exists to flag.
 const UNVALIDATED_TYPE: &str = "unvalidated";
 
-/// The grammar a type name must match to reach a journal line, shared with the
-/// placeholder grammar in `mapping` so the two cannot drift into disagreeing
-/// about what a type is.
+/// Whether a type name may be written into a journal line: the character
+/// grammar `mapping` uses for a placeholder, within `MAX_ENTITY_TYPE`, **and**
+/// a member of `mapping::ENTITY_TYPES`.
+///
+/// The grammar was all of it until this round, and the grammar is not a check
+/// on the value — it is a check on the *shouting*. `MARTINA_WEBER_HAUPTSTRASSE_VIER`
+/// passes every clause of it: non-empty, forty characters, upper-case and
+/// underscores. Uppercasing and underscore-joining costs a detector nothing,
+/// forty characters holds a name and a street, and every span of the request is
+/// a separate key — so the channel was as wide as the request, on an ordinary
+/// 200 whose client response was correct and whose provider saw
+/// `[REDACTED_1]`. The vocabulary is the check that asks about the value:
+/// there are twenty-two names it may be, and they are declared here rather
+/// than by the detector for the reason `ENTITY_TYPES` gives.
+///
+/// The grammar is kept rather than replaced. It is strictly redundant while
+/// every declared type satisfies it — `every_declared_type_reaches_a_journal_line`
+/// is what keeps that true, and would fail loudly rather than let a declared
+/// type carrying a digit be bucketed as `unvalidated` — and `MAX_ENTITY_TYPE`'s
+/// own documentation names this as its one use at runtime.
 fn is_entity_type(name: &str) -> bool {
-    !name.is_empty()
+    crate::mapping::is_type_characters(name)
         && name.len() <= crate::mapping::MAX_ENTITY_TYPE
-        && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        && crate::mapping::ENTITY_TYPES.contains(&name)
 }
 
 /// A salted digest, and the only thing `Record::attribute` accepts.
@@ -421,11 +451,80 @@ struct State {
     session: Option<Digest>,
     stream: bool,
     texts: usize,
+    documents: usize,
     spans: usize,
     types: BTreeMap<String, usize>,
     redacted: usize,
+    forwarded: usize,
     upstream: bool,
     outcome: Option<(&'static str, u16, Option<&'static str>)>,
+}
+
+/// What detection found in one request, and what became of it.
+///
+/// A struct rather than six positional arguments, five of them `usize`: two
+/// counts transposed at a call site produce a journal line that parses, that
+/// reconciles against nothing, and that no test asserting on a response body
+/// could see. The fields are the journal's own vocabulary, so they are named
+/// here rather than assembled from a tuple at the call site.
+///
+/// **Two units, and the partition is over the smaller one.** A *finding* is one
+/// distinct (type, value) pair the detector reported, and `types` counts
+/// findings per type. An *occurrence* is one span; `spans` counts occurrences
+/// and is never the smaller of the two — a value found twice under one name is
+/// one finding and two spans. `redacted` and `forwarded` count **occurrences**,
+/// so they are commensurable with `spans` and not with `types`: every
+/// occurrence is in exactly one of three states, and `spans - redacted -
+/// forwarded` is the third — the ordinary one, where the provider received
+/// `[TYPE_n]` under the name `types` gives it.
+///
+/// **A finding cannot carry the partition, and that is not a preference.** One
+/// value can occupy a numeric leaf, where `proxy::mask_all` forwards it, and a
+/// string leaf, where it is masked; one value can also be forwarded in a number
+/// and masked under *another* type's name in a string. Its fate is a set, not a
+/// state, and counters over sets do not partition. Counting per finding made a
+/// line say the provider had received the digits *instead of* the placeholder
+/// when it had received both.
+///
+/// What an auditor may still read off one line: `redacted` and `forwarded` both
+/// zero says every name in `types` reached the provider as `[TYPE_n]`, and
+/// nothing else does. A mixed fate cannot make that sentence false, because a
+/// mixed finding puts a count in one of the two fields and the sentence
+/// declines to speak.
+#[derive(Debug, Default)]
+pub struct Detected {
+    /// Texts this request asked a detection for — one each.
+    ///
+    /// *Asked for*, not *called*: a text already seen under the same credential
+    /// is served from the detection cache and reaches no detector, so two
+    /// identical messages are two here and one call. Measured, at 200: `texts:
+    /// 2` against one request at the detector's door.
+    pub texts: usize,
+    /// Tool documents this request asked a detection for — one each, however
+    /// many leaves the document holds, and served from the cache on a repeat
+    /// exactly as `texts` is. A document holding **no** leaves is not counted
+    /// here, because nothing about it was scanned and nothing was asked of
+    /// anybody: counting it as a text is what let a document the detector never
+    /// saw read, in the evidence, exactly like one it did.
+    pub documents: usize,
+    /// Occurrences the detector reported, across every call.
+    pub spans: usize,
+    /// Distinct values per type, as the **detector** named them. Not as the
+    /// provider received them — `redacted` and `forwarded` are what say that.
+    pub types: BTreeMap<String, usize>,
+    /// Occurrences the provider received under a placeholder that does not
+    /// carry the detector's own name for them. Occurrences, so that a value
+    /// masked three times is three of these and the line's own `spans` accounts
+    /// for it; every masked occurrence of one value carries the same
+    /// placeholder, so the count is exact.
+    pub redacted: usize,
+    /// Occurrences the provider received verbatim, because this gateway
+    /// deliberately declined to mask them: a span on a numeric leaf of a tool
+    /// document, where a placeholder would change the field's type. The
+    /// forwarding is a decision made in `proxy::mask_all` and argued there;
+    /// this is the field that stops the journal from recording it as a
+    /// pseudonymization that happened.
+    pub forwarded: usize,
 }
 
 impl Record {
@@ -461,8 +560,8 @@ impl Record {
         });
     }
 
-    /// What detection found in *this request's* texts: distinct values per
-    /// type, and occurrences in total. Never the values.
+    /// What detection found in *this request's* texts, and what the provider
+    /// then received. Never the values.
     ///
     /// The keys arrive from the detector's `span.entity_type`, an unrestricted
     /// string on the wire, and this check is the only thing standing between
@@ -473,30 +572,32 @@ impl Record {
     /// value that is already mapped — a repeat within one text, or anything
     /// seeded from an earlier turn of a session — passes the mapping with its
     /// type unexamined and arrives here intact. A 200-OK request is enough to
-    /// produce one.
+    /// produce one, and until this round a name shaped like a type was *copied
+    /// into the evidence*, which is why the check is now a vocabulary and not
+    /// only a grammar. See `is_entity_type`.
     ///
-    /// So a key that is not a legible type name is counted under
-    /// `UNVALIDATED_TYPE` rather than copied into the evidence. Deleting this
-    /// loop puts detector-controlled text into the journal on a successful
-    /// request; `a_repeated_value_carries_its_type_past_the_mapping_unvalidated`
-    /// in `proxy.rs` is that request.
+    /// So a key that is not one of ours is counted under `UNVALIDATED_TYPE`
+    /// rather than written down. Deleting this loop puts detector-controlled
+    /// text into the journal on a successful request;
+    /// `a_repeated_value_carries_its_type_past_the_mapping_unvalidated` in
+    /// `proxy.rs` is that request.
     ///
-    /// `redacted` is how many spans the *mapping* declined to name, which is a
-    /// different question from the one this loop asks and is answered by a
-    /// different rule: a type this check finds legible — `WEBER` is — can still
-    /// be one the mapping does not declare, in which case the provider received
-    /// `[REDACTED_1]` while this line says `WEBER`. An auditor reconciling the
-    /// journal against the traffic would get a mismatch on the artifact the
-    /// product exists to produce. The count is passed in rather than derived
-    /// here, and `types` is still built without consulting the mapping, so that
-    /// recording the divergence does not make either check depend on the other.
-    pub fn detected(
-        &self,
-        texts: usize,
-        spans: usize,
-        types: BTreeMap<String, usize>,
-        redacted: usize,
-    ) {
+    /// `redacted` and `forwarded` answer a different question from the one this
+    /// loop asks — what the *provider* received, against what the detector
+    /// *said* — and they are computed where that is knowable, in
+    /// `proxy::mask_all` against the mapping this request masked with. They are
+    /// passed in rather than derived here, and `types` is still built without
+    /// consulting the mapping, so that recording the divergence does not make
+    /// either check depend on the other.
+    pub fn detected(&self, found: Detected) {
+        let Detected {
+            texts,
+            documents,
+            spans,
+            types,
+            redacted,
+            forwarded,
+        } = found;
         let mut checked: BTreeMap<String, usize> = BTreeMap::new();
         let mut unvalidated = 0usize;
         for (name, count) in types {
@@ -516,15 +617,17 @@ impl Record {
             // to be noticed.
             tracing::warn!(
                 count = unvalidated,
-                "the detector reported entity types outside the placeholder grammar; \
+                "the detector reported entity types this gateway does not declare; \
                  they are counted as unvalidated rather than named"
             );
         }
         self.with(|state| {
             state.texts = texts;
+            state.documents = documents;
             state.spans = spans;
             state.types = checked;
             state.redacted = redacted;
+            state.forwarded = forwarded;
         });
     }
 
@@ -547,9 +650,11 @@ impl Record {
                 "session": state.session,
                 "stream": state.stream,
                 "texts": state.texts,
+                "documents": state.documents,
                 "spans": state.spans,
                 "types": state.types,
                 "redacted": state.redacted,
+                "forwarded": state.forwarded,
             })
             .to_string()
         });
@@ -625,6 +730,14 @@ impl Drop for Inner {
             .unwrap_or_else(|error| error.into_inner());
         // No signal means the request ended in a way none of the exits reach —
         // in practice a client that disconnected mid-stream.
+        //
+        // The 0 is not an HTTP status and is not meant to be read as one: on
+        // this line no status was ever observed, and the alternative — leaving
+        // the field out, or carrying the 200 an open stream had already sent —
+        // either breaks the schema every other line has or claims an outcome
+        // nobody saw. `README.md` says so where it describes `aborted`, because
+        // a reader parsing `status` as a code is the one person this would
+        // mislead.
         let (result, status, error) = state.outcome.unwrap_or(("aborted", 0, None));
         // `tenant` and `session` are repeated from the `masked` line rather
         // than left to a join, because a request refused before `masked` has
@@ -1241,7 +1354,14 @@ mod tests {
         let tenant = Digest("a41f9c02".repeat(4));
         let session = Digest("3bd7e105".repeat(4));
         record.attribute(tenant, Some(session));
-        record.detected(4, 9, types(&[("PERSON", 2), ("IBAN", 1)]), 0);
+        record.detected(Detected {
+            texts: 4,
+            documents: 2,
+            spans: 9,
+            types: types(&[("PERSON", 2), ("IBAN", 1)]),
+            redacted: 0,
+            forwarded: 0,
+        });
         record.streaming();
         record.masked().await.expect("writes");
         record.completed(200);
@@ -1254,6 +1374,7 @@ mod tests {
         assert_eq!(lines[0]["route"], "/v1/messages");
         assert_eq!(lines[0]["stream"], true);
         assert_eq!(lines[0]["texts"], 4);
+        assert_eq!(lines[0]["documents"], 2);
         assert_eq!(lines[0]["spans"], 9);
         assert_eq!(lines[0]["types"]["PERSON"], 2);
         assert_eq!(lines[0]["session"], "3bd7e105".repeat(4));
@@ -1262,18 +1383,42 @@ mod tests {
 
     #[tokio::test]
     async fn a_masked_record_says_how_many_types_were_not_the_gateways_own() {
-        // Without this the line above is ambiguous: `types` naming WEBER is
-        // consistent both with a placeholder that carried WEBER upstream and
-        // with one masked as [REDACTED_1], and only the second is what happened.
+        // **This test asserted the opposite until this round, and the sentence
+        // it asserted was `"the type is still named"` over the key `WEBER` — a
+        // real German surname, standing in for a detector that returns the text
+        // it found as the type it found.** The reasoning was that `redacted`
+        // disambiguates the line, and it does; what it does not do is stop the
+        // name itself from being written, and the name is a string from outside
+        // the perimeter. `WEBER` was the polite version of
+        // `MARTINA_WEBER_HAUPTSTRASSE_VIER`, which passes exactly the same
+        // check and is a name and a street.
+        //
+        // So the pair is still what this test is about — a type the gateway
+        // does not declare, and the count that says the placeholder did not
+        // carry it — but the type is now counted rather than named.
         let (_dir, audit, path) = fixture();
         let record = Record::new(audit, "openai", "/v1/chat/completions");
-        record.detected(1, 2, types(&[("PERSON", 1), ("WEBER", 1)]), 1);
+        record.detected(Detected {
+            texts: 1,
+            spans: 2,
+            types: types(&[("PERSON", 1), ("WEBER", 1)]),
+            redacted: 1,
+            ..Detected::default()
+        });
         record.masked().await.expect("writes");
         record.completed(200);
         drop(record);
 
         let lines = lines(&path);
-        assert_eq!(lines[0]["types"]["WEBER"], 1, "the type is still named");
+        assert!(
+            lines[0]["types"]["WEBER"].is_null(),
+            "a type the gateway does not declare is not a name to write down: {}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[0]["types"][UNVALIDATED_TYPE], 1,
+            "it is counted, and the count is what tells an operator to look"
+        );
         assert_eq!(
             lines[0]["redacted"], 1,
             "the line does not say the placeholder carried a name the gateway declines"
@@ -1287,39 +1432,90 @@ mod tests {
         // that field would put submitted text in the evidence — which is the
         // one thing the journal may never contain — and this module must not
         // depend on `mapping.mask` having refused it two calls earlier.
+        //
+        // The fourth name is the one this round added, and it is the one the
+        // other three hid: a value **dressed in the grammar**. Every clause of
+        // the old check passes it — non-empty, forty characters, upper-case and
+        // underscores — so a detector willing to uppercase what it found had a
+        // text channel into the evidence file on an ordinary 200.
         let (_dir, audit, path) = fixture();
         let record = Record::new(audit, "openai", "/v1/chat/completions");
-        record.detected(
-            1,
-            4,
-            types(&[
+        record.detected(Detected {
+            texts: 1,
+            spans: 5,
+            types: types(&[
                 ("PERSON", 1),
                 ("Weber, Hauptstrasse 4", 1),
                 ("person", 1),
                 (&"A".repeat(crate::mapping::MAX_ENTITY_TYPE + 1), 1),
+                ("MARTINA_WEBER_HAUPTSTRASSE_VIER", 1),
             ]),
-            0,
-        );
+            ..Detected::default()
+        });
         record.masked().await.expect("writes");
         record.completed(200);
         drop(record);
 
         let text = std::fs::read_to_string(&path).expect("readable");
         assert!(
-            !text.contains("Weber"),
+            !text.contains("Weber") && !text.contains("WEBER"),
             "a detector's type name reached the journal verbatim: {text}"
         );
 
         let lines = lines(&path);
-        assert_eq!(lines[0]["types"]["PERSON"], 1, "a legible type is kept");
+        assert_eq!(lines[0]["types"]["PERSON"], 1, "a declared type is kept");
         assert_eq!(
-            lines[0]["types"][UNVALIDATED_TYPE], 3,
-            "the three illegible names are counted, not quoted"
+            lines[0]["types"][UNVALIDATED_TYPE], 4,
+            "the four names that are not this gateway's own are counted, not quoted"
         );
         assert!(
             !UNVALIDATED_TYPE.chars().any(|c| c.is_ascii_uppercase()),
             "the bucket must be a name no detector's type could also be"
         );
+    }
+
+    #[test]
+    fn every_declared_type_reaches_a_journal_line() {
+        // The cost of keeping the grammar beside the vocabulary rather than
+        // replacing it. The two agree today, so the grammar decides nothing;
+        // a declared type carrying a digit — `PHONE_E164` is a plausible
+        // spelling for the telephone entity the spec records as missing —
+        // would be masked correctly as `[PHONE_E164_1]` and journalled under
+        // `unvalidated`, and the line would report a disagreement between
+        // detector and gateway where there is none.
+        //
+        // This is the assertion that makes that a failing test rather than a
+        // wrong evidence line nobody reads.
+        for entity_type in crate::mapping::ENTITY_TYPES {
+            assert!(
+                is_entity_type(entity_type),
+                "{entity_type} is declared and would be counted as {UNVALIDATED_TYPE}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_dressed_as_a_type_is_not_one() {
+        // C1, at the function rather than through the router. Each of these
+        // passes the character grammar and the length bound that were the whole
+        // of this check, and none of them is a type.
+        for shouted in [
+            "MARTINA_WEBER_HAUPTSTRASSE_VIER",
+            "WEBER",
+            "MARTINA",
+            "PERSON_WEBER",
+            "REDACTED",
+        ] {
+            assert!(
+                crate::mapping::is_type_characters(shouted)
+                    && shouted.len() <= crate::mapping::MAX_ENTITY_TYPE,
+                "{shouted} is supposed to be a name the old check admitted"
+            );
+            assert!(
+                !is_entity_type(shouted),
+                "{shouted} would be written into a journal line"
+            );
+        }
     }
 
     #[tokio::test]

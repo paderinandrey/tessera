@@ -113,3 +113,99 @@ detection_cache_entries = 10000
 # the figure above holds as a typical case rather than an assumed ceiling —
 # the true ceiling is nearer 200 MB at these defaults.
 max_spans_per_entry = 250
+
+# How many characters of text — every tool definition, call argument and
+# result, summed across one request — may be handed to the detector.
+#
+# Characters, not serialized bytes. Cost scales with the text the detector
+# reads; braces, quotes and property names are structure it never sees. On the
+# real ten-tool payload in gateway/src/testdata/claude_code_tools.json the two
+# differ by 1.43x — 13 177 serialized against 9 193 charged.
+#
+# Set from that measurement, at twice it. Ten real tool definitions charge 9 193
+# characters: 9 005 of text, 50 of numbers, and 138 of the separators the join
+# inserts between leaves, every one of which the detector reads. Those ten are a
+# floor: a stock session carries about fifteen tools, extrapolating to roughly
+# 13 800, so 20 000 covers a stock session with room for a small MCP server and
+# does not pretend to cover an arbitrary one. The test
+# a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins the figure and
+# fails if this default stops admitting twice it.
+#
+# What that costs. Two things were offered as making it tolerable: it is the
+# FIRST turn of a session only, since tool definitions are byte-identical
+# afterwards and the detection cache serves them; and the alternative is not a
+# faster gateway but a refused one, because a bound below real traffic makes
+# this unusable with the clients it exists for.
+#
+# NOTHING BOUNDS A REQUEST'S WALL CLOCK, and the caller's patience is not ours
+# to set. Whatever this number permits is what the caller waits, and the caller
+# has its own timeout that this gateway neither sees nor controls. At thirty
+# seconds a client is inside these figures by a hair; at twenty it gives up
+# first and the failure arrives on its side looking like an outage here. No
+# cumulative deadline exists anywhere on the request path that would turn that
+# into an honest refusal instead.
+#
+# THE CONTAINERISED COST IS MEASURED, NOT DERIVED. The 77 leaves of the real
+# ten-tool payload were replayed through /detect in sequence, three times,
+# salted so nothing could come from a cache: 54.9 s median, about 700 ms a leaf.
+# That is a session's first turn with a real tool set. A single call costs
+# 265-410 ms whatever its length, so per-call overhead is the majority of it.
+#
+# That measurement is what BATCHING was built on, and it describes the cost that
+# no longer applies: a document's leaves are one call now, so the same payload is
+# 20 calls rather than 77. The 57 calls that went away were 265-410 ms each --
+# fifteen to twenty-three seconds of pure overhead, derived from the two
+# measurements either side of it. The post-batching wall clock has not been
+# re-replayed.
+#
+# The first version of this figure was DERIVED -- characters over a throughput
+# taken from 1 200- and 6 000-character texts, applied to leaves averaging 116,
+# where overhead dominates and throughput barely applies. It could have been out
+# by a factor of five and nothing in it would have said so. It landed within 5%
+# of the replay, which is luck rather than method.
+#
+# THE NATIVE FIGURE BELOW IS STILL DERIVED and is labelled so, because it cannot
+# be measured here: the host detector/.venv has no onnxruntime, so its /health
+# reports ner: false and it runs the deterministic layer alone. Derived: about
+# 15 s, from the README bench's 80-character row (109 ms, per-call cost and
+# almost nothing else) plus its 1 200-character row for the marginal rate. An
+# estimate until someone runs the replay on a host with the NER extras.
+#
+# The number was NOT lowered on the strength of that evidence: a bound below
+# real traffic turns a long wait into a refusal of a client that did nothing
+# wrong. One call per document instead of one per string was the fix, and it has
+# landed; what is left for issue #28 is making detection fast on a large text,
+# which is a different problem and not a number here. 20 000 rather than 18 000
+# because the headroom rule is now asserted rather than described, and 18 000
+# failed it by ten characters.
+#
+# It is NOT a timeout budget, and this comment used to say it was.
+# detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
+# detector call on its own and never their sum; no cumulative deadline exists
+# anywhere on the request path. Two constraints: the timeout catches a stuck
+# call, this caps how long a caller waits for the whole request.
+max_tool_chars = 20000
+
+# How many detector round-trips those structures may need.
+#
+# One per tool description and one per schema holding any text at all: a
+# document's leaves are detected in a SINGLE call, so a schema of a thousand
+# short strings costs one round-trip rather than a thousand.
+#
+# This key was max_tool_leaves and counted strings, because detection really was
+# one call per string. Batching changed the unit, not the failure: an unbounded
+# number of sequential calls is still what this stops, and max_tool_chars does
+# not stop it -- ten thousand definitions each with a one-character description
+# are ten thousand characters, inside that bound, and ten thousand calls.
+#
+# Set from measurement at twice the measured payload, the same rule
+# max_tool_chars uses. The real ten-tool payload needs 20 calls -- ten
+# descriptions and ten schemas -- where it needed 77 strings before. The test
+# a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins that and
+# fails if this default stops admitting twice it.
+#
+# A call costs 265-410 ms against the compose detector and 109 ms natively,
+# because the price is paid per inference pass rather than per character. At 40
+# that is about sixteen seconds of overhead containerised, against 63 before
+# batching.
+max_tool_calls = 40

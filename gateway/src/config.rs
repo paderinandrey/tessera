@@ -14,6 +14,10 @@ pub enum ConfigError {
         "max_spans_per_entry must be greater than zero unless detection_cache_entries is zero"
     )]
     ZeroSpansPerEntry,
+    #[error("max_tool_chars must be greater than zero")]
+    ZeroToolChars,
+    #[error("max_tool_calls must be greater than zero")]
+    ZeroToolCalls,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +69,145 @@ pub struct Config {
     /// a large result into a refusal.
     #[serde(default = "default_max_spans_per_entry")]
     pub max_spans_per_entry: usize,
+    /// How many **characters of text** one request's tool structures will hand
+    /// to the detector, summed across every definition, argument and result.
+    ///
+    /// Characters, not serialized bytes, and the distinction is the point.
+    /// Detection cost scales with the text the detector reads; braces, quotes
+    /// and property names are structure it never sees. On `mapping`'s real
+    /// ten-tool payload the two differ by 1.43x — 13 177 serialized against
+    /// 9 193 charged — so a bound charging serialized size charges nearly half
+    /// again what detection costs.
+    ///
+    /// **Set from measurement, at twice the measured payload.** Ten real tool
+    /// definitions charge 9 193 characters, about 900 per tool: 9 005 of text,
+    /// 50 of numbers, and 138 of the separators the join inserts between
+    /// leaves, every one of which the detector reads.
+    /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` pins that
+    /// figure and fails if this default stops admitting twice it. Those ten are
+    /// a floor — a stock session carries about fifteen tools, extrapolating to
+    /// roughly 13 800 characters — so 20 000 covers a stock session with room
+    /// for a small MCP server, and does not pretend to cover an arbitrary one.
+    ///
+    /// **What that costs, stated plainly, because it is not free — and no
+    /// figure here is derived from this ceiling.** What was measured is a
+    /// payload, not a bound: the ten-tool replay below, and what one call
+    /// costs. Turning either into "what 20 000 characters costs" means
+    /// characters over a throughput taken on texts ten to fifty times the size
+    /// of these leaves, where per-call overhead dominates and throughput barely
+    /// applies — the derivation `9f9ce70` on this branch exists to correct, and
+    /// the paragraphs below narrate. So: the wait is seconds rather than
+    /// milliseconds, it is paid on a session's first turn, and slower hardware
+    /// has to lower this rather than inherit it. Anything more precise about
+    /// this ceiling would be arithmetic wearing a measurement's clothes.
+    ///
+    /// Two things were offered as making that tolerable. It is the *first* turn
+    /// of a session only: tool definitions are byte-identical every turn after,
+    /// and the detection cache serves them. And the alternative is not a faster
+    /// gateway but a refused one — a bound below real traffic makes this
+    /// unusable with the clients it exists for.
+    ///
+    /// **Nothing bounds a request's wall clock, and the caller's patience is
+    /// not ours to set.** Whatever this number permits is what the caller
+    /// waits, and the caller has its own timeout that this gateway neither
+    /// sees nor controls. A client timeout in the tens of seconds is the same
+    /// order as what these bounds permit: at thirty it is inside by a hair, at
+    /// twenty it may give up first, and the failure then arrives on its side
+    /// looking like an outage here. There is no cumulative deadline anywhere on
+    /// the request path that would turn that into an honest refusal instead.
+    ///
+    /// **The containerised cost is measured, not derived — and it is the cost
+    /// before batching.** The 77 leaves of `mapping`'s real ten-tool payload
+    /// were replayed through `/detect` in sequence, three times, salted so
+    /// nothing could be served from a cache: **54.9 s median**, about 700 ms a
+    /// leaf. That was a session's first turn with a real tool set, one call per
+    /// leaf.
+    ///
+    /// That measurement is what batching was built on, and it prices a cost
+    /// that no longer applies: a document's leaves are one call now, so the
+    /// same payload is 20 calls rather than 77. The 57 calls that went away
+    /// were 265–410 ms each — fifteen to twenty-three seconds of pure overhead,
+    /// derived from the two measurements either side of it. **The post-batching
+    /// wall clock has never been replayed.** Every figure for what this gateway
+    /// costs today, at this ceiling or any other, is therefore derived, and is
+    /// labelled so wherever one is quoted.
+    ///
+    /// Why it is quoted as a measurement rather than as arithmetic: the first
+    /// version of this figure was **derived** — characters divided by a
+    /// throughput taken from texts of 1 200 and 6 000 characters, applied to a
+    /// payload whose leaves average 116. At that size per-call overhead
+    /// dominates and throughput barely applies, so the derivation could have
+    /// been out by a factor of five in either direction and nothing in it would
+    /// have said so. It happened to land within 5% of the replay, which is luck
+    /// and not method. `9f9ce70` on this branch corrected exactly this mistake
+    /// once already, in a different comment.
+    ///
+    /// **The native equivalent of that replay is still derived, and is
+    /// labelled as such** because it cannot be measured here: the host
+    /// `detector/.venv` has no `onnxruntime`, so its `/health` reports
+    /// `ner: false` and it runs the deterministic layer alone. **Derived: about
+    /// 15 s**, from the README bench's 80-character row (109 ms, per-call cost
+    /// and almost nothing else, because the price is paid per inference pass
+    /// rather than per character) plus its 1 200-character row for the marginal
+    /// rate. Treat it as an estimate until somebody runs the replay on a host
+    /// with the NER extras installed.
+    ///
+    /// Per-call overhead is the majority of both figures — 265–410 ms of a call
+    /// against the compose detector, 109 ms natively — not a rounding term.
+    ///
+    /// These defaults are under review on that evidence, and the number was not
+    /// lowered on the strength of it: a bound below real traffic turns a long
+    /// wait into a refusal of a client that did nothing wrong. One call for a
+    /// document instead of one per string was the fix for the term that
+    /// dominates, and it has landed; what is left for issue #28 is making
+    /// detection fast on a large text, which is a different problem and not a
+    /// number here.
+    ///
+    /// 20 000 rather than 18 000 because the headroom rule above is now
+    /// asserted rather than described, and 18 000 failed it by ten characters.
+    ///
+    /// **It is not a timeout budget**, and this comment used to say it was
+    /// ("one constraint written twice"). `detector_timeout_secs` becomes
+    /// `reqwest`'s per-request timeout, so it bounds each detector call on its
+    /// own and never their sum; no cumulative deadline exists anywhere on the
+    /// request path. Two constraints — the timeout catches one stuck call, this
+    /// caps how long a caller waits for the whole request.
+    ///
+    /// Per-call overhead is no longer unmeasured; see above. It is the larger
+    /// half of what both bounds permit.
+    #[serde(default = "default_max_tool_chars")]
+    pub max_tool_chars: usize,
+
+    /// How many detector round-trips one request's tool structures may need.
+    ///
+    /// One per tool description, and one per schema that holds any text at all:
+    /// **a document's leaves are detected in a single call**, so a schema of a
+    /// thousand short strings costs one round-trip rather than a thousand.
+    ///
+    /// This key was `max_tool_leaves` and counted strings, because detection
+    /// really was one call per string and cost tracked the count. Batching
+    /// changed the unit, not the failure — an unbounded number of sequential
+    /// calls is still what this stops, and `max_tool_chars` does not stop it:
+    /// ten thousand tool definitions each carrying a one-character description
+    /// are ten thousand characters, inside that bound, and ten thousand calls.
+    /// So it is renamed to what it now counts rather than kept pointing at a
+    /// quantity that stopped costing anything.
+    ///
+    /// **Set from measurement, at twice the measured payload**, the same rule
+    /// `max_tool_chars` is set by and asserted the same way. The real ten-tool
+    /// payload in `mapping`'s testdata needs **20 calls** — ten descriptions
+    /// and ten schemas — where it used to need 77.
+    /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` pins that
+    /// figure and fails if this default stops admitting twice it.
+    ///
+    /// What a call costs is measured and is the reason this number is small:
+    /// 265–410 ms against the compose detector and 109 ms natively, because the
+    /// price is paid per inference pass rather than per character. At 40 that
+    /// is roughly sixteen seconds of overhead containerised — still the larger
+    /// half of what a request at both bounds costs, but against 63 seconds
+    /// before batching.
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls: usize,
 }
 
 fn default_bind() -> String {
@@ -142,6 +285,12 @@ fn default_detection_cache_entries() -> usize {
 fn default_max_spans_per_entry() -> usize {
     250
 }
+pub fn default_max_tool_chars() -> usize {
+    20_000
+}
+pub fn default_max_tool_calls() -> usize {
+    40
+}
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -159,6 +308,12 @@ impl Config {
         }
         if config.detection_cache_entries > 0 && config.max_spans_per_entry == 0 {
             return Err(ConfigError::ZeroSpansPerEntry);
+        }
+        if config.max_tool_chars == 0 {
+            return Err(ConfigError::ZeroToolChars);
+        }
+        if config.max_tool_calls == 0 {
+            return Err(ConfigError::ZeroToolCalls);
         }
         Ok(config)
     }
@@ -320,5 +475,34 @@ mod tests {
         ))
         .expect("a disabled cache does not care what its dead setting says");
         assert_eq!(config.max_spans_per_entry, 0);
+    }
+
+    #[test]
+    fn the_tool_bounds_have_defaults() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(config.max_tool_chars, 20_000);
+        assert_eq!(config.max_tool_calls, 40);
+    }
+
+    #[test]
+    fn a_zero_tool_bound_is_rejected() {
+        // Either bound at zero is a typo rather than a configuration: it
+        // refuses every tool request, and says so only in a 400 per call.
+        let text = with_audit("max_tool_chars = 0");
+        assert!(matches!(
+            Config::from_toml(&text),
+            Err(ConfigError::ZeroToolChars)
+        ));
+        let text = with_audit("max_tool_calls = 0");
+        assert!(matches!(
+            Config::from_toml(&text),
+            Err(ConfigError::ZeroToolCalls)
+        ));
+    }
+
+    #[test]
+    fn the_call_bound_can_be_sized() {
+        let config = Config::from_toml(&with_audit("max_tool_calls = 8")).unwrap();
+        assert_eq!(config.max_tool_calls, 8);
     }
 }

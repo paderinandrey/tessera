@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::mapping::Shape;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShapeError {
     #[error("request body is not in the expected {0} shape")]
@@ -10,6 +12,14 @@ pub enum ShapeError {
     Pointer(String),
     #[error("{0} request uses {1}, which this gateway does not mask yet; it is refused rather than forwarded")]
     Unsupported(&'static str, &'static str),
+    /// An embedded document that is not the JSON it claims to be. Its own
+    /// variant because it is the *caller's* mistake and nothing else here is:
+    /// `Pointer` is a 502 that blames the upstream, and a model emitting
+    /// truncated `arguments` — which they do — is echoed back by the client on
+    /// the next turn as ordinary input. Blaming the provider for that would
+    /// send the caller looking in the wrong place forever.
+    #[error("{0} tool arguments at {1} are not the JSON they are declared to be")]
+    MalformedDocument(&'static str, String),
 }
 
 /// Where the text lives. Providers describe locations; masking and restoration
@@ -17,8 +27,8 @@ pub enum ShapeError {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn upstream_path(&self) -> &'static str;
-    fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
-    fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError>;
+    fn request_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError>;
+    fn response_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError>;
     /// Where the text lives inside one streamed event. An event type we do not
     /// know carries no slots and is forwarded as it came: both protocols add
     /// event types over time, and `ping` must not break a stream.
@@ -56,41 +66,1020 @@ pub enum Terminates {
     All,
 }
 
+/// Where a maskable value lives, and what kind of value it is. `Text` is a
+/// string masked as it stands. `Json` is a document whose string leaves are
+/// masked and whose keys are not — `embedded` distinguishes a document from a
+/// string holding one, which is the only difference between Anthropic's
+/// `input` object and OpenAI's `arguments`, and `shape` says whether the
+/// document is a schema, whose strings are not all data.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Slot {
+    Text {
+        pointer: String,
+        /// Whether this string is tool traffic, and so counts against
+        /// `max_tool_chars`. A `tool_result` is a `Text` slot like any prompt
+        /// text — it is a bare string — but it is the largest surface tool
+        /// support opens, and a bound that skipped it would be a bound on the
+        /// smaller half. False for ordinary prompt and message text, which the
+        /// tool bound has no business limiting.
+        tool: bool,
+    },
+    Json {
+        pointer: String,
+        embedded: bool,
+        /// Whether the document is a JSON Schema. Every `Json` slot is tool
+        /// traffic, so there is no `tool` flag here — there would be nothing
+        /// to distinguish.
+        shape: Shape,
+    },
+}
+
+impl Slot {
+    /// A plain string that is not tool traffic — prompt text, an identifier
+    /// field, a message part. The common case, named so the call sites do not
+    /// each repeat `tool: false`.
+    fn text(pointer: String) -> Self {
+        Slot::Text {
+            pointer,
+            tool: false,
+        }
+    }
+
+    /// Test-only, and marked so rather than suppressed. Every production site
+    /// has to know *which* kind it holds — masking reads a string or a
+    /// document, the size bound counts documents alone — so each destructures
+    /// its own arm and none of them wants an accessor that erases the kind.
+    /// The tests want exactly that, to assert a list of locations without
+    /// restating how each one is read.
+    #[cfg(test)]
+    pub fn pointer(&self) -> &str {
+        match self {
+            Slot::Text { pointer, .. } => pointer,
+            Slot::Json { pointer, .. } => pointer,
+        }
+    }
+}
+
 pub struct OpenAi;
 pub struct Anthropic;
 
 /// Content parts we deliberately do not scan. Anything else without a `text`
 /// string is refused rather than forwarded: a shape we do not understand may
-/// carry personal data we would pass through untouched. Tool blocks are on this
-/// list by absence — masking their arguments is a later slice, and until then
-/// a request carrying them is refused rather than silently leaked.
+/// carry personal data we would pass through untouched. Tool blocks are not on
+/// this list and are not refused either — `content_pointers` describes them,
+/// because their arguments and results are exactly the text this gateway
+/// exists to mask.
+///
+/// This says what a block type *costs* once it is admitted, not *where* it may
+/// appear. `admissible_block_types` is the second question and it is per
+/// provider and per position; this list is read after that one.
 const UNSCANNED_PART_TYPES: [&str; 4] = ["image_url", "image", "input_audio", "audio"];
 
-/// Fields carrying tool definitions or tool traffic. Masking their arguments is
-/// a later slice, so a request that uses them is refused: forwarding it would
-/// send arbitrary strings past the masker.
-const TOOL_FIELDS: [&str; 5] = [
-    "tools",
-    "tool_choice",
+/// Where a `content` array sits. With the provider it decides which block types
+/// are legal in it — a question `content_pointers` did not ask.
+///
+/// **The fourth provider-or-context asymmetry on this branch, and they have all
+/// failed the same way:** one list serving callers that need different answers,
+/// with a comment somewhere saying they are the same. `content_pointers` is
+/// shared by two providers and four positions, and it admitted every block type
+/// in all of them. So an OpenAI message carried an Anthropic `tool_use`, whose
+/// `name` is dispatch and therefore unscanned, and `Martina Weber` reached
+/// OpenAI in it (measured, at 200 — and refused outright before this slice).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Position {
+    /// A message's `content`.
+    Message,
+    /// Anthropic's top-level `system`.
+    System,
+    /// A `tool_result` block's own `content`, reached by recursion.
+    ToolResult,
+}
+
+/// The block types a provider defines in a position, read from each provider's
+/// published shape rather than from what the walk happens to understand.
+///
+/// An empty slice refuses everything, which is the answer for a position a
+/// provider does not have at all.
+fn admissible_block_types(provider: &str, position: Position) -> &'static [&'static str] {
+    /// OpenAI's chat-completions content part union. `image` is Anthropic's
+    /// spelling and was never legal here; `tool_use` and `tool_result` are
+    /// Anthropic block types, and OpenAI represents a call through `tool_calls`
+    /// and a result through a `role: "tool"` message. Not narrowed per role —
+    /// see the note on the function's tests: role scoping would refuse an
+    /// assistant turn a client echoes back, and it closes no channel, because
+    /// after this list no OpenAI block type has a dispatch field at all.
+    ///
+    /// `file` and `refusal` are legal parts OpenAI defines and this gateway
+    /// refuses, before this change and after it. Neither is this round's doing
+    /// and both are recorded as capabilities not delivered.
+    const OPENAI_MESSAGE: [&str; 4] = ["audio", "image_url", "input_audio", "text"];
+    /// Anthropic's request block types, restricted to the ones this gateway
+    /// reads. `document`, `thinking`, `redacted_thinking`, `search_result`,
+    /// `server_tool_use`, the five `*_tool_result` families and
+    /// `container_upload` are legal Anthropic blocks that were already refused
+    /// for having no arm; they are unchanged here.
+    const ANTHROPIC_MESSAGE: [&str; 4] = ["image", "text", "tool_result", "tool_use"];
+    /// **Read, not assumed.** Anthropic's `system` is `string | TextBlockParam[]`
+    /// — an array of *text blocks* and nothing else. It admitted tool blocks,
+    /// which system content does not carry in any provider.
+    const ANTHROPIC_SYSTEM: [&str; 1] = ["text"];
+    /// A `tool_result`'s own content, which the recursion reaches. **Neither
+    /// Codex nor the brief named this position.** Anthropic documents
+    /// `text`, `image`, `search_result`, `document`, `tool_reference` and
+    /// `browser_state` here — and never `tool_use` or `tool_result`, both of
+    /// which the shared list admitted, so a `tool_use` nested inside a result
+    /// leaked its `name` exactly as the OpenAI case does. The last four are
+    /// refused for having no arm, as they are one level up.
+    const ANTHROPIC_TOOL_RESULT: [&str; 2] = ["image", "text"];
+    match (provider, position) {
+        ("openai", Position::Message) => &OPENAI_MESSAGE,
+        ("anthropic", Position::Message) => &ANTHROPIC_MESSAGE,
+        ("anthropic", Position::System) => &ANTHROPIC_SYSTEM,
+        ("anthropic", Position::ToolResult) => &ANTHROPIC_TOOL_RESULT,
+        // OpenAI has neither a `system` content array nor a `tool_result`
+        // block, so neither position exists for it and neither is reachable —
+        // the second only because `tool_result` is off the list above, which is
+        // the coupling `every_reachable_position_admits_something` pins.
+        _ => &[],
+    }
+}
+
+/// Tool fields a provider still has no slots for. A request that uses one is
+/// refused rather than forwarded, because forwarding it would send arbitrary
+/// strings past the masker — the same silence-is-a-leak shape as an
+/// unrecognized content part.
+///
+/// Per provider, because the two are relaxed one slice at a time, and per
+/// *level*, because a field is only described where the protocol puts it.
+/// `tools` is described on the body and is undefined on a message; `tool_calls`
+/// is described on a message and is undefined on the body. Each one therefore
+/// stays refused at the level it did not move at: relaxing both lists together
+/// would have left a `tools` smuggled onto a message carrying its descriptions
+/// and schemas straight past the masker, and a `tool_calls` on the body
+/// carrying its arguments.
+///
+/// What both OpenAI lists keep is `functions` and `function_call`, the
+/// deprecated shape of all of this. Nothing here produces a slot for either —
+/// `functions` holds descriptions and schemas, and an assistant message's
+/// `function_call` holds `arguments` — so both are refused rather than becoming
+/// fields that are silently forwarded. `tool_choice` is deliberately absent
+/// from the body list, because both providers define it there and it is
+/// described now — `known_tool_choice` below reads it. It stays on the message
+/// list because neither provider defines it there.
+///
+/// **`tool_choice`'s absence from a denylist is how it went unchecked, and that
+/// is worth stating where the absence is.** The round that gave every allowlist
+/// entry a reason it was safe to admit swept the *allowlists*; a field admitted
+/// by not being refused is on no list at all, so the sweep could not see it, and
+/// what it was admitted on was a comment right here arguing about its `name`.
+/// Everything around the name travelled unchecked: `{"type": "auto", "note":
+/// "Martina Weber"}` reached both providers verbatim (measured, at 200).
+///
+/// Anthropic's tool traffic is described now, so what is left on its lists is
+/// the fields Anthropic's API does not define at the level they appear. They are
+/// still refused rather than ignored: a field no slot addresses is forwarded
+/// exactly as it came, so `tool_calls` smuggled into an Anthropic body would
+/// carry its arguments past the masker.
+///
+/// **Anthropic is split into two lists for the same reason OpenAI is, and it was
+/// one list for longer.** A single list cannot express the only rule that
+/// matters here — `tools` is described on the body and is undefined on a
+/// message — so while the two levels shared a list, `tools` could be on neither
+/// of them: adding it refuses every tool-using request the body carries, and
+/// leaving it off forwards a message's tool descriptions verbatim, which is what
+/// happened. Whatever a level does not describe, that level refuses. Keeping the
+/// providers symmetrical is part of the fix: the asymmetry is why nobody saw it.
+const OPENAI_BODY_TOOL_FIELDS: [&str; 3] = ["functions", "function_call", "tool_calls"];
+const OPENAI_MESSAGE_TOOL_FIELDS: [&str; 4] =
+    ["functions", "function_call", "tools", "tool_choice"];
+const ANTHROPIC_BODY_TOOL_FIELDS: [&str; 4] = [
     "functions",
     "function_call",
     "tool_calls",
+    // Not an OpenAI-shaped field but the same hole: `mcp_servers` grants the
+    // model tools that are declared nowhere in the body, so their calls and
+    // results arrive shaped by a server this gateway never described — and it
+    // carries the caller's own `authorization_token` besides.
+    "mcp_servers",
+];
+/// The body list plus `tools` and `tool_choice`, which a message defines
+/// neither of and no slot here addresses at that level. `mcp_servers` stays on
+/// both deliberately rather than by copy: Anthropic defines it on the body
+/// alone, so on a message it is a field this gateway describes nowhere — and it
+/// is the one that carries an `authorization_token`. A field undefined at a
+/// level is the strongest case for refusing it there, not a reason to drop it
+/// from the list.
+///
+/// **`tool_choice` was missing from this list and present on OpenAI's**, under
+/// a comment claiming the two providers were treated the same way. They were
+/// not: `{"role": "user", "content": "hi", "tool_choice": {"note": "Martina
+/// Weber"}}` was a 400 on OpenAI and reached Anthropic verbatim (measured, at
+/// 200). That is the third provider asymmetry on this branch and it failed the
+/// way the other two did — the code is the thing that says which lists are the
+/// same, and the sentence saying so was written once and never re-derived.
+const ANTHROPIC_MESSAGE_TOOL_FIELDS: [&str; 6] = [
+    "functions",
+    "function_call",
+    "tool_calls",
+    "mcp_servers",
+    "tools",
+    "tool_choice",
 ];
 
-/// Every message must be an object carrying `content`. A bare string entry, or
-/// an object without content, produced no pointer and was forwarded untouched —
-/// the same silence-is-a-leak shape as the others.
-fn require_scannable_message(message: &Value, provider: &'static str) -> Result<(), ShapeError> {
-    if !message.is_object() || message.get("content").is_none() {
+/// Every message must be an object carrying something this gateway describes.
+/// A bare string entry, or an object with none of the carriers, produced no
+/// pointer and was forwarded untouched — the same silence-is-a-leak shape as
+/// the others.
+///
+/// `carriers` is per provider because what a message may carry instead of
+/// `content` is: an OpenAI assistant turn may hold `tool_calls` and no content
+/// at all, and describing those is what makes such a message scannable. A
+/// shared list would have relaxed the rule for a provider that describes no
+/// such field.
+fn require_scannable_message(
+    message: &Value,
+    carriers: &[&str],
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    // `is_some_and(!is_null)`, not `is_some`: `{"content": null}` is
+    // `Some(Value::Null)`, so a presence test passed the guard while the
+    // filter that reads the field further down treats the same null as absent
+    // and produces no slot. A message with no slots and no allowlist is
+    // forwarded field for field, which is the shape this guard exists to stop.
+    //
+    // It stays true that a null `content` is a valid turn — the provider
+    // writes it beside `tool_calls` and clients echo it back. That turn is
+    // admitted by `tool_calls` being a carrier, not by its null content.
+    if !message.is_object()
+        || !carriers
+            .iter()
+            .any(|field| message.get(field).is_some_and(|value| !value.is_null()))
+    {
         return Err(ShapeError::Request(provider));
     }
     Ok(())
 }
 
-fn reject_tool_fields(body: &Value, provider: &'static str) -> Result<(), ShapeError> {
-    for field in TOOL_FIELDS {
+fn reject_tool_fields(
+    body: &Value,
+    fields: &[&'static str],
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    for field in fields {
         if body.get(field).is_some_and(|value| !value.is_null()) {
             return Err(ShapeError::Unsupported(provider, field));
+        }
+    }
+    Ok(())
+}
+
+/// `proxy.rs` calls `request_pointers` before it looks at `stream`, so relaxing
+/// the tool refusal admits streamed tool requests as readily as buffered ones —
+/// and `stream_slots`, which this slice does not touch, would then reject the
+/// tool events *after* the upstream call, spending the caller's tokens to
+/// return a broken stream. The streaming slice deletes this function; nothing
+/// else should.
+fn reject_streamed_tools(
+    body: &Value,
+    slots: &[Slot],
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // Every `Json` slot is tool traffic, and a `Text` slot says whether it is.
+    // Reading the slots rather than a field name is what makes this cover a
+    // continuation that carries an earlier call and its result without
+    // repeating the definitions.
+    let carries_tools = slots
+        .iter()
+        .any(|slot| matches!(slot, Slot::Json { .. } | Slot::Text { tool: true, .. }));
+    if streaming && carries_tools {
+        return Err(ShapeError::Unsupported(provider, "streamed tool traffic"));
+    }
+    Ok(())
+}
+
+/// Why one key is safe to admit — the question every allowlist entry below has
+/// to answer, asked by the type rather than by a comment.
+///
+/// **An allowlist admitted a key.** Nothing read the value under it, so a field
+/// whose shape the provider constrains was an unmasked egress channel with a
+/// comment beside it saying it could not be: `"strict": "Martina Weber"`
+/// reached OpenAI, `"is_error": "Martina Weber"` reached Anthropic, and
+/// `cache_control: {"type": "Martina Weber"}` reached Anthropic through a list
+/// added one commit earlier *to check `cache_control`* — which checked its keys.
+/// All three were written by someone who knew the shape and wrote it down in
+/// prose. That is the third time on this branch a comment asserted a property
+/// the code did not have, and prose is what failed each time, so the answer is
+/// a value the code consumes instead of a sentence the next person reads.
+///
+/// The seven answers, and every one of them is an answer somebody actually
+/// gave:
+///
+/// - `Described` — a slot addresses it, so masking reads the value and it is
+///   not raw egress. `description`, `input_schema`, `parameters`, `arguments`,
+///   a tool result's `content`.
+/// - `Dispatch` — a free identifier the caller chooses and the protocol routes
+///   on, **and a string**. Masking the characters would break the call it
+///   names, so they are forwarded deliberately and their exposure is argued in
+///   the spec rather than here. The *type* is a different question, and it was
+///   answered by sharing an arm with `Described`: `{"name": {"owner": "Martina
+///   Weber"}}` on a tool definition reached the upstream verbatim (measured, at
+///   200), scanned by nothing, because a structured value has no characters for
+///   the argument about characters to be about. Requiring a string costs
+///   nothing — every one of these is a string in both providers' own
+///   definitions — and it leaves the permissive character grammar exactly as
+///   permissive, which is what MCP's `.` and `/` in tool names need.
+///
+///   What it does not close, and this has to keep being said: `"name":
+///   "Martina Weber"` still forwards. That is what dispatch means. But the
+///   residual is now **a string the caller chose**, which is a smaller and more
+///   precise claim than the one this variant was making.
+/// - `Elsewhere` — a named check at the use site already decides this value,
+///   and naming it in the comment beside the entry is what stops a second check
+///   drifting from the first.
+/// - `Unscanned` — forwarded whole under a policy stated outside this file.
+///   `UNSCANNED_PART_TYPES` is that policy and images are that content; the
+///   entry exists so the exception is visible where the field is admitted
+///   rather than only in the README.
+/// - `Bool`, `Number`, `OneOf` — the provider constrains the value's *shape*,
+///   so this checks it. Explicitly null passes: an SDK serializing its default
+///   is not a request to use the field, the same reading `tools`, `thinking`,
+///   `logprobs`, `audio` and `content` already get.
+///
+///   `Number` is the weakest of the three and says so at the entry: what it
+///   closes is prose or a structured value travelling under a numeric key —
+///   `"display_width_px": "Martina Weber"` — and what it leaves open is a
+///   number the caller chose, which is the residual `Dispatch` carries one
+///   type over. Neither the documented minimums nor integer-ness are checked
+///   here: those are Anthropic's own validation, this gateway keeping a second
+///   copy of them would be a copy to keep in step, and a bound of `>= 1`
+///   closes nothing a number can carry.
+/// - `Nothing` — the provider *always sends this key*, and no slot addresses
+///   what it can carry, so the only admissible values are the ones that carry
+///   nothing: explicitly null, or an empty list. Anything else refuses. This is
+///   the answer for a field this gateway cannot restore but cannot simply leave
+///   off the list either, because leaving it off would refuse every well-formed
+///   response. `logprobs_carry_nothing` is the same reading, written for one
+///   field before there was a variant for it.
+/// - `Object` — a nested allowlist, read by this same function.
+///
+/// An eighth answer is not on this list on purpose: there is no "forwarded, and
+/// nobody has looked at it". A key with no answer does not go on a list.
+/// Three of these carry a payload and three do not, and the split is not a
+/// stylistic one: a payload here has to be something the *checking* reads.
+/// `Elsewhere` and `Unscanned` were written carrying the name of the check and
+/// of the policy, and nothing outside a test could ever read either — a comment
+/// with a type on it, which is the failure this whole enum exists to correct,
+/// reproduced one level up. So the pointer to the check lives in the comment
+/// beside the entry, where a comment belongs, and the variant carries only the
+/// answer the author had to choose.
+#[derive(Debug, Clone, Copy)]
+enum Admits {
+    Described,
+    Dispatch,
+    Elsewhere,
+    Unscanned,
+    Bool,
+    /// A JSON number, and nothing about which number. See `Admits`' own doc
+    /// for what that closes and what it leaves open.
+    Number,
+    /// One of the strings the provider defines for this field.
+    OneOf(&'static [&'static str]),
+    /// Nothing this gateway can restore — so nothing is what it admits.
+    Nothing,
+    /// The nested allowlist, and what to call it when it refuses.
+    Object(&'static str, &'static [Field]),
+}
+
+/// One entry of an allowlist: a key, and why admitting it is safe.
+#[derive(Debug, Clone, Copy)]
+struct Field {
+    key: &'static str,
+    admits: Admits,
+}
+
+impl Field {
+    const fn described(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Described,
+        }
+    }
+    const fn dispatch(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Dispatch,
+        }
+    }
+    /// The `check` is the name of the thing that decides this value. It is
+    /// not stored — nothing outside a test could read it — but it is required,
+    /// so that choosing this answer means naming the check at the entry.
+    const fn elsewhere(key: &'static str, _check: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Elsewhere,
+        }
+    }
+    /// As `elsewhere`, with the policy the field is forwarded whole under.
+    const fn unscanned(key: &'static str, _policy: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Unscanned,
+        }
+    }
+    const fn boolean(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Bool,
+        }
+    }
+    const fn number(key: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Number,
+        }
+    }
+    const fn one_of(key: &'static str, values: &'static [&'static str]) -> Self {
+        Field {
+            key,
+            admits: Admits::OneOf(values),
+        }
+    }
+    /// The `follow_up` is the name of the work that turns this refusal back
+    /// into a working feature. It is not stored, for the reason `elsewhere`'s
+    /// `check` is not stored; requiring it is what stops an entry meaning
+    /// "refused, and nobody intends to do anything about it".
+    const fn nothing(key: &'static str, _follow_up: &'static str) -> Self {
+        Field {
+            key,
+            admits: Admits::Nothing,
+        }
+    }
+    const fn object(key: &'static str, what: &'static str, fields: &'static [Field]) -> Self {
+        Field {
+            key,
+            admits: Admits::Object(what, fields),
+        }
+    }
+}
+
+/// The tool types Anthropic publishes that carry no date: a plain custom tool,
+/// which some SDKs spell explicitly and most leave off entirely.
+const ANTHROPIC_UNDATED_TOOL_TYPES: [&str; 1] = ["custom"];
+
+/// The families of Anthropic-defined tool whose results **the caller sends
+/// back**, and the reason this list is a line rather than a preference.
+///
+/// Anthropic's own tools split in two, and the split is about who runs them:
+///
+/// - a **client-executed** tool — `bash`, `text_editor`, `computer`, `memory` —
+///   is described by Anthropic and run by the caller. The model asks for it
+///   with an ordinary `tool_use` block and the caller answers with an ordinary
+///   `tool_result`. Nothing new appears on either path: these are the shapes
+///   this gateway already describes, which is why this slice's ledger records
+///   the coding-agent category as unaffected by it.
+/// - a **server-executed** tool — `web_search`, `web_fetch`, `code_execution`,
+///   `tool_search_tool_regex`, `tool_search_tool_bm25`, `advisor` — is run by
+///   Anthropic. The response carries `server_tool_use` and a result block of
+///   the tool's own (`web_search_tool_result`, `bash_code_execution_tool_result`
+///   and so on), and `Anthropic::response_pointers` describes none of them. It
+///   refuses the block, which is the right answer to a shape that could carry
+///   this gateway's placeholders back to a client unrestored — but it fires
+///   *after* the upstream call. The model has run and the caller has paid for
+///   it. Measured at `6a06391`: a request enabling `code_execution_20250522`
+///   reached the upstream (one call) and the caller got a 502.
+///
+/// So the type is checked by `anthropic_tool_definition_fields`, before the
+/// call, and a refusal that costs nothing replaces a refusal that costs a turn. **This is a capability lost
+/// rather than a channel closed** — a bare server tool used to pass this gate
+/// — and it belongs with the citations refusal and OpenAI's `allowed_tools`
+/// refusal in the account of what this slice traded away. The follow-up is
+/// describing those response blocks, not keeping the request refused.
+///
+/// The families are matched against the segment before the **last** underscore,
+/// not as a prefix, and `bash_code_execution_20250825` is why: it is the code
+/// execution tool's own bash, run by Anthropic, and a `starts_with("bash_")`
+/// reading would have admitted it on the strength of a name.
+///
+/// **Adding a family here is half the work.** The other half is the arm in
+/// `anthropic_tool_definition_fields` that says which fields its definitions
+/// may carry; without one the family is refused, because a family admitted
+/// here and refused there is precisely the state `computer_*` spent a round in.
+const ANTHROPIC_CLIENT_TOOL_FAMILIES: [&str; 4] = ["bash", "text_editor", "computer", "memory"];
+
+/// Fields a tool definition may carry that this gateway can account for, **by
+/// the tool's `type`** — the shape `content_block_fields` and
+/// `anthropic_response_block_fields` already have, for the same reason: the
+/// fields a definition may carry are not one list, they are one list per tool.
+///
+/// Anything else is refused, because a tool definition is an object the caller
+/// fills in and a field no slot addresses is forwarded exactly as it came.
+/// Anthropic's own server tools are why this is not theoretical:
+/// `web_search_20250305` carries `user_location: {city, region, country,
+/// timezone}`, and `city` is a LOCATION in this gateway's own vocabulary.
+///
+/// **This was one shared list, and the cost of that was a family admitted by
+/// type and refused by field.** Anthropic documents `display_width_px` and
+/// `display_height_px` as *required* on a `computer_*` definition, and neither
+/// was on the shared list — so the round that admitted the `computer_*` family
+/// by type, arguing correctly that the caller runs it, delivered nothing: every
+/// definition a computer-use client actually sends was a 400 one layer up
+/// (measured: `{"type": "computer_20250124", "name": "computer",
+/// "display_width_px": 1024, "display_height_px": 768, "display_number": 1}` →
+/// 400, upstream never called). `text_editor_20250728`'s `max_characters` was
+/// the same defect in a second family, found by reading the documentation for
+/// all four rather than the review comment for one.
+///
+/// Which types are admissible at all is `ANTHROPIC_CLIENT_TOOL_FAMILIES`'
+/// argument: the ones the *caller* runs, whose results arrive in shapes this
+/// gateway already describes. A version of one of those is admitted the day
+/// Anthropic ships it, because the guard below names the family and the date
+/// shape rather than a list of today's strings — which is the coding-agent
+/// traffic this slice's ledger records as unaffected.
+///
+/// **A family on that list with no arm here is refused, not admitted with the
+/// wrong fields.** That is this function's whole structural claim: the defect
+/// above was a family admitted by one gate and refused by another, and the
+/// fifth family somebody adds to the constant cannot repeat it — the arms are
+/// exhaustive, `every_client_tool_family_selects_a_list` fails until an arm
+/// exists, and writing the arm is where its own fields get decided.
+///
+/// `description` and `input_schema` are on every list, including the lists for
+/// tools whose schema Anthropic defines and whose published shape has neither.
+/// A definition carrying them is malformed and Anthropic refuses it — but
+/// refusing it *here* would be this gateway enforcing the provider's schema on
+/// two fields it already masks, and a described field is never the channel this
+/// allowlist exists to close.
+fn anthropic_tool_definition_fields(definition: &Value) -> Result<&'static [Field], ShapeError> {
+    /// The tool's own `type`, decided by the dispatch below: it is what
+    /// selected this list, so a second check here would be the same check
+    /// written twice, and two checks on one value drift. This is what
+    /// `Admits::ToolType` was for one round; the grammar it held is now the
+    /// `match` below, where the answer is a list of fields rather than a bool.
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `type` that chose this list");
+    const NAME: Field = Field::dispatch("name");
+    const DESCRIPTION: Field = Field::described("description");
+    const INPUT_SCHEMA: Field = Field::described("input_schema");
+    const CACHE_CONTROL: Field = Field::object(
+        "cache_control",
+        "cache_control field",
+        &ANTHROPIC_CACHE_CONTROL_FIELDS,
+    );
+    /// A tool the caller defines, and the tools Anthropic defines that carry
+    /// no field of their own: `bash_*` and `memory_*` are a `type` and a
+    /// `name` and nothing else.
+    const BARE: [Field; 5] = [TYPE, NAME, DESCRIPTION, INPUT_SCHEMA, CACHE_CONTROL];
+    /// `max_characters` caps what a `view` returns. Anthropic defines it on
+    /// `text_editor_20250728` and later; it is admitted on every version of
+    /// the family, because refusing it on an older one would be this gateway
+    /// keeping a per-version compatibility matrix — the provider's own answer,
+    /// which it gives with a 400 — and the value is a number either way.
+    const TEXT_EDITOR: [Field; 6] = [
+        TYPE,
+        NAME,
+        DESCRIPTION,
+        INPUT_SCHEMA,
+        CACHE_CONTROL,
+        Field::number("max_characters"),
+    ];
+    /// The display the caller runs the tool against. `display_width_px` and
+    /// `display_height_px` are **required** on every published `computer_*`
+    /// version, `display_number` is the optional X11 display, and
+    /// `enable_zoom` arrived with `computer_20251124`; the last two are
+    /// admitted on every version for `max_characters`' reason. None of the
+    /// four is addressed by a slot, so each is checked here or forwarded
+    /// unread.
+    const COMPUTER: [Field; 9] = [
+        TYPE,
+        NAME,
+        DESCRIPTION,
+        INPUT_SCHEMA,
+        CACHE_CONTROL,
+        Field::number("display_width_px"),
+        Field::number("display_height_px"),
+        Field::number("display_number"),
+        Field::boolean("enable_zoom"),
+    ];
+    let refuse = || ShapeError::Unsupported("anthropic", "tool definition field");
+    let kind = match definition.get("type") {
+        // No `type` at all is how most SDKs spell a custom tool, and an
+        // explicit null is one serializing that default.
+        None | Some(Value::Null) => ANTHROPIC_UNDATED_TOOL_TYPES[0],
+        Some(Value::String(kind)) => kind,
+        // A `type` that is not a string names no tool. `known_tool_choice`
+        // maps its missing discriminant to the empty string and lets the empty
+        // list refuse; that cannot be done here, because the empty string is a
+        // *valid* tool definition — the custom one — so an object would select
+        // the custom list and travel whole.
+        Some(_) => return Err(refuse()),
+    };
+    if ANTHROPIC_UNDATED_TOOL_TYPES.contains(&kind) {
+        return Ok(&BARE);
+    }
+    // `family_YYYYMMDD`, matched against the segment before the **last**
+    // underscore so `bash_code_execution_20250825` asks after the family
+    // `bash_code_execution` and is refused, and with a date of eight digits and
+    // nothing else so a family name is not a prefix a caller can extend.
+    let Some((family, date)) = kind.rsplit_once('_') else {
+        return Err(refuse());
+    };
+    if date.len() != 8
+        || !date.bytes().all(|byte| byte.is_ascii_digit())
+        || !ANTHROPIC_CLIENT_TOOL_FAMILIES.contains(&family)
+    {
+        return Err(refuse());
+    }
+    match family {
+        "bash" | "memory" => Ok(&BARE),
+        "text_editor" => Ok(&TEXT_EDITOR),
+        "computer" => Ok(&COMPUTER),
+        // A family this gateway serves and whose fields nobody has decided.
+        // Refusing is the answer that cannot ship a capability it does not
+        // have; deciding the fields is the work that makes it one.
+        _ => Err(refuse()),
+    }
+}
+
+/// The only object this gateway allowlists without describing it, so it is the
+/// one place the allowlist rule had to be applied to a field's *contents*
+/// rather than to the field name. A comment used to assert the shape —
+/// "`cache_control` is `{"type": "ephemeral"}` and carries nothing of the
+/// caller's" — and that assertion was false: `{"type": "ephemeral", "note":
+/// "Weber"}` reached the upstream verbatim on both a content block and a tool
+/// definition.
+///
+/// **Then the list that replaced the comment overclaimed in the same way**, and
+/// in the sentence correcting it: it admitted the two key names and read
+/// neither value, so `{"type": "Martina Weber"}` and `{"type": "ephemeral",
+/// "ttl": {"owner": "Weber"}}` both reached the upstream verbatim (measured, at
+/// 200). Anthropic defines `ephemeral` and nothing else, and `5m` or `1h` and
+/// nothing else, so those are what these admit — the whole field is provider
+/// vocabulary with no room in it for the caller's text.
+const ANTHROPIC_CACHE_CONTROL_FIELDS: [Field; 2] = [
+    Field::one_of("type", &["ephemeral"]),
+    Field::one_of("ttl", &["5m", "1h"]),
+];
+
+/// OpenAI wraps a definition: `{"type": "function", "function": {...}}`. The
+/// wrapper is checked as its own object because a field beside `function` — a
+/// vendor extension, a `custom` payload — would otherwise travel exactly as it
+/// came.
+///
+/// `strict` is a boolean, and until this list said so nothing checked it:
+/// `"strict": "Martina Weber"` reached OpenAI verbatim (measured, at 200) under
+/// a comment that read "`strict` on the inner object is a boolean and carries
+/// nothing of the caller's". It is a boolean; nothing made it one.
+const OPENAI_TOOL_WRAPPER_FIELDS: [Field; 2] = [
+    Field::elsewhere(
+        "type",
+        "the `type != \"function\"` refusal at the call site",
+    ),
+    Field::described("function"),
+];
+const OPENAI_TOOL_DEFINITION_FIELDS: [Field; 4] = [
+    Field::dispatch("name"),
+    Field::described("description"),
+    Field::described("parameters"),
+    Field::boolean("strict"),
+];
+
+/// A tool call the client echoes back, and the function inside it. The
+/// arguments live here, so a field beside them is the one place an added key
+/// walks a document past the masker. `id` and `name` are dispatch.
+const OPENAI_TOOL_CALL_FIELDS: [Field; 3] = [
+    Field::dispatch("id"),
+    Field::elsewhere(
+        "type",
+        "the `type != \"function\"` refusal in this function",
+    ),
+    Field::described("function"),
+];
+const OPENAI_TOOL_CALL_FUNCTION_FIELDS: [Field; 2] =
+    [Field::dispatch("name"), Field::described("arguments")];
+
+/// A `role: "tool"` message is OpenAI's shape of a tool result, and OpenAI
+/// defines exactly these three fields on it. `name` is deliberately absent:
+/// OpenAI does not define it here, and the two ways of treating it are both
+/// silent — described, it is masked, and if the client meant the function's
+/// name the call it answers is broken with no way to learn why. Refusing costs
+/// nothing that worked before this slice, since the whole message was refused
+/// for its `tool_call_id`.
+const OPENAI_TOOL_MESSAGE_FIELDS: [Field; 3] = [
+    Field::elsewhere("role", "the `role == \"tool\"` test that selects this list"),
+    Field::described("content"),
+    Field::dispatch("tool_call_id"),
+];
+
+/// The other half of the list above, and it has to exist because the list above
+/// is selected by a role.
+///
+/// `tool_call_id` is defined on a `role: "tool"` message and nowhere else, so
+/// on any other role it is a field this gateway describes nowhere — and a field
+/// no slot addresses is forwarded exactly as it came. `{"role": "user",
+/// "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}` reached the
+/// upstream with the object in it (measured, at 200).
+///
+/// **This was a refusal before this slice.** The whole message used to be
+/// refused for carrying `tool_call_id` at all; giving the tool role an
+/// allowlist admitted the field there and, by being selected on the role,
+/// stopped asking about it everywhere else. It went into the ledger as cosmetic
+/// on the grounds that the field is an identifier. The value need not be one.
+///
+/// It cannot go on `OPENAI_MESSAGE_TOOL_FIELDS`, which runs for every message
+/// and would refuse the tool message this field belongs to. So it is refused in
+/// the arm the role dispatch already has: one `if`, both halves of one rule —
+/// the field is admitted exactly where the shape that defines it governs, and
+/// refused exactly where it does not. Anthropic has no twin to keep symmetrical
+/// here: its `tool_use_id` lives on a `tool_result` content block, where
+/// `content_block_fields` governs it by the block's own type.
+const OPENAI_NON_TOOL_MESSAGE_FIELDS: [&str; 1] = ["tool_call_id"];
+
+/// `tool_choice` forces or forbids a call. Which fields are legal depends on
+/// its `type`, so this dispatches on that string to pick a list exactly as
+/// `content_block_fields` does, and for the same reason: one flat list would
+/// admit `disable_parallel_tool_use` beside `"type": "none"`, and an allowlist
+/// that admits a field the provider does not define at that discriminant is an
+/// allowlist doing half its job.
+///
+/// Anthropic publishes four shapes and no bare string. `none` carries its
+/// `type` alone; `auto` and `any` take the parallel-use flag; `tool` takes it
+/// and the name of the tool to force. That name is dispatch, so after this
+/// round it is a string and nothing more is asked of it.
+///
+/// An empty slice means a `type` Anthropic does not define, refused by the
+/// caller — the same contract `content_block_fields` has.
+fn anthropic_tool_choice_fields(kind: &str) -> &'static [Field] {
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `kind` that chose this arm");
+    const PARALLEL: Field = Field::boolean("disable_parallel_tool_use");
+    const AUTO: [Field; 2] = [TYPE, PARALLEL];
+    const TOOL: [Field; 3] = [TYPE, PARALLEL, Field::dispatch("name")];
+    const NONE: [Field; 1] = [TYPE];
+    match kind {
+        "auto" | "any" => &AUTO,
+        "tool" => &TOOL,
+        "none" => &NONE,
+        _ => &[],
+    }
+}
+
+/// OpenAI's three modes as a bare string. This is the half of `tool_choice`
+/// that `Admits` cannot express — a value that is *either* a string from a set
+/// *or* an object — and the reason it does not need to is below.
+const OPENAI_TOOL_CHOICE_MODES: [&str; 3] = ["none", "auto", "required"];
+
+/// As `anthropic_tool_choice_fields`. OpenAI's object shapes name the tool
+/// under a key that repeats the `type`: `{"type": "function", "function":
+/// {"name": ...}}` and `{"type": "custom", "custom": {"name": ...}}`. Both
+/// inner objects hold a name and nothing else, so both get the same nested
+/// list, and that name is dispatch.
+fn openai_tool_choice_fields(kind: &str) -> &'static [Field] {
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `kind` that chose this arm");
+    const NAMED: [Field; 1] = [Field::dispatch("name")];
+    const FUNCTION: [Field; 2] = [TYPE, Field::object("function", "tool_choice", &NAMED)];
+    const CUSTOM: [Field; 2] = [TYPE, Field::object("custom", "tool_choice", &NAMED)];
+    match kind {
+        "function" => &FUNCTION,
+        "custom" => &CUSTOM,
+        _ => &[],
+    }
+}
+
+/// The whole of `tool_choice`, checked before the upstream call.
+///
+/// **`Admits` does not express this value and does not need to.** A body field
+/// is on no allowlist — `Admits` answers "why is this *key on this list* safe",
+/// and there is no list at body level for `tool_choice` to be an entry of. So
+/// the union lives at the use site beside `logprobs`, `audio` and `thinking`,
+/// which are the other body fields decided by a named check, and the machinery
+/// does the part it is for: every *object* below here is a list of `Field`s
+/// read by `known_fields`. Bending a string-or-object union into
+/// `Admits::Object` would have needed a variant meaning "or", and the one thing
+/// the enum's shape is for is that each entry has exactly one answer.
+///
+/// What is refused rather than described: OpenAI's `{"type": "allowed_tools",
+/// "allowed_tools": {"mode": ..., "tools": [...]}}`. Its `tools` are *tool
+/// definitions*, and describing a tool definition is `tool_definition_slots`'
+/// job — it produces slots, masks the prose and charges the tool bounds.
+/// Admitting a second, name-only reading of a tool definition here would be a
+/// second answer to a question this file already answers, and two answers to
+/// one question in this file have drifted twice. **This narrows behaviour for a
+/// client using `allowed_tools`: it was a 200 and is now a 400.** Describing it
+/// properly is a slice, not a fix, and it is in the report.
+fn known_tool_choice(
+    body: &Value,
+    fields_for: fn(&str) -> &'static [Field],
+    modes: &[&str],
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    // Explicitly null is an SDK serializing its default, not a request to force
+    // a tool — the reading `tools`, `thinking`, `logprobs` and `content` get.
+    let Some(choice) = body.get("tool_choice").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let refuse = || ShapeError::Unsupported(provider, "tool_choice");
+    if let Some(mode) = choice.as_str() {
+        return if modes.contains(&mode) {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    }
+    // A number, an array, or an object without a string `type` all land here:
+    // no discriminant means no list, and a value we cannot pick a list for is
+    // refused rather than forwarded.
+    let fields = fields_for(choice.get("type").and_then(Value::as_str).unwrap_or(""));
+    if fields.is_empty() {
+        return Err(refuse());
+    }
+    known_fields(choice, fields, "tool_choice", provider)
+}
+
+/// An object every field of which this gateway can account for, checked against
+/// both halves of the entry: the key is on the list, and the value is the shape
+/// the entry admits. A field outside the list is refused rather than forwarded,
+/// because a field no slot addresses travels to the provider exactly as it came
+/// — which is the whole reason any of these lists are allowlists rather than
+/// denylists — and a value outside the shape travels the same way for the same
+/// reason.
+fn known_fields(
+    value: &Value,
+    allowed: &[Field],
+    what: &'static str,
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    // Not an object means no fields to describe and a value that would travel
+    // whole: `"tools": ["Martina Weber"]` produced no slot and no refusal.
+    let fields = value.as_object().ok_or(ShapeError::Request(provider))?;
+    for (key, held) in fields {
+        let Some(field) = allowed.iter().find(|field| field.key == key.as_str()) else {
+            return Err(ShapeError::Unsupported(provider, what));
+        };
+        known_value(held, field.admits, what, provider)?;
+    }
+    Ok(())
+}
+
+/// The value half. One refusal for both halves — `Unsupported(provider, what)`
+/// — because they are one refusal: this list admits a key *and* a shape, and
+/// what reaches the upstream if either goes unchecked is the same bytes. The
+/// message reads "uses {what}, which this gateway does not mask yet; it is
+/// refused rather than forwarded", which is as true of a value nothing here
+/// masks as of a key nothing here describes.
+fn known_value(
+    value: &Value,
+    admits: Admits,
+    what: &'static str,
+    provider: &'static str,
+) -> Result<(), ShapeError> {
+    let refuse = || ShapeError::Unsupported(provider, what);
+    match admits {
+        Admits::Described | Admits::Elsewhere | Admits::Unscanned => Ok(()),
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use the field — the reading five other fields on this branch get.
+        // Placed before the checks so each of them is about a value that is
+        // actually there.
+        _ if value.is_null() => Ok(()),
+        // The type, and nothing about the characters. See `Admits::Dispatch`.
+        Admits::Dispatch => value.as_str().map(|_| ()).ok_or_else(refuse),
+        Admits::Bool => value.as_bool().map(|_| ()).ok_or_else(refuse),
+        // The shape and nothing about the value. See `Admits::Number`.
+        Admits::Number => value.is_number().then_some(()).ok_or_else(refuse),
+        Admits::OneOf(values) => match value.as_str() {
+            Some(text) if values.contains(&text) => Ok(()),
+            _ => Err(refuse()),
+        },
+        // Null is already `Ok` above; an empty list carries as little, and
+        // `logprobs_carry_nothing` reads both the same way for the same reason.
+        // A populated one is the whole hazard: `citations[].cited_text` is
+        // quoted source material this gateway cannot restore.
+        Admits::Nothing => match value {
+            Value::Array(items) if items.is_empty() => Ok(()),
+            _ => Err(refuse()),
+        },
+        // The nested list names itself, so a bad `cache_control` says
+        // `cache_control field` wherever it was reached from.
+        Admits::Object(nested, fields) => known_fields(value, fields, nested, provider),
+    }
+}
+
+/// The same shape failure, re-blamed at the response.
+///
+/// `content_pointers`, `read_document` and the field allowlists are all written
+/// for the request path, where an unreadable shape is the caller's mistake and
+/// 400 is the honest answer. Reading the *upstream's* body with them would tell
+/// a caller they got wrong something they never sent — a model emitting
+/// truncated `arguments` is the upstream's doing, and `status()` maps every one
+/// of these variants to 400 on the stated rule that they are the caller's. This
+/// keeps that rule true by not letting any of them escape from the response
+/// path in the first place.
+pub fn as_response_error(error: ShapeError) -> ShapeError {
+    match error {
+        ShapeError::Request(provider)
+        | ShapeError::Unsupported(provider, _)
+        | ShapeError::MalformedDocument(provider, _) => ShapeError::Response(provider),
+        // A pointer addressing nothing is this gateway describing a location
+        // that does not exist, which is ours and is already a 502.
+        other => other,
+    }
+}
+
+/// A tool definition's prose and its schema. The schema goes in whole rather
+/// than by naming the keywords that carry text: `description` is not the only
+/// one — `default`, `const`, `enum`, `examples`, `title` and `$comment` are all
+/// client-controlled strings — and a list of what to scan is wrong the day
+/// someone adds to it. Property names are keys, which the walk never yields in
+/// key position; `Shape::Schema` is what handles the positions where a schema
+/// names one as a value.
+fn tool_definition_slots(
+    prefix: &str,
+    definition: &Value,
+    schema_field: &str,
+    allowed: &[Field],
+    provider: &'static str,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    known_fields(definition, allowed, "tool definition field", provider)?;
+    // Present but not a string cannot be masked, so it is refused rather than
+    // forwarded as it is — the rule `identifier_pointer` already applies to
+    // `/user` and `/name`, which this once did not.
+    //
+    // `tool: true`, because before this slice `tools` was refused whole: every
+    // one of these strings is text newly sent to the detector, one round-trip
+    // each, and a request carrying thirty tools carries thirty of them. Prompt
+    // text is exempt from the tool bounds because it predates them; a tool
+    // definition's prose does not.
+    match definition.get("description") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(_)) => out.push(Slot::Text {
+            pointer: format!("{prefix}/description"),
+            tool: true,
+        }),
+        Some(_) => return Err(ShapeError::Request(provider)),
+    }
+    if definition
+        .get(schema_field)
+        .is_some_and(|value| !value.is_null())
+    {
+        out.push(Slot::Json {
+            pointer: format!("{prefix}/{schema_field}"),
+            embedded: false,
+            shape: Shape::Schema,
+        });
+    }
+    Ok(())
+}
+
+/// The arguments of every call in a `tool_calls` array, wherever it sits — an
+/// assistant message the client echoes back, or a choice in the response. Both
+/// directions read the same shape, so both read it here.
+///
+/// `arguments` is a **string holding a document**, which is the whole of the
+/// difference from Anthropic's `input` and is carried by `embedded`. One
+/// consequence is client-visible and is intended rather than incidental:
+/// masking parses the string and re-serializes it, and this crate's
+/// `serde_json::Map` is a `BTreeMap` with no `preserve_order`, so the arguments
+/// that reach the provider carry the same keys in alphabetical order. JSON
+/// objects are unordered and a client parses rather than compares, so nothing
+/// breaks — but somebody debugging changed argument bytes should find it
+/// written down. `an_embedded_document_round_trips_through_read_and_write`
+/// pins it.
+fn tool_call_slots(
+    prefix: &str,
+    calls: &Value,
+    provider: &'static str,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    let calls = calls.as_array().ok_or(ShapeError::Request(provider))?;
+    for (index, call) in calls.iter().enumerate() {
+        known_fields(call, &OPENAI_TOOL_CALL_FIELDS, "tool call field", provider)?;
+        // A custom tool call carries `custom: {name, input}`, where `input` is
+        // a raw string in whatever grammar the tool declared — not JSON, and
+        // not something any slot here describes. The allowlist above already
+        // refuses it for its `custom` field; this refuses the type itself, so
+        // a call that declares one and carries nothing is refused too rather
+        // than passing as a call with no arguments.
+        if call.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(ShapeError::Unsupported(provider, "tool call type"));
+        }
+        let function = call.get("function").ok_or(ShapeError::Request(provider))?;
+        known_fields(
+            function,
+            &OPENAI_TOOL_CALL_FUNCTION_FIELDS,
+            "tool call field",
+            provider,
+        )?;
+        // `name` is dispatch. Absent or null arguments is a call with none;
+        // present but unreadable is `read_document`'s answer to give, since it
+        // is the one that knows whether the string parses.
+        if function
+            .get("arguments")
+            .is_some_and(|value| !value.is_null())
+        {
+            out.push(Slot::Json {
+                pointer: format!("{prefix}/{index}/function/arguments"),
+                embedded: true,
+                shape: Shape::Instance,
+            });
         }
     }
     Ok(())
@@ -103,12 +1092,12 @@ fn identifier_pointer(
     lookup: &str,
     output: String,
     provider: &'static str,
-    out: &mut Vec<String>,
+    out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
     match body.pointer(lookup) {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(_)) => {
-            out.push(output);
+            out.push(Slot::text(output));
             Ok(())
         }
         Some(_) => Err(ShapeError::Request(provider)),
@@ -136,23 +1125,291 @@ fn logprobs_carry_nothing(logprobs: &Value) -> bool {
     })
 }
 
+/// Fields a content block may carry that this gateway can account for, by block
+/// type. Every entry says why it is safe to admit, and `Admits` is where that
+/// vocabulary is explained. `is_error` is the field that made the point: it was
+/// admitted as a flag whose shape a comment asserted, and `"is_error": "Martina
+/// Weber"` reached Anthropic verbatim (measured, at 200).
+///
+/// The rule `ANTHROPIC_TOOL_DEFINITION_FIELDS` applies to tool definitions,
+/// one layer up: a block is an object the caller fills in, and a field no slot
+/// addresses is forwarded exactly as it came. Anthropic's `citations` is why
+/// this is not hypothetical — a `text` block may carry `cited_text`, which is
+/// quoted source material, and clients echo assistant turns back as history so
+/// it arrives on the request path. Refusing costs a caller who does not use
+/// citations nothing, and the alternative is forwarding quoted documents
+/// unmasked.
+///
+/// **This list never kept the response path safe, and it was twice claimed to.**
+/// The claim was that no request it admits can enable citations, so nothing can
+/// come back carrying them. That is an argument about citations, and it covered
+/// two hazards it was never about: a block arriving in a shape we did not
+/// expect, and a field the block's type does not define being forwarded to the
+/// client exactly as the provider wrote it. Both are closed now, and neither is
+/// closed *here* — `response_pointers` reads the block's type first, and
+/// `anthropic_response_block_fields` is that path's own closed list, derived
+/// from Anthropic's response shape rather than from this one.
+///
+/// The two lists are siblings, not copies. `cache_control` is on every list
+/// here and on neither of those; `citations` is refused outright here and
+/// admitted there in the null form Anthropic sends on every text block. The
+/// citations follow-up — describe `cited_text` as a slot rather than leave the
+/// feature closed — still has to land on all three sites in one change: this
+/// list, that dispatch, and that list.
+///
+/// An empty slice means a type this function does not know. Those are left to
+/// the dispatch below, which refuses them for being unrecognized rather than
+/// for their fields.
+fn content_block_fields(kind: &str) -> &'static [Field] {
+    /// The block's own `type`, decided by the dispatch that chose this arm:
+    /// `kind` *is* that string, so a second check here would be the same check
+    /// written twice, and two checks on one value drift.
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `kind` that chose this arm");
+    const CACHE_CONTROL: Field = Field::object(
+        "cache_control",
+        "cache_control field",
+        &ANTHROPIC_CACHE_CONTROL_FIELDS,
+    );
+    /// The images-and-audio policy: `UNSCANNED_PART_TYPES` names these block
+    /// types, and their payload — a base64 `source`, a URL, an audio blob —
+    /// is forwarded whole. Written as an entry rather than left implicit so
+    /// that the one exception to "nothing unmasked is forwarded" is visible at
+    /// the field it applies to.
+    const UNSCANNED: &str = "the images-and-audio policy at `UNSCANNED_PART_TYPES`";
+    // Named rather than written into the match arms because a `&[..]` of
+    // `const fn` calls is not promoted to `'static` and cannot be returned.
+    const TEXT: [Field; 3] = [TYPE, Field::described("text"), CACHE_CONTROL];
+    const IMAGE: [Field; 3] = [TYPE, Field::unscanned("source", UNSCANNED), CACHE_CONTROL];
+    const IMAGE_URL: [Field; 3] = [
+        TYPE,
+        Field::unscanned("image_url", UNSCANNED),
+        CACHE_CONTROL,
+    ];
+    const INPUT_AUDIO: [Field; 3] = [
+        TYPE,
+        Field::unscanned("input_audio", UNSCANNED),
+        CACHE_CONTROL,
+    ];
+    const AUDIO: [Field; 3] = [TYPE, Field::unscanned("audio", UNSCANNED), CACHE_CONTROL];
+    const TOOL_USE: [Field; 5] = [
+        TYPE,
+        Field::dispatch("id"),
+        Field::dispatch("name"),
+        Field::described("input"),
+        CACHE_CONTROL,
+    ];
+    const TOOL_RESULT: [Field; 5] = [
+        TYPE,
+        Field::dispatch("tool_use_id"),
+        Field::described("content"),
+        Field::boolean("is_error"),
+        CACHE_CONTROL,
+    ];
+    match kind {
+        "text" => &TEXT,
+        "image" => &IMAGE,
+        "image_url" => &IMAGE_URL,
+        "input_audio" => &INPUT_AUDIO,
+        "audio" => &AUDIO,
+        "tool_use" => &TOOL_USE,
+        "tool_result" => &TOOL_RESULT,
+        _ => &[],
+    }
+}
+
+/// Fields a block **in Anthropic's response** may carry, by block type — the
+/// other half of `content_block_fields`, and deliberately not the same lists.
+///
+/// A request block is an object the caller fills in; a response block is what
+/// the model produced. So these are derived from Anthropic's published response
+/// shape rather than mirrored from the request side, and they differ in both
+/// directions:
+///
+/// - `cache_control` is on every request list and on neither of these. It is a
+///   caching directive the *caller* attaches to content it sends; Anthropic's
+///   response blocks do not carry one. Admitting it here would be this file
+///   describing a field the provider never sends, which is the same defect as
+///   failing to describe one it does.
+/// - `citations` is on neither request list — the request path refuses a block
+///   carrying it — and it **has to be here**, because Anthropic documents it as
+///   required and nullable on a response `text` block: every text block carries
+///   `"citations": null`, so a list that omitted the key would refuse every
+///   well-formed response this gateway has ever served (measured: `{"type":
+///   "text", "text": "...", "citations": null}` is a 200 today, and stays one).
+///   `Admits::Nothing` is that distinction — the key is admitted, and only in
+///   the forms that carry no text.
+///
+/// **What this refuses that used to be forwarded:** a populated `citations`,
+/// whose `cited_text` is quoted source material carrying this gateway's own
+/// placeholders. `{"cited_text": "[PERSON_1] lives here"}` reached the client
+/// verbatim (measured, at 6f013b9, in what the client received). The
+/// alternative to refusing was handing over the placeholder, which is the
+/// failure restoration exists to prevent; and the refusal cannot fire on
+/// traffic this gateway admitted, because the request-side allowlist refuses
+/// every block that can enable citations. **Refusing is not the finished
+/// feature**: describing `cited_text` as a slot — on the request allowlist,
+/// this dispatch, and this list, in one change — is what turns it back into
+/// one. Until then the `Nothing` entry is where that debt is recorded.
+///
+/// An empty slice means a type this function does not know, left to the
+/// dispatch in `response_pointers`, which refuses it for being unreadable.
+fn anthropic_response_block_fields(kind: &str) -> &'static [Field] {
+    /// As `content_block_fields`' `TYPE`: `kind` *is* this string, and two
+    /// checks on one value drift.
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `kind` that chose this arm");
+    const TEXT: [Field; 3] = [
+        TYPE,
+        Field::described("text"),
+        Field::nothing(
+            "citations",
+            "describing `cited_text` as a slot on both paths",
+        ),
+    ];
+    // `id` and `name` are dispatch here as on the request side, with one
+    // difference worth stating: the model chose these strings, not the caller.
+    // The type check is what stops a structured value travelling unscanned;
+    // the characters are forwarded as the model wrote them, deliberately.
+    const TOOL_USE: [Field; 4] = [
+        TYPE,
+        Field::dispatch("id"),
+        Field::dispatch("name"),
+        Field::described("input"),
+    ];
+    match kind {
+        "text" => &TEXT,
+        "tool_use" => &TOOL_USE,
+        _ => &[],
+    }
+}
+
+/// This slice gave `content_pointers` a call to itself — a `tool_result` reads
+/// its own `content` through the same function — and a self-recursive walk over
+/// a caller's document needs a bound of its own. `mapping::walk` was given
+/// `MAX_JSON_DEPTH` for the identical hazard, and `Mapping::restore_value`
+/// carries a paragraph saying why a parser's limit is a backstop rather than a
+/// guarantee. Both apply here.
+///
+/// `serde_json` does bound deserialization depth, and it does hold today: a
+/// `tool_result` nested past about sixty levels is rejected at parse
+/// (measured — 50 levels parse, 100 do not, under a limit of 128 that counts
+/// each level's array *and* object). But that figure is a dependency's promise
+/// under a `serde_json = "1"` that any `cargo update` may move, and
+/// `disable_recursion_limit` exists to switch it off entirely. The bound below
+/// is ours. `MAX_JSON_DEPTH` rather than a second number, because a document
+/// deep enough to refuse here is one the walk would refuse anyway, and two
+/// bounds on one hazard drift.
 fn content_pointers(
     prefix: &str,
     content: &Value,
     provider: &'static str,
-    out: &mut Vec<String>,
+    position: Position,
+    out: &mut Vec<Slot>,
 ) -> Result<(), ShapeError> {
+    content_pointers_at(prefix, content, provider, position, 0, out)
+}
+
+fn content_pointers_at(
+    prefix: &str,
+    content: &Value,
+    provider: &'static str,
+    position: Position,
+    depth: usize,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    if depth > crate::mapping::MAX_JSON_DEPTH {
+        return Err(ShapeError::Unsupported(
+            provider,
+            "tool results nested deeper than this gateway walks",
+        ));
+    }
     match content {
-        Value::String(_) => out.push(prefix.to_owned()),
+        Value::String(_) => out.push(Slot::text(prefix.to_owned())),
         Value::Array(parts) => {
             for (index, part) in parts.iter().enumerate() {
-                if part.get("text").and_then(Value::as_str).is_some() {
-                    out.push(format!("{prefix}/{index}/text"));
-                    continue;
-                }
+                // `type` first, always. A block's type is what says which of
+                // its fields carry the caller's text; reading a field before
+                // the type meant any block that carried a `text` was described
+                // by that alone, and every other field in it — a tool call's
+                // `input`, a result's `content` — was forwarded untouched. A
+                // block with no type cannot be read at all, so it falls to the
+                // refusal below with everything else we do not understand.
                 let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
-                if !UNSCANNED_PART_TYPES.contains(&kind) {
+                // *Where* before *what*: a block type this walk can read is
+                // still refused in a position its provider does not define it
+                // in. Asked first because the field list below is chosen by the
+                // type alone and would otherwise wave through an Anthropic
+                // `tool_use` sent to OpenAI, or a tool block in `system`.
+                if !admissible_block_types(provider, position).contains(&kind) {
                     return Err(ShapeError::Request(provider));
+                }
+                // Checked before the dispatch, so a block is refused for what
+                // it carries as readily as for what it is.
+                let allowed = content_block_fields(kind);
+                if !allowed.is_empty() {
+                    // Both halves of every entry: the key is on the list, and
+                    // the value is the shape the entry admits. `cache_control`
+                    // is an entry like any other now, so the six sites that
+                    // allow it and the one that checked it are one site.
+                    known_fields(part, allowed, "content block field", provider)?;
+                }
+                match kind {
+                    "text" => {
+                        // Present but not a string cannot be masked, and the
+                        // arm below refuses it rather than dropping the block.
+                        match part.get("text") {
+                            Some(Value::String(_)) => {
+                                out.push(Slot::text(format!("{prefix}/{index}/text")));
+                                continue;
+                            }
+                            _ => return Err(ShapeError::Request(provider)),
+                        }
+                    }
+                    // `id` and `name` are the client's dispatch and are never
+                    // described; only the arguments are.
+                    "tool_use" => {
+                        if part.get("input").is_some() {
+                            out.push(Slot::Json {
+                                pointer: format!("{prefix}/{index}/input"),
+                                embedded: false,
+                                shape: Shape::Instance,
+                            });
+                        }
+                        continue;
+                    }
+                    // A result recurses through this same function, which is
+                    // what makes a string result and a list of blocks one case
+                    // rather than two — and what makes an image inside a result
+                    // inherit the policy images already have. `tool_use_id`
+                    // is dispatch and is left alone.
+                    "tool_result" => {
+                        if let Some(content) = part.get("content") {
+                            let from = out.len();
+                            content_pointers_at(
+                                &format!("{prefix}/{index}/content"),
+                                content,
+                                provider,
+                                // The position changes with the frame: a
+                                // result's content is not a message's, and the
+                                // recursion carrying `Message` down is what let
+                                // a `tool_use` nest inside a `tool_result`.
+                                Position::ToolResult,
+                                depth + 1,
+                                out,
+                            )?;
+                            // Whatever the recursion just produced is tool
+                            // traffic, however deep it went. Marked here rather
+                            // than inside the recursion because this is the
+                            // only frame that knows it is inside a result.
+                            for slot in &mut out[from..] {
+                                if let Slot::Text { tool, .. } = slot {
+                                    *tool = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    kind if UNSCANNED_PART_TYPES.contains(&kind) => continue,
+                    _ => return Err(ShapeError::Request(provider)),
                 }
             }
         }
@@ -172,12 +1429,31 @@ impl Provider for OpenAi {
         "/v1/chat/completions"
     }
 
-    fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn request_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("openai"))?;
-        reject_tool_fields(body, "openai")?;
+        reject_tool_fields(body, &OPENAI_BODY_TOOL_FIELDS, "openai")?;
+        known_tool_choice(
+            body,
+            openai_tool_choice_fields,
+            &OPENAI_TOOL_CHOICE_MODES,
+            "openai",
+        )?;
+        // OpenAI defines this as a boolean and nothing else. It is a tool field
+        // on the tool surface, it is on no allowlist because there is no
+        // allowlist at body level, and nothing read it:
+        // `"parallel_tool_calls": {"owner": "Martina Weber"}` reached the
+        // upstream verbatim (measured, at 200). Same class as `strict` and
+        // `is_error`, found by sweeping the denylists the way the last round
+        // swept the allowlists.
+        known_value(
+            body.get("parallel_tool_calls").unwrap_or(&Value::Null),
+            Admits::Bool,
+            "parallel_tool_calls",
+            "openai",
+        )?;
         // With logprobs on, every choice carries the model's output again as
         // token strings under `logprobs`. Those are the masked tokens: joined
         // back together they spell the placeholder, and their probabilities
@@ -220,11 +1496,55 @@ impl Provider for OpenAi {
         // forwarding them verbatim would leak exactly what the proxy exists to
         // stop.
         identifier_pointer(body, "/user", "/user".to_owned(), "openai", &mut pointers)?;
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use tools — the same reading `logprobs` and `audio` already get.
+        if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
+            let tools = tools.as_array().ok_or(ShapeError::Request("openai"))?;
+            for (index, tool) in tools.iter().enumerate() {
+                known_fields(
+                    tool,
+                    &OPENAI_TOOL_WRAPPER_FIELDS,
+                    "tool definition field",
+                    "openai",
+                )?;
+                // A wrapper that does not declare itself a function is a tool
+                // kind described nowhere here — a custom tool's `custom` object
+                // carries its own `description` and grammar.
+                if tool.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err(ShapeError::Unsupported("openai", "tool type"));
+                }
+                let function = tool.get("function").ok_or(ShapeError::Request("openai"))?;
+                tool_definition_slots(
+                    &format!("/tools/{index}/function"),
+                    function,
+                    "parameters",
+                    &OPENAI_TOOL_DEFINITION_FIELDS,
+                    "openai",
+                    &mut pointers,
+                )?;
+            }
+        }
         for (index, message) in messages.iter().enumerate() {
-            require_scannable_message(message, "openai")?;
-            reject_tool_fields(message, "openai")?;
-            if message.get("tool_call_id").is_some() {
-                return Err(ShapeError::Unsupported("openai", "tool_call_id"));
+            require_scannable_message(message, &["content", "tool_calls"], "openai")?;
+            reject_tool_fields(message, &OPENAI_MESSAGE_TOOL_FIELDS, "openai")?;
+            // A `role: "tool"` message is a tool result and nothing else, so it
+            // gets the allowlist a result deserves. Checked before anything is
+            // described, so the message is refused for what it carries as
+            // readily as for what it is.
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            if role == "tool" {
+                known_fields(
+                    message,
+                    &OPENAI_TOOL_MESSAGE_FIELDS,
+                    "tool message field",
+                    "openai",
+                )?;
+            } else {
+                // The same rule read the other way round: a field the tool
+                // shape defines is refused on a message that is not one. See
+                // `OPENAI_NON_TOOL_MESSAGE_FIELDS` — the allowlist above being
+                // chosen by the role is exactly what stopped anything asking.
+                reject_tool_fields(message, &OPENAI_NON_TOOL_MESSAGE_FIELDS, "openai")?;
             }
             identifier_pointer(
                 message,
@@ -233,29 +1553,91 @@ impl Provider for OpenAi {
                 "openai",
                 &mut pointers,
             )?;
-            if let Some(content) = message.get("content") {
+            // Null content is an assistant turn that carried tool calls
+            // instead: the provider writes it that way and clients echo it
+            // back, so reading it as an unreadable content shape refused the
+            // commonest tool body there is. Skipping it here is safe only
+            // because `require_scannable_message` above does not count a null
+            // as a carrier — otherwise a message whose content is null and
+            // whose carriers are all null would produce no slot and still be
+            // forwarded.
+            if let Some(content) = message.get("content").filter(|value| !value.is_null()) {
+                let from = pointers.len();
                 content_pointers(
                     &format!("/messages/{index}/content"),
                     content,
+                    "openai",
+                    Position::Message,
+                    &mut pointers,
+                )?;
+                // A tool message's content is a tool result — the OpenAI shape
+                // of what Anthropic sends as a `tool_result` block — so it is
+                // charged against the tool bounds like one. Unmarked it would
+                // be counted by neither: a coding agent's file reads arrive
+                // here, and they are the largest surface this slice opens.
+                if role == "tool" {
+                    for slot in &mut pointers[from..] {
+                        if let Slot::Text { tool, .. } = slot {
+                            *tool = true;
+                        }
+                    }
+                }
+            }
+            if let Some(calls) = message.get("tool_calls").filter(|value| !value.is_null()) {
+                tool_call_slots(
+                    &format!("/messages/{index}/tool_calls"),
+                    calls,
                     "openai",
                     &mut pointers,
                 )?;
             }
         }
+        // Last, because the slots are the answer: a definition, a call's
+        // arguments and a result each say they are tool traffic, so a
+        // continuation carrying only history is covered without asking for a
+        // top-level `tools` that a continuation need not repeat.
+        reject_streamed_tools(body, &pointers, "openai")?;
         Ok(pointers)
     }
 
-    fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn response_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let choices = body
             .get("choices")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Response("openai"))?;
         let mut pointers = Vec::new();
         for (index, choice) in choices.iter().enumerate() {
-            if let Some(content) = choice.pointer("/message/content") {
+            // Null content is what the provider writes beside `tool_calls`.
+            if let Some(content) = choice
+                .pointer("/message/content")
+                .filter(|value| !value.is_null())
+            {
                 content_pointers(
                     &format!("/choices/{index}/message/content"),
                     content,
+                    "openai",
+                    // The response side gets the request side's list rather
+                    // than the narrower one a model's own output takes. A
+                    // well-formed chat-completions response carries `content`
+                    // as a string, so the array branch is unreachable on
+                    // documented traffic and a narrower list would only ever
+                    // fire on a compatible endpoint doing something else —
+                    // after the caller's tokens were spent. Round 4's citations
+                    // lesson, applied the cautious way round.
+                    Position::Message,
+                    &mut pointers,
+                )?;
+            }
+            // The arguments the client is about to execute. Left undescribed
+            // they reach it holding the placeholders we issued, and it opens
+            // `/home/[PERSON_1]/notes.txt`.
+            if let Some(calls) = choice
+                .pointer("/message/tool_calls")
+                .filter(|value| !value.is_null())
+            {
+                tool_call_slots(
+                    &format!("/choices/{index}/message/tool_calls"),
+                    calls,
                     "openai",
                     &mut pointers,
                 )?;
@@ -361,12 +1743,36 @@ impl Provider for Anthropic {
         "/v1/messages"
     }
 
-    fn request_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn request_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Request("anthropic"))?;
-        reject_tool_fields(body, "anthropic")?;
+        reject_tool_fields(body, &ANTHROPIC_BODY_TOOL_FIELDS, "anthropic")?;
+        // Anthropic publishes no bare-string form, so the empty mode list is
+        // the whole of that difference between the providers.
+        known_tool_choice(body, anthropic_tool_choice_fields, &[], "anthropic")?;
+        let mut pointers = Vec::new();
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use tools — the same reading `thinking` and `logprobs` already get.
+        if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
+            let tools = tools.as_array().ok_or(ShapeError::Request("anthropic"))?;
+            for (index, definition) in tools.iter().enumerate() {
+                // The list is chosen by the tool's own `type`, so the type is
+                // read before the fields it decides. That ordering is the
+                // whole of the dependency: `anthropic_tool_definition_fields`
+                // refuses a type it cannot serve, and `known_fields` below
+                // refuses a field the type does not define.
+                tool_definition_slots(
+                    &format!("/tools/{index}"),
+                    definition,
+                    "input_schema",
+                    anthropic_tool_definition_fields(definition)?,
+                    "anthropic",
+                    &mut pointers,
+                )?;
+            }
+        }
         // Extended thinking opens the stream with a `thinking` block whose text
         // this gateway neither masks nor restores, and whose signature is
         // computed over the text the provider saw — restoring it would break
@@ -382,7 +1788,6 @@ impl Provider for Anthropic {
                 _ => return Err(ShapeError::Unsupported("anthropic", "thinking")),
             },
         }
-        let mut pointers = Vec::new();
         // Anthropic carries a caller-supplied identifier here.
         identifier_pointer(
             body,
@@ -391,39 +1796,122 @@ impl Provider for Anthropic {
             "anthropic",
             &mut pointers,
         )?;
-        if let Some(system) = body.get("system") {
-            content_pointers("/system", system, "anthropic", &mut pointers)?;
+        // Explicitly null is an SDK serializing its default, not a request to
+        // use X — the same reading `tools`, `thinking` and `content` already
+        // get. Without the filter `content_pointers` saw `Value::Null`, could
+        // not say where the text was, and refused: `{"system": null}` was a 400
+        // (measured) for a body carrying no system prompt at all.
+        if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
+            content_pointers(
+                "/system",
+                system,
+                "anthropic",
+                Position::System,
+                &mut pointers,
+            )?;
         }
         for (index, message) in messages.iter().enumerate() {
-            require_scannable_message(message, "anthropic")?;
-            reject_tool_fields(message, "anthropic")?;
+            require_scannable_message(message, &["content"], "anthropic")?;
+            reject_tool_fields(message, &ANTHROPIC_MESSAGE_TOOL_FIELDS, "anthropic")?;
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
                     content,
                     "anthropic",
+                    Position::Message,
                     &mut pointers,
                 )?;
             }
         }
+        // Last, because the slots are the answer. A definition, a call's
+        // arguments and a result are all tool traffic, and each of them already
+        // says so — so asking the slots cannot miss a location the way asking
+        // for a top-level `tools` did, and a location added later is covered
+        // the day it is described.
+        reject_streamed_tools(body, &pointers, "anthropic")?;
         Ok(pointers)
     }
 
-    fn response_pointers(&self, body: &Value) -> Result<Vec<String>, ShapeError> {
+    fn response_pointers(&self, body: &Value) -> Result<Vec<Slot>, ShapeError> {
         let blocks = body
             .get("content")
             .and_then(Value::as_array)
             .ok_or(ShapeError::Response("anthropic"))?;
         let mut pointers = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
-            if block.get("text").and_then(Value::as_str).is_some() {
-                pointers.push(format!("/content/{index}/text"));
-                continue;
+            // `type` first, always — `content_pointers`' rule, on the path it
+            // had not reached. A block's type is what says which of its fields
+            // carry text; reading `text` before the type meant any block
+            // carrying one was described by that alone, and every other field
+            // in it went back to the client unrestored. `{"type": "tool_use",
+            // "text": "ok", "input": {"path": "/home/[PERSON_1]/notes.txt"}}`
+            // pushed the text slot and skipped the block, so `input` was never
+            // restored and **the client read that path as a real argument**
+            // (measured: the client received the placeholder).
+            //
+            // This comment used to argue the hazard away: the request-side
+            // allowlist refuses every block that can enable citations, so
+            // nothing could arrive shaped like that. **That argument is about
+            // citations and this is not a citation.** It needs only a provider
+            // returning a block shaped differently from the one we expect — a
+            // new field, a malformed body, a bad day upstream — and this
+            // gateway's threat model already says in writing that a *detector*
+            // may misbehave, with a whole `REDACTED` mechanism for when it
+            // does. The same reading has to apply to a provider. A refusal
+            // upstream of here is not a guard here.
+            //
+            // The type dispatch was half the fix and the comment used to say
+            // so: a field the type does *not* define was still forwarded to the
+            // client exactly as the provider wrote it. The other half is below
+            // — a closed field list per type, `content_block_fields`' rule on
+            // the path it had not reached either. `citations[].cited_text` was
+            // the live case: `{"cited_text": "[PERSON_1] lives here"}` reached
+            // the client verbatim (measured, at 6f013b9).
+            //
+            // Refusing rather than forwarding is the same policy the `_` arm
+            // below already applied to an unknown *type*; applying it to an
+            // unknown *field* is that policy on the rest of its surface. It
+            // spends the caller's tokens before it fires — and it can only fire
+            // on a response no request this gateway accepted could have asked
+            // for, since the request-side allowlist refuses every block that
+            // can enable citations. Zero cost on correct traffic, and on
+            // incorrect traffic the alternative is the placeholder.
+            let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+            // Checked before the dispatch, so a block is refused for what it
+            // carries as readily as for what it is — `content_pointers`' order.
+            let allowed = anthropic_response_block_fields(kind);
+            if !allowed.is_empty() {
+                known_fields(block, allowed, "response content block field", "anthropic")?;
             }
-            // A tool_use block's arguments can carry placeholders we issued.
-            // Handing them to the client unrestored is the failure restoration
-            // exists to prevent, so an unreadable block refuses the response.
-            return Err(ShapeError::Response("anthropic"));
+            match kind {
+                "text" => match block.get("text") {
+                    Some(Value::String(_)) => {
+                        pointers.push(Slot::text(format!("/content/{index}/text")));
+                    }
+                    // Present but not a string cannot be restored, and a block
+                    // typed `text` with no readable text is not one we can
+                    // hand on — the same refusal the request path makes.
+                    _ => return Err(ShapeError::Response("anthropic")),
+                },
+                // A tool_use block's arguments carry the placeholders we
+                // issued, and the client executes them. Its `id` and `name`
+                // are dispatch and are left exactly as the model wrote them.
+                "tool_use" => {
+                    if block.get("input").is_some() {
+                        pointers.push(Slot::Json {
+                            pointer: format!("/content/{index}/input"),
+                            embedded: false,
+                            shape: Shape::Instance,
+                        });
+                    }
+                }
+                // Any other block — including one with no type at all — is one
+                // we cannot read. Handing a placeholder to the client is the
+                // failure restoration exists to prevent, so an unreadable block
+                // refuses the response. This arm was already here and already
+                // said so; what it did not do was run before `text`.
+                _ => return Err(ShapeError::Response("anthropic")),
+            }
         }
         Ok(pointers)
     }
@@ -505,17 +1993,369 @@ pub fn write_pointer(body: &mut Value, pointer: &str, text: &str) -> Result<(), 
     Ok(())
 }
 
+/// A `Json` slot's document. `embedded` means the pointer addresses a string
+/// holding a document rather than the document itself — OpenAI's `arguments`
+/// against Anthropic's `input`.
+pub fn read_document(
+    body: &Value,
+    pointer: &str,
+    embedded: bool,
+    provider: &'static str,
+) -> Result<Value, ShapeError> {
+    let at = body
+        .pointer(pointer)
+        .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
+    if !embedded {
+        return Ok(at.clone());
+    }
+    // Both failures below are the caller's: a slot said this holds a document,
+    // and it does not. Neither is the upstream's fault, and a 502 would say it
+    // was.
+    let text = at
+        .as_str()
+        .ok_or_else(|| ShapeError::MalformedDocument(provider, pointer.to_owned()))?;
+    serde_json::from_str(text)
+        .map_err(|_| ShapeError::MalformedDocument(provider, pointer.to_owned()))
+}
+
+pub fn write_document(
+    body: &mut Value,
+    pointer: &str,
+    document: &Value,
+    embedded: bool,
+) -> Result<(), ShapeError> {
+    let slot = body
+        .pointer_mut(pointer)
+        .ok_or_else(|| ShapeError::Pointer(pointer.to_owned()))?;
+    *slot = if embedded {
+        Value::String(serde_json::to_string(document).map_err(|_| ShapeError::Response("json"))?)
+    } else {
+        document.clone()
+    };
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    /// **Every allowlist in this file, in one place.** Codex found three
+    /// constrained-but-unchecked fields in a single pass, which is evidence
+    /// about the population and not about those three, so the answer was to
+    /// enumerate the population rather than patch its known members. This is
+    /// that enumeration, and it is a function rather than a comment so that the
+    /// classification each entry carries is *read* — `Elsewhere` and
+    /// `Unscanned` exist to name the check and the policy behind an admitted
+    /// key, and a payload nothing reads is a comment with a type on it.
+    ///
+    /// A list added and not put here is still checked at its own call site;
+    /// what it loses is this test's insistence that each of its entries has an
+    /// answer. Add it.
+    fn every_allowlist() -> Vec<(&'static str, &'static [Field])> {
+        let mut lists = every_named_allowlist();
+        // A nested list is an allowlist too, and it was the one place this
+        // enumeration could hold a member it never named: `Admits::Object`
+        // carries its fields inline, so the `name` under `tool_choice`'s
+        // `function` is reachable only through the entry holding it. Walked
+        // rather than listed, because listing it is the step that gets missed.
+        let mut index = 0;
+        while index < lists.len() {
+            let (_, fields) = lists[index];
+            for field in fields {
+                if let Admits::Object(what, nested) = field.admits {
+                    if !lists.iter().any(|(named, _)| *named == what) {
+                        lists.push((what, nested));
+                    }
+                }
+            }
+            index += 1;
+        }
+        lists
+    }
+
+    /// The tool definition list for one `type`, for the enumeration above and
+    /// the family guard below. Panics on a type this gateway refuses, which is
+    /// what both callers want: they name types it serves.
+    fn definition_fields(kind: &str) -> &'static [Field] {
+        anthropic_tool_definition_fields(&json!({"type": kind}))
+            .unwrap_or_else(|_| panic!("{kind} names a tool this gateway serves"))
+    }
+
+    fn every_named_allowlist() -> Vec<(&'static str, &'static [Field])> {
+        vec![
+            // One entry per tool type, because that is what the lists are now.
+            // A type missing here is a list this test does not read, which is
+            // why `every_client_tool_family_selects_a_list` reads the families
+            // from the constant rather than from this hand-written vec.
+            (
+                "anthropic_tool_definition_fields(custom)",
+                definition_fields("custom"),
+            ),
+            (
+                "anthropic_tool_definition_fields(bash_20250124)",
+                definition_fields("bash_20250124"),
+            ),
+            (
+                "anthropic_tool_definition_fields(text_editor_20250728)",
+                definition_fields("text_editor_20250728"),
+            ),
+            (
+                "anthropic_tool_definition_fields(computer_20251124)",
+                definition_fields("computer_20251124"),
+            ),
+            (
+                "anthropic_tool_definition_fields(memory_20250818)",
+                definition_fields("memory_20250818"),
+            ),
+            (
+                "ANTHROPIC_CACHE_CONTROL_FIELDS",
+                &ANTHROPIC_CACHE_CONTROL_FIELDS[..],
+            ),
+            (
+                "OPENAI_TOOL_WRAPPER_FIELDS",
+                &OPENAI_TOOL_WRAPPER_FIELDS[..],
+            ),
+            (
+                "OPENAI_TOOL_DEFINITION_FIELDS",
+                &OPENAI_TOOL_DEFINITION_FIELDS[..],
+            ),
+            ("OPENAI_TOOL_CALL_FIELDS", &OPENAI_TOOL_CALL_FIELDS[..]),
+            (
+                "OPENAI_TOOL_CALL_FUNCTION_FIELDS",
+                &OPENAI_TOOL_CALL_FUNCTION_FIELDS[..],
+            ),
+            (
+                "OPENAI_TOOL_MESSAGE_FIELDS",
+                &OPENAI_TOOL_MESSAGE_FIELDS[..],
+            ),
+            ("content_block_fields(text)", content_block_fields("text")),
+            ("content_block_fields(image)", content_block_fields("image")),
+            (
+                "content_block_fields(image_url)",
+                content_block_fields("image_url"),
+            ),
+            (
+                "content_block_fields(input_audio)",
+                content_block_fields("input_audio"),
+            ),
+            ("content_block_fields(audio)", content_block_fields("audio")),
+            (
+                "content_block_fields(tool_use)",
+                content_block_fields("tool_use"),
+            ),
+            (
+                "content_block_fields(tool_result)",
+                content_block_fields("tool_result"),
+            ),
+            (
+                "anthropic_response_block_fields(text)",
+                anthropic_response_block_fields("text"),
+            ),
+            (
+                "anthropic_response_block_fields(tool_use)",
+                anthropic_response_block_fields("tool_use"),
+            ),
+            (
+                "anthropic_tool_choice_fields(auto)",
+                anthropic_tool_choice_fields("auto"),
+            ),
+            (
+                "anthropic_tool_choice_fields(any)",
+                anthropic_tool_choice_fields("any"),
+            ),
+            (
+                "anthropic_tool_choice_fields(tool)",
+                anthropic_tool_choice_fields("tool"),
+            ),
+            (
+                "anthropic_tool_choice_fields(none)",
+                anthropic_tool_choice_fields("none"),
+            ),
+            (
+                "openai_tool_choice_fields(function)",
+                openai_tool_choice_fields("function"),
+            ),
+            (
+                "openai_tool_choice_fields(custom)",
+                openai_tool_choice_fields("custom"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_allowlisted_field_says_why_it_is_safe_to_admit() {
+        // The class this round exists to end: an allowlist admits a key, and a
+        // field whose shape the provider constrains is an unmasked egress
+        // channel until something checks its value. `Admits` makes the answer a
+        // value the code consumes; this makes the answer say something.
+        for (list, fields) in every_allowlist() {
+            assert!(!fields.is_empty(), "{list} admits nothing");
+            for field in fields {
+                assert!(!field.key.is_empty(), "{list} has a nameless entry");
+                match field.admits {
+                    Admits::Described
+                    | Admits::Dispatch
+                    | Admits::Bool
+                    | Admits::Number
+                    | Admits::Elsewhere
+                    | Admits::Unscanned
+                    | Admits::Nothing => {}
+                    Admits::OneOf(values) => assert!(
+                        !values.is_empty(),
+                        "{list}/{} admits one of nothing, which is a refusal \
+                         written as an allowlist",
+                        field.key
+                    ),
+                    Admits::Object(what, nested) => {
+                        assert!(!what.is_empty() && !nested.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_dispatch_field_requires_a_string() {
+        // The population rather than its known members. `Dispatch` shared
+        // `known_value`'s first arm with `Described`, `Elsewhere` and
+        // `Unscanned`, and that arm is `Ok(())` — so every entry below admitted
+        // a structured value, scanned by nothing and forwarded verbatim.
+        //
+        // The second assertion is the half that has to keep holding: the
+        // argument for leaving dispatch alone was always about the *character
+        // set*, so a name with `.` and `/` in it — MCP's spelling, which
+        // neither provider's published grammar admits — must still pass.
+        let mut dispatch = 0;
+        for (list, fields) in every_allowlist() {
+            for field in fields
+                .iter()
+                .filter(|f| matches!(f.admits, Admits::Dispatch))
+            {
+                dispatch += 1;
+                for structured in [
+                    json!({"owner": "Martina Weber"}),
+                    json!(["Martina Weber"]),
+                    json!(7),
+                    json!(true),
+                ] {
+                    assert!(
+                        known_value(&structured, field.admits, "w", "p").is_err(),
+                        "{list}/{} admits {structured}, which nothing scans",
+                        field.key
+                    );
+                }
+                assert!(
+                    known_value(&json!("mcp__server/read.file"), field.admits, "w", "p").is_ok(),
+                    "{list}/{} refuses a string, and the character grammar was to stay \
+                     permissive",
+                    field.key
+                );
+            }
+        }
+        assert_eq!(
+            dispatch, 16,
+            "each of these is a string this gateway forwards on purpose — the caller's on a \
+             request, the model's on a response — so adding one is a decision and not a \
+             discovery. It counts entries and not distinct keys, so splitting one list into \
+             several — the tool definition's five, each carrying `name` — moves it too; that \
+             is a re-read of the entries and not a new channel"
+        );
+    }
+
+    #[test]
+    fn no_allowlist_admits_a_key_twice() {
+        // Two entries for one key means the second is dead and the first is
+        // whichever `find` reaches — so a `Bool` shadowed by a `Dispatch` would
+        // check nothing while reading as though it did. The same defect
+        // `check_entity_types.py` grew a duplicate check for one round ago.
+        for (list, fields) in every_allowlist() {
+            for (index, field) in fields.iter().enumerate() {
+                assert!(
+                    !fields[..index].iter().any(|other| other.key == field.key),
+                    "{list} admits {} twice",
+                    field.key
+                );
+            }
+        }
+    }
+
+    // Unwraps `stream_slots`' `TextSlot` results, for the streamed-event tests.
     fn pointers(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
         slots
             .unwrap()
             .into_iter()
             .map(|slot| slot.pointer)
             .collect()
+    }
+
+    // Unwraps `request_pointers`/`response_pointers`' `Slot` results — a
+    // different type from `TextSlot` above, so a second helper rather than a
+    // shared one; Rust does not overload free functions by parameter type.
+    // Named constructors so a full-`Slot` expectation stays as readable as a
+    // list of pointers was. The kind is the point: `slot_pointers` below cannot
+    // see it, and the first slot whose kind mattered got through a mutation
+    // because of that.
+    fn text(pointer: &str) -> Slot {
+        Slot::text(pointer.to_owned())
+    }
+    fn tool_text(pointer: &str) -> Slot {
+        Slot::Text {
+            pointer: pointer.to_owned(),
+            tool: true,
+        }
+    }
+    fn instance(pointer: &str) -> Slot {
+        Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: false,
+            shape: Shape::Instance,
+        }
+    }
+    fn schema(pointer: &str) -> Slot {
+        Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: false,
+            shape: Shape::Schema,
+        }
+    }
+
+    /// Pointers alone, for the one kind of assertion that is a predicate over
+    /// pointer strings rather than a description of what was found. Everything
+    /// that says "these are the slots" asserts the slots.
+    fn slot_pointers(slots: Result<Vec<Slot>, ShapeError>) -> Vec<String> {
+        slots
+            .unwrap()
+            .into_iter()
+            .map(|slot| slot.pointer().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_text_slot_names_the_pointer_it_wraps() {
+        let slot = Slot::text("/messages/0/content".to_owned());
+        assert_eq!(slot.pointer(), "/messages/0/content");
+        assert!(
+            matches!(slot, Slot::Text { tool: false, .. }),
+            "prompt text is not tool traffic and the tool bound must not count it"
+        );
+    }
+
+    #[test]
+    fn a_json_slot_remembers_whether_the_document_is_embedded() {
+        let plain = Slot::Json {
+            pointer: "/messages/0/content/0/input".to_owned(),
+            embedded: false,
+            shape: Shape::Instance,
+        };
+        let embedded = Slot::Json {
+            pointer: "/messages/0/tool_calls/0/function/arguments".to_owned(),
+            embedded: true,
+            shape: Shape::Instance,
+        };
+        assert_eq!(plain.pointer(), "/messages/0/content/0/input");
+        assert!(!matches!(plain, Slot::Json { embedded: true, .. }));
+        assert!(matches!(embedded, Slot::Json { embedded: true, .. }));
     }
 
     fn keys(slots: Result<Vec<TextSlot>, ShapeError>) -> Vec<String> {
@@ -569,7 +2409,7 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": "Weber"}]});
         assert_eq!(
             OpenAi.request_pointers(&body).unwrap(),
-            vec!["/messages/0/content"]
+            vec![text("/messages/0/content")]
         );
     }
 
@@ -581,7 +2421,7 @@ mod tests {
         ]}]});
         assert_eq!(
             OpenAi.request_pointers(&body).unwrap(),
-            vec!["/messages/0/content/0/text"]
+            vec![text("/messages/0/content/0/text")]
         );
     }
 
@@ -593,7 +2433,11 @@ mod tests {
         });
         assert_eq!(
             OpenAi.request_pointers(&body).unwrap(),
-            vec!["/user", "/messages/0/name", "/messages/0/content"]
+            vec![
+                text("/user"),
+                text("/messages/0/name"),
+                text("/messages/0/content")
+            ]
         );
     }
 
@@ -605,7 +2449,7 @@ mod tests {
         });
         assert_eq!(
             Anthropic.request_pointers(&body).unwrap(),
-            vec!["/metadata/user_id", "/messages/0/content"]
+            vec![text("/metadata/user_id"), text("/messages/0/content")]
         );
     }
 
@@ -614,7 +2458,7 @@ mod tests {
         let body = json!({"choices": [{"message": {"role": "assistant", "content": "Hallo"}}]});
         assert_eq!(
             OpenAi.response_pointers(&body).unwrap(),
-            vec!["/choices/0/message/content"]
+            vec![text("/choices/0/message/content")]
         );
     }
 
@@ -626,7 +2470,7 @@ mod tests {
         });
         assert_eq!(
             Anthropic.request_pointers(&body).unwrap(),
-            vec!["/system", "/messages/0/content/0/text"]
+            vec![text("/system"), text("/messages/0/content/0/text")]
         );
     }
 
@@ -635,8 +2479,885 @@ mod tests {
         let body = json!({"content": [{"type": "text", "text": "Hallo"}]});
         assert_eq!(
             Anthropic.response_pointers(&body).unwrap(),
-            vec!["/content/0/text"]
+            vec![text("/content/0/text")]
         );
+    }
+
+    #[test]
+    fn anthropic_describes_tool_definitions_and_calls_and_results() {
+        let body = json!({
+            "model": "claude",
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file for Dr. Weber",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"path": "/home/weber/notes.txt"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Martina Weber"}
+                ]}
+            ]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![
+                tool_text("/tools/0/description"),
+                schema("/tools/0/input_schema"),
+                instance("/messages/0/content/0/input"),
+                tool_text("/messages/1/content/0/content"),
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_never_describes_a_tool_name_or_a_result_id() {
+        let body = json!({
+            "model": "claude",
+            "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "x"}
+            ]}]
+        });
+        let described = slot_pointers(Anthropic.request_pointers(&body));
+        assert!(
+            !described
+                .iter()
+                .any(|p| p.ends_with("/name") || p.ends_with("/tool_use_id")),
+            "a tool name and a result id are the client's dispatch: {described:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_definition_this_gateway_cannot_account_for_is_refused() {
+        // A tool definition is an object the caller fills in, and a field no
+        // slot addresses travels exactly as it came. Anthropic's own server
+        // tools are the live case: `web_search_20250305` carries
+        // `user_location`, whose `city` is a LOCATION in this gateway's
+        // vocabulary.
+        let server_tool = json!({
+            "model": "claude",
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "user_location": {"city": "Zurich", "country": "CH"}
+            }],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&server_tool),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "tool definition field"
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_tool_definition_that_cannot_be_read_is_refused_rather_than_forwarded() {
+        // Each of these produced no slot and no refusal, which is the shape
+        // that forwards a value untouched. `identifier_pointer` has refused
+        // exactly this for `/user` and `/name` all along.
+        let not_an_object = json!({
+            "model": "claude",
+            "tools": ["Martina Weber"],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(Anthropic.request_pointers(&not_an_object).is_err());
+
+        let description_not_a_string = json!({
+            "model": "claude",
+            "tools": [{"name": "f", "description": {"long": "Martina Weber"},
+                       "input_schema": {}}],
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(Anthropic
+            .request_pointers(&description_not_a_string)
+            .is_err());
+
+        let tools_not_an_array = json!({
+            "model": "claude",
+            "tools": {"name": "f"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(Anthropic.request_pointers(&tools_not_an_array).is_err());
+    }
+
+    #[test]
+    fn a_tool_definitions_schema_is_described_as_a_schema_not_an_instance() {
+        // The kind is load-bearing and a pointer list cannot see it: a schema
+        // read as an instance masks the property names it states as values.
+        let body = json!({
+            "model": "claude",
+            "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}}
+            ]}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![
+                Slot::Text {
+                    pointer: "/tools/0/description".to_owned(),
+                    tool: true,
+                },
+                Slot::Json {
+                    pointer: "/tools/0/input_schema".to_owned(),
+                    embedded: false,
+                    shape: Shape::Schema,
+                },
+                Slot::Json {
+                    pointer: "/messages/0/content/0/input".to_owned(),
+                    embedded: false,
+                    shape: Shape::Instance,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_results_text_is_marked_as_tool_traffic_and_a_prompts_is_not() {
+        // The byte bound reads this flag. A result is a bare string like any
+        // prompt text, so nothing but the flag distinguishes the largest
+        // surface tool support opens from ordinary conversation.
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "prompt"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "result"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": [
+                    {"type": "text", "text": "nested result"}
+                ]}
+            ]}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![
+                Slot::Text {
+                    pointer: "/messages/0/content/0/text".to_owned(),
+                    tool: false,
+                },
+                Slot::Text {
+                    pointer: "/messages/0/content/1/content".to_owned(),
+                    tool: true,
+                },
+                Slot::Text {
+                    pointer: "/messages/0/content/2/content/0/text".to_owned(),
+                    tool: true,
+                },
+            ],
+            "a result nested inside blocks is still a result"
+        );
+    }
+
+    #[test]
+    fn anthropic_still_refuses_the_openai_shaped_tool_fields() {
+        // Anthropic's API defines none of these, so nothing here produces a
+        // slot for them and nothing would mask them. A field no slot addresses
+        // is forwarded exactly as it came, which is how `tool_calls` smuggled
+        // into an Anthropic body would carry its arguments past the masker.
+        for field in ["functions", "function_call", "tool_calls"] {
+            let at_body = json!({
+                "model": "claude",
+                field: [{"name": "read_file", "arguments": "{\"n\":\"Weber\"}"}],
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                Anthropic.request_pointers(&at_body).is_err(),
+                "{field} was allowed at the top level"
+            );
+            let at_message = json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": "Hi",
+                              field: [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}]
+            });
+            assert!(
+                Anthropic.request_pointers(&at_message).is_err(),
+                "{field} was allowed on a message"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_refuses_a_tools_array_on_a_message_and_still_describes_one_on_the_body() {
+        // The Anthropic twin of the hole the OpenAI list closed. Anthropic
+        // defines `tools` on the body and nowhere else, so on a message no slot
+        // addresses it and it travels exactly as the caller wrote it —
+        // descriptions, schemas and all. Verified before the fix: 200, and
+        // `"description":"Weber"` in the upstream's body.
+        //
+        // Both halves are asserted here because one list served both levels,
+        // and the fix is the split. Refusing the message without still serving
+        // the body would close the feature this slice exists to open.
+        let on_a_message = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi",
+                          "tools": [{"name": "t", "description": "Weber",
+                                     "input_schema": {"type": "object"}}]}]
+        });
+        assert!(
+            matches!(
+                Anthropic.request_pointers(&on_a_message),
+                Err(ShapeError::Unsupported("anthropic", "tools"))
+            ),
+            "described nowhere and refused nowhere, so forwarded whole: {:?}",
+            Anthropic.request_pointers(&on_a_message)
+        );
+        let on_the_body = json!({
+            "model": "claude",
+            "tools": [{"name": "t", "description": "Weber", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&on_the_body).unwrap(),
+            vec![
+                tool_text("/tools/0/description"),
+                schema("/tools/0/input_schema"),
+                text("/messages/0/content"),
+            ],
+            "the body's tools are described, not refused"
+        );
+    }
+
+    /// A nest of `tool_result` blocks, built in memory rather than parsed.
+    /// That is the case with no backstop at all: `serde_json`'s recursion limit
+    /// bounds what it *parses*, and this walk is reachable from a value a
+    /// caller assembled — which is exactly the gap `restore_value`'s note
+    /// names.
+    fn nested_tool_results(depth: usize) -> Value {
+        let mut content = Value::String("leaf".to_owned());
+        for _ in 0..depth {
+            content = json!([{"type": "tool_result", "tool_use_id": "t", "content": content}]);
+        }
+        content
+    }
+
+    #[test]
+    fn an_explicitly_null_system_is_not_a_system_prompt() {
+        // Verified as a 400 before this filter: `content_pointers` was handed
+        // `Value::Null`, could not say where the text was, and refused the
+        // whole request. The reading this branch already applies to `tools`,
+        // `thinking` and `content` is that explicitly null is an SDK
+        // serializing its default — this is the field that predates them.
+        let body = json!({
+            "model": "claude",
+            "system": null,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic
+                .request_pointers(&body)
+                .expect("a null system is no system"),
+            vec![text("/messages/0/content")],
+        );
+        // A system prompt that is there is still described.
+        let present = json!({
+            "model": "claude",
+            "system": "you are a bot",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&present).unwrap(),
+            vec![text("/system"), text("/messages/0/content")],
+        );
+    }
+
+    #[test]
+    fn a_tool_result_nested_inside_a_tool_result_is_refused_one_frame_in() {
+        // **This test asserted the opposite until round 7, and the answer it
+        // asserted was a leak.** It drove `nested_tool_results(70)` into the
+        // depth bound and `(60)` to the leaf, which required a `tool_result`
+        // inside a `tool_result` to be admissible sixty times over. Anthropic's
+        // `ToolResultBlockParam.content` admits `text`, `image`,
+        // `search_result`, `document`, `tool_reference` and `browser_state` —
+        // never `tool_result`, and never `tool_use`, whose `name` is dispatch
+        // and travelled unscanned from inside a result (measured, at 200).
+        //
+        // So the position rule refuses the second frame, and the depth bound
+        // below it now has no reachable input: `content_pointers_at` recurses
+        // only for `tool_result`, and `Position::ToolResult` does not admit
+        // one. **The bound is kept and this is the test that says why** — it is
+        // the guard that stays correct if a position set ever re-admits
+        // nesting, and a stack exhausted by a caller's document ends the
+        // process and every live session mapping with it. An unreachable
+        // backstop is worth its lines here; an unrecorded one is not.
+        let nested = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": nested_tool_results(2)}]
+        });
+        assert!(
+            matches!(
+                Anthropic.request_pointers(&nested),
+                Err(ShapeError::Request("anthropic"))
+            ),
+            "a result inside a result is not a shape Anthropic defines: {:?}",
+            Anthropic.request_pointers(&nested)
+        );
+        // One frame is the whole of what the recursion serves, and it still
+        // serves it: a result's own content read to its leaf.
+        let one = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": nested_tool_results(1)}]
+        });
+        let slots = Anthropic.request_pointers(&one).expect("one frame");
+        assert_eq!(slots.len(), 1, "the leaf is described once: {slots:?}");
+    }
+
+    #[test]
+    fn cache_control_is_checked_rather_than_asserted() {
+        // The one allowlisted object this gateway does not describe. A comment
+        // claimed its shape — "`cache_control` is `{"type": "ephemeral"}` and
+        // carries nothing of the caller's" — and the code checked nothing, so
+        // `{"type": "ephemeral", "note": "Weber"}` reached the upstream
+        // verbatim on both a tool definition and a content block. Measured,
+        // both of them, before this test existed.
+        for body in [
+            json!({
+                "model": "claude",
+                "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object"},
+                           "cache_control": {"type": "ephemeral", "note": "Weber"}}],
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi",
+                     "cache_control": {"type": "ephemeral", "note": "Weber"}}]}]
+            }),
+        ] {
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported("anthropic", "cache_control field"))
+                ),
+                "a field no slot addresses travelled whole: {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+        // And the shapes Anthropic actually defines still work: the bare form,
+        // and the extended lifetime that is the reason `ttl` is on the list.
+        for cache_control in [
+            json!({"type": "ephemeral"}),
+            json!({"type": "ephemeral", "ttl": "1h"}),
+        ] {
+            let body = json!({
+                "model": "claude",
+                "tools": [{"name": "t", "input_schema": {"type": "object"},
+                           "cache_control": cache_control}],
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a cache_control Anthropic defines was refused: {cache_control}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_controls_values_are_checked_and_not_only_its_keys() {
+        // The list above replaced a comment that asserted the shape, and then
+        // overclaimed in the same way: it admitted the two key names and read
+        // neither value, so both of these reached the upstream verbatim
+        // (measured, at 200). Anthropic defines `ephemeral`, and `5m` or `1h`,
+        // and nothing else — there is no room in this field for the caller's
+        // text, which is what makes checking it free.
+        for cache_control in [
+            json!({"type": "Martina Weber"}),
+            json!({"type": "ephemeral", "ttl": {"owner": "Weber"}}),
+            json!({"type": "ephemeral", "ttl": "Martina Weber"}),
+            json!({"type": ["ephemeral"]}),
+        ] {
+            for body in [
+                json!({
+                    "model": "claude",
+                    "tools": [{"name": "t", "input_schema": {"type": "object"},
+                               "cache_control": cache_control}],
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "hi", "cache_control": cache_control}]}]
+                }),
+            ] {
+                assert!(
+                    matches!(
+                        Anthropic.request_pointers(&body),
+                        Err(ShapeError::Unsupported("anthropic", "cache_control field"))
+                    ),
+                    "a value no slot addresses travelled whole: {cache_control} -> {:?}",
+                    Anthropic.request_pointers(&body)
+                );
+            }
+        }
+        // And a null is an SDK serializing its default, not a request to cache.
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": null}]}]
+        });
+        assert!(Anthropic.request_pointers(&body).is_ok());
+    }
+
+    #[test]
+    fn a_non_boolean_strict_is_refused_rather_than_forwarded() {
+        // `strict` is a boolean, and the comment above the list said so while
+        // nothing made it one: `"strict": "Martina Weber"` reached OpenAI
+        // verbatim (measured, at 200). `tool_definition_slots` scans
+        // `description` and `parameters`, so no slot ever looked at this field.
+        for strict in [json!("Martina Weber"), json!({"owner": "Weber"}), json!(1)] {
+            let body = json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function",
+                           "function": {"name": "t", "strict": strict}}]
+            });
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Unsupported("openai", "tool definition field"))
+                ),
+                "a non-boolean strict travelled whole: {strict} -> {:?}",
+                OpenAi.request_pointers(&body)
+            );
+        }
+        // Both booleans, and a null, are what OpenAI defines here.
+        for strict in [json!(true), json!(false), json!(null)] {
+            let body = json!({
+                "model": "gpt",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function",
+                           "function": {"name": "t", "strict": strict}}]
+            });
+            assert!(
+                OpenAi.request_pointers(&body).is_ok(),
+                "a strict OpenAI defines was refused: {strict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_is_error_is_refused_rather_than_forwarded() {
+        // The same shape one provider over. A `tool_result`'s recursive scan
+        // visits `content` and nothing else, so `"is_error": "Martina Weber"`
+        // reached Anthropic verbatim (measured, at 200) under a list that
+        // admitted the key and a comment that called it a flag.
+        for is_error in [json!("Martina Weber"), json!({"owner": "Weber"})] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "ok", "is_error": is_error}]}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported("anthropic", "content block field"))
+                ),
+                "a non-boolean is_error travelled whole: {is_error} -> {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+        for is_error in [json!(true), json!(false), json!(null)] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "ok", "is_error": is_error}]}]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "an is_error Anthropic defines was refused: {is_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_type_naming_anything_but_a_client_executed_tool_is_refused() {
+        // Two findings, one entry. The first was the fourth field of round 1's
+        // class, found by sweeping the lists: `type` on an Anthropic tool
+        // definition was admitted and never read, so `"type": "Martina Weber"`
+        // reached the upstream verbatim (measured, at 200).
+        //
+        // The second is why this test changed answer. The grammar that closed
+        // the first — lowercase, digits, underscores — admitted every **server**
+        // tool too, and a server tool is answered with `server_tool_use` and a
+        // result block `Anthropic::response_pointers` does not describe. So the
+        // request passed, the model ran, and the caller got a 502 for a turn
+        // they paid for (measured at `6a06391`: one upstream call, then 502).
+        // What is admitted here is now the client-executed families, whose
+        // results come back as the ordinary `tool_result` the caller sends.
+        for kind in [
+            json!("Martina Weber"),
+            json!("Weber, Martina"),
+            json!({"type": "custom"}),
+            json!(""),
+            // Every server-executed type Anthropic has published. Each of these
+            // was a 200 here and a 502 after the model had run.
+            json!("web_search_20250305"),
+            json!("web_search_20260209"),
+            json!("web_fetch_20260209"),
+            json!("code_execution_20250522"),
+            json!("code_execution_20260521"),
+            json!("tool_search_tool_regex_20251119"),
+            json!("advisor_20260301"),
+            // The code execution tool's own bash and editor. They are run by
+            // Anthropic, and a family read as a prefix would have admitted them.
+            json!("bash_code_execution_20250825"),
+            json!("text_editor_code_execution_20250825"),
+            // A family this gateway serves, without the date that makes it a
+            // version — so the family names are not a prefix to build on.
+            json!("bash"),
+            json!("bash_"),
+            json!("bash_2025012"),
+            json!("bash_20250124x"),
+            json!("bash_martina_weber"),
+        ] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "t", "type": kind, "input_schema": {"type": "object"}}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported(
+                        "anthropic",
+                        "tool definition field"
+                    ))
+                ),
+                "a tool this gateway cannot serve was admitted: {kind} -> {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+        // Every client-executed type Anthropic has published, and a dated
+        // version of each family that it has not. **This half is the whole
+        // reason the check names families rather than values**: the ledger
+        // records the coding-agent category as unaffected by this slice, and a
+        // list of today's strings would refuse the next `bash_*` on the day it
+        // shipped.
+        //
+        // Each is built as `documented_definition` builds it — the definition
+        // Anthropic's own documentation shows for that type, not a `type` and
+        // a `name`. That distinction is not cosmetic: for three rounds this
+        // loop passed with `{"name": "t", "type": "computer_20250124"}` while
+        // every definition a real client sends was a 400, because a type-and-
+        // name definition is what a review comment looks like and not what a
+        // caller writes.
+        for kind in [
+            "custom",
+            "bash_20241022",
+            "bash_20250124",
+            "text_editor_20241022",
+            "text_editor_20250124",
+            "text_editor_20250429",
+            "text_editor_20250728",
+            "computer_20241022",
+            "computer_20250124",
+            "computer_20251124",
+            "memory_20250818",
+            "bash_20991231",
+            "text_editor_20991231",
+            "computer_20991231",
+            "memory_20991231",
+        ] {
+            let definition = documented_definition(kind);
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [definition.clone()]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a tool the caller runs was refused: {definition}"
+            );
+        }
+    }
+
+    /// The definition Anthropic's documentation shows for a tool type, with
+    /// every field that documentation defines for it. The `computer_*` and
+    /// `text_editor_*` entries are the ones that were refused before this
+    /// round; the rest are here so one helper builds every family and the next
+    /// one added has an obvious place to be written down.
+    fn documented_definition(kind: &str) -> Value {
+        let mut definition = json!({"type": kind});
+        let object = definition.as_object_mut().expect("an object");
+        let family = kind.rsplit_once('_').map_or(kind, |(family, _)| family);
+        let name = match family {
+            "computer" => "computer",
+            "bash" => "bash",
+            "memory" => "memory",
+            "text_editor" if kind == "text_editor_20241022" => "str_replace_editor",
+            "text_editor" => "str_replace_based_edit_tool",
+            // A custom tool is the caller's, so its name and schema are too.
+            _ => {
+                object.insert("input_schema".to_owned(), json!({"type": "object"}));
+                "get_weather"
+            }
+        };
+        object.insert("name".to_owned(), json!(name));
+        if family == "computer" {
+            // Required on every published version, and the reason this round
+            // exists: a definition without them is not one Anthropic accepts.
+            object.insert("display_width_px".to_owned(), json!(1024));
+            object.insert("display_height_px".to_owned(), json!(768));
+            object.insert("display_number".to_owned(), json!(1));
+        }
+        if kind == "computer_20251124" {
+            object.insert("enable_zoom".to_owned(), json!(true));
+        }
+        if kind == "text_editor_20250728" {
+            object.insert("max_characters".to_owned(), json!(10_000));
+        }
+        definition
+    }
+
+    #[test]
+    fn a_computer_use_definition_is_served_with_the_fields_its_type_requires() {
+        // The round's own finding. `computer_*` was admitted by type on the
+        // argument — correct, and established from the documentation — that the
+        // caller runs it and answers with an ordinary `tool_result`. The field
+        // allowlist then refused every definition that carries the display
+        // Anthropic documents as **required**, so the admission delivered
+        // nothing: measured at `2e4da2a`, the definition below was a 400 with
+        // the upstream never called.
+        //
+        // The second half is what makes the list per type rather than shared:
+        // a `bash_*` definition carrying a display is malformed, and admitting
+        // these four fields everywhere would have served that too.
+        for kind in [
+            "computer_20241022",
+            "computer_20250124",
+            "computer_20251124",
+        ] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [documented_definition(kind)]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a computer-use request Anthropic documents was refused: {kind}"
+            );
+        }
+        for (kind, field) in [
+            ("bash_20250124", "display_width_px"),
+            ("memory_20250818", "display_height_px"),
+            ("text_editor_20250728", "display_number"),
+            ("custom", "enable_zoom"),
+            ("bash_20250124", "max_characters"),
+        ] {
+            let mut definition = documented_definition(kind);
+            definition[field] = json!(1024);
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [definition]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported(
+                        "anthropic",
+                        "tool definition field"
+                    ))
+                ),
+                "{field} was admitted on {kind}, which does not define it: {:?}",
+                Anthropic.request_pointers(&body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_field_that_is_not_a_number_is_refused_rather_than_forwarded() {
+        // `is_error` and `strict` one type over. None of these four is
+        // addressed by a slot, so a value nothing checks is a value nothing
+        // masks: `"display_width_px": "Martina Weber"` would reach Anthropic
+        // exactly as it came.
+        for field in [
+            "display_width_px",
+            "display_height_px",
+            "display_number",
+            "max_characters",
+        ] {
+            let kind = if field == "max_characters" {
+                "text_editor_20250728"
+            } else {
+                "computer_20250124"
+            };
+            for value in [
+                json!("Martina Weber"),
+                json!({"owner": "Weber"}),
+                json!([768]),
+            ] {
+                let mut definition = documented_definition(kind);
+                definition[field] = value.clone();
+                let body = json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [definition]
+                });
+                assert!(
+                    matches!(
+                        Anthropic.request_pointers(&body),
+                        Err(ShapeError::Unsupported(
+                            "anthropic",
+                            "tool definition field"
+                        ))
+                    ),
+                    "a {field} that is not a number travelled whole: {value} -> {:?}",
+                    Anthropic.request_pointers(&body)
+                );
+            }
+            // What Anthropic defines here, and the null five other fields on
+            // this branch already read as an SDK serializing its default.
+            for value in [json!(1024), json!(0), json!(1024.0), json!(null)] {
+                let mut definition = documented_definition(kind);
+                definition[field] = value.clone();
+                let body = json!({
+                    "model": "claude",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [definition]
+                });
+                assert!(
+                    Anthropic.request_pointers(&body).is_ok(),
+                    "a {field} Anthropic defines was refused: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_client_tool_family_selects_a_list() {
+        // The structural half of this round, and the thing that stops it
+        // happening a third time. `ANTHROPIC_CLIENT_TOOL_FAMILIES` is the line
+        // between the tools the caller runs and the ones Anthropic runs; a
+        // family added to it whose fields nobody decided is exactly the state
+        // `computer_*` was in — admitted by type, refused by field, with the
+        // code claiming a capability it did not have. The `match` refuses such
+        // a family, and this fails until somebody writes its arm.
+        for family in ANTHROPIC_CLIENT_TOOL_FAMILIES {
+            let kind = format!("{family}_20250124");
+            let fields = anthropic_tool_definition_fields(&json!({"type": kind}));
+            assert!(
+                fields.is_ok(),
+                "{family} is on the client-executed list and selects no fields, so every \
+                 definition of it is refused"
+            );
+        }
+        // And the other direction: a family nobody has decided about is
+        // refused rather than served the bare list.
+        for kind in ["browser_20260801", "computer_toolset_20260801"] {
+            assert!(
+                anthropic_tool_definition_fields(&json!({"type": kind})).is_err(),
+                "{kind} was admitted with fields nobody chose for it"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_choice_is_not_masked_and_a_documented_shape_is_not_refused() {
+        // The first half of the old claim survives unchanged: it selects a tool
+        // by name, the name is the client's dispatch, and masking it would
+        // break the call it dispatches. So `tool_choice` still produces no
+        // slot.
+        //
+        // The second half — "nor refused" — was unconditional, and that is what
+        // made the field an egress channel: it was admitted by absence from a
+        // denylist, so *no* shape of it was refused. It is now conditional on
+        // the shape, and this pins every shape Anthropic publishes so that the
+        // condition cannot quietly become "refused".
+        let body = json!({
+            "model": "claude",
+            "tools": [{"name": "read_file", "input_schema": {}}],
+            "tool_choice": {"type": "tool", "name": "read_file"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![schema("/tools/0/input_schema"), text("/messages/0/content")],
+            "tool_choice must not appear here"
+        );
+        for choice in [
+            json!({"type": "auto"}),
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+            json!({"type": "any"}),
+            json!({"type": "any", "disable_parallel_tool_use": false}),
+            json!({"type": "tool", "name": "read_file"}),
+            json!({"type": "tool", "name": "read_file", "disable_parallel_tool_use": true}),
+            json!({"type": "none"}),
+            // An SDK serializing its default is not asking to force a tool.
+            Value::Null,
+        ] {
+            let body = json!({
+                "model": "claude",
+                "tools": [{"name": "read_file", "input_schema": {}}],
+                "tool_choice": choice,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                Anthropic.request_pointers(&body).is_ok(),
+                "a documented tool_choice was refused: {}",
+                body["tool_choice"]
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_a_tool_choice_field_no_slot_addresses_is_refused() {
+        // Each of these reached the upstream verbatim (measured, at 200) while
+        // the field was admitted by not being on a denylist.
+        for choice in [
+            // The extra key, which is the plain form of the hole.
+            json!({"type": "auto", "note": "Martina Weber"}),
+            // The name is dispatch, and dispatch is a string.
+            json!({"type": "tool", "name": {"owner": "Weber"}}),
+            // A `type` Anthropic does not define picks no list at all.
+            json!({"type": "Martina Weber"}),
+            // `none` takes its type alone; the flag belongs to the other three.
+            json!({"type": "none", "disable_parallel_tool_use": true}),
+            // The flag is a boolean, and it was as unchecked as `strict` was.
+            json!({"type": "auto", "disable_parallel_tool_use": "Martina Weber"}),
+            // No discriminant, so no list.
+            json!("auto"),
+            json!(["auto"]),
+        ] {
+            let body = json!({
+                "model": "claude",
+                "tools": [{"name": "t", "input_schema": {}}],
+                "tool_choice": choice,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Unsupported("anthropic", "tool_choice"))
+                ),
+                "a value no slot addresses travelled whole: {} -> {:?}",
+                body["tool_choice"],
+                Anthropic.request_pointers(&body)
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_refuses_tool_traffic_on_a_streamed_request() {
+        let body = json!({
+            "model": "claude",
+            "stream": true,
+            "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&body),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "streamed tool traffic"
+            ))
+        ));
     }
 
     #[test]
@@ -657,10 +3378,436 @@ mod tests {
 
     #[test]
     fn an_unrecognized_content_part_is_refused() {
+        // A part type nobody has taught this gateway to read. `tool_result`
+        // used to stand here and no longer can: `content_pointers` describes
+        // it now, for both providers, since a result's text is text wherever
+        // it turns up.
         let body = json!({"messages": [{"role": "user", "content": [
-            {"type": "tool_result", "content": "Weber"}
+            {"type": "video_url", "video_url": {"url": "http://x"}}
         ]}]});
         assert!(OpenAi.request_pointers(&body).is_err());
+        assert!(Anthropic.request_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn a_streamed_continuation_is_refused_for_its_tool_history_not_its_definitions() {
+        // The refusal keyed on top-level `tools`, so a continuation carrying an
+        // earlier call and its result — but no repeated definitions — passed,
+        // and `stream_slots` would refuse the tool events afterwards, once the
+        // caller had already paid for them.
+        //
+        // Whether Anthropic itself accepts such a request is not the question.
+        // Anthropic's tool-use documentation passes `tools` on every
+        // continuation in every example but nowhere states it is required, and
+        // `mcp_servers` grants tools without `tools` at all — so "no
+        // definitions means no tool events" is not something to rest a refusal
+        // on. What this gateway can mask is its own business to decide.
+        let continuation = json!({
+            "model": "claude",
+            "stream": true,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"path": "x"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Weber"}]}
+            ]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&continuation),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "streamed tool traffic"
+            ))
+        ));
+
+        // A result alone is enough — it is tool traffic and `stream_slots` does
+        // not know how to mask what comes back for it either.
+        let result_only = json!({
+            "model": "claude",
+            "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "Weber"}]}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&result_only),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "streamed tool traffic"
+            ))
+        ));
+
+        // And an ordinary streamed conversation is untouched by any of this.
+        let plain = json!({
+            "model": "claude",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&plain).unwrap(),
+            vec![text("/messages/0/content")]
+        );
+    }
+
+    #[test]
+    fn an_mcp_server_grants_tools_this_gateway_cannot_see_and_is_refused() {
+        // `mcp_servers` gives the model tools without `tools`, so its calls and
+        // results would arrive shaped by a server this gateway never described.
+        // It also carries the caller's own `authorization_token`. A field no
+        // slot addresses is forwarded exactly as it came, so it is refused.
+        let body = json!({
+            "model": "claude",
+            "mcp_servers": [{"type": "url", "url": "https://example.invalid/sse",
+                             "name": "weber-notes", "authorization_token": "secret"}],
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&body),
+            Err(ShapeError::Unsupported("anthropic", _))
+        ));
+    }
+
+    #[test]
+    fn a_block_cannot_hide_its_payload_behind_a_text_field() {
+        // The dispatch read `text` before `type`, so *any* block that carried a
+        // `text` field was described by that field alone and everything else in
+        // it travelled to the provider exactly as it came. Adding one key was
+        // enough to walk a tool call's arguments straight past the masker.
+        let smuggled_call = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_use", "id": "t1", "name": "f",
+             "text": "nothing to see", "input": {"who": "Martina Weber"}}
+        ]}]});
+        // Two outcomes are acceptable and one is not. Describing the arguments
+        // is fine; refusing the block is fine — the field allowlist does exactly
+        // that, because `text` is not a field a `tool_use` may carry. What must
+        // never happen is the third thing: served, with the arguments described
+        // nowhere and forwarded as they came.
+        for described in [
+            Anthropic.request_pointers(&smuggled_call),
+            OpenAi.request_pointers(&smuggled_call),
+        ] {
+            let Ok(slots) = described else { continue };
+            assert!(
+                slots.iter().any(|slot| matches!(
+                    slot,
+                    Slot::Json { pointer, .. } if pointer.ends_with("/input")
+                )),
+                "served with the arguments described nowhere: {slots:?}"
+            );
+        }
+
+        let smuggled_result = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "text": "nothing to see", "content": "Martina Weber"}
+        ]}]});
+        for described in [
+            Anthropic.request_pointers(&smuggled_result),
+            OpenAi.request_pointers(&smuggled_result),
+        ] {
+            let Ok(slots) = described else { continue };
+            assert!(
+                slots
+                    .iter()
+                    .any(|slot| slot.pointer().ends_with("/content")),
+                "served with the result described nowhere: {slots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_content_block_carrying_a_field_no_slot_addresses_is_refused() {
+        // Tool definitions got an allowlist; content blocks never did, so a
+        // block's undeclared fields still travelled exactly as they came. This
+        // is not hypothetical: Anthropic's `text` blocks may carry `citations`,
+        // whose `cited_text` is quoted source material — among the likeliest
+        // fields in the protocol to hold somebody's personal data — and clients
+        // echo assistant turns back as history, so it arrives on the request
+        // path where `/text` is described and the citation is not.
+        let cited = json!({"model": "claude", "messages": [{"role": "assistant", "content": [
+            {"type": "text", "text": "As established,",
+             "citations": [{"type": "char_location", "cited_text": "Martina Weber lives in Bern",
+                            "document_title": "Weber file", "start_char_index": 0}]}
+        ]}]});
+        assert!(matches!(
+            Anthropic.request_pointers(&cited),
+            Err(ShapeError::Unsupported("anthropic", "content block field"))
+        ));
+
+        // A tool_use block is an object the caller fills in too.
+        let extra_on_a_call = json!({"model": "claude", "messages": [{"role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {},
+                         "annotations": {"who": "Martina Weber"}}]}]});
+        assert!(Anthropic.request_pointers(&extra_on_a_call).is_err());
+    }
+
+    #[test]
+    fn the_fields_a_content_block_is_built_from_are_still_understood() {
+        // The allowlist must not refuse the protocol it exists to serve. Every
+        // field here is one this gateway describes or deliberately leaves
+        // alone, across all four block types it reads.
+        let ordinary = json!({"model": "claude", "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hallo", "cache_control": {"type": "ephemeral"}},
+                {"type": "image", "source": {"type": "base64", "data": "x", "media_type": "image/png"}}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {"path": "x"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": false}
+            ]}
+        ]});
+        assert_eq!(
+            Anthropic.request_pointers(&ordinary).unwrap(),
+            vec![
+                text("/messages/0/content/0/text"),
+                instance("/messages/1/content/0/input"),
+                tool_text("/messages/2/content/0/content"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_part_that_does_not_say_what_it_is_is_refused() {
+        // The `text`-first dispatch also meant a part with no `type` at all was
+        // described from its `text` and forwarded. Type is what says which
+        // fields a block has, so a block that does not declare one cannot be
+        // read — and an unreadable shape is refused, never forwarded.
+        let untyped = json!({"messages": [{"role": "user", "content": [
+            {"text": "hello", "input": {"who": "Martina Weber"}}
+        ]}]});
+        assert!(Anthropic.request_pointers(&untyped).is_err());
+        assert!(OpenAi.request_pointers(&untyped).is_err());
+    }
+
+    #[test]
+    fn an_openai_message_carries_no_anthropic_tool_block() {
+        // `content_pointers` is shared by two providers, and the block types it
+        // admitted were scoped to neither. So an OpenAI message could carry an
+        // Anthropic-shaped `tool_use`, whose `name` is dispatch and therefore
+        // never scanned, and `Martina Weber` reached OpenAI in it (measured
+        // through the proxy, at 200). **Before this slice that block was
+        // refused** — the sharing is what removed the refusal.
+        //
+        // OpenAI represents a call through `tool_calls` on the message and a
+        // result through a `role: "tool"` message; neither is a content part.
+        for block in [
+            json!({"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}),
+            json!({"type": "tool_result", "tool_use_id": "Martina Weber", "content": "ok"}),
+            // Anthropic's spelling of an image, which OpenAI has never taken.
+            json!({"type": "image", "source": {"type": "base64", "data": "AA"}}),
+        ] {
+            let body = json!({"messages": [{"role": "user", "content": [block.clone()]}]});
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Request("openai"))
+                ),
+                "an Anthropic block reached an OpenAI request: {block}"
+            );
+            // And the same block on the provider that defines it is unchanged,
+            // which is the half that makes this scoping rather than refusing.
+            if block["type"] != "tool_result" {
+                let body = json!({"messages": [{"role": "user", "content": [block.clone()]}]});
+                assert!(
+                    Anthropic.request_pointers(&body).is_ok(),
+                    "the block is legal where it is defined: {block}"
+                );
+            }
+        }
+        // OpenAI's own parts still pass, including the tool message whose
+        // content is an array of text parts.
+        let openai = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "http://x"}},
+                {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "ok"}]}
+        ]});
+        assert!(OpenAi.request_pointers(&openai).is_ok());
+    }
+
+    #[test]
+    fn anthropic_system_content_is_text_and_nothing_else() {
+        // Read rather than assumed: Anthropic's `system` is `string |
+        // TextBlockParam[]`, an array of text blocks. The shared walk admitted
+        // every block type there, so a tool block in a system prompt carried
+        // its `name` to the provider unscanned (measured, at 200) — and an
+        // image block was accepted into a field that has never taken one.
+        for block in [
+            json!({"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}),
+            json!({"type": "image", "source": {"type": "base64", "data": "AA"}}),
+            json!({"type": "tool_result", "tool_use_id": "t1", "content": "ok"}),
+        ] {
+            let body = json!({
+                "system": [block.clone()],
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            assert!(
+                matches!(
+                    Anthropic.request_pointers(&body),
+                    Err(ShapeError::Request("anthropic"))
+                ),
+                "system content is not a message's: {block}"
+            );
+        }
+        // Both published spellings of a system prompt still work, and a text
+        // block in one is still described.
+        let blocks = json!({
+            "system": [{"type": "text", "text": "you are a bot"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&blocks).unwrap(),
+            vec![text("/system/0/text"), text("/messages/0/content")],
+        );
+        let bare = json!({
+            "system": "you are a bot",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(
+            Anthropic.request_pointers(&bare).unwrap(),
+            vec![text("/system"), text("/messages/0/content")],
+        );
+    }
+
+    #[test]
+    fn a_tool_results_content_carries_no_tool_block() {
+        // **The position neither the review nor the brief named.** The
+        // recursion passed the message's own admissible set down into a
+        // result's content, so a `tool_use` nested inside a `tool_result`
+        // carried its `name` unscanned to Anthropic (measured, at 200).
+        // Anthropic documents this position as `text`, `image`,
+        // `search_result`, `document`, `tool_reference` and `browser_state`;
+        // the last four have no arm here and were already refused.
+        let nested = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "tool_use", "id": "x", "name": "Martina Weber", "input": {}}
+            ]}
+        ]}]});
+        assert!(
+            matches!(
+                Anthropic.request_pointers(&nested),
+                Err(ShapeError::Request("anthropic"))
+            ),
+            "a tool call inside a tool result: {:?}",
+            Anthropic.request_pointers(&nested)
+        );
+        // What the position does admit, unchanged — this is the traffic the
+        // recursion exists for.
+        let served = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image", "source": {"type": "base64", "data": "AA"}}
+            ]}
+        ]}]});
+        assert_eq!(
+            Anthropic.request_pointers(&served).unwrap(),
+            vec![tool_text("/messages/0/content/0/content/0/text")],
+        );
+    }
+
+    #[test]
+    fn every_block_type_this_walk_reads_is_admissible_somewhere() {
+        // The structural half, and the guard against the next asymmetry. Two
+        // couplings, both of which held silently wrong until this round:
+        //
+        // 1. A type admitted in a position must be one `content_block_fields`
+        //    can read, or the position promises a block the dispatch refuses.
+        // 2. A type `content_block_fields` reads must be admissible in some
+        //    position, or the fields were written for traffic that cannot
+        //    arrive — the state `computer_*` was in one layer up, and the
+        //    reason round 6 exists.
+        const POSITIONS: [(&str, Position); 6] = [
+            ("openai", Position::Message),
+            ("openai", Position::System),
+            ("openai", Position::ToolResult),
+            ("anthropic", Position::Message),
+            ("anthropic", Position::System),
+            ("anthropic", Position::ToolResult),
+        ];
+        const READABLE: [&str; 7] = [
+            "audio",
+            "image",
+            "image_url",
+            "input_audio",
+            "text",
+            "tool_result",
+            "tool_use",
+        ];
+        for (provider, position) in POSITIONS {
+            for kind in admissible_block_types(provider, position) {
+                assert!(
+                    !content_block_fields(kind).is_empty(),
+                    "{provider}/{position:?} admits {kind}, which the dispatch cannot read"
+                );
+            }
+        }
+        for kind in READABLE {
+            assert!(
+                !content_block_fields(kind).is_empty(),
+                "{kind} is listed here as readable and is not"
+            );
+            assert!(
+                POSITIONS.iter().any(|(provider, position)| {
+                    admissible_block_types(provider, *position).contains(&kind)
+                }),
+                "{kind} has a field list and no position admits it"
+            );
+        }
+        // The positions OpenAI does not have refuse everything rather than
+        // falling back to a list. `Position::ToolResult` is unreachable for
+        // OpenAI only because `tool_result` is off its message list, and this
+        // is the line that makes that coupling a decision.
+        for position in [Position::System, Position::ToolResult] {
+            assert!(
+                admissible_block_types("openai", position).is_empty(),
+                "OpenAI has no {position:?} content and was given a list for it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_result_part_is_understood_rather_than_refused() {
+        // The positive half of the test above: `tool_result` moved from the
+        // refused side to the described side.
+        //
+        // The result recurses through `content_pointers` itself, so a bare
+        // string and a list of blocks are one case, and an image inside a
+        // result inherits the policy images already have — asserted here rather
+        // than argued, since it is the reason the recursion exists.
+        //
+        // **The sentence that used to stand here was the bug.** It read
+        // "`content_pointers` is shared, so it moved for both providers at
+        // once", and the loop below ran the identical body through *both*
+        // providers and asserted the identical answer. OpenAI has no
+        // `tool_result` block — a result is a `role: "tool"` message there —
+        // so what this pinned was an Anthropic block type being admitted into
+        // an OpenAI request. The fourth asymmetry on this branch, and the
+        // fourth to be written down as a similarity first.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "Martina Weber"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": [
+                {"type": "text", "text": "Weber"},
+                {"type": "image", "source": {"type": "base64", "data": "..."}}
+            ]}
+        ]}]});
+        assert_eq!(
+            Anthropic.request_pointers(&body).unwrap(),
+            vec![
+                tool_text("/messages/0/content/0/content"),
+                tool_text("/messages/0/content/1/content/0/text"),
+            ],
+            "the image is unscanned and the tool_use_id is dispatch"
+        );
+        assert!(
+            matches!(
+                OpenAi.request_pointers(&body),
+                Err(ShapeError::Request("openai"))
+            ),
+            "the same body is not an OpenAI request: {:?}",
+            OpenAi.request_pointers(&body)
+        );
     }
 
     #[test]
@@ -671,23 +3818,638 @@ mod tests {
         ]}]});
         assert_eq!(
             OpenAi.request_pointers(&body).unwrap(),
-            vec!["/messages/0/content/0/text"]
+            vec![text("/messages/0/content/0/text")]
+        );
+    }
+
+    fn embedded(pointer: &str) -> Slot {
+        Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: true,
+            shape: Shape::Instance,
+        }
+    }
+
+    #[test]
+    fn openai_describes_definitions_and_arguments_and_tool_messages() {
+        let body = json!({
+            "model": "gpt",
+            "tools": [{"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read a file for Dr. Weber",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }}],
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/home/weber\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "t1", "content": "Martina Weber"}
+            ]
+        });
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                tool_text("/tools/0/function/description"),
+                schema("/tools/0/function/parameters"),
+                embedded("/messages/0/tool_calls/0/function/arguments"),
+                tool_text("/messages/1/content"),
+            ],
+            "a tool message's content is a result, and results are what the \
+             tool bounds exist to count"
         );
     }
 
     #[test]
-    fn tool_bearing_requests_are_refused() {
-        // Masking tool arguments is a later slice; until then a request that
-        // uses them is refused rather than forwarded past the masker.
-        let with_tools = json!({"messages": [{"role": "user", "content": "Hi"}],
-                                "tools": [{"type": "function"}]});
-        assert!(OpenAi.request_pointers(&with_tools).is_err());
-        assert!(Anthropic.request_pointers(&with_tools).is_err());
+    fn openai_marks_arguments_as_an_embedded_document() {
+        let body = json!({
+            "model": "gpt",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}
+            }]}]
+        });
+        let slots = OpenAi.request_pointers(&body).unwrap();
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Json { embedded: true, pointer, .. } if pointer.ends_with("/arguments")
+            )),
+            "arguments is a string holding a document, not a document: {slots:?}"
+        );
+    }
 
-        let with_calls = json!({"messages": [
-            {"role": "assistant", "tool_calls": [{"function": {"arguments": "{\"n\":\"Weber\"}"}}]}
+    #[test]
+    fn openai_never_describes_a_tool_call_id_or_a_name() {
+        // All three are the client's dispatch. `tool_call_id` pairs a result
+        // with the call it answers; the two `name`s say which function. Masked,
+        // the call arrives addressed to nothing — and silently, because a
+        // placeholder is a perfectly well-formed string.
+        let body = json!({
+            "model": "gpt",
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "t1", "content": "ok"}
+            ]
+        });
+        let described = slot_pointers(OpenAi.request_pointers(&body));
+        assert!(
+            !described.iter().any(|pointer| pointer.ends_with("/name")
+                || pointer.ends_with("/tool_call_id")
+                || pointer.ends_with("/id")),
+            "dispatch must not be described: {described:?}"
+        );
+    }
+
+    #[test]
+    fn a_null_content_with_nothing_beside_it_is_still_refused() {
+        // The guard tested `.is_some()`, and `{"content": null}` is
+        // `Some(Value::Null)` — so it passed, while the filter further down
+        // reads the same null as absent and produces no slot. A message with
+        // zero slots and no allowlist is forwarded field for field: the
+        // silence-is-a-leak shape, defeating the one guard written against it.
+        //
+        // One field between this and `an_assistant_turn_may_carry_calls_...`
+        // below, which tests `{"role": "assistant"}` with no `content` key at
+        // all and therefore never reaches the hole.
+        let refusal_beside_a_null = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "refusal": "Martina Weber",
+             "audio": {"id": "a", "transcript": "Martina Weber"}}
         ]});
-        assert!(OpenAi.request_pointers(&with_calls).is_err());
+        assert!(
+            OpenAi.request_pointers(&refusal_beside_a_null).is_err(),
+            "a turn whose only text is in fields no slot addresses must not travel"
+        );
+
+        // Not confined to assistant turns or to tool traffic: any message whose
+        // content is null carries whatever else it likes.
+        let vendor_field = json!({"model": "gpt", "messages": [
+            {"role": "user", "content": null, "vendor_notes": "Martina Weber"}
+        ]});
+        assert!(OpenAi.request_pointers(&vendor_field).is_err());
+
+        // And Anthropic reads the same guard.
+        let anthropic = json!({"model": "claude", "messages": [
+            {"role": "user", "content": null, "vendor_notes": "Martina Weber"}
+        ]});
+        assert!(Anthropic.request_pointers(&anthropic).is_err());
+    }
+
+    #[test]
+    fn an_assistant_turn_may_carry_calls_instead_of_content() {
+        // The provider's own response says `"content": null` beside
+        // `tool_calls`, and clients echo the turn back verbatim. Read as an
+        // unreadable content shape it was a 400 on the commonest tool body
+        // there is.
+        let explicit_null = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}}]}
+        ]});
+        assert_eq!(
+            OpenAi.request_pointers(&explicit_null).unwrap(),
+            vec![embedded("/messages/0/tool_calls/0/function/arguments")]
+        );
+
+        // Omitted entirely is the same turn from an SDK that skips nulls.
+        let omitted = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}}]}
+        ]});
+        assert_eq!(
+            OpenAi.request_pointers(&omitted).unwrap(),
+            vec![embedded("/messages/0/tool_calls/0/function/arguments")]
+        );
+
+        // A message carrying neither is still the silence-is-a-leak shape.
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [{"role": "assistant"}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_openai_tool_definition_this_gateway_cannot_account_for_is_refused() {
+        // Same rule as Anthropic's, one layer deeper: a definition is an object
+        // the caller fills in, and a field no slot addresses is forwarded
+        // exactly as it came.
+        let unknown_inner = json!({"model": "gpt",
+            "tools": [{"type": "function", "function": {
+                "name": "f", "parameters": {}, "user_location": {"city": "Zurich"}}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_inner),
+            Err(ShapeError::Unsupported("openai", "tool definition field"))
+        ));
+
+        let unknown_outer = json!({"model": "gpt",
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}},
+                       "notes": "Martina Weber"}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_outer),
+            Err(ShapeError::Unsupported("openai", "tool definition field"))
+        ));
+
+        // A wrapper shaped exactly like a function but declaring some other
+        // kind. No allowlist can catch this one — every field it carries is on
+        // the list — so the type is checked in its own right. If OpenAI ever
+        // gives `function` a different meaning under a new type, describing it
+        // as a definition would describe the wrong thing.
+        let unknown_type = json!({"model": "gpt",
+            "tools": [{"type": "custom",
+                       "function": {"name": "f", "description": "Martina Weber"}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_type),
+            Err(ShapeError::Unsupported("openai", "tool type"))
+        ));
+
+        // A custom tool's `custom` object holds a `description` and a grammar
+        // this gateway has described nowhere.
+        let custom = json!({"model": "gpt",
+            "tools": [{"type": "custom", "custom": {
+                "name": "grep", "description": "Search Martina Weber's notes"}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(matches!(
+            OpenAi.request_pointers(&custom),
+            Err(ShapeError::Unsupported("openai", _))
+        ));
+
+        // Not an object, and a `tools` that is not an array: neither has fields
+        // to describe and both would travel whole.
+        assert!(OpenAi
+            .request_pointers(&json!({"model": "gpt", "tools": ["Martina Weber"],
+                                      "messages": [{"role": "user", "content": "Hi"}]}))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&json!({"model": "gpt", "tools": {"function": {}},
+                                      "messages": [{"role": "user", "content": "Hi"}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn the_fields_an_openai_tool_definition_is_built_from_are_understood() {
+        // The allowlist must not refuse the protocol it exists to serve.
+        let body = json!({"model": "gpt",
+            "tools": [{"type": "function", "function": {
+                "name": "f", "description": "d", "parameters": {"type": "object"},
+                "strict": true}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                tool_text("/tools/0/function/description"),
+                schema("/tools/0/function/parameters"),
+                text("/messages/0/content"),
+            ]
+        );
+
+        // `tools: null` is an SDK serializing its default, not a request to use
+        // tools — the reading `logprobs` and `thinking` already get.
+        let null_tools = json!({"model": "gpt", "tools": null,
+                                "messages": [{"role": "user", "content": "Hi"}]});
+        assert_eq!(
+            OpenAi.request_pointers(&null_tools).unwrap(),
+            vec![text("/messages/0/content")]
+        );
+    }
+
+    #[test]
+    fn an_openai_tool_call_this_gateway_cannot_account_for_is_refused() {
+        // The arguments live in here. A field beside them travels as it came.
+        let unknown_on_the_call = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function", "notes": "Martina Weber",
+                "function": {"name": "f", "arguments": "{}"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_on_the_call),
+            Err(ShapeError::Unsupported("openai", "tool call field"))
+        ));
+
+        let unknown_on_the_function = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "f", "arguments": "{}", "notes": "Martina Weber"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_on_the_function),
+            Err(ShapeError::Unsupported("openai", "tool call field"))
+        ));
+
+        // Shaped like a function call and declaring some other kind. The
+        // allowlist cannot catch this one either, and `arguments` under a type
+        // this gateway has not read about is not something to assume is JSON.
+        let unknown_type = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "custom",
+                "function": {"name": "f", "arguments": "Martina Weber"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&unknown_type),
+            Err(ShapeError::Unsupported("openai", "tool call type"))
+        ));
+
+        // A custom tool call carries its payload as a raw `input` string that
+        // is not JSON and has no slot.
+        let custom = json!({"model": "gpt", "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "t1", "type": "custom",
+                "custom": {"name": "grep", "input": "Martina Weber"}}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&custom),
+            Err(ShapeError::Unsupported("openai", _))
+        ));
+
+        // Neither an array of calls nor an object per call would have any
+        // fields to read.
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [
+                {"role": "assistant", "content": null, "tool_calls": "Martina Weber"}]}))
+            .is_err());
+        assert!(OpenAi
+            .request_pointers(&json!({"messages": [
+                {"role": "assistant", "content": null, "tool_calls": ["Martina Weber"]}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_openai_tool_message_carrying_a_field_no_slot_addresses_is_refused() {
+        // A `role: "tool"` message is the OpenAI shape of a result, and OpenAI
+        // defines exactly three fields on it. Anything else is a field this
+        // gateway would forward exactly as it came.
+        let extra = json!({"model": "gpt", "messages": [
+            {"role": "tool", "tool_call_id": "t1", "content": "ok",
+             "annotations": [{"quoted": "Martina Weber"}]}
+        ]});
+        assert!(matches!(
+            OpenAi.request_pointers(&extra),
+            Err(ShapeError::Unsupported("openai", "tool message field"))
+        ));
+    }
+
+    #[test]
+    fn openai_a_tool_call_id_outside_a_tool_message_is_refused() {
+        // The allowlist that admits `tool_call_id` is chosen by `role ==
+        // "tool"`, so on any other role nothing asked about the field at all —
+        // and `OPENAI_MESSAGE_TOOL_FIELDS`, which runs for every message, does
+        // not carry it. This slice deleted the refusal that used to cover it:
+        // before the tool message had an allowlist, the whole message was
+        // refused for carrying `tool_call_id` on any role.
+        for role in ["user", "assistant", "system", "developer", "function"] {
+            let smuggled = json!({"model": "gpt", "messages": [
+                {"role": role, "content": "hi", "tool_call_id": {"owner": "Martina Weber"}}
+            ]});
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&smuggled),
+                    Err(ShapeError::Unsupported("openai", "tool_call_id"))
+                ),
+                "{role} carried a tool_call_id no slot addresses: {:?}",
+                OpenAi.request_pointers(&smuggled)
+            );
+        }
+
+        // The field the rule is about, where it belongs: still admitted, still
+        // dispatch, still no slot. Refusing it here would refuse every tool
+        // result OpenAI clients send.
+        let legitimate = json!({"model": "gpt", "messages": [
+            {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
+        ]});
+        let slots = OpenAi.request_pointers(&legitimate).expect("a tool result");
+        assert!(
+            !slots
+                .iter()
+                .any(|slot| slot.pointer().contains("tool_call_id")),
+            "a dispatch identifier is never described: {slots:?}"
+        );
+
+        // Null is an SDK serializing its default, the reading five other
+        // fields on this branch already get.
+        assert!(OpenAi
+            .request_pointers(&json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi", "tool_call_id": null}]}))
+            .is_ok());
+    }
+
+    #[test]
+    fn openai_still_refuses_the_tool_fields_it_does_not_describe() {
+        // `functions` and `function_call` are the deprecated shape of all of
+        // this: `functions` carries descriptions and schemas, and an assistant
+        // message's `function_call` carries `arguments`. Nothing here produces
+        // a slot for either, so both stay refused rather than becoming fields
+        // that are silently forwarded.
+        for field in ["functions", "function_call"] {
+            let at_body = json!({"model": "gpt", field: [{"name": "f",
+                "description": "Martina Weber", "parameters": {}}],
+                "messages": [{"role": "user", "content": "Hi"}]});
+            assert!(
+                OpenAi.request_pointers(&at_body).is_err(),
+                "{field} was allowed at the top level"
+            );
+            let at_message = json!({"model": "gpt", "messages": [
+                {"role": "assistant", "content": null,
+                 field: {"name": "f", "arguments": "{\"n\":\"Martina Weber\"}"}}]});
+            assert!(
+                OpenAi.request_pointers(&at_message).is_err(),
+                "{field} was allowed on a message"
+            );
+        }
+
+        // The two that moved from refused to described each stay refused where
+        // OpenAI does not define them, because a field no slot addresses is
+        // forwarded exactly as it came: `tools` on a message would carry its
+        // descriptions and schemas past the masker, and `tool_calls` on the
+        // body would carry its arguments.
+        let tools_on_a_message = json!({"model": "gpt", "messages": [
+            {"role": "user", "content": "Hi",
+             "tools": [{"type": "function", "function": {"name": "f",
+                        "description": "Martina Weber"}}]}]});
+        assert!(
+            matches!(
+                OpenAi.request_pointers(&tools_on_a_message),
+                Err(ShapeError::Unsupported("openai", "tools"))
+            ),
+            "described nowhere and refused nowhere, so forwarded whole: {:?}",
+            OpenAi.request_pointers(&tools_on_a_message)
+        );
+        let calls_on_the_body = json!({"model": "gpt",
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "f", "arguments": "{\"n\":\"Martina Weber\"}"}}],
+            "messages": [{"role": "user", "content": "Hi"}]});
+        assert!(
+            matches!(
+                OpenAi.request_pointers(&calls_on_the_body),
+                Err(ShapeError::Unsupported("openai", "tool_calls"))
+            ),
+            "described nowhere and refused nowhere, so forwarded whole: {:?}",
+            OpenAi.request_pointers(&calls_on_the_body)
+        );
+    }
+
+    #[test]
+    fn openai_tool_choice_is_not_masked_and_a_documented_shape_is_not_refused() {
+        // As Anthropic's: "not masked" survives, "not refused" is now
+        // conditional on the shape. OpenAI's list is longer because a bare
+        // string is a legal `tool_choice` here and is not on Anthropic.
+        let body = json!({
+            "model": "gpt",
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                schema("/tools/0/function/parameters"),
+                text("/messages/0/content"),
+            ],
+            "tool_choice must not appear here"
+        );
+        for choice in [
+            json!("none"),
+            json!("auto"),
+            json!("required"),
+            json!({"type": "function", "function": {"name": "read_file"}}),
+            json!({"type": "custom", "custom": {"name": "read_file"}}),
+            Value::Null,
+        ] {
+            let body = json!({
+                "model": "gpt",
+                "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                "tool_choice": choice,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                OpenAi.request_pointers(&body).is_ok(),
+                "a documented tool_choice was refused: {}",
+                body["tool_choice"]
+            );
+        }
+    }
+
+    #[test]
+    fn openai_a_tool_choice_field_no_slot_addresses_is_refused() {
+        for choice in [
+            json!({"type": "function", "note": "Martina Weber",
+                   "function": {"name": "read_file"}}),
+            json!({"type": "function", "function": {"name": {"owner": "Weber"}}}),
+            json!({"type": "function", "function": {"name": "t", "note": "Martina Weber"}}),
+            json!({"type": "custom", "custom": {"name": "t", "note": "Martina Weber"}}),
+            // A mode outside the documented three is prose in a string slot.
+            json!("Martina Weber"),
+            // A `type` this gateway picks no list for. `allowed_tools` is here
+            // deliberately and is the one shape this refusal narrows: its
+            // `tools` are tool definitions, which `tool_definition_slots`
+            // describes and this does not.
+            json!({"type": "Martina Weber"}),
+            json!({"type": "allowed_tools",
+                   "allowed_tools": {"mode": "auto",
+                                     "tools": [{"type": "function",
+                                                "function": {"name": "t",
+                                                             "description": "Martina Weber"}}]}}),
+            json!(["auto"]),
+        ] {
+            let body = json!({
+                "model": "gpt",
+                "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+                "tool_choice": choice,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Unsupported("openai", "tool_choice"))
+                ),
+                "a value no slot addresses travelled whole: {} -> {:?}",
+                body["tool_choice"],
+                OpenAi.request_pointers(&body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_parallel_tool_calls_is_refused_rather_than_forwarded() {
+        // The denylist sweep's own finding: a tool field on the tool surface,
+        // constrained to a boolean by OpenAI, on no allowlist because there is
+        // no allowlist at body level, and read by nothing.
+        for value in [json!({"owner": "Martina Weber"}), json!("Martina Weber")] {
+            let body = json!({
+                "model": "gpt",
+                "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+                "parallel_tool_calls": value,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Unsupported("openai", "parallel_tool_calls"))
+                ),
+                "a non-boolean parallel_tool_calls travelled whole: {} -> {:?}",
+                body["parallel_tool_calls"],
+                OpenAi.request_pointers(&body)
+            );
+        }
+        for value in [json!(true), json!(false), Value::Null] {
+            let body = json!({
+                "model": "gpt",
+                "tools": [{"type": "function", "function": {"name": "t", "parameters": {}}}],
+                "parallel_tool_calls": value,
+                "messages": [{"role": "user", "content": "Hi"}]
+            });
+            assert!(
+                OpenAi.request_pointers(&body).is_ok(),
+                "a boolean parallel_tool_calls was refused: {}",
+                body["parallel_tool_calls"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_choice_on_a_message_is_refused_by_both_providers() {
+        // Neither provider defines it there, and OpenAI's message denylist
+        // said so while Anthropic's did not — so the identical body was a 400
+        // on one and a 200 on the other (measured). The asymmetry, not the
+        // field, is the finding.
+        for (provider, body) in [
+            (
+                "anthropic",
+                json!({"model": "claude", "messages": [
+                    {"role": "user", "content": "hi",
+                     "tool_choice": {"note": "Martina Weber"}}]}),
+            ),
+            (
+                "openai",
+                json!({"model": "gpt", "messages": [
+                    {"role": "user", "content": "hi",
+                     "tool_choice": {"note": "Martina Weber"}}]}),
+            ),
+        ] {
+            let outcome = if provider == "anthropic" {
+                Anthropic.request_pointers(&body)
+            } else {
+                OpenAi.request_pointers(&body)
+            };
+            assert!(
+                matches!(&outcome, Err(ShapeError::Unsupported(named, "tool_choice")) if *named == provider),
+                "{provider} forwarded a tool_choice on a message: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_refuses_tool_traffic_on_a_streamed_request() {
+        // `stream_slots` refuses tool events, and it does so *after* the
+        // upstream call. Refusing here costs the caller nothing; refusing there
+        // costs them the tokens and hands back a broken stream.
+        let with_definitions = json!({
+            "model": "gpt", "stream": true,
+            "tools": [{"type": "function", "function": {"name": "f", "description": "d"}}],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&with_definitions),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
+        ));
+
+        // A continuation carrying only history is tool traffic too — the
+        // predicate reads the slots, not a field name.
+        let continuation = json!({
+            "model": "gpt", "stream": true,
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"a\":\"Weber\"}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": "Weber"}
+            ]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&continuation),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
+        ));
+
+        // A result alone is enough, which is only true because a tool message's
+        // content is marked as tool traffic.
+        let result_only = json!({
+            "model": "gpt", "stream": true,
+            "messages": [{"role": "tool", "tool_call_id": "t1", "content": "Weber"}]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&result_only),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
+        ));
+
+        // And an ordinary streamed conversation is untouched by any of this.
+        let plain = json!({"model": "gpt", "stream": true,
+                           "messages": [{"role": "user", "content": "hallo"}]});
+        assert_eq!(
+            OpenAi.request_pointers(&plain).unwrap(),
+            vec![text("/messages/0/content")]
+        );
+    }
+
+    #[test]
+    fn openai_reads_tool_call_arguments_out_of_the_response() {
+        // The client executes these arguments. A placeholder left in one is a
+        // call against a path that does not exist.
+        let body = json!({"choices": [{"message": {
+            "role": "assistant", "content": null,
+            "tool_calls": [{"id": "t1", "type": "function", "function": {
+                "name": "read_file", "arguments": "{\"path\":\"/home/[PERSON_1]\"}"}}]
+        }}]});
+        assert_eq!(
+            OpenAi.response_pointers(&body).unwrap(),
+            vec![embedded(
+                "/choices/0/message/tool_calls/0/function/arguments"
+            )],
+            "the id and both names are dispatch and are not described"
+        );
     }
 
     #[test]
@@ -722,10 +4484,155 @@ mod tests {
 
     #[test]
     fn an_unreadable_anthropic_response_block_is_refused() {
-        // A tool_use block can carry placeholders we issued; handing them to
-        // the client unrestored is the failure restoration exists to prevent.
-        let body = json!({"content": [{"type": "tool_use", "input": {"n": "[PERSON_1]"}}]});
+        // A block that can carry placeholders we issued and that nothing here
+        // knows how to read. Handing them to the client unrestored is the
+        // failure restoration exists to prevent. `tool_use` used to stand
+        // here; it is read now, and the test below says so.
+        let body = json!({"content": [{"type": "thinking", "thinking": "[PERSON_1] again"}]});
         assert!(Anthropic.response_pointers(&body).is_err());
+    }
+
+    #[test]
+    fn anthropic_reads_a_tool_use_block_out_of_the_response() {
+        // The client executes these arguments. A placeholder left in one is a
+        // call against a path that does not exist.
+        let body = json!({"content": [
+            {"type": "text", "text": "Reading it now"},
+            {"type": "tool_use", "id": "t1", "name": "read_file",
+             "input": {"path": "/home/[PERSON_1]/notes.txt"}}
+        ]});
+        let slots = Anthropic.response_pointers(&body).unwrap();
+        assert_eq!(
+            slots,
+            vec![
+                Slot::text("/content/0/text".to_owned()),
+                Slot::Json {
+                    pointer: "/content/1/input".to_owned(),
+                    embedded: false,
+                    shape: Shape::Instance,
+                },
+            ],
+            "the id and the name are dispatch and are not described"
+        );
+    }
+
+    #[test]
+    fn an_anthropic_response_block_is_read_by_its_type_before_its_fields() {
+        // The request path's rule — `type` first, always — arriving on the
+        // response path, where the same defect had survived. A block carrying
+        // both a `text` and an `input` was described by the `text` alone and
+        // `continue`d, so the arguments the client executes were never
+        // restored: it opened `/home/[PERSON_1]/notes.txt`.
+        //
+        // The direction matters. On the request path an unread field leaks to
+        // a provider; here it hands a placeholder to a client that acts on it.
+        //
+        // **This fixture changed answer when the closed field list landed, and
+        // the change is the point.** `text` is not a field a `tool_use` block
+        // defines, and the list runs before the dispatch — so the block is now
+        // refused rather than described-by-type-and-forwarded. Refusing is the
+        // stricter answer to the same question and the client is no worse off:
+        // it received the restored path before and receives a 502 now, and in
+        // neither case a placeholder. The variant here is `Unsupported`;
+        // `as_response_error` at the one call site re-blames it to `Response`,
+        // which is the 502 the proxy test measures.
+        let mixed = json!({"content": [
+            {"type": "tool_use", "id": "t1", "name": "read_file", "text": "ok",
+             "input": {"path": "/home/[PERSON_1]/notes.txt"}}
+        ]});
+        assert!(
+            matches!(
+                Anthropic.response_pointers(&mixed),
+                Err(ShapeError::Unsupported("anthropic", _))
+            ),
+            "a field the block's type does not define is refused, not forwarded"
+        );
+
+        // The ordering itself still needs a fixture the list cannot answer for,
+        // or reverting `type`-before-`text` would break nothing a test can see.
+        // A type this gateway does not know gets an empty list and no field
+        // check, so the dispatch is the only thing standing between the client
+        // and an unrestored `thinking` — exactly the shape the ordering fix was
+        // for, one block type over.
+        let unknown = json!({"content": [
+            {"type": "thinking", "text": "ok", "thinking": "[PERSON_1] wrote it"}
+        ]});
+        assert!(
+            matches!(
+                Anthropic.response_pointers(&unknown),
+                Err(ShapeError::Response("anthropic"))
+            ),
+            "a block carrying a `text` is still read by its type first"
+        );
+
+        // A block with no type is one we cannot read, and the refusal that was
+        // already at the bottom of this function now runs for it: reading
+        // `text` first meant a typeless block carrying one was described and
+        // every other field of it forwarded unrestored.
+        let typeless = json!({"content": [{"text": "Hallo [PERSON_1]"}]});
+        assert!(matches!(
+            Anthropic.response_pointers(&typeless),
+            Err(ShapeError::Response("anthropic"))
+        ));
+
+        // And a block typed `text` whose `text` cannot be restored is refused
+        // rather than dropped, the same reading the request path gives it.
+        let unreadable = json!({"content": [{"type": "text", "text": ["Hallo"]}]});
+        assert!(Anthropic.response_pointers(&unreadable).is_err());
+    }
+
+    #[test]
+    fn an_embedded_document_round_trips_through_read_and_write() {
+        // The `embedded: true` branch has no production caller yet — OpenAI's
+        // `arguments` is its first, in the next slice — but both functions are
+        // pure, so nothing about testing them needs to wait for one.
+        let mut body = json!({"call": {"arguments": "{\"b\":\"Weber\",\"a\":1}"}});
+        let document = read_document(&body, "/call/arguments", true, "openai").unwrap();
+        assert_eq!(document, json!({"a": 1, "b": "Weber"}));
+
+        write_document(&mut body, "/call/arguments", &document, true).unwrap();
+        // Alphabetical, and deliberately asserted rather than discovered: this
+        // crate's `serde_json::Map` is a `BTreeMap` — no `preserve_order`
+        // feature — so re-serializing an embedded document sorts its keys.
+        // Harmless (JSON objects are unordered and the client parses rather
+        // than compares) but somebody debugging changed argument bytes should
+        // find it written down.
+        assert_eq!(body["call"]["arguments"], r#"{"a":1,"b":"Weber"}"#);
+    }
+
+    #[test]
+    fn an_embedded_document_that_is_not_json_is_the_callers_mistake() {
+        // Models emit truncated `arguments`, and clients echo the turn back
+        // verbatim, so this is routine input rather than an exotic failure.
+        // `Pointer` would have made it a 502 blaming the upstream and sent the
+        // caller looking in the wrong place.
+        let truncated = json!({"call": {"arguments": "{\"path\": \"/home/we"}});
+        assert!(matches!(
+            read_document(&truncated, "/call/arguments", true, "openai"),
+            Err(ShapeError::MalformedDocument("openai", _))
+        ));
+
+        let not_a_string = json!({"call": {"arguments": {"path": "x"}}});
+        assert!(matches!(
+            read_document(&not_a_string, "/call/arguments", true, "openai"),
+            Err(ShapeError::MalformedDocument("openai", _))
+        ));
+
+        // A pointer addressing nothing is still a `Pointer`: that is this
+        // gateway describing a location that does not exist, which is ours.
+        assert!(matches!(
+            read_document(&truncated, "/call/missing", true, "openai"),
+            Err(ShapeError::Pointer(_))
+        ));
+    }
+
+    #[test]
+    fn a_plain_document_is_read_and_written_as_itself() {
+        let mut body = json!({"input": {"path": "Weber"}});
+        let document = read_document(&body, "/input", false, "anthropic").unwrap();
+        assert_eq!(document, json!({"path": "Weber"}));
+        write_document(&mut body, "/input", &json!({"path": "[PERSON_1]"}), false).unwrap();
+        assert_eq!(body["input"], json!({"path": "[PERSON_1]"}));
     }
 
     #[test]

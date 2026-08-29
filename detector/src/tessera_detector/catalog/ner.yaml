@@ -2,6 +2,17 @@
 # categories (REQ-3). Labels are the zero-shot prompts handed to the model;
 # specificity stays below every catalog identifier (40-90) so a checksum-backed
 # identifier wins a partial overlap with a model guess.
+#
+# BEFORE ADDING A DIGIT-SHAPED ENTITY HERE, READ THIS. The gateway refuses a
+# request over a span found in a *numeric* JSON leaf only when the span's type
+# is one of the eight in `identifiers.yaml`; a span of a type on this list is
+# left alone there, because a model's label on a bare digit run is grounded in
+# nothing. Not one of the types below has a digit-only realization today, which
+# is what makes that split safe. A `TELEPHONE` added here — the gap the spec
+# names as open — would be the first, and it would land on the non-refusing
+# side with `make check-entity-types` passing and nobody having decided: that
+# check holds the partition's shape, not its meaning. Adding one is a decision
+# about the numeric predicate in `proxy::mask_all`, not only about this file.
 entities:
   - entity_type: PERSON
     label: person

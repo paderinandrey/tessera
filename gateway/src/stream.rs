@@ -49,13 +49,46 @@ pub enum StreamError {
 impl StreamError {
     /// The fixed vocabulary the journal records. `Mapping`'s inner
     /// `MappingError::Unknown` carries a token and `Unplaceable` a run key;
-    /// neither reaches the journal, only the class. Matched with no `_` arm:
-    /// a new variant must fail to compile here rather than be silently
-    /// recorded as an existing class.
+    /// neither reaches the journal, only the class — and the token no longer
+    /// reaches the client either, see `error_event`.
+    ///
+    /// **Matched with no `_` arm, including inside the two variants that wrap
+    /// another enum.** That sentence stood here while `Mapping(_)` and
+    /// `Shape(_)` were wildcards over eleven variants between them, which made
+    /// it a claim about this enum's own seven and no more: measured at
+    /// `41eb85e`, a probe variant added to `MappingError` produced two compile
+    /// errors, both in `proxy.rs`, and this function took it silently as
+    /// `stream_unrestorable`.
+    ///
+    /// **The coarseness was a defect, not a deliberate difference.** The
+    /// argument for it is that the client's outcome is the same however a
+    /// stream fails — bytes have already gone out, so the stream ends — and
+    /// that is an argument about the response, not about the evidence. The
+    /// journal exists to say what happened, and the buffered path gives these
+    /// same errors eleven classes: an unresolvable placeholder, a placeholder
+    /// used as a property name, and two of this gateway's own walks disagreeing
+    /// are three different investigations, and they were one word.
+    ///
+    /// `stream_unrestorable` keeps `MappingError::Unknown`, which is the
+    /// failure it was named for and the one that actually occurs here: a
+    /// placeholder in the stream that no mapping resolves is precisely a
+    /// restoration that cannot be done. Renaming it would renumber evidence
+    /// already written for no gain.
     pub(crate) fn audit_class(&self) -> &'static str {
         match self {
-            StreamError::Mapping(_) => "stream_unrestorable",
-            StreamError::Shape(_) => "stream_shape_error",
+            StreamError::Mapping(MappingError::Unknown(_)) => "stream_unrestorable",
+            StreamError::Mapping(MappingError::BadSpan(_)) => "stream_bad_span",
+            StreamError::Mapping(MappingError::TooDeep) => "stream_too_deep",
+            StreamError::Mapping(MappingError::TooLarge) => "stream_too_large",
+            StreamError::Mapping(MappingError::MaskCountMismatch(_)) => "stream_mask_mismatch",
+            StreamError::Mapping(MappingError::PlaceholderKey(_)) => "stream_placeholder_key",
+            StreamError::Shape(ShapeError::Request(_)) => "stream_shape_request",
+            StreamError::Shape(ShapeError::Response(_)) => "stream_shape_response",
+            StreamError::Shape(ShapeError::Pointer(_)) => "stream_shape_pointer",
+            StreamError::Shape(ShapeError::Unsupported(_, _)) => "stream_shape_unsupported",
+            StreamError::Shape(ShapeError::MalformedDocument(_, _)) => {
+                "stream_tool_arguments_malformed"
+            }
             StreamError::Unplaceable(_) => "stream_unplaceable",
             StreamError::Oversized => "stream_oversized",
             StreamError::Stalled => "stream_stalled",
@@ -715,8 +748,13 @@ pub fn restore_stream(
 }
 
 /// What the client sees when restoration fails after bytes have already gone
-/// out. The message names the failure and, at most, a placeholder — never a
-/// value: `MappingError::Unknown` carries the token, not what it stood for.
+/// out. The message names the failure and nothing else — not a value, and not
+/// a placeholder either. This comment used to promise only the first: a
+/// placeholder was judged safe to show because it is not the value it stood
+/// for. It is still the gateway's own token, and a client is never otherwise
+/// supposed to see one, so `MappingError::Unknown` no longer puts it in the
+/// message. `Unplaceable` still names a run key, which is a position in the
+/// provider's own envelope rather than anything of ours or the caller's.
 fn error_event(message: &str) -> String {
     SseEvent::new(
         Some("error".to_owned()),
@@ -728,6 +766,57 @@ fn error_event(message: &str) -> String {
         ),
     )
     .render()
+}
+
+#[cfg(test)]
+mod audit_class_tests {
+    use super::*;
+
+    #[test]
+    fn a_streamed_failure_is_recorded_as_precisely_as_a_buffered_one() {
+        // I4. `Mapping(_)` and `Shape(_)` were wildcards over eleven variants,
+        // so an unresolvable placeholder, a placeholder used as a property
+        // name, a document past the depth bound and two of this gateway's own
+        // walks disagreeing were one word — `stream_unrestorable` — for every
+        // streamed response, while the buffered path gave the same errors
+        // eleven classes. The doc comment above said the opposite, and a probe
+        // variant on `MappingError` compiled here while failing in `proxy.rs`
+        // twice.
+        let classes = [
+            StreamError::Mapping(MappingError::Unknown("[PERSON_1]".to_owned())).audit_class(),
+            StreamError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
+            StreamError::Mapping(MappingError::TooDeep).audit_class(),
+            StreamError::Mapping(MappingError::TooLarge).audit_class(),
+            StreamError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
+            StreamError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+            StreamError::Shape(ShapeError::Request("messages")).audit_class(),
+            StreamError::Shape(ShapeError::Response("choices")).audit_class(),
+            StreamError::Shape(ShapeError::Pointer("/a".to_owned())).audit_class(),
+            StreamError::Shape(ShapeError::Unsupported("openai", "logprobs")).audit_class(),
+            StreamError::Shape(ShapeError::MalformedDocument("openai", "/a".to_owned()))
+                .audit_class(),
+            StreamError::Unplaceable("0".to_owned()).audit_class(),
+            StreamError::Oversized.audit_class(),
+            StreamError::Stalled.audit_class(),
+            StreamError::TooManyRuns.audit_class(),
+            StreamError::Malformed.audit_class(),
+        ];
+        let mut seen: Vec<&str> = classes.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            classes.len(),
+            "two streamed failures an auditor must tell apart are one word: {classes:?}"
+        );
+        assert_eq!(
+            StreamError::Mapping(MappingError::Unknown("[PERSON_1]".to_owned())).audit_class(),
+            "stream_unrestorable",
+            "the class this path was named for keeps its name, so evidence \
+             already written still reads"
+        );
+    }
 }
 
 #[cfg(test)]
