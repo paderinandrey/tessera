@@ -9,7 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use crate::audit::Record;
+use crate::audit::{Detected, Record};
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping;
@@ -112,12 +112,24 @@ impl ProxyError {
     /// The fixed vocabulary the journal records. A class rather than the
     /// message, so that no expression in the audit writer could interpolate
     /// submitted text even if a message one day carried it.
+    ///
+    /// Matched with no `_` arm anywhere, over `ShapeError`, `DetectorError`,
+    /// `MappingError` and `SessionError` as well as over this enum's own
+    /// variants. `Shape(_)` used to collapse the last two of five, and it cost
+    /// more than tidiness twice over: `Response` and `Pointer` shared one class,
+    /// so an auditor reading a run of 502s could not tell a body the upstream
+    /// sent from a pointer this gateway produced — a defect here rather than
+    /// there — and a new variant would have compiled, taking a correct status
+    /// from `status()` and a wrong class from this function, silently. Measured
+    /// at `41eb85e` with a probe variant: one compile error, in `status()`, and
+    /// none here.
     fn audit_class(&self) -> &'static str {
         match self {
             ProxyError::Shape(ShapeError::Request(_)) => "shape_request",
             ProxyError::Shape(ShapeError::Unsupported(_, _)) => "shape_unsupported",
             ProxyError::Shape(ShapeError::MalformedDocument(_, _)) => "tool_arguments_malformed",
-            ProxyError::Shape(_) => "shape_response",
+            ProxyError::Shape(ShapeError::Response(_)) => "shape_response",
+            ProxyError::Shape(ShapeError::Pointer(_)) => "shape_pointer",
             ProxyError::Detector(DetectorError::Transport(_)) => "detector_transport",
             ProxyError::Detector(DetectorError::Status(_)) => "detector_status",
             ProxyError::Mapping(MappingError::Unknown(_)) => "mapping_unknown_placeholder",
@@ -223,18 +235,12 @@ impl AppState {
     }
 }
 
-/// Detect and mask every text the provider pointed at, and report what was
-/// found. Shared by both branches of `handle`: inline it would exist twice and
-/// diverge at the first edit.
-///
-/// The counts describe *this request's* texts. Counting the mapping instead
-/// would report a session's running total on every turn, and the record would
-/// stop describing the request. The values themselves live in the local set
-/// only long enough to be counted and never leave this function.
 /// The distinct values one text contributed, folded into the caller's set.
 ///
 /// A free function so both slot kinds count the same way: inlined twice they
 /// would drift, and the counts are what the journal reports about the request.
+/// The values themselves live in that set only long enough to be counted and
+/// never leave `mask_all`.
 fn count_distinct(text: &str, spans: &[Span], distinct: &mut HashSet<(String, String)>) {
     // The `Vec<char>` is a copy of the whole text, and a conversation
     // history is many texts: it is built only when there is a span to
@@ -252,6 +258,20 @@ fn count_distinct(text: &str, spans: &[Span], distinct: &mut HashSet<(String, St
     }
 }
 
+/// Detect and mask every text the provider pointed at, and report what was
+/// found and what became of it. Shared by both branches of `handle`: inline it
+/// would exist twice and diverge at the first edit.
+///
+/// (This paragraph was attached to `count_distinct` below, which is not the
+/// function it describes. Moved rather than rewritten.)
+///
+/// **Every count describes *this request*.** Reading one off the mapping
+/// instead reports a session's running total, or — worse, because it looks
+/// right — a number that quietly depends on what an earlier turn happened to
+/// allocate: that is exactly what `redacted` was, and two turns of identical
+/// traffic wrote two different evidence lines because of it. The mapping is
+/// still consulted, but only ever with a value from this request in hand, and
+/// only to ask what the provider received for it.
 async fn mask_all(
     provider: &'static str,
     detector: &DetectorClient,
@@ -259,10 +279,23 @@ async fn mask_all(
     slots: &[Slot],
     mapping: &mut Mapping,
     credential: Option<&[u8]>,
-) -> Result<(Value, usize, BTreeMap<String, usize>), ProxyError> {
+) -> Result<(Value, Detected), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
     let mut distinct: HashSet<(String, String)> = HashSet::new();
+    // Findings on a numeric leaf, which this gateway deliberately forwards
+    // rather than masking — see the long comment at the exemption below. They
+    // are collected structurally, from the leaf the span landed in, rather than
+    // inferred at the end from "no placeholder was issued for this value": a
+    // value that is both a number here and a string somewhere else in the same
+    // request has a placeholder *and* went out verbatim, and the journal should
+    // say the digits left.
+    let mut forwarded: HashSet<(String, String)> = HashSet::new();
+    // What the detector was actually shown, which is not the same as what the
+    // request holds: a `Slot::Json` is one call however many leaves it has, and
+    // no call at all when it has none.
+    let mut texts = 0usize;
+    let mut documents = 0usize;
     // **Every literal in the request, reserved before the first allocation.**
     // `Mapping::mask` reserves the text it is handed, which is one string; the
     // collision is between two. With `{"a": "Martina Weber", "z":
@@ -326,6 +359,7 @@ async fn mask_all(
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(body, pointer)?;
                 let spans = detector.detect(&text, credential).await?;
+                texts += 1;
                 total += spans.len();
                 count_distinct(&text, &spans, &mut distinct);
                 write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
@@ -390,6 +424,7 @@ async fn mask_all(
                 } else {
                     let joined = mapping::Joined::of(&rendered);
                     let spans = detector.detect(joined.text(), credential).await?;
+                    documents += 1;
                     total += spans.len();
                     // Read off the joined text with the spans as the detector
                     // reported them, before any rebasing — the values are the
@@ -513,14 +548,30 @@ async fn mask_all(
                 // this check is also strictly cheaper than reaching the same
                 // answer later, and it does not depend on that being true.
                 for (leaf, spans) in leaves.iter().zip(&per_leaf) {
-                    if matches!(leaf, mapping::Leaf::Number(_))
-                        && spans.iter().any(|span| {
-                            let entity_type = span.entity_type.as_str();
-                            !mapping::ENTITY_TYPES.contains(&entity_type)
-                                || mapping::DETERMINISTIC_TYPES.contains(&entity_type)
-                        })
-                    {
+                    let mapping::Leaf::Number(number) = leaf else {
+                        continue;
+                    };
+                    if spans.iter().any(|span| {
+                        let entity_type = span.entity_type.as_str();
+                        !mapping::ENTITY_TYPES.contains(&entity_type)
+                            || mapping::DETERMINISTIC_TYPES.contains(&entity_type)
+                    }) {
                         return Err(ProxyError::NumericPersonalData);
+                    }
+                    // Past that `return`, every span on this leaf is one the
+                    // exemption above lets through, and the digits under it
+                    // reach the provider unchanged. The journal is told here,
+                    // where the decision is made: without it the line reads
+                    // `spans: 1`, `types: {"PERSON": 1}`, `redacted: 0` — which
+                    // is what a *masked* value looks like — for a value that
+                    // was never masked at all. The exemption is deliberate; the
+                    // evidence claiming a pseudonymization that did not happen
+                    // was not.
+                    let characters: Vec<char> = number.chars().collect();
+                    for span in spans {
+                        if let Some(value) = characters.get(span.start..span.end) {
+                            forwarded.insert((span.entity_type.clone(), value.iter().collect()));
+                        }
                     }
                 }
                 let mut replacements = Vec::new();
@@ -537,9 +588,34 @@ async fn mask_all(
             }
         }
     }
+    // **One pass, three questions, one answer each.** Every finding — one
+    // distinct (type, value) pair the detector reported anywhere in this
+    // request — is named in `types`, and is then in exactly one of three
+    // states: forwarded verbatim, masked under a name that is not the one
+    // `types` gives it, or masked under that name. The third is the ordinary
+    // case and is not counted, because it is what remains.
+    //
+    // **Why this is asked here and not read off the mapping.**
+    // `Mapping::redacted_count` counts *allocations*: `placeholder_for` returns
+    // on a `by_value` hit before it looks at the type, so a value already
+    // mapped — a repeat inside one request, or anything an earlier turn of the
+    // session seeded — never reaches the counter. Two turns of identical
+    // traffic, both sending `[REDACTED_1]`, wrote `redacted: 1` and then
+    // `redacted: 0`; and a value found twice under two names in one request
+    // wrote both names with `redacted: 0`, when only the first name was issued.
+    // The journal describes a request, so it asks about this request's
+    // findings, and it asks the mapping what the provider actually got.
     let mut types: BTreeMap<String, usize> = BTreeMap::new();
-    for (entity_type, _) in distinct {
-        *types.entry(entity_type).or_default() += 1;
+    let mut redacted = 0usize;
+    let mut forwarded_count = 0usize;
+    for finding in &distinct {
+        let (entity_type, value) = finding;
+        *types.entry(entity_type.clone()).or_default() += 1;
+        if forwarded.contains(finding) {
+            forwarded_count += 1;
+        } else if !mapping.named_as(value, entity_type) {
+            redacted += 1;
+        }
     }
     if mapping.redacted_count() > 0 {
         // The count, never the name: the name is the untrusted string this
@@ -551,7 +627,17 @@ async fn mask_all(
             "the detector reported entity types outside this gateway's vocabulary"
         );
     }
-    Ok((masked, total, types))
+    Ok((
+        masked,
+        Detected {
+            texts,
+            documents,
+            spans: total,
+            types,
+            redacted,
+            forwarded: forwarded_count,
+        },
+    ))
 }
 
 /// Which branch `handle` took. `serve` uses this to decide whether it is the
@@ -697,7 +783,7 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
-            let (masked, spans, types) = mask_all(
+            let (masked, found) = mask_all(
                 provider.name(),
                 &state.detector,
                 &body,
@@ -706,7 +792,7 @@ async fn handle(
                 credential,
             )
             .await?;
-            record.detected(slots.len(), spans, types, work.redacted_count());
+            record.detected(found);
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
             // request, and a request that never left must leave the session
@@ -727,7 +813,7 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
-            let (masked, spans, types) = mask_all(
+            let (masked, found) = mask_all(
                 provider.name(),
                 &state.detector,
                 &body,
@@ -736,7 +822,7 @@ async fn handle(
                 credential,
             )
             .await?;
-            record.detected(slots.len(), spans, types, work.redacted_count());
+            record.detected(found);
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
             record.masked().await?;
@@ -1259,12 +1345,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_journal_says_a_type_it_names_was_masked_generically() {
+    async fn the_journal_says_a_type_it_counts_was_masked_generically() {
         // `types` is built from the detector's response, before the mapping
-        // rules on it, so a line can name WEBER while the provider received
-        // [REDACTED_1]. Deliberately: the two checks stay independent. What
-        // must not happen is the divergence going unrecorded, leaving an
-        // auditor to reconcile a name against traffic that never carried it.
+        // rules on it, so the two checks stay independent and the journal can
+        // report a type the provider never received. What must not happen is
+        // the divergence going unrecorded, leaving an auditor to reconcile a
+        // name against traffic that never carried it.
+        //
+        // **This test used to assert `types["WEBER"] == 1`** — the name written
+        // out — on the argument that `redacted` beside it made the line
+        // unambiguous. It did, and it was the wrong half of the problem:
+        // `WEBER` is a surname, and the check that admitted it admits
+        // `MARTINA_WEBER_HAUPTSTRASSE_VIER` on the same terms. The divergence is
+        // now recorded as a count under `unvalidated`, which is what an operator
+        // acts on, and the name stays outside the evidence file.
         let detector = detector_returning(json!([
             {"entity_type": "WEBER", "start": 0, "end": 5, "confidence": 1.0,
              "recognizer": "ner:fake", "tier": 2, "boosted": false},
@@ -1286,10 +1380,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let lines = journal(&path);
-        assert_eq!(lines[0]["types"]["WEBER"], 1);
+        assert!(
+            lines[0]["types"]["WEBER"].is_null(),
+            "the detector's own string is a key in the evidence: {}",
+            lines[0]
+        );
+        assert_eq!(lines[0]["types"]["unvalidated"], 1);
         assert_eq!(
             lines[0]["redacted"], 1,
-            "the line names a type no placeholder carried and does not say so: {}",
+            "the line counts a type no placeholder carried and does not say so: {}",
             lines[0]
         );
     }
@@ -6053,5 +6152,306 @@ mod tests {
                 "{note}: loosening the check took its load-bearing half with it, {sent}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_value_dressed_as_a_type_never_reaches_a_journal_line() {
+        // C1, driven the way it is actually reachable: an ordinary 200, no
+        // session, the client's own response correct and the provider given
+        // `[REDACTED_1]`. The string exists in exactly one place — the evidence
+        // file — which is why eleven rounds of probes on response bodies could
+        // not see it.
+        //
+        // The grammar the check used to be is a check on the shouting, not on
+        // the value: uppercasing and underscore-joining costs a detector
+        // nothing, `MAX_ENTITY_TYPE` is forty characters, and every span of the
+        // request is a separate key.
+        let detector = detector_returning(json!([
+            {"entity_type": "MARTINA_WEBER_HAUPTSTRASSE_VIER", "start": 0, "end": 13,
+             "confidence": 1.0, "recognizer": "ner:fake", "tier": 2, "boosted": false}
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Martina Weber schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "an ordinary request: {returned}");
+        let sent = sent_to(&upstream).await.to_string();
+        assert!(
+            sent.contains("[REDACTED_1]"),
+            "the mapping declined it: {sent}"
+        );
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            !text.contains("MARTINA") && !text.contains(SECRET.to_uppercase().as_str()),
+            "the detector wrote a submitted value into the evidence: {text}"
+        );
+        assert_eq!(
+            journal(&path)[0]["types"]["unvalidated"],
+            1,
+            "and the operator is told there was one, without being told what"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_turns_of_one_session_carrying_the_same_traffic_write_the_same_line() {
+        // I1. Both turns send `[REDACTED_1] called` to the provider. The
+        // journal said `redacted: 1` and then `redacted: 0`, because the count
+        // was read off the mapping, which counts *allocations*: turn two's span
+        // hit `by_value` and returned before the type was looked at, so nothing
+        // was allocated and nothing was counted.
+        //
+        // A field that describes the request must not depend on what an earlier
+        // request happened to have put in the session's table.
+        let detector = detector_returning(json!([
+            {"entity_type": "WEBER", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        for _ in 0..2 {
+            call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"messages": [{"role": "user", "content": "Weber called"}]}),
+                &session_headers("sk-tenant", "chat-1"),
+            )
+            .await;
+        }
+
+        let sent: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| String::from_utf8(request.body.clone()).unwrap())
+            .collect();
+        assert_eq!(sent[0], sent[1], "the premise: identical traffic");
+        let lines = journal(&path);
+        let masked: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        // Every field but the two that are supposed to differ. `README.md`
+        // says two turns carrying identical traffic write identical lines, and
+        // a comparison of one field would have missed the next count to be
+        // read off the mapping instead of off the request.
+        let strip = |line: &Value| {
+            let mut line = line.clone();
+            let object = line.as_object_mut().expect("a JSON object");
+            object.remove("ts");
+            object.remove("request");
+            line
+        };
+        assert_eq!(
+            strip(masked[0]),
+            strip(masked[1]),
+            "identical traffic, two different evidence lines: {} / {}",
+            masked[0],
+            masked[1]
+        );
+        assert_eq!(
+            masked[1]["redacted"], 1,
+            "and the number is the true one: the provider received no WEBER placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_named_twice_says_the_second_name_did_not_reach_the_provider() {
+        // I1 without a session at all, and the case that shows what `redacted`
+        // has to mean. One value, two spans, two types: only one placeholder
+        // can be issued for a value, so `[PERSON_1]` went up twice and no
+        // `WEBER` placeholder was ever issued. Reading `types` alone the line
+        // claims two types were found and both were honoured.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 5, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+            {"entity_type": "ORG", "start": 10, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "Weber und Weber"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        let sent = sent_to(&upstream).await.to_string();
+        assert!(
+            sent.contains("[PERSON_1] und [PERSON_1]") && !sent.contains("[ORG_"),
+            "the premise: one placeholder for one value: {sent}"
+        );
+        let line = &journal(&path)[0];
+        assert_eq!(line["types"]["PERSON"], 1);
+        assert_eq!(line["types"]["ORG"], 1, "both types are declared and named");
+        assert_eq!(
+            line["redacted"], 1,
+            "one of the two names did not reach the provider and the line must say so: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_number_the_exemption_forwards_is_journalled_as_forwarded() {
+        // I2. The one place this gateway deliberately does not mask a detected
+        // span was the one place the journal had no field for: the line read
+        // `spans: 1`, `types: {"PERSON": 1}`, `redacted: 0` — which is what a
+        // *masked* value looks like — while the digits went to the provider
+        // unchanged. The forwarding is a ruling of this branch; the evidence
+        // recording a pseudonymization that did not happen was not.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 16, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false},
+        ]))
+        .await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "pay",
+                     "input": {"card": 4_111_111_111_111_111u64}}
+                ]}]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        assert_eq!(
+            sent_to(&upstream).await["messages"][0]["content"][0]["input"]["card"],
+            json!(4_111_111_111_111_111u64),
+            "the premise: the number reaches the provider as the client wrote it"
+        );
+        let line = &journal(&path)[0];
+        assert_eq!(line["types"]["PERSON"], 1, "the finding is still reported");
+        assert_eq!(
+            line["forwarded"], 1,
+            "the line claims a masking that did not happen: {line}"
+        );
+        assert_eq!(
+            line["redacted"], 0,
+            "forwarded and redacted are different fates and each finding has one: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_the_detector_was_never_shown_is_not_counted_as_a_text() {
+        // M1. `texts` was `slots.len()`, and since tool traffic a slot may be a
+        // document: at most one detector call however many leaves it holds, and
+        // **zero** calls when it holds none. Two empty schemas were two texts in
+        // the evidence and nothing at all in the detector's log.
+        //
+        // What that costs is not tidiness. Round 1's H2 on this branch was "the
+        // schema document produced no leaves at all, so Weber was never scanned
+        // by anything", and the journal is the artifact that should expose a
+        // recurrence — while it was recording the un-scanned document as a
+        // scanned text.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, returned) = call(
+            state,
+            "/v1/messages",
+            json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": "hallo"}],
+                "tools": [
+                    {"name": "a", "description": "da", "input_schema": {}},
+                    {"name": "b", "description": "db", "input_schema": {}},
+                ]
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{returned}");
+        // Every text here is distinct, so nothing is served from the detection
+        // cache and the mock's own count is the number of detections asked for.
+        let calls = detector.received_requests().await.unwrap().len();
+        let line = &journal(&path)[0];
+        assert_eq!(
+            line["texts"].as_u64().expect("a count") + line["documents"].as_u64().expect("a count"),
+            calls as u64,
+            "the journal counts what the detector was shown, and it was shown {calls}: {line}"
+        );
+        assert_eq!(
+            line["documents"], 0,
+            "neither schema was scanned, so neither is evidence of a scan: {line}"
+        );
+        assert_eq!(line["texts"], 3, "one message and two descriptions: {line}");
+    }
+
+    #[test]
+    fn a_shape_failure_of_the_upstream_is_not_one_of_our_own() {
+        // I3. `Shape(_)` collapsed `Response` and `Pointer` into one class, so
+        // an auditor reading a run of 502s could not separate "the upstream
+        // sent a body we could not read" from "a pointer this gateway produced
+        // did not resolve" — the second is a defect here, and it is the one
+        // worth paging somebody about.
+        let response = ProxyError::Shape(ShapeError::Response("choices"));
+        let pointer = ProxyError::Shape(ShapeError::Pointer("/messages/0".to_owned()));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(pointer.status(), StatusCode::BAD_GATEWAY);
+        assert_ne!(
+            response.audit_class(),
+            pointer.audit_class(),
+            "one status, two causes, and the journal is the only place they differ"
+        );
+    }
+
+    #[test]
+    fn every_error_this_gateway_records_has_a_class_of_its_own() {
+        // The other half of I3, and what makes the wildcard's absence visible
+        // rather than merely absent: a variant added to any of the four wrapped
+        // enums now fails to compile in `audit_class` as it already did in
+        // `status()`. This asserts the consequence — no two errors that mean
+        // different things share a word — because a compile error cannot be
+        // asserted from inside the crate that must compile.
+        let classes = [
+            ProxyError::Shape(ShapeError::Request("messages")).audit_class(),
+            ProxyError::Shape(ShapeError::Response("choices")).audit_class(),
+            ProxyError::Shape(ShapeError::Pointer("/a".to_owned())).audit_class(),
+            ProxyError::Shape(ShapeError::Unsupported("openai", "logprobs")).audit_class(),
+            ProxyError::Shape(ShapeError::MalformedDocument("openai", "/a".to_owned()))
+                .audit_class(),
+            ProxyError::Mapping(MappingError::Unknown("[PERSON_1]".to_owned())).audit_class(),
+            ProxyError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
+            ProxyError::Mapping(MappingError::TooDeep).audit_class(),
+            ProxyError::Mapping(MappingError::TooLarge).audit_class(),
+            ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
+            ProxyError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+        ];
+        let mut seen: Vec<&str> = classes.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            classes.len(),
+            "two errors an auditor must tell apart are one word: {classes:?}"
+        );
     }
 }

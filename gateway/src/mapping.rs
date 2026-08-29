@@ -179,8 +179,33 @@ impl Mapping {
     }
 
     /// How many spans this mapping had to mask under the generic type.
+    ///
+    /// Allocations, not findings: a value already mapped is returned from
+    /// `by_value` before its type is looked at, so a repeat does not count
+    /// again. That is the right number for the one thing that reads it — a
+    /// `tracing` line about a detector whose vocabulary disagrees with ours —
+    /// and it is deliberately *not* the journal's `redacted` field, which
+    /// counts this request's findings rather than this mapping's allocations.
+    /// The two were the same number until the journal stopped asking this one.
     pub fn redacted_count(&self) -> usize {
         self.redacted
+    }
+
+    /// Whether the provider received `value` under `entity_type`'s own name.
+    ///
+    /// False in three different situations, and the journal treats them alike
+    /// because the provider does: the type was not one we declare and the value
+    /// went up as `[REDACTED_n]`; the value was already carrying a placeholder
+    /// issued for some *other* type, in this request or in an earlier turn of
+    /// the session; or the value was never masked at all. What the caller is
+    /// asking is "did the name in my evidence line reach the provider", and the
+    /// answer is no in all three.
+    pub fn named_as(&self, value: &str, entity_type: &str) -> bool {
+        self.by_value
+            .get(value)
+            .map(|placeholder| placeholder.as_str())
+            .and_then(placeholder_type)
+            == Some(entity_type)
     }
 
     pub fn mask(&mut self, text: &str, spans: &[Span]) -> Result<String, MappingError> {
@@ -1849,21 +1874,41 @@ impl<'a> Iterator for Pieces<'a> {
 /// measured at `6a06391`. A placeholder this gateway issues has exactly one
 /// bracket at each end, so that is what is read.
 fn is_placeholder(candidate: &str) -> bool {
-    let Some(inner) = candidate
+    placeholder_type(candidate).is_some()
+}
+
+/// The type name a placeholder carries, or `None` if the candidate is not one.
+///
+/// `is_placeholder` is this function asked a coarser question, so the two
+/// cannot disagree about what a token is: reading the name out and deciding
+/// whether there is a name to read are one walk.
+fn placeholder_type(candidate: &str) -> Option<&str> {
+    let inner = candidate
         .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-    else {
-        return false;
-    };
-    let Some((entity_type, number)) = inner.rsplit_once('_') else {
-        return false;
-    };
-    !entity_type.is_empty()
-        && entity_type
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c == '_')
+        .and_then(|rest| rest.strip_suffix(']'))?;
+    let (entity_type, number) = inner.rsplit_once('_')?;
+    let well_formed = is_type_characters(entity_type)
         && !number.is_empty()
-        && number.chars().all(|c| c.is_ascii_digit())
+        && number.chars().all(|c| c.is_ascii_digit());
+    well_formed.then_some(entity_type)
+}
+
+/// The characters a type name is made of: non-empty, ASCII upper-case and
+/// underscore.
+///
+/// It lives here rather than at either of its call sites because both of them
+/// have to agree — the placeholder grammar above, which decides what this
+/// gateway will restore, and `audit::is_entity_type`, which decides what may
+/// become a key in the journal. Written out twice they were two grammars that
+/// happened to match, and `audit`'s comment claimed a sharing that did not
+/// exist until this function did.
+///
+/// The length bound is deliberately *not* here. `MAX_ENTITY_TYPE` is a bound on
+/// what this gateway may issue and on what may reach a journal line; a longer
+/// token in the caller's own text is still a token to be reserved and restored,
+/// and folding the two rules together would quietly change that.
+pub(crate) fn is_type_characters(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
 }
 
 #[cfg(test)]
@@ -2275,6 +2320,53 @@ mod tests {
             .expect("masked");
 
         assert_eq!(mapping.redacted_count(), 1, "one unknown type, one count");
+    }
+
+    #[test]
+    fn a_value_is_named_as_its_type_only_when_the_provider_saw_that_name() {
+        // What the journal's `redacted` is computed from. Three ways for the
+        // detector's name not to reach the provider, and the field counts all
+        // three because the provider does not distinguish them: the type was
+        // not one we declare; the value already carried a placeholder issued
+        // for another type; and the value was never masked at all.
+        let mut mapping = Mapping::new();
+        mapping
+            .mask("Weber", &[span("PERSON", 0, 5)])
+            .expect("masked");
+        mapping
+            .mask("Meier", &[span("WEBER", 0, 5)])
+            .expect("masked");
+
+        assert!(mapping.named_as("Weber", "PERSON"));
+        assert!(
+            !mapping.named_as("Weber", "ORG"),
+            "the provider received [PERSON_1], whatever a second span called it"
+        );
+        assert!(
+            !mapping.named_as("Meier", "WEBER"),
+            "an undeclared type went up as [REDACTED_n] and the name went nowhere"
+        );
+        assert!(
+            !mapping.named_as("4111111111111111", "PERSON"),
+            "a value that was never masked carries no name at all"
+        );
+    }
+
+    #[test]
+    fn the_journal_and_the_placeholder_grammar_are_one_grammar() {
+        // `audit::is_entity_type`'s comment claimed this sharing for as long as
+        // the two predicates were written out separately, which is exactly the
+        // arrangement in which they drift. `is_type_characters` is now the one
+        // copy, and this is the assertion that a change to it is felt on both
+        // sides rather than only where it was made.
+        for name in ["PERSON", "DE_STEUER_ID"] {
+            assert!(is_type_characters(name));
+            assert!(is_placeholder(&format!("[{name}_1]")));
+        }
+        for name in ["", "person", "PHONE_E164", "PERSON-1"] {
+            assert!(!is_type_characters(name), "{name}");
+            assert!(!is_placeholder(&format!("[{name}_1]")), "{name}");
+        }
     }
 
     #[test]

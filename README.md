@@ -520,7 +520,7 @@ group the fields for reading; on disk each line serializes its keys in
 alphabetical order, which nothing depends on.
 
 ```json
-{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0}
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"documents":2,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0,"forwarded":0}
 {"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
@@ -536,28 +536,55 @@ That is why `tenant` and `session` appear on the outcome line as well as the
 masked one: a refusal has no masked line to join to, and the redundancy on the
 two-line case costs a few bytes.
 
-The record counts and never quotes. `types` counts distinct values per type and
-`spans` counts occurrences; the gap between them is a value named more than once
-within the same request, not anything a session did — detection runs over every
-text on every request whether or not one is attached, so the coreference a
-session buys across turns leaves no trace here. Neither the values, hashes of
-them, their offsets nor the placeholder names are written. `error` is drawn from
-a fixed vocabulary rather than formatted from a message, so no expression in the
-writer could interpolate submitted text. A type name the detector reports that
-is not a legible type — the mapping lets one through whenever the value was
-already masked earlier in the same request or in an earlier turn — is counted
-under `unvalidated` rather than written out, since the name itself came from
-outside the perimeter. Seeing that key means the detector and the gateway
-disagree about what a type is; the gateway also says so in its own log.
-`redacted` counts the values the mapping masked as `[REDACTED_n]` because their
-type was not one it declares — which `types` does not show, since it is built
-from what the detector reported and not from what the placeholder ended up
-carrying. A line naming `WEBER` and a `redacted` of 1 says the provider received
-`[REDACTED_1]`, not `[WEBER_1]`.
+The record counts and never quotes. Neither the values, hashes of them, their
+offsets nor the placeholder names are written. `error` is drawn from a fixed
+vocabulary rather than formatted from a message, so no expression in the writer
+could interpolate submitted text.
+
+**What the detector was shown.** `texts` counts texts and `documents` counts
+tool documents; each is one detector call, whatever the number of leaves the
+document holds. A document holding no leaves at all — `{}`, or one whose every
+field is a boolean — is counted in neither, because nothing about it was
+scanned. `texts + documents` is therefore exactly the number of detections this
+request asked for — served by the detector, or from its cache when the same text
+has already been seen under the same credential.
+
+**What it found.** `types` counts distinct values per type, as the *detector*
+named them, and `spans` counts occurrences; the gap between them is a value
+found more than once under the same name within the same request, not anything
+a session did — detection runs over every text on every request whether or not
+one is attached.
+A type name the detector reports that is not one of the twenty-two this gateway
+declares is counted under `unvalidated` rather than written out, since the name
+arrived from outside the perimeter and a name is a place a value can hide.
+Seeing that key means the detector and the gateway disagree about what a type
+is; the gateway also says so in its own log.
+
+**What the provider received.** Every finding — one distinct value under one
+type name — is in exactly one of three states, and two of them are counted.
+`redacted` counts the findings the provider received under a placeholder that
+does **not** carry the detector's name for them: usually because the type was
+not one this gateway declares, so the value went up as `[REDACTED_n]`, and also
+when the value was already carrying a placeholder issued for another type,
+whether earlier in this request or in an earlier turn of the session.
+`forwarded` counts the findings the provider received verbatim: a span on a
+numeric leaf of a tool document, which this gateway deliberately does not mask,
+because a placeholder there would change the field from a number to a string.
+Whatever is left went up under the name `types` gives it. So a line naming
+`PERSON` with `redacted` and `forwarded` both zero says the provider received
+`[PERSON_1]`, and it is the only line that says so.
+
+Both counts describe *this* request. Two turns of a session carrying identical
+traffic write identical lines, and what the session bought across them — the
+same value keeping the same number — leaves no trace here.
+
 `result` is one of `completed`,
 `refused`, `stream_failed` or `aborted`; the last is what an unsignalled record
 defaults to on drop — in practice, a client that disconnects while a stream is
-still open, recorded as itself rather than as a success nobody observed.
+still open, recorded as itself rather than as a success nobody observed. On an
+`aborted` line `status` is `0` and is not an HTTP code: no status was ever
+observed for that request, and the field keeps the shape every other line has
+rather than claiming an outcome nobody saw.
 
 `tenant` and `session` are salted digests, never a key and never the raw session
 id — a client may well name its session after the person in it. The salt lives
