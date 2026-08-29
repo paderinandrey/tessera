@@ -495,6 +495,28 @@ pub enum Shape {
 /// | `dependentRequired` | 2019-09, 2020-12 | one rule, and it is the caller's own vocabulary either way |
 /// | `$anchor` | 2019-09, 2020-12 | **two drafts, two patterns — the union is right here** |
 /// | `$dynamicAnchor`, `$dynamicRef` | 2020-12 only | **one draft, so one grammar.** `$dynamicAnchor` was the leak |
+/// | `$recursiveRef` | 2019-09 only | one draft, one rule, and the rule is URI-reference |
+///
+/// **A keyword this list omits is walked as prose, and that is the other way to
+/// over-mask.** `$recursiveRef` was on the ledger's deferred pile since Task 4
+/// and reached this round unlisted, so `{"$recursiveRef": "Weber.json"}` went to
+/// the provider as `{"$recursiveRef": "[PERSON_1].json"}` — a rewritten
+/// reference target, which breaks the schema exactly as a masked `$ref` would
+/// (measured, at 200). The comment beside `$dynamicRef` said the keyword's
+/// "value must be `\"#\"`", and 2019-09 says no such thing: §8.2.4.2.1 is "MUST
+/// be a string which is a URI-reference", and the core meta-schema publishes it
+/// as `{"type": "string", "format": "uri-reference"}`. The draft adds that the
+/// *behavior* is defined only for `"#"` and that implementations MAY treat
+/// other values as errors — a statement about evaluation, not about syntax, and
+/// a permission this gateway is not the one to exercise.
+///
+/// **Its other half is not on this list and cannot be: `$recursiveAnchor` MUST
+/// be a boolean** (§8.2.4.2.2, and the meta-schema agrees). It holds no string
+/// in any draft, so there is nothing for a detector to see and nothing for a
+/// mask to break; a `$recursiveAnchor` holding a *string* states no anchor and
+/// is the caller's data, which is what an unlisted keyword already gets. The
+/// second name the ledger deferred, **OpenAPI's `discriminator`**, is not on
+/// this list either and the reason is different — see `Content`.
 ///
 /// Two entries are looser than the drafts on purpose and both are recorded
 /// where the looseness is: draft-03 spelled `required` as a boolean on the
@@ -504,7 +526,7 @@ pub enum Shape {
 /// `{"type": "any"}` is now scanned, and `any` is not a person, so the cost is
 /// a detector call. Widening a genuinely closed vocabulary for a draft nobody
 /// sends is the trade this list exists to refuse.
-const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 14] = [
+const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 15] = [
     // Two drafts define it and they publish different patterns, so the check
     // is the union of the two — see `Content::Anchor`. `$dynamicAnchor` below
     // is the same shape of keyword and *not* the same answer, for a reason
@@ -515,11 +537,18 @@ const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 14] = [
     // with 2019-09's pattern gives it a spelling no draft ever published, and
     // 2019-09's permits `:`, so `Martina:Weber` was skipped (measured, at 200).
     ("$dynamicAnchor", Identifier::Name, Content::DynamicAnchor),
-    // 2020-12 too, and 2019-09's nearest analogue is a different keyword
-    // (`$recursiveRef`, whose value must be `"#"`) that is not on this list.
-    // One draft, one grammar, and 2020-12 says URI-reference.
+    // 2020-12 too, and 2019-09's nearest analogue is a different keyword —
+    // `$recursiveRef`, below. One draft, one grammar, and 2020-12 says
+    // URI-reference.
     ("$dynamicRef", Identifier::Name, Content::UriReference),
     ("$id", Identifier::Name, Content::UriReference),
+    // 2019-09's own dynamic reference — the keyword 2020-12 retired in favour
+    // of `$dynamicRef` above. The draft that defines it says URI-reference and
+    // says so twice, in the prose and in the meta-schema; the sentence people
+    // remember instead ("only the value `#` has a clear use case") is about
+    // what an implementation may *do* with the value, not about which values
+    // are legal to write.
+    ("$recursiveRef", Identifier::Name, Content::UriReference),
     ("$ref", Identifier::Name, Content::UriReference),
     ("$schema", Identifier::Name, Content::UriReference),
     ("contentEncoding", Identifier::Name, Content::Token),
@@ -531,7 +560,14 @@ const SCHEMA_IDENTIFIER_KEYWORDS: [(&str, Identifier, Content); 14] = [
         Identifier::NamesPerName,
         Content::Arbitrary,
     ),
-    ("format", Identifier::Name, Content::Token),
+    // **No draft publishes a grammar for it.** "The value of this keyword is
+    // called a format attribute. It MUST be a string" is the whole of the
+    // constraint, and §7.2.3 adds that implementations MAY support custom
+    // format attributes. A one-token check was inferred from what the
+    // registered names happen to look like, and `{"format": "Weber Martina"}`
+    // went to the provider as `{"format": "[PERSON_1] Martina"}` (measured, at
+    // 200). See `Content::Arbitrary` for the residual that buys.
+    ("format", Identifier::Name, Content::Arbitrary),
     // draft-04 spelled `$id` this way. A schema written to that draft is
     // still a schema a client may send, and a masked base URI breaks every
     // `$ref` that resolves against it.
@@ -624,25 +660,73 @@ impl Identifier {
 /// `type`. `Martina Weber` is not one, so that document states no type, and the
 /// bytes are the caller's data like any other unrecognized value here.
 ///
-/// **The fourteen keywords are three kinds, not fourteen of one**, and the
-/// third kind is why this enum has a variant that checks nothing:
+/// **The fifteen keywords are three kinds, not fifteen of one**, and the third
+/// kind is why this enum has a variant that checks nothing:
 ///
 /// - **a closed vocabulary** — `type`, and only `type`. The seven names are
 ///   published by every draft and extended by none.
-/// - **a grammar** — `$ref`, `$id`, `id`, `$schema` and `$dynamicRef` are
-///   URI-references; `$anchor` and `$dynamicAnchor` have a published pattern,
-///   and *not the same one*, because they are not published by the same set of
-///   drafts; `contentMediaType` is a media type down to its parameters;
-///   `format` and `contentEncoding` are bare tokens naming an attribute out of
-///   an extensible registry; `pattern` is a regular expression, checked for
+/// - **a grammar** — `$ref`, `$id`, `id`, `$schema`, `$dynamicRef` and
+///   `$recursiveRef` are URI-references; `$anchor` and `$dynamicAnchor` have a
+///   published pattern, and *not the same one*, because they are not published
+///   by the same set of drafts; `contentMediaType` is a media type down to its
+///   parameters; `contentEncoding` is a bare token, and the drafts name where
+///   its values come from; `pattern` is a regular expression, checked for
 ///   structure only.
-/// - **the caller's own vocabulary** — `required` and `dependentRequired` hold
-///   *property names*. Nothing about the characters is knowable, and a check
-///   invented here would mask the schema's real property names.
-///   `Content::Arbitrary` is that answer written down rather than left as an
-///   omission. It is **two** keywords; `pattern` was a third until the argument
-///   putting it there — "every string is a valid regex" — turned out to be
-///   false.
+/// - **a string the caller chose, with no grammar anywhere to hold it to** —
+///   `required` and `dependentRequired` hold *property names*, and `format`
+///   holds a format attribute the drafts decline to constrain past "MUST be a
+///   string". Nothing about the characters is knowable, and a check invented
+///   here would mask a schema that was correct. `Content::Arbitrary` is that
+///   answer written down rather than left as an omission. It is **three**
+///   keywords; `pattern` was a fourth until the argument putting it there —
+///   "every string is a valid regex" — turned out to be false, and `format`
+///   left for one round and came back.
+///
+/// **Nine rounds found this walk too loose and the tenth found it too strict,
+/// twice, both times in a check written in the two rounds before it.** The
+/// question that catches that is the mirror of round 8's: not "does the
+/// document state the thing the rule exempts", but *does the draft actually say
+/// this, or was it inferred from what the well-formed values happen to look
+/// like*. `format` failed it — every registered format name is one token, and
+/// no draft ever said it had to be. Asking it of a grammar is cheap and asking
+/// it late is not: a check stricter than the draft masks a valid schema and
+/// breaks a caller who was working, and unlike a leak they see it immediately.
+///
+/// **What it costs to be too strict is exposure, not a mask, and the difference
+/// decides which of these is worth closing.** An over-strict grammar hands the
+/// value to the detector; the value is only rewritten if it also *fires* one.
+/// So `contentMediaType`'s refusal of the trailing space in `"text/plain "` is
+/// a real strictness — RFC 822 folds whitespace around a structured field's
+/// tokens, and this check's own parameter half trims for exactly that reason —
+/// and it was measured costing nothing: `{"contentMediaType": "text/plain "}`
+/// is handed to the detector, fires nothing, and reaches the provider verbatim.
+/// It is only a mask when the *essence* is also a person, which is
+/// `"text/Weber "` and not a document anyone writes. Recorded here and left,
+/// with the trade named: trimming each half separately would admit `"Weber /
+/// Martina"` as the media type `Weber/Martina`, and buying a marginal over-mask
+/// with a new skip is the over-correction this paragraph exists to stop.
+///
+/// **And the keyword that belongs on no list at all: OpenAPI's
+/// `discriminator`.** It has been beside `$recursiveRef` on the ledger since
+/// Task 4 and it is not the same kind of item, which is why one round can close
+/// both. It is not a JSON Schema keyword, and its value is an *object*:
+/// `propertyName`, a property name; `mapping`, from discriminator values the
+/// client chose to `$ref` strings; and — OpenAPI says so explicitly — any
+/// number of `x-` extensions. Three kinds in one value, so no single
+/// `(Identifier, Content)` pair describes it, and a list entry is a verdict on
+/// the whole subtree. Entered here it would skip an `x-note` holding a
+/// sentence, which is a leak; left off, as it is, `mapping`'s right-hand
+/// `$ref`s are walked as prose and a detection rewrites one, which is
+/// `$recursiveRef`'s bug at one remove.
+///
+/// So: **nowhere on this list, and the ledger's entry is closed as that** — but
+/// closed with its residual named rather than as a tidiness item that turned
+/// out to be nothing. What `discriminator` needs is what `propertyNames` got: a
+/// `Shape`, which is a rule applied per field, not a verdict on a subtree. That
+/// is a keyword's worth of work, it is OpenAPI's vocabulary rather than JSON
+/// Schema's, and the cost of not doing it is an over-masked `$ref` inside one
+/// OpenAPI-only object — visible at the caller, in the direction this walk
+/// chooses when it has to be wrong.
 ///
 /// **Every one of these carries a residual, and this comment says what each one
 /// is rather than reading as though the checks are complete.** Two rounds
@@ -657,16 +741,25 @@ impl Identifier {
 ///   masks a valid schema and breaks a working caller — visibly, at the call.
 ///   So a URI-reference is read for whitespace and control characters and not
 ///   for RFC 3986's other exclusions; `$schema` is not required to be
-///   absolute; `format` and `contentEncoding` share one token rule because
-///   neither registry closes; a `contentMediaType` parameter whose value is a
-///   *quoted string* is arbitrary text by RFC 2045's own definition and is
+///   absolute; `$recursiveRef` is not held to `"#"`, which is a rule about
+///   evaluation rather than syntax; `contentEncoding` is one token because the
+///   drafts name where its values come from and every one of them, extension
+///   points included, is a token; a `contentMediaType` parameter whose value is
+///   a *quoted string* is arbitrary text by RFC 2045's own definition and is
 ///   accepted whole; and `pattern` is checked for structure and not parsed.
 ///   Each of those is a string that states no identifier and is forwarded
 ///   anyway, and each is named at its variant with the reason.
-/// - The **caller's own vocabulary** is a residual end to end and always was:
-///   `{"required": ["Martina Weber"]}` reaches the provider verbatim, because a
-///   property name is dispatch and masking it breaks the schema it names. That
-///   is the branch's recorded position and no round has changed it.
+/// - The **third kind** is a residual end to end and always was, and it is now
+///   **three** strings wide rather than two. `{"required": ["Martina Weber"]}`
+///   reaches the provider verbatim, because a property name is dispatch and
+///   masking it breaks the schema it names; `{"dependentRequired": {"card":
+///   ["Martina Weber"]}}` likewise; and, added this round, `{"format":
+///   "Martina Weber"}` **forwards verbatim too**, because no draft says a
+///   format attribute is anything but a string. That is a leak with a name and
+///   it is the same one the other two carry. It is bought deliberately: the
+///   alternative was a token rule no specification contains, which this round
+///   measured breaking `{"format": "Weber Martina"}` into `{"format":
+///   "[PERSON_1] Martina"}`.
 ///
 /// A mismatch is scanned as an instance, as every neighbouring arm does:
 /// `descend_into` has no refusal channel, and an over-masked *malformed* schema
@@ -740,13 +833,41 @@ enum Content {
     /// sends. Recorded rather than closed, and it is a decision a later round
     /// can overturn as a decision.
     MediaType,
-    /// A bare token: an attribute name out of a registry the drafts publish
-    /// and explicitly allow implementations to extend, so **membership is not
-    /// the check** — `uuid` was a custom format before it was a registered
-    /// one, and refusing tomorrow's would break the client that defined it.
-    /// What every published name and every custom convention share is being
-    /// one token, and a value with a space in it names no format attribute in
-    /// any implementation.
+    /// A bare token: `contentEncoding`, and **only** `contentEncoding` — it
+    /// held `format` too until the drafts were read for what they say rather
+    /// than for what their examples look like.
+    ///
+    /// **The two keywords were given one rule by analogy and the analogy is
+    /// false.** `format` has no cited origin at all: "MUST be a string" is the
+    /// whole constraint, and 2020-12 §7.2.3 invites implementations to define
+    /// custom attributes without saying what one may be spelled like. That is
+    /// `Content::Arbitrary`, and it is where `format` now is.
+    /// `contentEncoding`'s text is different in every draft that has it, and
+    /// all three name a *source* for the values:
+    ///
+    /// - draft-07 §8.3 — "RFC 2045, Sec 6.1 lists the possible values for this
+    ///   property";
+    /// - 2019-09 §8.3 — "Possible values for this property are listed in RFC
+    ///   2045, Sec 6.1 and RFC 4648";
+    /// - 2020-12 §8.3 — RFC 4648's names, RFC 2045 §§6.7 and 6.8, and "this
+    ///   keyword is derived from MIME's Content-Transfer-Encoding header".
+    ///
+    /// **And the cited source closes the extensibility argument the other
+    /// way.** RFC 2045 §6.1's `mechanism` is open — `ietf-token` and `x-token`
+    /// are there precisely so a new encoding can be named — but both are RFC
+    /// 2045 `token`s, so the extension point *has a published grammar*, which
+    /// is exactly what `format`'s does not. `x-Weber-encoding` is a token and
+    /// is forwarded (measured). A value with a space in it names no encoding in
+    /// either RFC, in either RFC's extension point, or in a header field whose
+    /// value grammar cannot hold one.
+    ///
+    /// Two keywords, two texts, two answers. That is a result, not a
+    /// discrepancy, and reading them as one rule is what round 8 did.
+    ///
+    /// The check itself is looser than RFC 2045's `token` — non-empty, no
+    /// whitespace, no control character, and nothing about tspecials or ASCII —
+    /// for the standing reason: the draft cites the RFC to say where the names
+    /// come from, not to make the RFC's lexer normative here.
     Token,
     /// An ECMA-262 regular expression, checked for **structure only**:
     /// balanced `(`/`)`, a closed `[`…`]`, and no trailing lone backslash.
@@ -789,9 +910,32 @@ enum Content {
     /// a gap in this check; it is the same position `required` holds.
     RegularExpression,
     /// A string the caller chose, and there is nothing to check. The third
-    /// kind, and the one that must stay this way. **Two keywords** — `required`
-    /// and `dependentRequired`, both holding property names. `pattern` was a
-    /// third until its argument was measured and failed.
+    /// kind, and the one that must stay this way. **Three keywords**:
+    /// `required` and `dependentRequired`, both holding property names, and
+    /// `format`, holding an attribute name the drafts decline to constrain.
+    /// `pattern` was a fourth until its argument — "every string is a valid
+    /// regex" — was measured and failed.
+    ///
+    /// **`format` arrived here by the same argument that sent `pattern` away,
+    /// run honestly in both directions.** Round 8 called it a grammar because
+    /// every registered format name is one word; that is a fact about the
+    /// registry's contents, not a rule the registry imposes, and JSON Schema
+    /// says only "It MUST be a string" (2020-12 §7.1) while §7.2.3 lets an
+    /// implementation recognise whatever names it likes. By this walk's own
+    /// criterion — does the document *state* the thing the rule exempts — any
+    /// string states a format attribute, because a format attribute may be any
+    /// string. `{"format": "Weber Martina"}` reached the provider as
+    /// `{"format": "[PERSON_1] Martina"}` (measured, at 200), which is a valid
+    /// schema broken to enforce a rule no specification contains.
+    ///
+    /// **What that costs, stated rather than implied: `{"format": "Martina
+    /// Weber"}` now forwards verbatim.** A person's name written where a
+    /// format attribute goes reaches the provider unread. That is the identical
+    /// residual `required` and `pattern` already carry — a string the caller
+    /// controls, in a position the draft leaves open — and it is the price of
+    /// not masking the format attribute a client actually defined. Closing it
+    /// would need a grammar, and inventing one here is the mistake this variant
+    /// exists to record.
     Arbitrary,
 }
 
@@ -2765,17 +2909,27 @@ mod tests {
         // added here cannot compile without a shape, and one given the wrong
         // shape fails on one half or the other.
         for (keyword, shape, content) in SCHEMA_IDENTIFIER_KEYWORDS {
-            // **Round 3's useful negative, in the column this round added.**
+            // **Round 3's useful negative, in the column round 8 added.**
             // The content half below asserts that an `Arbitrary` keyword
             // *skips* a person's name, so a keyword loosened to `Arbitrary`
             // passes both halves and its grammar quietly stops being checked.
-            // The three that hold a string the caller chose are named here, so
-            // widening the third kind is an edit to this line.
+            // The keywords that hold a string the caller chose are named here,
+            // so widening the third kind is an edit to this line.
+            //
+            // **`format` was added to this list in round 10 and the line is
+            // the reason the round had to be deliberate about it.** Loosening
+            // a keyword to `Arbitrary` buys a residual — that keyword now
+            // forwards a person's name verbatim — and this assertion is where
+            // that purchase is recorded, one name per line, rather than
+            // arrived at by a check quietly going soft. `format` is here
+            // because no draft constrains a format attribute past "MUST be a
+            // string"; `required` and `dependentRequired` because property
+            // names are the caller's own vocabulary.
             assert_eq!(
                 content == Content::Arbitrary,
-                ["dependentRequired", "required"].contains(&keyword),
+                ["dependentRequired", "format", "required"].contains(&keyword),
                 "{keyword} is classified as holding a string the caller chose, and only \
-                 property names are"
+                 property names and a format attribute are"
             );
             // One string that really is an identifier of this kind, out of the
             // draft that publishes the kind — and one that is an identifier of
@@ -2952,8 +3106,21 @@ mod tests {
             // The seven type names are lowercase, and the drafts are
             // case-sensitive about them.
             json!({"type": "Object"}),
-            // A token is non-empty. An empty `format` names no format.
-            json!({"format": ""}),
+            // A token is non-empty. An empty `contentEncoding` names no
+            // encoding in either RFC the drafts cite.
+            //
+            // **This case read `format` until round 10 and could not stay
+            // there.** The two keywords shared `Content::Token` on an analogy
+            // round 8 drew and no draft supports: `format`'s only constraint
+            // is "MUST be a string", so the near-miss for a token grammar has
+            // to be asked of the keyword that still has one. The value is the
+            // same and the keyword is not.
+            json!({"contentEncoding": ""}),
+            // The other half of the same grammar, and the one that made the
+            // token check worth keeping for this keyword: a space. RFC 2045
+            // §6.1's `mechanism` is open at `ietf-token` and `x-token`, and
+            // both of those are tokens.
+            json!({"contentEncoding": "Martina Weber"}),
             // A URI-reference has no control character in it either, which is
             // the half of that rule a space does not reach.
             json!({"$ref": "#/defs/Weber\u{7f}"}),
@@ -2976,6 +3143,45 @@ mod tests {
              later keyword pairs with a grammar"
         );
         assert!(Content::TypeName.stated_by(&json!({"card": ["object"]})));
+    }
+
+    #[test]
+    fn openapis_discriminator_is_walked_as_data_and_the_reason_is_recorded() {
+        // **The ledger's other deferred name, closed as "nowhere".** It sat
+        // beside `$recursiveRef` from Task 4 to round 10 and they are not the
+        // same kind of item: `$recursiveRef` is one string with one published
+        // grammar and belongs on `SCHEMA_IDENTIFIER_KEYWORDS`, and this is an
+        // object holding three different kinds at once.
+        //
+        // The four leaves below are the whole argument. Two are identifiers
+        // OpenAPI publishes as such — `mapping`'s right-hand side is "schema
+        // names or references" — and masking one rewrites a reference, which
+        // is precisely `$recursiveRef`'s bug. One is a property name, the
+        // third kind. And the fourth is prose in an `x-` extension, which the
+        // Discriminator Object explicitly permits ("This object MAY be
+        // extended with Specification Extensions").
+        //
+        // A list entry is a verdict on the whole subtree, so entering
+        // `discriminator` skips the prose with the references. Closing this
+        // properly needs a `Shape` — a rule per field, which is what
+        // `propertyNames` got — and until one exists the over-masked `$ref` is
+        // the cost, in the direction this walk chooses when it must be wrong.
+        // Pinned here so that changing it is a decision rather than a drift.
+        let schema = json!({"oneOf": [{"type": "object"}], "discriminator": {
+            "propertyName": "petType",
+            "mapping": {"Weber": "#/$defs/Weber"},
+            "x-note": "Martina Weber wrote this"
+        }});
+        assert_eq!(
+            json_leaves(&schema, Shape::Schema).unwrap(),
+            vec![
+                Leaf::Text("#/$defs/Weber".to_owned()),
+                Leaf::Text("petType".to_owned()),
+                Leaf::Text("Martina Weber wrote this".to_owned()),
+            ],
+            "an exemption for `discriminator` would have to skip the extension holding a \
+             sentence in order to spare the reference beside it"
+        );
     }
 
     #[test]
@@ -3043,6 +3249,20 @@ mod tests {
             // caller's own regular expression, and is forwarded. Unchanged by
             // this round and stated so that changing it is a decision.
             json!({"pattern": "^Martina Weber$"}),
+            // **Round 10, and both of these were masked before it.**
+            // `$recursiveRef` was on no list at all, so 2019-09's own way of
+            // writing a recursive schema was walked as prose and a detection
+            // rewrote the reference target. The draft says URI-reference; the
+            // `"#"` everyone writes is one, and so is a file beside it.
+            json!({"$recursiveRef": "#"}),
+            json!({"$recursiveRef": "person.json"}),
+            json!({"$recursiveRef": "https://example.invalid/schemas/person.json#/$defs/A"}),
+            // A format attribute with a space in it. No draft forbids one —
+            // "MUST be a string" is the whole rule and §7.2.3 invites custom
+            // attributes — so the token check that refused it was stricter
+            // than every draft, which is the mistake three lines of this test
+            // already exist to catch in the other keywords.
+            json!({"format": "Martina Weber"}),
         ] {
             assert!(
                 json_leaves(&schema, Shape::Schema).unwrap().is_empty(),

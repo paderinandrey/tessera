@@ -5733,4 +5733,81 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn a_keyword_no_draft_constrains_reaches_the_provider_unmasked() {
+        // **Round 10, and the probe runs the other way round for the first
+        // time in ten.** Every earlier boundary test here asserts that a value
+        // reached the *detector*; these assert that it reached the *provider*
+        // untouched, because the failure being reproduced is over-masking. Nine
+        // rounds of closing leaks under time pressure produced two checks
+        // stricter than the drafts they cite, and a check stricter than the
+        // draft breaks a schema that was correct — visibly, at the caller, in
+        // the request they just made.
+        //
+        // Each pair is the over-mask and the near-miss it must not take down
+        // with it. The near-misses are the point: loosening a check is only
+        // safe if the part of it that was load-bearing survives.
+        let detector = detector_finding_weber().await;
+        for (forwarded, still_scanned, note) in [
+            (
+                // 2019-09 §8.2.4.2.1: "MUST be a string which is a
+                // URI-reference". It was on no identifier list at all, so this
+                // went upstream as `{"$recursiveRef": "[PERSON_1].json"}` — a
+                // rewritten reference target, which is a broken schema.
+                json!({"$recursiveRef": "Weber.json"}),
+                // And the grammar it is now held to still holds: a
+                // URI-reference has no space in it, so this states no
+                // reference and is the caller's data.
+                json!({"$recursiveRef": "Weber Martina"}),
+                "2019-09 defines `$recursiveRef` as a URI-reference and the value `\"#\"` \
+                 is a rule about evaluation, not about syntax",
+            ),
+            (
+                // 2020-12 §7.1: "It MUST be a string", and §7.2.3 lets an
+                // implementation recognise any custom attribute it likes. The
+                // one-token rule was inferred from what the registered names
+                // look like and went upstream as `{"format": "[PERSON_1]
+                // Martina"}`.
+                json!({"format": "Weber Martina"}),
+                // The sibling that keeps the token rule, and the reason this
+                // round did not loosen both: `contentEncoding`'s drafts name
+                // RFC 2045 §6.1 and RFC 4648 as where its values come from,
+                // and both of those extend through tokens.
+                json!({"contentEncoding": "Weber Martina"}),
+                "no draft publishes a grammar for a format attribute, and the keyword \
+                 whose draft cites one keeps its check",
+            ),
+        ] {
+            let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+            let (status, returned) = call(
+                state(&detector, &upstream),
+                "/v1/messages",
+                json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                       "tools": [{"name": "t", "input_schema": forwarded.clone()}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{returned}");
+            assert_eq!(
+                sent_to(&upstream).await["tools"][0]["input_schema"],
+                forwarded,
+                "{note}: a valid schema was masked, which breaks a client that was working"
+            );
+
+            let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
+            let (status, returned) = call(
+                state(&detector, &upstream),
+                "/v1/messages",
+                json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
+                       "tools": [{"name": "t", "input_schema": still_scanned}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{returned}");
+            let sent = sent_to(&upstream).await["tools"][0]["input_schema"].clone();
+            assert!(
+                sent.to_string().contains("[PERSON_1]"),
+                "{note}: loosening the check took its load-bearing half with it, {sent}"
+            );
+        }
+    }
 }
