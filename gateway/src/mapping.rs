@@ -506,16 +506,18 @@ impl Mapping {
         // The substitution inserted a character that can close a string. If the
         // original was a document, redo it structurally so the value lands in a
         // leaf and is escaped on the way out.
-        // `restore_document` returns None when a restored key would collide
-        // with one already in the map; the whole string is then left as it
-        // came, because losing a field is worse than losing a restoration.
-        match serde_json::from_str::<Value>(text) {
-            Ok(document) => match self.restore_document(&document, provenance) {
-                Some(restored) => serde_json::to_string(&restored).unwrap_or(out),
-                None => text.to_owned(),
-            },
-            Err(_) => out,
+        let Ok(document) = serde_json::from_str::<Value>(text) else {
+            return out;
+        };
+        let restored = self.restore_document(&document, provenance);
+        // A collision inside may have left every restorable token where it
+        // stood — see `restore_document`'s object arm. Nothing changed, so the
+        // caller gets back the bytes it gave rather than a re-serialized
+        // equivalent of them.
+        if restored == document {
+            return text.to_owned();
         }
+        serde_json::to_string(&restored).unwrap_or(out)
     }
 
     /// The recursion, which fixes escaping and **does not extend the key rule**.
@@ -554,14 +556,14 @@ impl Mapping {
     /// paying the escaping cost has removed it. And as in `restore_value`: a
     /// value assembled in memory rather than parsed has no protection at all,
     /// which is why this stays private.
-    fn restore_document(&self, value: &Value, provenance: &Provenance) -> Option<Value> {
-        Some(match value {
+    fn restore_document(&self, value: &Value, provenance: &Provenance) -> Value {
+        match value {
             Value::String(text) => Value::String(self.restore_in_string(text, provenance)),
             Value::Array(items) => Value::Array(
                 items
                     .iter()
                     .map(|item| self.restore_document(item, provenance))
-                    .collect::<Option<Vec<_>>>()?,
+                    .collect(),
             ),
             Value::Object(fields) => {
                 let mut out = serde_json::Map::with_capacity(fields.len());
@@ -572,16 +574,27 @@ impl Mapping {
                     // field — a tool argument lost, where today's textual
                     // substitution serves both. Substituting instead yields
                     // duplicate property names, whose meaning is ambiguous. So
-                    // the caller gets the document exactly as it came.
+                    // this object is handed back exactly as it came.
+                    //
+                    // **Exactly this object, and nothing above it.** The
+                    // ambiguity is a fact about one map's key set, and the
+                    // fields around it are not implicated by it. Reporting the
+                    // collision upwards instead — which is what returning
+                    // `None` from here did — made one such object an off
+                    // switch for the whole body: a `meta` object with a
+                    // colliding key left `refusal` holding the placeholder
+                    // that #31 is about. `Value` rather than `Option<Value>`
+                    // is what makes that unrepresentable; the fallback has no
+                    // way to travel.
                     if out.contains_key(&restored) {
-                        return None;
+                        return value.clone();
                     }
-                    out.insert(restored, self.restore_document(item, provenance)?);
+                    out.insert(restored, self.restore_document(item, provenance));
                 }
                 Value::Object(out)
             }
             other => other.clone(),
-        })
+        }
     }
 
     /// The lenient pass over a whole response body.
@@ -600,17 +613,17 @@ impl Mapping {
     /// by hand — with `json!` in a test, or by a future caller assembling one
     /// — carries none of that protection, and nothing here checks for it.
     ///
-    /// `restore_document` returns `None` when a restored key would collide
-    /// with one already in its object — the one way its recursion can fail.
-    /// The sweep is not allowed to propagate that failure: refusing here would
-    /// mean sending the client nothing, which is worse than the untouched
-    /// document `restore_document` was already declining to touch further.
-    /// So a `None` falls back to the value exactly as it arrived — every field
-    /// still present, just not restored — which keeps the same promise the
-    /// caller gets everywhere else in the sweep: nothing is silently dropped.
+    /// **What the sweep restores is not everything, and the exception is an
+    /// object.** A restored key that would collide with one already in its own
+    /// map leaves *that map* exactly as it arrived — every field present, none
+    /// of them restored, keys included. Everything outside it still restores.
+    /// So the promise is: every token this request issued and the caller did
+    /// not write is restored, except inside an object whose keys are ambiguous.
+    /// State it with that clause or not at all — it was once stated without,
+    /// while the fallback was body-wide, and the sentence read as a guarantee
+    /// the code could switch off from anywhere.
     pub fn restore_sweep(&self, value: &Value, provenance: &Provenance) -> Value {
         self.restore_document(value, provenance)
-            .unwrap_or_else(|| value.clone())
     }
 }
 
@@ -4538,13 +4551,16 @@ mod tests {
     }
 
     #[test]
-    fn a_collision_refuses_the_whole_string_from_however_deep_it_is_found() {
-        // The refusal has to travel. The collision above is at the top level,
-        // so it returns from the same call the caller made; here it is under an
-        // array under an object, so both propagation points carry it — and an
-        // implementation that swallowed `None` at either would drop the object
-        // that could not be restored, or serve a re-serialized document in
-        // place of the untouched string, while every other test still passed.
+    fn a_collision_costs_its_own_object_and_nothing_beside_it() {
+        // The collision used to travel: `restore_document` returned `None`
+        // from wherever it found one, and the `?`s at both propagation points
+        // carried it to the top, so one ambiguous object left the entire
+        // string as it came. `note` sits beside the colliding object, has
+        // nothing to do with its keys, and is restored.
+        //
+        // The nesting is deliberate — under an array under an object, which is
+        // where both propagation points used to be. What replaced them is a
+        // return type with nowhere to propagate to.
         let mut mapping = Mapping::default();
         mapping.begin_request();
         let value = "Martina \"Weber\"";
@@ -4553,11 +4569,18 @@ mod tests {
             .unwrap();
         let provenance = Provenance::new(mapping.issued(), HashSet::new());
 
-        let document = format!("{{\"wrapper\":[{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}]}}");
+        let document = format!(
+            "{{\"note\":\"{token}\",\"wrapper\":[{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}]}}"
+        );
+        let restored = mapping.restore_in_string(&document, &provenance);
         assert_eq!(
-            mapping.restore_in_string(&document, &provenance),
-            document,
-            "the string comes back exactly as it came, not merely intact"
+            serde_json::from_str::<Value>(&restored).expect("still a document"),
+            json!({
+                "note": value,
+                // Both fields still here, both keys as they came.
+                "wrapper": [{token.clone(): 1, value: 2}]
+            }),
+            "the collision reached past its own object: {restored}"
         );
     }
 

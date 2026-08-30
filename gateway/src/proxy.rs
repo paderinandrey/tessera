@@ -1021,11 +1021,18 @@ async fn handle(
     // request issued and overwrites the caller's own text with this turn's
     // value. That case is
     // `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`,
-    // and it is the only test in the suite that catches this ordering.
+    // which is what fails if this order is ever changed.
     //
     // Order matters the other way too: sweeping and stopping would make
     // `content` lenient, so an unmappable token there would be served instead
     // of refusing. The slot loop's strict result wins wherever the two overlap.
+    //
+    // **The sweep does not reach everywhere, and the exception is an object.**
+    // An object whose restored keys would collide keeps the keys and values it
+    // came with, so a placeholder can still reach the client from inside one —
+    // see `restore_sweep`. Everything around it restores;
+    // `a_colliding_key_costs_its_own_object_and_nothing_around_it` is what
+    // holds the exception to that size, having once been the whole body.
     //
     // `upstream` came out of `from_slice` above, which is the parse
     // `restore_sweep` requires: its recursion is bounded by nothing else.
@@ -2392,6 +2399,49 @@ mod tests {
         assert!(
             !body.contains("[PERSON_1]"),
             "a placeholder reached the client: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_colliding_key_costs_its_own_object_and_nothing_around_it() {
+        // The collision fallback used to be an off switch for the whole body:
+        // `restore_document` returned `None` from wherever it found the
+        // collision and the `?`s carried it to the top, so `restore_sweep`
+        // handed back the untouched response. An object with nothing to do
+        // with `refusal` put #31's exact symptom back, on a 200.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "I cannot help with [PERSON_1]",
+                // `[PERSON_1]` restores to `Weber`, which is already a key
+                // here. Restoring it would drop one of the two fields, so this
+                // object keeps the keys it came with — and only this object.
+                "meta": {"[PERSON_1]": "a", "Weber": "b"}
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        let message = &served["choices"][0]["message"];
+        assert_eq!(
+            message["refusal"], "I cannot help with Weber",
+            "one object's collision turned the sweep off for the whole body: {body}"
+        );
+        assert_eq!(
+            message["meta"],
+            json!({"[PERSON_1]": "a", "Weber": "b"}),
+            "the colliding object lost a field or was restored anyway: {body}"
         );
     }
 
