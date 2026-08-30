@@ -25,12 +25,16 @@ the client sent it. Downward: a placeholder issued by the gateway does not reach
 the client from a field the gateway describes, and elsewhere everything a
 request issued and the caller did not write is restored, *except where restoring
 it would drop something the provider sent*, which is served exactly as it came.
-That exception has two shapes and one rule — an object whose restored keys would
-collide, and a string that is itself a serialized document carrying two members
-of the same name — and in both the gateway cannot put the value back without
-losing a field, so it leaves the bytes alone and gives up the restoration. It
+That exception is one rule with several shapes — an object whose restored keys
+would collide, and a string that is itself a serialized document the gateway
+cannot write back as it came, whether because two members share a name, because
+a number carries more precision than the gateway's reader holds, or because that
+reader rejects a document a client would accept. In every one of them the
+gateway cannot put the value back without changing something else, so it leaves
+the bytes alone and gives up the restoration. Quote the rule rather than the
+shapes: the list has grown twice. It
 gives up the restoration only where giving it up is harmless, which is the
-"elsewhere" half: the same two shapes inside a field the gateway *describes*
+"elsewhere" half: the same shapes inside a field the gateway *describes*
 refuse the response with a 502, because bytes left alone there are bytes with the
 placeholder still in them.
 None of that is your surface — you are building against the detector, for the

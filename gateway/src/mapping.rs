@@ -65,14 +65,21 @@ pub enum MappingError {
     PlaceholderKey(String),
     /// A serialized document inside a described field that cannot be restored
     /// without changing what the upstream sent. Carries a fixed phrase naming
-    /// which of the two cases it is — the same `&'static str` treatment as
-    /// `MaskCountMismatch`, and for the same reason: two sites, one class, and
-    /// nothing in it that a response could have written.
+    /// which cause it is — the same `&'static str` treatment as
+    /// `MaskCountMismatch`, and for the same reason: several sites, one class,
+    /// and nothing in it that a response could have written.
+    ///
+    /// **The causes are not a list to memorize, and the phrase is why they do
+    /// not have to be.** Restoring structurally means reading a document and
+    /// writing it back, and this variant is what every way that round trip
+    /// fails to reproduce its input comes out as — a member collapsed, a key
+    /// renamed, a number rounded, or the read refused on a text a client would
+    /// have accepted. The phrase says which; the class and the answer are one.
     ///
     /// **Only reachable once a value needing escaping is already going in.** A
-    /// document restores textually and keeps every member it came with when no
+    /// document restores textually and keeps every byte it came with when no
     /// inserted value carries a `"`, a `\` or a control character, and that is
-    /// the overwhelming majority; the parse that loses a member happens only
+    /// the overwhelming majority; the parse that loses something happens only
     /// when the alternative is corrupting the document instead.
     ///
     /// **Why this refuses where the sweep leaves it.** The sweep's fallback is
@@ -539,8 +546,8 @@ impl Mapping {
     /// takes is the escaping rule and the recursion, which are properties of
     /// JSON and not of this gateway's provenance policy.
     ///
-    /// **The two documents that cannot be re-serialized faithfully refuse here
-    /// rather than being left.** On the sweep, leaving one costs coverage and
+    /// **A document that cannot be re-serialized faithfully refuses here rather
+    /// than being left, whatever the cause.** On the sweep, leaving one costs coverage and
     /// changes no bytes; the token stays, which is the lenient answer to
     /// everything. On this path leaving one would serve a placeholder from a
     /// described field, which is the one outcome this path exists to prevent —
@@ -580,17 +587,40 @@ impl Mapping {
     /// it: the described path was never byte-preserving on this input either,
     /// it was corrupting.
     ///
-    /// **Reformatting is the price; losing a member is not.** That parse is
-    /// lossy on one input — an object with two members of the same name — and
-    /// lossy before this code sees anything, so no later step can undo it. What
-    /// the two paths do about that is the one thing they do not share, and it
-    /// is `Restoration::lossy_document`'s to answer: the sweep leaves the
+    /// **Reformatting is the price; losing anything else is not.** This is the
+    /// sentence that has been wrong twice, and both times in the same way: it
+    /// said the parse was lossy *on one input*, an object with two members of
+    /// the same name, and read as an inventory it was a claim nobody had
+    /// checked. So the claim is made the other way round now — by asking what a
+    /// JSON text is made of, which is a closed question, rather than by listing
+    /// what has been noticed.
+    ///
+    /// **A JSON text is structure, strings, numbers and literals, and the round
+    /// trip is examined at each.** Structure and literals have one spelling
+    /// each, so `to_string` reproduces them. A string comes back with whatever
+    /// escapes `serde_json` prefers — `A` for `A` — and that is a
+    /// different spelling of the same string, which the client's own parse
+    /// undoes, so nothing is lost. Objects lose a member when two share a name,
+    /// because a map cannot hold both; that is the structural loss, and
+    /// `carries_duplicate_members` is its test. Numbers are held as `i64`,
+    /// `u64` or `f64`, so a lexeme too precise for a double or an integer past
+    /// 64 bits comes back rounded; that is the lexical loss, and
+    /// `carries_an_unstable_number` is its test. Key order is not preserved and
+    /// whitespace is not preserved, and those are the reformatting above.
+    ///
+    /// **And the fourth thing is not a loss but a refusal**: this reader can
+    /// reject a text a client accepts — a document past its recursion limit, an
+    /// exponent it calls out of range — and reading that as "not a document"
+    /// substitutes into one blind. `holds_no_string` is what stands there.
+    ///
+    /// What the two paths do about all four is the one thing they do not share,
+    /// and it is `Restoration::lossy_document`'s to answer: the sweep leaves the
     /// string exactly as it came, restoration and all, and the described path
-    /// refuses. `carries_duplicate_members` is the test either way, and it runs
-    /// behind the escaping test rather than in front of it, so a document is
-    /// only ever left — or refused — for a loss it was actually about to take.
-    /// A value needing no escaping still substitutes into such a document and
-    /// keeps both members, because nothing is ever re-serialized on that path.
+    /// refuses. Each test runs *behind* the escaping test rather than in front
+    /// of it, so a document is only ever left — or refused — for a loss it was
+    /// actually about to take. A value needing no escaping still substitutes
+    /// into any of them and keeps every byte around it, because nothing is ever
+    /// re-serialized on that path.
     ///
     /// Testing that the result still *parses* is not enough and was tried:
     /// restoring a token in `{"name":"[PERSON_1]"}` to `x","admin":true,...`
@@ -634,12 +664,34 @@ impl Mapping {
         // The substitution inserted a character that can close a string. If the
         // original was a document, redo it structurally so the value lands in a
         // leaf and is escaped on the way out.
+        //
+        // **A failed parse is not a proof that the string is prose**, and
+        // reading it as one is how `out` — the very substitution this branch
+        // exists to avoid emitting — used to go out. A document nested past
+        // `serde_json`'s recursion limit, or carrying an exponent it calls out
+        // of range, is a document every JavaScript client parses and this
+        // reader refuses; emitting `out` for it injects exactly as it would
+        // have into a document that parsed.
+        //
+        // What *is* a proof is `holds_no_string`: our value can only close a
+        // string that exists, a placeholder can only sit inside a string in a
+        // document, and both need a `"` in these bytes. Without one the
+        // substitution cannot create structure whatever the text is, so prose
+        // keeps the answer it has always had — which is the overwhelming
+        // majority of this branch, since the quote is usually in the *value*
+        // and not in the text around it. With one, and no parse, nothing here
+        // can tell corruption from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
-            return Ok(out);
+            if holds_no_string(text) {
+                return Ok(out);
+            }
+            rule.lossy_document("a string this gateway cannot parse but a client may")?;
+            return Ok(text.to_owned());
         };
-        // The parse above is lossy in exactly one way, and it happens before
-        // anything here gets to look at the document. Two members of the same
-        // name collapse into one, so re-serializing hands the client a
+        // The parse above loses two things, both before anything here gets to
+        // look at the document: this is the structural one, and
+        // `carries_an_unstable_number` below is the lexical one. Two members of
+        // the same name collapse into one, so re-serializing hands the client a
         // document the upstream did not send — a string forwarded byte for
         // byte before this sweep existed, and a parser differential the moment
         // the client's reader keeps the first member where `serde_json` keeps
@@ -663,7 +715,28 @@ impl Mapping {
         if restored == document {
             return Ok(text.to_owned());
         }
-        Ok(serde_json::to_string(&restored).unwrap_or(out))
+        // Nothing is re-serialized until the round trip is known to reproduce
+        // what it read. Numbers are the second of the two things it does not
+        // carry: `Value` holds them as `i64`/`u64`/`f64`, so a lexeme carrying
+        // more precision than a double, or an integer past 64 bits, comes back
+        // rounded — in a document a client executes, beside the name this pass
+        // was restoring. `carries_an_unstable_number` asks it of the bytes.
+        if carries_an_unstable_number(text) {
+            rule.lossy_document("a number the parse does not reproduce")?;
+            return Ok(text.to_owned());
+        }
+        // `out` is not the fallback here and cannot be: `text` parsed, so it is
+        // a document, and `out` is the unescaped substitution into it. A `Value`
+        // that came from a parse re-serializes or the two disagree about JSON,
+        // which is `carries_duplicate_members`'s case for the same treatment —
+        // the rule decides and the bytes stand.
+        match serde_json::to_string(&restored) {
+            Ok(serialized) => Ok(serialized),
+            Err(_) => {
+                rule.lossy_document("a document this gateway could not write back")?;
+                Ok(text.to_owned())
+            }
+        }
     }
 
     /// The recursion, which fixes escaping and **does not extend the key rule**.
@@ -779,31 +852,36 @@ impl Mapping {
     /// by hand — with `json!` in a test, or by a future caller assembling one
     /// — carries none of that protection, and nothing here checks for it.
     ///
-    /// **What the sweep restores is not everything, and there are two
-    /// exceptions. Both are places this gateway cannot re-serialize what it
-    /// was given, and both are left rather than guessed at.**
+    /// **What the sweep restores is not everything, and the exception is one
+    /// rule rather than a list: where this gateway cannot write back what it
+    /// was given, it leaves the bytes rather than guessing at them.**
     ///
     /// A restored key that would collide with one already in its own map
     /// leaves *that map* exactly as it arrived — every field present, none of
     /// them restored, keys included. Everything outside it still restores.
     ///
-    /// A string that *is* a serialized document with two members of the same
-    /// name is left whole, because the parse that would restore it collapses
-    /// those two before restoration begins — see `restore_in_string_with`. The unit
-    /// of the loss is the string, not the object, because by the time an
-    /// object could be identified the member is already gone. Everything
-    /// outside that string still restores.
+    /// A string that *is* a serialized document leaves *that string* whole
+    /// whenever restoring it would need re-serializing and the round trip
+    /// would not reproduce it — two members of the same name, which the parse
+    /// collapses; a number too precise for the `f64` it is held as; a text this
+    /// reader rejects and a client would accept. See `restore_in_string_with`,
+    /// which argues the set from what a JSON text is made of rather than from
+    /// what has been noticed so far. The unit of the loss is the string, not the
+    /// object, because by the time an object could be identified the loss has
+    /// already happened. Everything outside that string still restores.
     ///
     /// So the promise is: every token this request issued and the caller did
-    /// not write is restored, except inside an object whose keys are ambiguous
-    /// and inside a serialized document whose members are. State it with both
-    /// clauses or not at all — it was once stated without the first, while
-    /// that fallback was body-wide, and the sentence read as a guarantee the
-    /// code could switch off from anywhere.
+    /// not write is restored, except where restoring it would change something
+    /// else the upstream sent. State it with both clauses or not at all — it
+    /// was once stated without the first, while that fallback was body-wide,
+    /// and the sentence read as a guarantee the code could switch off from
+    /// anywhere. **And state the exception as the rule, not as the shapes**:
+    /// written as a closed list of two it has twice been made false by someone
+    /// finding a third, and each time in six other files at once.
     ///
-    /// **Both exceptions are the sweep's, and neither is the described path's.**
+    /// **Every exception is the sweep's, and none is the described path's.**
     /// They are `Lenient`'s answers to `Restoration::lossy_document`; `Strict`
-    /// refuses at both, so a described field is never served from one of these
+    /// refuses at each, so a described field is never served from one of these
     /// documents at all. The promise above is about what a *client receives on
     /// a 200 from a field no slot addresses*, and that is where it should stay
     /// stated.
@@ -831,12 +909,15 @@ impl Mapping {
 /// guarantee the described path exists for, and leniency reaching it would be
 /// this gateway serving its own placeholder from a field a client dispatches on.
 ///
-/// **What to do with a document that cannot be re-serialized faithfully.** Two
-/// of those exist — a restored key colliding with one already present, and two
-/// members of the same name that the parse already collapsed. The sweep leaves
-/// the bytes it was given, which loses restoration and corrupts nothing. The
-/// described path cannot: leaving the bytes there leaves the placeholder in
-/// them. It refuses.
+/// **What to do with a document that cannot be re-serialized faithfully.** A
+/// restored key colliding with one already present, two members of the same
+/// name that the parse already collapsed, a number the parse rounds, a text
+/// this reader will not accept and a client would. The sweep leaves the bytes
+/// it was given, which loses restoration and corrupts nothing. The described
+/// path cannot: leaving the bytes there leaves the placeholder in them. It
+/// refuses. **The list is deliberately not presented as closed** — it has grown
+/// twice, both times when someone checked rather than remembered, and this
+/// trait's job is that both paths keep answering whatever it grows to.
 ///
 /// **The error type is where the leniency is nailed down.** `Lenient::Error` is
 /// `Infallible`, so the shared code compiles to a sweep that has no way to fail
@@ -851,9 +932,9 @@ trait Restoration {
     fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, Self::Error>;
 
     /// Called when restoring a document would change what the upstream sent,
-    /// with a fixed phrase naming which of the two cases it is. Returning `Ok`
-    /// means the caller falls back to the bytes it was given; returning `Err`
-    /// refuses the response.
+    /// with a fixed phrase naming the cause. Returning `Ok` means the caller
+    /// falls back to the bytes it was given; returning `Err` refuses the
+    /// response.
     fn lossy_document(&self, cause: &'static str) -> Result<(), Self::Error>;
 }
 
@@ -1028,6 +1109,109 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// carrying one cannot be substituted into JSON text byte-safely.
 fn json_string_unsafe(character: char) -> bool {
     character == '"' || character == '\\' || character.is_control()
+}
+
+/// Whether these bytes contain no `"` at all, which is what makes an unescaped
+/// substitution into them safe *without* knowing whether they are a document.
+///
+/// The argument is short and it is the whole of it. A value of ours can only
+/// close a string that is open, a placeholder can only appear inside a string
+/// in a JSON document — unquoted it is not a JSON value — and a string in JSON
+/// text is delimited by `"`. So a text with no `"` is either not a document or
+/// a document with no place for the token that got us here, and in both cases
+/// the characters we insert cannot create structure.
+///
+/// It is the answer to a question the parse cannot answer: *this* reader
+/// refusing a text is not the client's reader refusing it.
+fn holds_no_string(text: &str) -> bool {
+    !text.contains('"')
+}
+
+/// Whether some number in this document would come back from a `Value` round
+/// trip spelled differently than it went in.
+///
+/// **Why a byte scan and not a visitor.** `DuplicateScan` can answer its
+/// question because member names survive `next_key::<String>` intact. A number
+/// does not: `deserialize_any` hands the visitor an `i64`, a `u64` or an `f64`,
+/// which is the loss itself, so a visitor is on the wrong side of it and can
+/// only ever compare a rounded value to itself. The lexeme exists in exactly
+/// one place — the bytes — so that is where it is read.
+///
+/// **The scan is only ever run on text that already parsed**, which is what
+/// makes it a scan rather than a parser. In valid JSON a `"` opens a string and
+/// the only escape that can hide the closing one is `\`, so skipping strings is
+/// exact; outside a string a `-` or a digit can begin nothing but a number, and
+/// no literal or key can supply one.
+///
+/// **The test per number is the round trip itself**, asked of that number
+/// alone: parse the lexeme, print it, compare. Nothing here knows what a
+/// double cannot hold, which is deliberate — it is the same argument
+/// `carries_duplicate_members` makes about members and not a list of the ways
+/// a number can be lost.
+///
+/// **It is exact about loss and inexact about spelling, in the safe
+/// direction.** `1e2` prints as `100.0` and denotes the same number, and this
+/// reports it. Deciding otherwise means comparing two decimal spellings for
+/// equality of value, which is a normalizer this does not have and a place to
+/// be subtly wrong; the cost of not having it is restoration lost on a document
+/// that spells a number unusually *and* carries a value needing escaping, and
+/// the cost of having it wrong is a rounded number in a tool call. Model output
+/// spells numbers canonically, so the case is nearly empty either way.
+fn carries_an_unstable_number(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            // A string. Its contents are not numbers, and a nested document
+            // inside one is this function's business at the depth that restores
+            // it, not at this one.
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    // Only `\` can hide the closing quote. A UTF-8
+                    // continuation byte is never ASCII, so indexing by byte
+                    // cannot mistake one for either.
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    index += 1;
+                }
+                if !number_survives(&text[start..index]) {
+                    return true;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// Whether one number's lexeme is what `Value` gives back for it.
+///
+/// A lexeme this reader cannot parse answers `false`, which reports a loss. It
+/// cannot arise from `carries_an_unstable_number`'s caller — the whole text
+/// parsed first — and if the scan and the parser ever disagree about where a
+/// number begins, costing restoration is the direction to be wrong in.
+fn number_survives(lexeme: &str) -> bool {
+    let Ok(number) = serde_json::from_str::<Value>(lexeme) else {
+        return false;
+    };
+    // Bound rather than compared in place, and not because of the allocation.
+    // `clippy::cmp_owned` reads `number.to_string() == lexeme` and suggests
+    // `number == lexeme`, which is a different question: `Value`'s comparison
+    // against a `str` is true only for `Value::String`, so a number would
+    // answer `false` for every input, every document would be reported lossy,
+    // and the structural path would go quiet. The printed form is the
+    // comparison this needs.
+    let printed = number.to_string();
+    printed == lexeme
 }
 
 /// Which tokens in a response this gateway may claim as its own.
@@ -4977,6 +5161,121 @@ mod tests {
             mapping.restore_in_string(&document, &provenance),
             document,
             "a member was collapsed on the way through"
+        );
+    }
+
+    #[test]
+    fn a_number_the_parse_would_round_costs_restoration_and_not_precision() {
+        // The round trip loses more than members. `Value` holds a number as an
+        // `i64`, a `u64` or an `f64`, so a lexeme carrying more precision than
+        // a double comes back rounded — silently, in a document beside the
+        // name this pass was restoring, and in `arguments` a client executes.
+        // The sweep's answer is the one it gives to every other thing the round
+        // trip cannot carry: leave the bytes, lose the restoration.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document =
+            format!("{{\"amount\":0.12345678901234567890123456789,\"name\":\"{token}\"}}");
+        let restored = mapping.restore_in_string(&document, &provenance);
+        assert_eq!(
+            restored, document,
+            "the unrelated number was rewritten by a pass that was restoring a name"
+        );
+        assert!(
+            restored.contains("0.12345678901234567890123456789"),
+            "the precision the upstream sent did not survive: {restored}"
+        );
+    }
+
+    #[test]
+    fn an_integer_past_what_a_double_holds_is_left_rather_than_rounded() {
+        // The same loss with no decimal point in sight, which is the shape that
+        // makes "it is only about floats" wrong: past `u64` an integer becomes
+        // an `f64` too. An id, an amount in minor units, a nonce.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"id\":123456789012345678901234567890,\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "an integer the parse could not hold was served rounded"
+        );
+    }
+
+    #[test]
+    fn a_document_this_reader_rejects_and_a_client_accepts_is_not_substituted_into() {
+        // A failed parse used to mean "not JSON", and the fallback was the
+        // unescaped substitution this whole branch exists not to emit. `1e999`
+        // is valid JSON — the grammar bounds no exponent — and every JavaScript
+        // client reads this document, as `Infinity` and the rest intact. This
+        // reader calls the number out of range and refuses the parse, so
+        // nothing here knows the shape of what it is substituting into.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let hostile = "x\",\"admin\":true,\"unused\":\"y";
+        let token = mapping
+            .mask(hostile, &[span("PERSON", 0, hostile.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"limit\":1e999,\"name\":\"{token}\"}}");
+        let restored = mapping.restore_in_string(&document, &provenance);
+        assert_eq!(
+            restored, document,
+            "the bytes were rewritten on the strength of a parse that failed"
+        );
+        assert!(
+            !restored.contains("\"admin\""),
+            "an unparseable document was injected into: {restored}"
+        );
+    }
+
+    #[test]
+    fn the_described_path_refuses_both_of_the_round_trips_new_losses() {
+        // The policies stay split at each new cause, for the reason they were
+        // split at the first two: leaving the bytes is the sweep's answer and
+        // costs restoration, and the same answer in a described field leaves
+        // the placeholder in `arguments` a client dispatches on. Both causes
+        // are asked of `restore_value`, which is the described path's door.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+
+        let rounded =
+            format!("{{\"amount\":0.12345678901234567890123456789,\"name\":\"{token}\"}}");
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": rounded })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described document was served with an unrelated number rounded"
+        );
+
+        let unparseable = format!("{{\"limit\":1e999,\"name\":\"{token}\"}}");
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": unparseable })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described document this reader cannot parse was substituted into anyway"
+        );
+    }
+
+    #[test]
+    fn prose_that_carries_no_quote_still_restores_a_value_that_does() {
+        // Additivity, and the reason the branch above tests the *text* for a
+        // quote rather than testing the parse. This is the ordinary case on
+        // this path — the quote is in the value, not in the prose around it —
+        // and it is not a document, never was, and still restores.
+        let (mapping, provenance, token) = structural_mapping();
+
+        assert_eq!(
+            mapping.restore_in_string(&format!("Hallo {token}!"), &provenance),
+            "Hallo Martina \"Weber\"!",
+            "prose stopped restoring because a document elsewhere might not parse"
         );
     }
 

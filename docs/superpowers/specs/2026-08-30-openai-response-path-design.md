@@ -202,6 +202,38 @@ that path. Hoisting the check answers `true` for every plain string too and
 turns the sweep off body-wide — the same defect as the paragraph above, reached
 by a different route.
 
+**And a duplicate member is not the only thing the round trip drops, which this
+section said it was.** The sentence "the parse is lossy on exactly one input"
+was written from what had been noticed, and two more were found by looking:
+a number is held as an `i64`, a `u64` or an `f64`, so a lexeme carrying more
+precision than a double — or an integer past 64 bits — comes back rounded, in a
+document a client executes and beside the name the pass was restoring; and the
+parse can *refuse* a text a client accepts, a document past `serde_json`'s
+recursion limit or an exponent it calls out of range, which the code read as
+"not a document" and answered with the unescaped substitution the whole branch
+exists not to emit.
+
+So the claim is now made from what a JSON text is made of, which is closed,
+rather than from what has been noticed, which is not. Structure and literals
+have one spelling each. A string comes back with whatever escapes `serde_json`
+prefers, which is a different spelling of the same string and is what the
+client's own parse undoes. Objects lose a member when two share a name.
+Numbers lose their lexeme. Key order and whitespace are the reformatting the
+section above already prices. That is every token class in the grammar, and
+`carries_duplicate_members` and `carries_an_unstable_number` are the two tests
+it leaves; `holds_no_string` is the third guard and answers the refusal case,
+which is not a loss but a reader disagreeing with a reader.
+
+**`serde_json`'s `arbitrary_precision` was considered and declined.** It would
+make numbers lossless at the source rather than detected after the fact, which
+is the better shape. It is a crate-wide feature that changes how every `Value`
+in this gateway holds a number, on the masking path as well as this one; it
+routes numbers through `visit_map`, which is the deserializer surface
+`DuplicateScan` is built on and would have to be re-argued; and it closes only
+one of the three causes, leaving the refusal case and the duplicate case exactly
+where they are. A byte scan over text that has already parsed is a smaller
+claim, and it is one this slice can prove.
+
 **The recursion fixes escaping and does not extend the key rule.** Parsing a
 nested serialized document promotes strings into *key* positions that were plain
 text a moment earlier, and applying the strict key rule to them would refuse a
@@ -379,15 +411,21 @@ then #32 — is deliberate.
 The README's promise is narrowed to match: a placeholder issued by this gateway
 does not reach the client **from a field the gateway describes**, and elsewhere
 everything this request issued and the caller did not write is restored — **except
-where restoring it would drop something the provider sent**, which is served as
-it came. That exception has two shapes and one rule: an object whose restored
-keys would collide, and a string that is itself a serialized document carrying
-two members of the same name. #32 restores the unqualified first half; the
-second clause is the cost of never dropping a field.
+where restoring it would change something else the provider sent**, which is
+served as it came. That exception is one rule with several shapes: an object
+whose restored keys would collide, and a string that is itself a serialized
+document the round trip cannot reproduce. #32 restores the unqualified first
+half; the second clause is the cost of never changing what came in.
+
+**State the rule and not the shapes.** The list was written as closed at two and
+has since gone to four, and each time the correction had to be made in seven
+files rather than one, because seven sites had copied the enumeration instead of
+the rule. The unchanging half is "what cannot be re-serialized faithfully is
+never guessed at"; that is the half to search on and the half to quote.
 
 **The exception belongs to the second clause only, and the embedded fix is what
-made that distinction real.** Both shapes are answers the *sweep* gives. Inside a
-field the gateway describes the same two shapes refuse the response — 502,
+made that distinction real.** Every shape is an answer the *sweep* gives. Inside a
+field the gateway describes the same shapes refuse the response — 502,
 `mapping_lossy_document` — because serving them as they came would serve the
 placeholder the first clause promises the client will not see, and serving them
 re-serialized would hand a client a document to execute with a member missing.

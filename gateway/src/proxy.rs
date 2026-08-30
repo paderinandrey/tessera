@@ -1046,22 +1046,26 @@ async fn handle(
     // `content` lenient, so an unmappable token there would be served instead
     // of refusing. The slot loop's strict result wins wherever the two overlap.
     //
-    // **The sweep does not reach everywhere, and there are two exceptions.**
-    // An object whose restored keys would collide keeps the keys and values it
-    // came with, and a string that is a serialized document with two members
-    // of the same name is left whole — see `restore_sweep`. A placeholder can
-    // still reach the client from inside either, and everything around them
-    // restores. `a_colliding_key_costs_its_own_object_and_nothing_around_it`
-    // holds the first to its size, having once been the whole body;
+    // **The sweep does not reach everywhere, and the exception is a rule
+    // rather than a list.** Where restoring would change something else the
+    // upstream sent, the bytes are left: an object whose restored keys would
+    // collide keeps the keys and values it came with, and a string that is a
+    // serialized document is left whole when the round trip that restores it
+    // would not reproduce it — see `restore_sweep`, and
+    // `restore_in_string_with` for why that set is argued from what JSON is
+    // made of rather than enumerated. A placeholder can still reach the client
+    // from inside any of them, and everything around them restores.
+    // `a_colliding_key_costs_its_own_object_and_nothing_around_it` holds the
+    // first to its size, having once been the whole body;
     // `a_serialized_document_with_duplicate_members_reaches_the_client_intact`
     // is the second, which exists because re-serializing that string dropped a
     // member the upstream sent.
     //
-    // **Both exceptions stop at the slot loop below.** They are the *sweep's*
+    // **Every one of them stops at the slot loop below.** They are the *sweep's*
     // answers, and the loop overwrites the sweep wherever the two address the
-    // same bytes: a slot carrying either shape refuses the whole response
+    // same bytes: a slot carrying any of these shapes refuses the whole response
     // rather than serving it, because leaving those bytes in a described field
-    // leaves the placeholder in them. So the two sentences above are about a
+    // leaves the placeholder in them. So the sentences above are about a
     // field no slot addresses, and `restore_sweep`'s doc says the same. The
     // refusal is `MappingError::Unrestorable`, and
     // `a_nested_document_that_cannot_be_restored_faithfully_refuses_the_response`
@@ -2666,12 +2670,13 @@ mod tests {
         // verbatim. It now sweeps first, so the two paths agree on this case.
         // They are not the same rule: the buffered sweep restores only what
         // this request issued and the caller did not write, *except where
-        // restoring it would drop something the upstream sent* — an object
-        // whose restored keys would collide, or a serialized document with two
-        // members of the same name — which is narrower than what a streamed
-        // event gets on every count. The clause belongs here like it belongs
-        // everywhere else the promise is written — a stream restores its event
-        // whole and has neither exception, so stating the buffered rule
+        // restoring it would change something else the upstream sent* — an
+        // object whose restored keys would collide, or a serialized document
+        // the round trip that restores it would not reproduce — which is
+        // narrower than what a streamed event gets on every count. The clause
+        // belongs here like it belongs everywhere else the promise is written —
+        // a stream restores its event whole and has no exception, so stating
+        // the buffered rule
         // without it understates the distance between the two paths this
         // comment exists to draw.
         //
@@ -2681,12 +2686,14 @@ mod tests {
         // halves are now false: the escaping rule and the recursion moved into
         // `restore_in_string_with`, which a streamed event *does* enter, via
         // the `restore_value` that restores everything in it the slots do not
-        // address. What keeps the two exceptions off this path is the token
+        // address. What keeps the exceptions off this path is the token
         // policy rather than the absence of the walk — `restore_value` is
         // strict, so a document it cannot re-serialize faithfully raises
         // `MappingError::Unrestorable` and the stream ends, exactly as an
-        // unmappable token already ends it. Neither exception, for a different
-        // reason than before.
+        // unmappable token already ends it. No exception, for a different
+        // reason than before — and the same answer however many causes the
+        // round trip turns out to have, which is the point of routing them all
+        // through one rule.
         //
         // So there is nothing to refuse here, which is just as well: a stream
         // cannot refuse after its first bytes have gone out — the position
