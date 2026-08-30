@@ -2476,6 +2476,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_providers_treat_an_undescribed_response_field_the_same_way() {
+        // The asymmetry is what made this bug: one provider was given a
+        // treatment the other was not, and nothing compared them. Every other
+        // test here names a field and a provider, so each catches its own
+        // instance; this one catches the class.
+        //
+        // One body, read twice. It carries both envelopes — OpenAI reads
+        // `choices` and Anthropic reads the top-level `content`, and neither
+        // looks at the other's — so the route is the only variable between the
+        // two calls, and a difference in what the client receives can only be
+        // a difference in how the provider was treated.
+        //
+        // `diagnostics` is described by neither. That is the whole shape of the
+        // hazard: not a field somebody forgot, but the field a provider adds
+        // tomorrow, which is how #31 arrived.
+        let detector = detector_returning(person_span()).await;
+        let upstream = MockServer::start().await;
+        let response = json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "content": [{"type": "text", "text": "ok", "citations": null}],
+            "diagnostics": {"note": "drafted for [PERSON_1]"}
+        });
+        for route in ["/v1/chat/completions", "/v1/messages"] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+                .mount(&upstream)
+                .await;
+        }
+        let state = state(&detector, &upstream);
+
+        let (openai_status, openai_body) = call(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        let (anthropic_status, anthropic_body) = call(
+            Arc::clone(&state),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(openai_status, StatusCode::OK, "{openai_body}");
+        assert_eq!(anthropic_status, StatusCode::OK, "{anthropic_body}");
+        let openai: Value = serde_json::from_str(&openai_body).expect("a JSON body");
+        let anthropic: Value = serde_json::from_str(&anthropic_body).expect("a JSON body");
+        assert_eq!(
+            openai["diagnostics"], anthropic["diagnostics"],
+            "one provider was given a treatment the other was not: \
+             {openai_body} against {anthropic_body}"
+        );
+        // Asserted as well as compared: two providers agreeing that a
+        // placeholder goes to the client is the bug, not the fix.
+        assert_eq!(
+            openai["diagnostics"]["note"],
+            format!("drafted for {SECRET}"),
+            "the undescribed field was not restored for either provider: {openai_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_streamed_block_restores_the_fields_no_slot_addresses() {
         // The streamed path never had the gap the buffered one had, and this
         // pins the reason rather than the absence. `stream::handle` restores
@@ -2487,8 +2550,13 @@ mod tests {
         // the slots, which is why the same shape reached a buffered client
         // verbatim. It now sweeps first, so the two paths agree on this case.
         // They are not the same rule: the buffered sweep restores only what
-        // this request issued and the caller did not write, which is narrower
-        // than what a streamed event gets.
+        // this request issued and the caller did not write, *except inside an
+        // object whose restored keys would collide*, which is narrower than
+        // what a streamed event gets on both counts. The clause belongs here
+        // like it belongs everywhere else the promise is written — a stream
+        // restores its event whole and has no such exception, so stating the
+        // buffered rule without it understates the distance between the two
+        // paths this comment exists to draw.
         //
         // So there is nothing to refuse here, which is just as well: a stream
         // cannot refuse after its first bytes have gone out — the position
@@ -4757,6 +4825,75 @@ mod tests {
         assert!(
             !served.contains("Braun"),
             "a value this turn issued was restored into an earlier turn's text: {served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_writing_a_session_owned_literal_gets_its_own_text_back() {
+        // Turn one issues `[PERSON_1]` for `Weber` and the session keeps it.
+        // Turn two's caller writes that literal itself and the provider echoes
+        // it into two fields: `content`, which the slot loop describes, and
+        // `refusal`, which it does not.
+        //
+        // The two answers differ, and the difference is the point. `refusal` is
+        // reached only by the sweep, which asks `Provenance::restorable` —
+        // turn two issued nothing, so the token is not this request's to claim
+        // and the caller gets back the bytes it sent. `content` is reached by
+        // the slot loop, which restores strictly out of the session table and
+        // does not consult provenance at all, so it hands back turn one's
+        // value. #32 is what makes the two agree; until then this is the
+        // behaviour, asserted here rather than left to be discovered.
+        //
+        // **This is not the ordering pin**, though an earlier draft of the plan
+        // said it was: measured, it passes with the sweep on either side of the
+        // slot loop. A token inside a value masked from *this* request is
+        // necessarily also in this request's `written` set, so `restorable`
+        // excludes it whichever order runs. The hazard needs a value that
+        // entered the table in an earlier turn, and
+        // `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`
+        // above is the test that fails when the sweep moves.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "[PERSON_1]",
+                "refusal": "I cannot help with [PERSON_1]"
+            }}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        // Turn two names the placeholder itself and says nothing the detector
+        // finds, so this request issues nothing at all.
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "[PERSON_1] wer?"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+
+        let served: Value = serde_json::from_str(&second).expect("a JSON body");
+        let message = &served["choices"][0]["message"];
+        assert_eq!(
+            message["refusal"], "I cannot help with [PERSON_1]",
+            "the sweep claimed a token this request never issued: {second}"
+        );
+        assert_eq!(
+            message["content"], SECRET,
+            "the described field stopped restoring strictly out of the table: {second}"
         );
     }
 

@@ -241,29 +241,44 @@ this gateway scans is forwarded unmasked. No error body or log line carries the 
 text.
 
 Restoration is narrower than that, and the difference is measured rather than assumed.
-Anthropic's response path is a closed list of block *types* — a block whose type it cannot
-read refuses the response rather than handing a placeholder over — and OpenAI's is not: it
-restores a choice's `content` and forwards every other field of the message as the provider
-sent it. Two things were measured wrong on the Anthropic half and both are now closed. The
-type check ran *second*, after a check for a `text` field, so a block carrying a `text`
-never reached the closed list at all: `{"type": "tool_use", "text": "ok", "input": {...}}`
-had its text described and its arguments forwarded unrestored, which is a placeholder
-reaching a client that *executes* it. And the list was closed on the type alone, so a field
-the block's type does not define was handed over as the provider wrote it — measured, at
-200, with `citations[].cited_text` carrying `[PERSON_1]` into what the client received.
-Anthropic's response blocks now have a closed list of *fields* as well as of types, and a
-field outside it refuses the response. **OpenAI's response path has neither**: a `refusal`,
-which any OpenAI refusal populates, and an `annotations[].url_citation.title` both reach
-the client **with this gateway's own placeholder in them**. That is the one direction the
-design is not closed in, it is filed as #31, and closing it means closing the list rather
-than naming those two fields.
+Anthropic's response path is a closed list of block *types* — a block whose type it cannot read
+refuses the response rather than handing a placeholder over. Two things were measured wrong on
+that half and both are now closed. The type check ran *second*, after a check for a `text`
+field, so a block carrying a `text` never reached the closed list at all: `{"type": "tool_use",
+"text": "ok", "input": {...}}` had its text described and its arguments forwarded unrestored,
+which is a placeholder reaching a client that *executes* it. And the list was closed on the
+type alone, so a field the block's type does not define was handed over as the provider wrote
+it — measured, at 200, with `citations[].cited_text` carrying `[PERSON_1]` into what the client
+received. Anthropic's response blocks now have a closed list of *fields* as well as of types,
+and a field outside it refuses the response.
 
-Two things it does not scan, and both are worth knowing before you rely on the sentence
-above. **Image and audio parts are forwarded untouched**, including a screenshot inside a
-tool result, which is the same exposure through a different field rather than a new one.
-Nothing here reads pixels, so a photograph of an identity document reaches the provider as
-the client sent it. And **the body and the message levels are not allowlisted at all** —
-see below, because that is the other half of the closed-allowlist claim.
+OpenAI's response path had neither, and #31 is the measurement: it restored a choice's
+`content` and forwarded every other field of the message as the provider sent it, so a
+`refusal` — which any OpenAI refusal populates — and an `annotations[].url_citation.title` both
+reached the client **with this gateway's own placeholder in them**, at 200. It no longer
+describes only what it names. Before the slots are written, the whole upstream body is swept
+for the placeholders *this request* issued, and the slot loop then overwrites what it describes
+with its own strict result, so a field nobody described is restored rather than forwarded. The
+promise, in both its clauses: **a placeholder issued by this gateway does not reach the client
+from a field the gateway describes. Elsewhere everything this request issued and the caller did
+not write is restored, except inside an object whose restored keys would collide**, which is
+served exactly as it came. Both clauses are load-bearing and neither is decoration. The sweep
+will not claim a token the *caller* wrote itself, because a caller that puts `[PERSON_1]` into
+a later turn of a session and has the model echo it back has to get its own text returned
+rather than turn one's value; a token that is both issued and written is ambiguous by
+construction and is left alone, and #32 is what separates the two and lets the first sentence
+be stated without its qualification. And an object whose restored keys would collide —
+`{"[PERSON_1]": "a", "Weber": "b"}`, where restoring the key would drop one of the two fields —
+keeps every key and value it arrived with, which is one object rather than the body around it
+but is still a place a placeholder can reach the client from.
+
+Two things it does not scan, and both are worth knowing before you rely on *no text this
+gateway scans is forwarded unmasked* above — a claim about the way up, which the two paragraphs
+before this one are not. **Image and audio parts are forwarded untouched**, including a
+screenshot inside a tool result, which is the same exposure through a different field rather
+than a new one. Nothing here reads pixels, so a photograph of an identity document reaches the
+provider as the client sent it. And **the body and the message levels are not allowlisted at
+all** — see below, because that is the other half of the closed-allowlist claim.
 
 Tool traffic is masked now, so what it still refuses is worth stating on its own.
 **Streamed tool calls**, which the buffered path's masking does not reach: a document
