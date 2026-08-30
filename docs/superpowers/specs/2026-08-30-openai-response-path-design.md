@@ -286,8 +286,10 @@ what restores the unqualified sentence, and the README says so.
 
 ### Two limits of the issued set, found by attacking it here
 
-Neither is reachable today. Both are properties of the discriminator rather than
-of this implementation, so they belong beside it rather than in a commit message.
+Both are properties of the discriminator rather than of this implementation, so
+they belong beside it rather than in a commit message. **One of them is
+unreachable and the other is live**, and an earlier draft called both unreachable
+— which would have kept the live one out of acceptance coverage.
 
 **It assumes the client echoes the conversation.** The set is built from what
 *this request* masked, which works because a client resends its history and the
@@ -298,12 +300,17 @@ remembers, and the sweep would leave it. This gateway serves no such endpoint, s
 it is a premise to record rather than a hole to plug, and adding one would
 require revisiting this.
 
-**One token can get two treatments in one response.** A described field restores
-strictly from the table, ambiguity included, which is today's behaviour and is
-not changed here. The same token in an undescribed field is left. So a client can
-see the value in `content` and the token in `refusal`. Making them agree means
-either weakening the described path — a regression — or #32. Recorded, because a
-reader meeting it should find it described rather than discover it.
+**One token can get two treatments in one response — and this one is reachable
+today, on `/v1/chat/completions`.** It is this document's opening example run one
+step further: `content` is restored while the same token in `refusal` is not. A
+described field restores strictly from the table, ambiguity included, which is
+today's behaviour and is not changed here; the same token in an undescribed field
+is left. So a client sees the value in `content` and the token in `refusal`.
+
+Making them agree means either weakening the described path — a regression — or
+#32. It is therefore **not** deferred quietly: it has a test of its own below, so
+the behaviour is pinned rather than merely described, and whoever reads the
+journal line or the response can find it written down.
 
 ## Anthropic's response-side refusals stay
 
@@ -368,10 +375,16 @@ The standard is mutation: break the invariant, run the **named** test, check
    rejected.
 8. **A document carrying none of our tokens is byte-identical**, so structural
    restoration never reformats what it did not change.
-9. **Provider parity.** One response shape driven through **both** providers,
+9. **The two treatments of one token, pinned rather than described.** A
+   multi-turn session where the caller writes a session-owned literal: the same
+   token comes back restored in `content` and untouched in `refusal`. This is
+   live behaviour on `/v1/chat/completions` today and is what #32 resolves, so
+   the test asserts the divergence deliberately and names the issue that will
+   change it.
+10. **Provider parity.** One response shape driven through **both** providers,
    asserting the same treatment.
 
-Item 9 is the only test here that catches the **class** rather than the instance.
+Item 10 is the only test here that catches the **class** rather than the instance.
 The others prove these two fields are fixed; that one exists so the next pair
 does not diverge again — which is how this bug, and three like it, were made.
 
