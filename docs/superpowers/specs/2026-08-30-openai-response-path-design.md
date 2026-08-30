@@ -43,50 +43,58 @@ instance while leaving the policy that produced it.
 
 ## Design
 
-**Restore the slots first, exactly as today. Then sweep the whole body
-leniently.**
+**Sweep the original body leniently. Then overwrite each described field with its
+strict slot restoration, computed from the same original.**
 
 The change is **purely additive**. Nothing that refuses today stops refusing;
 nothing that succeeds today starts failing. Coverage grows and nothing else
 moves.
 
-### Why that order
+### Why that order, and why the obvious order is wrong twice
 
-Strictness differs by field and a whole-body walk cannot tell which field it is
-in. Sweeping first would make `content` lenient too — an unknown placeholder in a
-described field would stop refusing, which is a regression nobody asked for.
+**Sweep the original, then overwrite.** The sweep never reads a value the slots
+produced, and the slots never read a value the sweep produced. Both are computed
+from the same untouched upstream body, and the strict result wins wherever the
+two overlap.
 
-Slots first keeps every existing guarantee in place, and the sweep then reaches
-what the slots did not.
+Two failures rule out the alternatives, and both were found on the design rather
+than in code:
 
-### Why no skip list is needed
+**Sweeping the already-restored body corrupts a multi-turn session.** The
+idempotence argument this spec first made — "a region the slots restored holds no
+placeholders, so the sweep does nothing there" — **is false**, and it is false in
+exactly the case #32 exists for. If turn one issued `[PERSON_1]` and a later
+request legitimately contains that literal, `reserve_literals` cannot map it to
+itself because the session already owns the token; `proxy.rs` records this
+limitation in those words. Strict slot restoration then inserts the caller's
+literal verbatim, and a sweep over the result replaces it with turn one's value.
+The client receives a string it never sent.
 
-Restoration is idempotent. A region the slots already restored holds no
-placeholders, so the sweep does nothing there. This matters because the
-alternative — sweeping everything *except* the slot pointers — needs a list of
-what to skip, and a hand-written list of what matters has been wrong five times
-in this codebase. Idempotence does the work a list would have done badly.
+**Sweeping first and stopping there makes described fields lenient.** An
+unmappable token in `content` would be served instead of refusing, which
+contradicts this design's own guarantee that nothing which refuses today stops
+refusing.
 
-Two cases make the idempotence claim non-obvious and both hold:
+Overwriting is what satisfies both: the sweep may leniently restore `content`,
+and the slot's strict restoration of `content` — from the original — replaces it,
+refusing if the token cannot be mapped. No value is ever restored twice.
 
-- an embedded `arguments` document, after slot restoration, is re-serialized
-  with real values and carries no token for the sweep to find;
-- a restored value that legitimately contains a bracket-shaped token is mapped to
-  itself by `reserve_literals`, so the sweep restores it to itself.
+### What stays a slot: every described field, unchanged
 
-### What stays a slot
+**Every field described today keeps its slot and its strict restoration.** The
+sweep adds coverage for fields nobody describes; it takes nothing over.
 
-**Exactly one case: a string holding a document** — `tool_calls[].function.arguments`
-on OpenAI, and nothing else today.
+Dropping the slot for ordinary text or a non-embedded document — on the grounds
+that the sweep reaches them anyway — would silently move `content` and
+`tool_use.input` from strict to lenient, which is the same regression by a
+different route.
 
-`restore_value` on a string does a plain substitution. If a restored value
-contains a quote, a backslash or a newline, substituting it into JSON *text*
-breaks the syntax. The request path already solves this with `embedded: true` —
-parse, restore per leaf, re-serialize — and `write_document` escapes correctly.
-So the slot is a requirement here, not a preference.
-
-Ordinary text and a non-embedded document need no slot on the response path: they
-are nested values and the sweep handles them.
+One case additionally *cannot* be served by the sweep at all, and is why slots
+would be needed even if leniency were not a concern: **a string holding a
+document**, `tool_calls[].function.arguments`. `restore_value` on a string does a
+plain substitution, so a restored value containing a quote, a backslash or a
+newline breaks the JSON *text* it is substituted into. `embedded: true` parses,
+restores per leaf and re-serializes, and `write_document` escapes correctly.
 
 The error-body path and the streamed path are unchanged. Both already restore
 whole and neither gains nor loses anything here.
@@ -108,11 +116,13 @@ Strict here would let a model kill a paid-for answer by writing bracket-shaped
 text into a field this gateway does not care about. That is the trade, made
 deliberately, and #32 is what removes the need for it.
 
-**The structural win.** Whether a field is described stops deciding *whether* it
-is handled and starts deciding only *how*. An undescribed field degrades to naive
-but correct restoration instead of to a leak. That is the same inversion applied
-four times during the tool-traffic slice: an unknown thing must land in the safe
-branch, not in the hole.
+**The structural win**, stated carefully because an earlier draft overstated it.
+A description still decides how strictly a field is treated, and that does not
+change. What changes is what a *missing* description costs: today it means the
+field is not restored at all, and after this it means the field is restored
+leniently. An unknown field degrades to naive-but-correct instead of to a leak —
+the same inversion applied four times during the tool-traffic slice, where an
+unknown thing had to land in the safe branch rather than the hole.
 
 ### Leniency, and exactly where it stops
 
@@ -186,8 +196,12 @@ The standard is mutation: break the invariant, run the **named** test, check
    also the test that proves the ordering**: mutating the sweep to run first
    fails it, and mutating it to run first also fails a strictness test in a
    described field. The order is held from both sides.
-4. **Idempotence**, proved rather than argued: a restored value legitimately
-   containing a bracket-shaped token survives the sweep unchanged.
+4. **The multi-turn session case**, which is what killed the idempotence
+   argument. Turn one issues `[PERSON_1]`; a later request legitimately contains
+   that literal in a described field; the client must receive its own literal
+   back, not turn one's value. This is the test that fails if the sweep is ever
+   moved after the slots, and it is the reason the order is what it is rather
+   than a preference.
 5. **The decidable key half stays strict** in an undescribed field; the
    undecidable half is left.
 6. **Provider parity.** One response shape driven through **both** providers,
