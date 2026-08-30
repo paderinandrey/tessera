@@ -149,6 +149,17 @@ undescribed field may carry the serialized scalar `"[PERSON_1]"`, which is a
 complete JSON document, and a naive substitution breaks it exactly as it breaks
 an object. A draft of this rule said "object or array" and missed that.
 
+**The recursion fixes escaping and does not extend the key rule.** Parsing a
+nested serialized document promotes strings into *key* positions that were plain
+text a moment earlier, and applying the strict key rule to them would refuse a
+response that succeeds today: a described `arguments` carrying the string
+`{"[PERSON_1]":"ok"}` is text to `restore_value` now, is substituted, and is
+served. Additivity decides it. At that depth the key is restored exactly as
+today's substitution restores it, because that *is* today's behaviour; the key
+rule keeps the depth it already has and gains no new one. Anything else trades a
+corruption fix for a refusal regression, which is the swap this design exists to
+avoid.
+
 **And the rule is recursive, which is a defect in the path that already ships.**
 A leaf inside a document may itself be a string holding serialized JSON, and
 restoring *that* leaf naively is the same injection one level down. This is not
@@ -348,12 +359,15 @@ The standard is mutation: break the invariant, run the **named** test, check
    placeholder-shaped token in an undescribed field is **served**, not refused.
    "The suite stayed green" only covers what the suite already tests.
 3. **Embedded document integrity.** A restored value containing a quote, a
-   backslash and a newline inside `arguments` must produce valid JSON. **The
-   mutation is moving the sweep to run *after* the slots** — it then scans the
-   re-serialized `arguments` string and corrupts its JSON with the inserted
-   characters. An earlier draft of this section had the mutation the other way
-   round, left over from an earlier draft of the design; the order it describes
-   is now the shipped one.
+   backslash and a newline inside `arguments` must produce valid JSON carrying
+   the fields it started with. **The mutation is reverting structural
+   restoration to plain substitution**, which is the rule the property depends
+   on. Two earlier drafts named the *ordering* mutation here and both were
+   wrong — the first because the design's order had since flipped, and the
+   second because the structural rule made the ordering mutation harmless:
+   after strict slot restoration the token is gone, and any token still
+   standing is parsed and re-serialized rather than substituted. The ordering
+   regression is item 4's job and this item should not duplicate it.
 4. **The multi-turn session case**, which is what killed the idempotence
    argument. Turn one issues `[PERSON_1]`; a later request legitimately contains
    that literal in a described field; the client must receive its own literal
