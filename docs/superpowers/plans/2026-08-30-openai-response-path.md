@@ -304,9 +304,19 @@ Add the field to `Mapping`:
 And the two methods:
 
 ```rust
-    /// Starts a request's issuance record. `handle` masks into a clone of the
-    /// session's mapping, and the clone carries the previous request's set, so
-    /// this clears it rather than relying on the clone being fresh.
+    /// Starts a request's issuance record.
+    ///
+    /// The clear is a no-op today and is kept deliberately. `absorb` never
+    /// carries `issued` into the session, and `handle` masks into a clone, so
+    /// a session's copy of this field is structurally always empty and there is
+    /// nothing to clear. What this method buys is the *boundary*: the set means
+    /// "issued since the last `begin_request`", and a caller that reuses a
+    /// mapping across two requests — a future batch path, a test driving two
+    /// turns through one `Mapping` — gets the meaning the name promises rather
+    /// than a set that silently accumulates.
+    ///
+    /// Do not delete it on the grounds that it clears nothing. The one thing it
+    /// must not say is that the clone arrives dirty; it does not.
     pub fn begin_request(&mut self) {
         self.issued.clear();
     }
