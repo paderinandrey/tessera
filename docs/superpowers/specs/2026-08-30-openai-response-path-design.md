@@ -89,8 +89,24 @@ Ordinary text and a non-embedded document need no slot on the response path: the
 are nested values and the sweep handles them.
 
 The error-body path and the streamed path are unchanged. Both already restore
-whole and neither gains or loses anything here; this brings the third path into
-line with them rather than inventing a fourth policy.
+whole and neither gains nor loses anything here.
+
+**But be exact about what the sweep is, because the tempting sentence is false.**
+Those two paths restore whole **strictly**: `restore` raises `Unknown` on a token
+it cannot map, so an unmappable token refuses there. A lenient sweep is therefore
+a **fourth** policy, not the third path falling into line with the other two.
+
+It is worth adding anyway, and the reason is that the two existing whole-body
+sites are not comparable to this one. A streamed event and an error envelope
+quote what *we sent*, so a placeholder-shaped token in them is overwhelmingly one
+we issued, and refusing is right. A success body is the model's own output, where
+a token can equally be something the model invented — `[ANYTHING_1]` in a field
+nobody described — and `reserve_literals` does not cover that, because it
+reserves what went **up** in this request and never saw the model's invention.
+
+Strict here would let a model kill a paid-for answer by writing bracket-shaped
+text into a field this gateway does not care about. That is the trade, made
+deliberately, and #32 is what removes the need for it.
 
 **The structural win.** Whether a field is described stops deciding *whether* it
 is handled and starts deciding only *how*. An undescribed field degrades to naive
