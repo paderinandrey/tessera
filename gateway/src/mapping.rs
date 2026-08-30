@@ -161,6 +161,11 @@ pub struct Mapping {
     /// per request rather than per span: a detector that disagrees about types
     /// disagrees about all of them, and one line per span would be a flood.
     redacted: usize,
+    /// Tokens `placeholder_for` returned since `begin_request`. Per request,
+    /// not per session: a session's table is what provenance cannot be read
+    /// from. `absorb` does not carry it, for the same reason reserved literals
+    /// are absent from `order`.
+    issued: HashSet<String>,
 }
 
 impl Mapping {
@@ -176,6 +181,19 @@ impl Mapping {
 
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// Starts a request's issuance record. `handle` masks into a clone of the
+    /// session's mapping, and the clone carries the previous request's set, so
+    /// this clears it rather than relying on the clone being fresh.
+    #[allow(dead_code)]
+    pub fn begin_request(&mut self) {
+        self.issued.clear();
+    }
+
+    #[allow(dead_code)]
+    pub fn issued(&self) -> HashSet<String> {
+        self.issued.clone()
     }
 
     /// How many spans this mapping had to mask under the generic type.
@@ -297,7 +315,9 @@ impl Mapping {
         value: String,
     ) -> Result<String, MappingError> {
         if let Some(existing) = self.by_value.get(&value) {
-            return Ok(existing.clone());
+            let existing = existing.clone();
+            self.issued.insert(existing.clone());
+            return Ok(existing);
         }
         // Syntax cannot tell a type name from a value shaped like one, and
         // `WEBER` for a span covering WEBER passes any grammar. So the name is
@@ -320,6 +340,7 @@ impl Mapping {
         self.by_value.insert(value.clone(), placeholder.clone());
         self.by_placeholder.insert(placeholder.clone(), value);
         self.order.push(placeholder.clone());
+        self.issued.insert(placeholder.clone());
         Ok(placeholder)
     }
 
@@ -2047,6 +2068,30 @@ mod tests {
     }
 
     #[test]
+    fn a_mapping_records_the_tokens_this_request_issued_and_forgets_the_last_ones() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let masked = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        assert_eq!(mapping.issued(), HashSet::from([masked.clone()]));
+
+        // A literal the caller wrote is not issued. `reserve_literals` sees it;
+        // `placeholder_for` never does, which is what makes the set unforgeable.
+        mapping.reserve_literals("the caller wrote [ORG_5] here");
+        assert_eq!(mapping.issued(), HashSet::from([masked.clone()]));
+
+        // A second turn re-masking the same value still issues it: the token is
+        // reused from `by_value`, and reuse is issuance for this purpose.
+        mapping.begin_request();
+        assert_eq!(mapping.issued(), HashSet::new());
+        mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        assert_eq!(mapping.issued(), HashSet::from([masked]));
+    }
+
+    #[test]
     fn numbering_continues_across_calls() {
         // One request carries several texts; they share a mapping.
         let mut mapping = Mapping::new();
@@ -2294,6 +2339,10 @@ mod tests {
 
         session.absorb(&work, 10);
         assert_eq!(session.redacted_count(), 0);
+        // Same reasoning applies to `issued`: it is this request's record, and
+        // `absorb` never reads or writes it, so the session's own set is
+        // untouched by a request it never masked with directly.
+        assert_eq!(session.issued(), HashSet::new());
     }
 
     #[test]
