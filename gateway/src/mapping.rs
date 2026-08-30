@@ -1904,6 +1904,51 @@ impl<'a> Iterator for Pieces<'a> {
     }
 }
 
+/// Every placeholder-shaped token the request body carries, from every string
+/// in it — values, keys, and fields no slot addresses.
+///
+/// It looks for a lexical shape rather than for meaning, so it needs no
+/// provider knowledge and **nothing may be exempt from it**. Exempting a field
+/// is how `lookup_[PERSON_1]` in a tool name — dispatch, and deliberately not a
+/// slot — would have been missed, and the echoed name restored to
+/// `lookup_Martina Weber`.
+#[allow(dead_code)]
+pub fn placeholder_literals(value: &Value) -> HashSet<String> {
+    let mut found = HashSet::new();
+    collect_literals(value, &mut found);
+    found
+}
+
+fn collect_literals(value: &Value, found: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => {
+            for piece in pieces(text) {
+                if let Piece::Placeholder(candidate) = piece {
+                    found.insert(candidate.to_owned());
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_literals(item, found);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                // Keys as well as values: a property name is a string the
+                // caller chose, and it reaches the response the same way.
+                for piece in pieces(key) {
+                    if let Piece::Placeholder(candidate) = piece {
+                        found.insert(candidate.to_owned());
+                    }
+                }
+                collect_literals(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `[TYPE_N]`: **one** opening bracket, upper-case type, underscore, digits,
 /// **one** closing bracket.
 ///
@@ -4115,5 +4160,33 @@ mod tests {
         assert!(!provenance.restorable("[ORG_9]"));
         // Neither: the model invented it.
         assert!(!provenance.restorable("[PERSON_7]"));
+    }
+
+    #[test]
+    fn the_literal_walk_reads_every_string_including_the_ones_no_slot_addresses() {
+        let body = json!({
+            "model": "gpt",
+            // A dispatch string. `reserve_literals` never sees one, because
+            // dispatch is deliberately not a slot — this is the case that
+            // would echo back as a broken tool name.
+            "tools": [{"type": "function", "function": {"name": "lookup_[PERSON_1]"}}],
+            "messages": [
+                {"role": "user", "content": "see [ORG_2]"},
+                // Nested, and in key position.
+                {"role": "user", "content": {"[IBAN_3]": ["deep [PERSON_4]"]}}
+            ],
+            // Not placeholder-shaped: no type, no number.
+            "metadata": {"note": "[not a token]"}
+        });
+
+        assert_eq!(
+            placeholder_literals(&body),
+            HashSet::from([
+                "[PERSON_1]".to_owned(),
+                "[ORG_2]".to_owned(),
+                "[IBAN_3]".to_owned(),
+                "[PERSON_4]".to_owned(),
+            ])
+        );
     }
 }
