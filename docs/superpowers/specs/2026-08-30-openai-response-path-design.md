@@ -149,17 +149,58 @@ undescribed field may carry the serialized scalar `"[PERSON_1]"`, which is a
 complete JSON document, and a naive substitution breaks it exactly as it breaks
 an object. A draft of this rule said "object or array" and missed that.
 
-**A restored key that collides keeps the original string.** A nested document
-can carry both the key `"[PERSON_1]"` and the key that token restores to.
+**A restored key that collides keeps its own object.** A nested document can
+carry both the key `"[PERSON_1]"` and the key that token restores to.
 Structural restoration builds a map, which cannot hold both, so one would be
 **silently discarded** — a tool argument lost, where today's textual substitution
 serves both. Neither restoring nor substituting is safe there: substitution
 yields duplicate property names, whose meaning is ambiguous.
 
-So on a collision the whole string is left exactly as the provider sent it. That
-loses restoration for that one document, refuses nothing, and cannot lose a
+So on a collision *that map* is handed back exactly as it came — every field
+present, every key unrestored — and nothing around it is touched. The ambiguity
+is a fact about one map's key set, and the fields beside it are not implicated
+by it. That loses restoration for one object, refuses nothing, and cannot lose a
 field. It is the same rule the sweep follows everywhere else: what cannot be
 restored safely is left, not guessed at.
+
+**An earlier draft of this section specified the whole string, and that was the
+defect rather than a simplification.** Leaving the string means reporting the
+collision upward, which is what returning `None` from the object arm does; the
+`?`s at both propagation points then carried it to the top, and one ambiguous
+object became an off switch for the entire body — a `meta` object with a
+colliding key left `refusal` holding the very placeholder #31 is about.
+`restore_document` returns `Value` rather than `Option<Value>` exactly so that
+fallback has nowhere to travel. Anyone reading the old sentence to understand
+the design would build #31 back, which is why the correction is recorded here
+rather than silently applied.
+`a_collision_costs_its_own_object_and_nothing_beside_it` and
+`a_colliding_key_costs_its_own_object_and_nothing_around_it` are what hold the
+fallback to its size.
+
+The string as a whole comes back verbatim in one narrow case that is not the
+fallback: when the restored document compares equal to the parsed one, every
+restorable token in it having happened to sit inside a colliding object. Nothing
+changed, so the caller gets its own bytes rather than a re-serialized equivalent
+of them. That is byte preservation, not a scope.
+
+**A document that already carried two members of the same name is left whole,
+and here the unit really is the string.** The parse that opens the structural
+path collapses those two before any restoring happens, so re-serializing emits a
+document the provider did not send — and one that two readers disagree about,
+since `serde_json` keeps the last member and a reader keeping the first sees a
+different document. No later step can put the lost member back, and by the time
+an object could be named the member is already gone, so there is nothing smaller
+than the string to hand back. It is the same rule again: what cannot be
+re-serialized faithfully is left.
+
+The test is `carries_duplicate_members`, a second pass over the same bytes with
+a visitor that sees member names one at a time. It runs *behind* the escaping
+test, not in front of it, so a document is only ever left for a loss it was
+about to take: a value needing no escaping still substitutes into such a
+document textually and keeps both members, because nothing is re-serialized on
+that path. Hoisting the check answers `true` for every plain string too and
+turns the sweep off body-wide — the same defect as the paragraph above, reached
+by a different route.
 
 **The recursion fixes escaping and does not extend the key rule.** Parsing a
 nested serialized document promotes strings into *key* positions that were plain
@@ -305,9 +346,27 @@ then #32 — is deliberate.
 The README's promise is narrowed to match: a placeholder issued by this gateway
 does not reach the client **from a field the gateway describes**, and elsewhere
 everything this request issued and the caller did not write is restored — **except
-inside an object whose restored keys would collide**, which is served as it came.
-#32 restores the unqualified first half; the second clause is the cost of never
-dropping a field, and it is stated wherever the promise is stated.
+where restoring it would drop something the provider sent**, which is served as
+it came. That exception has two shapes and one rule: an object whose restored
+keys would collide, and a string that is itself a serialized document carrying
+two members of the same name. #32 restores the unqualified first half; the
+second clause is the cost of never dropping a field.
+
+**The sentence that used to close this paragraph — "and it is stated wherever
+the promise is stated" — was false at the moment it was written**, since this
+paragraph listed only the collision exception while claiming the synchronisation
+it was breaking. A claim about other files is not evidence about them. The
+promise has seven live sites: `README.md`, `docs/frontend-handoff.md`,
+`restore_sweep`'s doc, `restore_in_string`'s doc, `proxy::handle`'s comment above
+the sweep, `a_streamed_block_restores_the_fields_no_slot_addresses`, and this
+paragraph. (The step list in `docs/superpowers/plans/` is an eighth occurrence
+and is deliberately left stale: it is a historical instruction, not a live
+claim.) Three separate rounds each corrected the sites sharing the correcting
+reader's vocabulary and missed the one that stated the claim in its own words —
+first the streamed-path comment, then the handoff paragraph, then this one. So:
+when the clause changes, enumerate the sites and search on the *unchanging* half
+of the promise. Sweeping for the wording you are replacing finds only the sites
+that already agree with you.
 
 ### Two limits of the issued set, found by attacking it here
 
