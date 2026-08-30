@@ -682,16 +682,16 @@ impl Mapping {
         // and not in the text around it. With one, and no parse, nothing here
         // can tell corruption from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
-            if holds_no_string(text) {
+            if holds_no_string(text) || !begins_like_a_document(text) {
                 return Ok(out);
             }
             rule.lossy_document("a string this gateway cannot parse but a client may")?;
             return Ok(text.to_owned());
         };
         // The parse above loses two things, both before anything here gets to
-        // look at the document: this is the structural one, and
-        // `carries_an_unstable_number` below is the lexical one. Two members of
-        // the same name collapse into one, so re-serializing hands the client a
+        // look at the document, and `round_trip_loses` below asks about both.
+        // The structural one: two members of the same name
+        // collapse into one, so re-serializing hands the client a
         // document the upstream did not send — a string forwarded byte for
         // byte before this sweep existed, and a parser differential the moment
         // the client's reader keeps the first member where `serde_json` keeps
@@ -702,27 +702,26 @@ impl Mapping {
         // field the client executes. Same shape as the collision arm of
         // `restore_document_with`: what cannot be restored faithfully is not
         // restored unfaithfully.
-        if carries_duplicate_members(text) {
-            rule.lossy_document("two members of the same name")?;
-            return Ok(text.to_owned());
-        }
         let restored = self.restore_document_with(&document, rule)?;
         // A collision inside may have left every restorable token where it
         // stood — see `restore_document_with`'s object arm, which only reaches
         // that fallback under a rule that tolerates it. Nothing changed, so the
         // caller gets back the bytes it gave rather than a re-serialized
         // equivalent of them.
+        //
+        // **This runs before the loss check below and that ordering is
+        // load-bearing.** A document is only ever left — or refused — for a
+        // loss it was actually about to take, and a document nobody is
+        // rewriting takes none. Asking first would refuse a response over a
+        // number in a string this pass was not going to touch.
         if restored == document {
             return Ok(text.to_owned());
         }
-        // Nothing is re-serialized until the round trip is known to reproduce
-        // what it read. Numbers are the second of the two things it does not
-        // carry: `Value` holds them as `i64`/`u64`/`f64`, so a lexeme carrying
-        // more precision than a double, or an integer past 64 bits, comes back
-        // rounded — in a document a client executes, beside the name this pass
-        // was restoring. `carries_an_unstable_number` asks it of the bytes.
-        if carries_an_unstable_number(text) {
-            rule.lossy_document("a number the parse does not reproduce")?;
+        // Nothing is re-serialized in *this function* until the round trip is
+        // known to reproduce what it read. `round_trip_loses` is that question
+        // and both its causes are asked here.
+        if let Some(cause) = round_trip_loses(text) {
+            rule.lossy_document(cause)?;
             return Ok(text.to_owned());
         }
         // `out` is not the fallback here and cannot be: `text` parsed, so it is
@@ -1111,6 +1110,57 @@ fn json_string_unsafe(character: char) -> bool {
     character == '"' || character == '\\' || character.is_control()
 }
 
+/// Everything `parse → Value → to_string` does not carry, asked of the bytes
+/// that would go into it, and named for the journal if the answer is `Some`.
+///
+/// **One function because there is more than one caller, and the second caller
+/// is why this exists.** `restore_in_string_with` asks it of a *nested*
+/// serialized document. `proxy::handle` asks it of the outer one — a described
+/// `arguments` is read by `read_document` and written by `write_document`, and
+/// that pair is a `parse → Value → to_string` of its own, one frame above
+/// anything this module can see. The guards lived only on the inner path for a
+/// round, which read as covered and was not: `arguments` is exactly the field
+/// the finding was about.
+///
+/// The set is argued in `restore_in_string_with` from what a JSON text is made
+/// of. Adding to it here reaches both callers, which is the point.
+pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
+    if carries_duplicate_members(text) {
+        return Some("two members of the same name");
+    }
+    if carries_an_unstable_number(text) {
+        return Some("a number the parse does not reproduce");
+    }
+    None
+}
+
+/// Whether these bytes could be a JSON document with one of our tokens inside
+/// it — the question `holds_no_string` asks, asked better.
+///
+/// A placeholder can only appear inside a string, and a JSON document that
+/// contains a string is an object, an array, or a string. So a document that
+/// could hold our token begins, after whitespace, with `{`, `[` or `"`, and a
+/// text that begins with anything else is prose whatever this reader thinks of
+/// it. `Der Bericht "Q3" nennt [PERSON_1].` begins with `D`.
+///
+/// **This is what keeps ordinary traffic off the refusal.** `holds_no_string`
+/// alone tested for a `"` anywhere in the text, so prose quoting anything at
+/// all — a report title, a line the model is citing back — fell through to the
+/// rule and cost a 502 on a plain chat completion, since every `Slot::Text`
+/// takes the strict door. The two questions are kept as an `||` rather than one
+/// replacing the other: a text with no quote at all is safe even when it does
+/// begin with a brace.
+///
+/// Trimming is `trim_start`, which removes more than JSON's four whitespace
+/// characters. That is the conservative direction: a text opening with U+00A0
+/// is no document to any reader, and calling it one only costs restoration.
+fn begins_like_a_document(text: &str) -> bool {
+    matches!(
+        text.trim_start().as_bytes().first(),
+        Some(b'{' | b'[' | b'"')
+    )
+}
+
 /// Whether these bytes contain no `"` at all, which is what makes an unescaped
 /// substitution into them safe *without* knowing whether they are a document.
 ///
@@ -1121,8 +1171,13 @@ fn json_string_unsafe(character: char) -> bool {
 /// a document with no place for the token that got us here, and in both cases
 /// the characters we insert cannot create structure.
 ///
-/// It is the answer to a question the parse cannot answer: *this* reader
-/// refusing a text is not the client's reader refusing it.
+/// It is half the answer to a question the parse cannot answer — *this* reader
+/// refusing a text is not the client's reader refusing it — and
+/// `begins_like_a_document` is the other half and the larger one. This was the
+/// whole of it for one commit, and testing for a quote *anywhere* meant every
+/// sentence quoting anything at all fell through to the rule. Kept beside the
+/// other test rather than replaced by it: `{[PERSON_1]}` begins like a document
+/// and still has nothing our characters could close.
 fn holds_no_string(text: &str) -> bool {
     !text.contains('"')
 }
@@ -1211,7 +1266,72 @@ fn number_survives(lexeme: &str) -> bool {
     // and the structural path would go quiet. The printed form is the
     // comparison this needs.
     let printed = number.to_string();
-    printed == lexeme
+    normalized_number(&printed) == normalized_number(lexeme)
+}
+
+/// One number's lexeme with the spellings that carry no information removed, so
+/// that comparing two of them compares values and not typography.
+///
+/// **This exists because the number row was held to a stricter standard than
+/// every other row, and nothing justified the difference.** Key order is not
+/// preserved and that is priced as reformatting; escape spellings are not
+/// preserved and that is waved through as the same string spelled differently.
+/// Then `2.50` → `2.5` — the same number spelled differently, which the
+/// client's own parse undoes exactly as it undoes the other two — was called a
+/// loss and refused the response. In JSON-mode `content` that is money:
+/// measured, `2.50`, `10.00`, `1e308` and `-0` all reported as losses, and all
+/// four had been served correctly before the check existed.
+///
+/// **Two normalizations, and both are value-preserving by definition, which is
+/// what keeps the comparison a proof.** Trailing zeros in a *fraction* carry
+/// nothing — `2.50` is `2.5`, and a `10.00` reduced to `10` is still `10`
+/// because the zeros before the point are never touched. An exponent's `+`, its
+/// leading zeros and a zero exponent entirely carry nothing — `1e+308`,
+/// `1e0308` and `1e308` are one number, and `1e0` is `1`. Neither rewrites a
+/// digit that means anything, so two lexemes equal after this denote the same
+/// number, and the round trip that produced one from the other lost nothing.
+///
+/// **What it deliberately does not do is arithmetic.** `1e2` normalizes to
+/// `1e2` and `serde_json` prints `100.0`, so that pair still reports a loss —
+/// the same for `1E5`, `1e+5` and `1e08`, which all expand the same way.
+/// Deciding those equal means evaluating the exponent, which is the normalizer
+/// declined last round and declined again: being subtly wrong there rounds a
+/// number in a tool call, while being conservative costs restoration on a
+/// spelling model output does not produce.
+fn normalized_number(lexeme: &str) -> String {
+    let (mantissa, exponent) = match lexeme.find(['e', 'E']) {
+        Some(at) => (&lexeme[..at], Some(&lexeme[at + 1..])),
+        None => (lexeme, None),
+    };
+    let mut out = String::with_capacity(lexeme.len());
+    match mantissa.split_once('.') {
+        // Only the fraction is trimmed. `100` keeps its zeros: they are the
+        // number, and stripping them is the one way this could change a value.
+        Some((whole, fraction)) => {
+            out.push_str(whole);
+            let fraction = fraction.trim_end_matches('0');
+            if !fraction.is_empty() {
+                out.push('.');
+                out.push_str(fraction);
+            }
+        }
+        None => out.push_str(mantissa),
+    }
+    if let Some(exponent) = exponent {
+        let (sign, digits) = match exponent.strip_prefix('-') {
+            Some(digits) => ("-", digits),
+            None => ("", exponent.strip_prefix('+').unwrap_or(exponent)),
+        };
+        let digits = digits.trim_start_matches('0');
+        // All zeros: `1e0` is `1`, and dropping the exponent is how it compares
+        // equal to the `1.0` the round trip prints for it.
+        if !digits.is_empty() {
+            out.push('e');
+            out.push_str(sign);
+            out.push_str(digits);
+        }
+    }
+    out
 }
 
 /// Which tokens in a response this gateway may claim as its own.
@@ -5231,12 +5351,23 @@ mod tests {
     }
 
     #[test]
-    fn the_described_path_refuses_both_of_the_round_trips_new_losses() {
+    fn the_strict_string_door_refuses_both_of_the_round_trips_new_losses() {
         // The policies stay split at each new cause, for the reason they were
         // split at the first two: leaving the bytes is the sweep's answer and
         // costs restoration, and the same answer in a described field leaves
-        // the placeholder in `arguments` a client dispatches on. Both causes
-        // are asked of `restore_value`, which is the described path's door.
+        // the placeholder in `arguments` a client dispatches on.
+        //
+        // **Read what this reaches, because its first name claimed more.** It
+        // was `the_described_path_refuses_...`, and it hands `restore_value` a
+        // `Value` whose `arguments` is a *string leaf* — which routes to
+        // `restore_in_string_strictly`, the door for a document nested one
+        // level down. Production does not route `arguments` that way:
+        // `read_document` parses that string before `restore_value` ever sees
+        // it, so what production exercises is the outer round trip in
+        // `proxy::handle`, which this test cannot reach and did not cover while
+        // reading as though it did.
+        // `an_arguments_document_the_round_trip_would_change_refuses_the_response`
+        // is that path. This one is the nested door, named for it now.
         let mut mapping = Mapping::default();
         mapping.begin_request();
         let value = "Martina \"Weber\"";
@@ -5262,6 +5393,49 @@ mod tests {
             ),
             "a described document this reader cannot parse was substituted into anyway"
         );
+    }
+
+    #[test]
+    fn prose_that_quotes_something_of_its_own_still_restores() {
+        // The regression the parse-failure guard shipped with, and the reason
+        // `begins_like_a_document` is beside `holds_no_string` rather than
+        // instead of it. Testing the text for a quote *anywhere* caught every
+        // sentence that quotes a report title, a heading, a line the model is
+        // citing back — and since every `Slot::Text` takes the strict door,
+        // that was a 502 on a plain chat completion whose `content` happened to
+        // carry a quotation mark and whose restored value carried one too.
+        //
+        // A document holding our token in a string begins with `{`, `[` or `"`.
+        // This begins with `D`.
+        let (mapping, provenance, token) = structural_mapping();
+
+        assert_eq!(
+            mapping.restore_in_string(&format!("Der Bericht \"Q3\" nennt {token}."), &provenance),
+            "Der Bericht \"Q3\" nennt Martina \"Weber\".",
+            "prose that quotes something stopped restoring"
+        );
+    }
+
+    #[test]
+    fn a_number_spelled_with_trailing_zeros_is_the_same_number_and_still_restores() {
+        // The number row was held to a stricter standard than every other row.
+        // Key order is not preserved and that is priced as reformatting; an
+        // escape respelled is waved through as the same string. Then `2.50` →
+        // `2.5` — a spelling the client's own parse undoes exactly as it undoes
+        // those two — was called a loss and cost the response. In JSON-mode
+        // `content` that is money.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"amount\":2.50,\"total\":10.00,\"name\":\"{token}\"}}");
+        let restored: Value =
+            serde_json::from_str(&mapping.restore_in_string(&document, &provenance))
+                .expect("a document, restored rather than left");
+        assert_eq!(
+            restored["name"], "Martina \"Weber\"",
+            "the document was left unrestored over a number that lost nothing: {restored}"
+        );
+        assert_eq!(restored["amount"], json!(2.5), "the amount changed value");
+        assert_eq!(restored["total"], json!(10.0), "the total changed value");
     }
 
     #[test]

@@ -224,6 +224,41 @@ section above already prices. That is every token class in the grammar, and
 it leaves; `holds_no_string` is the third guard and answers the refusal case,
 which is not a loss but a reader disagreeing with a reader.
 
+**The guards went on the wrong frame first, and that is worth recording because
+the mistake reads as coverage.** They were put in `restore_in_string_with`,
+which sees the strings *inside* a parsed document — so a document nested one
+level down inside `arguments` was covered while `arguments` itself was not.
+`read_document` and `write_document` are a `parse → Value → to_string` of their
+own, one frame above, and that pair is how a described `arguments` is actually
+handled. Measured through it: an `amount` of
+`0.12345678901234567890123456789` came back `0.12345678901234568` — the
+finding's own example, on the finding's own field, with the guard already
+written and passing its test. The test passed because it handed `restore_value`
+a `Value` whose `arguments` was a string leaf, which is not how production
+routes it. A guard proved on a path production does not take is worse than no
+guard, because the next reader stops looking.
+
+Two things follow, and both are in the code now. The guard is asked at
+`write_document`'s call site as well, through one shared `round_trip_loses` so
+that a third cause reaches both callers. And the pair no longer re-serializes
+when there is nothing to put back: most `arguments` carry no placeholder, their
+round trip was silently rounding numbers before any of this, and a guard without
+that skip would have turned the silent rounding into a refusal bought for
+nothing.
+
+**The frame above *that* is the whole response body, and it stays open.**
+`proxy::handle` reads the body with `from_slice::<Value>` and writes it back
+with `Json(restored)`, so every number in every buffered response round-trips —
+measured on a body with no placeholder in it at all, `usage.total` of
+`123456789012345678901234567890` came back `1.2345678901234568e+29`. That is
+pre-existing, provider-wide and older than this slice. Closing it means either
+refusing any response carrying a number this reader cannot reproduce — a refusal
+on ordinary traffic that no finding asks for — or not representing a response
+body as a `Value`, which is a different slice with its own additivity argument.
+The prose that claimed "nothing is re-serialized until the round trip is known
+to reproduce what it read" was true of one function and false one frame up; it
+now says which.
+
 **`serde_json`'s `arbitrary_precision` was considered and declined.** It would
 make numbers lossless at the source rather than detected after the fact, which
 is the better shape. It is a crate-wide feature that changes how every `Value`

@@ -1010,9 +1010,19 @@ async fn handle(
                 Ok(parsed) => {
                     (status, returned, Json(mapping.restore_value(&parsed)?)).into_response()
                 }
+                // Reached when *this* reader will not parse the body, which is
+                // not the same as the body not being one — a document nested
+                // past the parser's limit or carrying an exponent it calls out
+                // of range arrives here and a client reads it. `restore` alone
+                // has no escaping rule and no structural retry, so a mapped
+                // value carrying a `"` closed the string it landed in, here,
+                // for the same reason it did in the arm above before this fix.
+                // The strict door asks the question this arm cannot: it
+                // substitutes as text only where it can prove nothing can be
+                // closed, and refuses rather than guessing otherwise.
                 Err(_) => {
                     let text = String::from_utf8_lossy(&raw);
-                    (status, returned, mapping.restore(&text)?).into_response()
+                    (status, returned, mapping.restore_in_string_strictly(&text)?).into_response()
                 }
             },
         ));
@@ -1073,6 +1083,28 @@ async fn handle(
     //
     // `upstream` came out of `from_slice` above, which is the parse
     // `restore_sweep` requires: its recursion is bounded by nothing else.
+    //
+    // **And that parse is a round trip this gateway does not guard, which is
+    // the widest statement of the problem the guards below answer.** The whole
+    // body is read into a `Value` here and written back by `Json(restored)` at
+    // the end of this function, so every number in every buffered response goes
+    // through `i64`/`u64`/`f64` — Anthropic's `input`, OpenAI's `usage`, and
+    // every field nobody describes. Measured on a body with no placeholder in
+    // it at all: `"total":123456789012345678901234567890` came back
+    // `1.2345678901234568e+29` and `"cost":0.12345678901234567890123456789`
+    // came back `0.12345678901234568`, on a 200, with nothing restored and no
+    // tool traffic involved.
+    //
+    // **It is not closed here and the reason is scope rather than difficulty.**
+    // The two guards below cover the round trips this slice *adds* — a
+    // described `arguments`, and a document nested inside a restored string —
+    // where the alternative was corrupting a document a client executes.
+    // Covering this one means either refusing any response carrying a number
+    // this reader cannot reproduce, which is a refusal on ordinary traffic that
+    // no finding asks for, or not representing a response body as a `Value` at
+    // all, which is a different slice with its own additivity argument to make.
+    // Recorded here rather than in a commit message so the next reader of these
+    // guards finds the frame above them.
     let mut restored = mapping.restore_sweep(&upstream, &provenance);
     for slot in provider
         .response_pointers(&upstream)
@@ -1124,12 +1156,48 @@ async fn handle(
             // Restored whole rather than leaf by leaf: nothing here has to
             // agree with a detector about positions, so the walk that already
             // knows how to replace placeholders inside a value does the job.
+            //
+            // **`read_document` and `write_document` are themselves a
+            // `parse → Value → to_string`, and it is this pair that handles
+            // `arguments`.** That is one frame above anything `restore_value`
+            // can see: the guards inside it are asked of the strings *within*
+            // the parsed document, so a described `arguments` — the field the
+            // finding was about — had its own round trip unguarded while a
+            // document nested one level deeper inside it was covered. Measured
+            // through the pair: an `amount` of
+            // `0.12345678901234567890123456789` came back
+            // `0.12345678901234568`, an integer past 64 bits came back in
+            // exponent form, and a duplicate `mode` was collapsed — the loss
+            // the round before this one existed to close, on the path it was
+            // named for.
             Slot::Json {
                 pointer, embedded, ..
             } => {
                 let document = read_document(&upstream, &pointer, embedded, provider.name())
                     .map_err(as_response_error)?;
                 let restored_document = mapping.restore_value(&document)?;
+                // Nothing to put back means nothing to write, and the upstream's
+                // own bytes are already in `restored` from the sweep. This is
+                // the same rule `restore_in_string_with` applies one level down
+                // and it is what keeps the guard below off ordinary traffic:
+                // most `arguments` carry no placeholder at all, and refusing
+                // one over a number nobody was going to rewrite would be a
+                // refusal bought for nothing.
+                if embedded && restored_document == document {
+                    continue;
+                }
+                // `write_document` is about to re-serialize, so the round trip
+                // has to be known to reproduce what `read_document` read. Only
+                // `embedded` asks it: without it there is no text at this
+                // pointer, the value is part of the body, and the body's own
+                // round trip is a wider question this slot cannot answer — see
+                // the note above `restore_sweep`'s call.
+                if embedded {
+                    let text = read_pointer(&upstream, &pointer)?;
+                    if let Some(cause) = mapping::round_trip_loses(&text) {
+                        return Err(MappingError::Unrestorable(cause).into());
+                    }
+                }
                 write_document(&mut restored, &pointer, &restored_document, embedded)?;
             }
         }
@@ -3211,6 +3279,121 @@ mod tests {
             lines[1]["error"], "mapping_lossy_document",
             "the journal has to name this failure as its own class: {:?}",
             lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_the_round_trip_would_change_refuses_the_response() {
+        // The path the finding was actually about, which the guards missed for
+        // a round. `arguments` is read by `read_document` and written by
+        // `write_document`, and that pair is a `parse -> Value -> to_string` of
+        // its own, one frame above the strings `restore_value` walks. So the
+        // document *nested inside* `arguments` was covered and `arguments`
+        // itself was not.
+        //
+        // **The restored value here carries no quote, and that is the point.**
+        // The nested guard only runs once something needs escaping; this round
+        // trip happens whenever there is anything to restore at all, so the
+        // case is wider than the one it was hiding behind.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f",
+             "arguments":
+                 r#"{"amount":0.12345678901234567890123456789,"name":"[PERSON_1]"}"#
+            }}]}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !body.contains("0.12345678901234568"),
+            "the amount was rounded on the way to the client: {body}"
+        );
+        let lines = journal(&path);
+        assert_eq!(lines[1]["error"], "mapping_lossy_document");
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_with_nothing_to_restore_keeps_its_own_bytes() {
+        // Additivity for the guard above, and a repair to what the pair did
+        // before it. `read_document` and `write_document` re-serialized
+        // `arguments` on every response that carried one, whether or not there
+        // was anything to put back — so a number too precise for a double was
+        // rounded on the way through with no placeholder in sight, and adding a
+        // guard without this would have turned that silent rounding into a 502
+        // bought for nothing.
+        //
+        // Nothing to restore means nothing to write, and the upstream's own
+        // bytes are already in the body from the sweep.
+        let arguments =
+            r#"{"amount":0.12345678901234567890123456789,"id":123456789012345678901234567890}"#;
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": arguments}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json!(arguments),
+            "a document nobody was restoring came back rewritten: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_this_reader_rejects_is_not_injected_into() {
+        // P1-B at the fourth fallback. An error envelope that this reader will
+        // not parse — `1e999` is valid JSON and every client reads it — took
+        // the text arm, where `restore` substitutes with no escaping rule and
+        // no structural retry. A mapped value carrying a `"` closed the string
+        // it landed in, in a body the client parses for its retry semantics.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(
+                r#"{"limit":1e999,"error":"[PERSON_1]"}"#.as_bytes().to_vec(),
+                "application/json",
+            ))
+            .mount(&upstream)
+            .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+
+        assert!(
+            !body.contains("\"admin\""),
+            "an error body was injected into: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "the upstream's status is worth keeping, but not at the price of \
+             serving a body this gateway corrupted: {body}"
         );
     }
 
