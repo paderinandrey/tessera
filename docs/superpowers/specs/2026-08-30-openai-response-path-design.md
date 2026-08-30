@@ -304,8 +304,10 @@ then #32 — is deliberate.
 
 The README's promise is narrowed to match: a placeholder issued by this gateway
 does not reach the client **from a field the gateway describes**, and elsewhere
-everything this request issued and the caller did not write is restored. #32 is
-what restores the unqualified sentence, and the README says so.
+everything this request issued and the caller did not write is restored — **except
+inside an object whose restored keys would collide**, which is served as it came.
+#32 restores the unqualified first half; the second clause is the cost of never
+dropping a field, and it is stated wherever the promise is stated.
 
 ### Two limits of the issued set, found by attacking it here
 

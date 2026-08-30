@@ -910,7 +910,13 @@ cd .. && make check-entity-types && make check-layers && make check-base-install
 
 - [ ] **Step 4: Narrow the README's promise**
 
-`README.md` says no placeholder is ever handed to the client in place of a value. Correct it to what the code now does: a placeholder issued by this gateway does not reach the client from a field the gateway describes, and elsewhere everything this request issued and the caller did not write is restored. Name #32 as what restores the unqualified sentence.
+`README.md` says no placeholder is ever handed to the client in place of a value. Correct it to what the code now does, **with both clauses** — the second was added by Task 6 and the sentence is wrong without it:
+
+> A placeholder issued by this gateway does not reach the client from a field the gateway describes. Elsewhere everything this request issued and the caller did not write is restored, **except inside an object whose restored keys would collide**, which is served exactly as it came.
+
+Name #32 as what restores the unqualified first half. The second clause is the price of never dropping a field, and `restore_sweep`'s own doc says to state the promise with that clause or not at all.
+
+**Also correct the fourth occurrence the fix round missed:** `gateway/src/proxy.rs:2490`, inside `a_streamed_block_restores_the_fields_no_slot_addresses`, still states the promise without the object clause. Three other occurrences were updated and this one was not — which is the failure this branch has already paid for twice, a correction applied to the sentences being read rather than to the claim. Sweep for a fifth rather than assuming four.
 
 Sweep the README for any other sentence about restoration that this changes, and report every claim you checked including the ones that held.
 
