@@ -594,6 +594,15 @@ impl Mapping {
     /// placeholder-shaped key of either kind. Strictness lives in the slot path
     /// that runs after this and overwrites what it addresses.
     ///
+    /// **`value` must have come from `serde_json::from_str` or
+    /// `serde_json::from_slice`, not be assembled in memory.** This is the
+    /// public door onto `restore_document`'s recursion, which is unbounded on
+    /// its own terms — what bounds it is that everything it walks was
+    /// produced by one parse, whose own recursion limit (128, measured, a
+    /// dependency's promise rather than ours) caps the depth. A `Value` built
+    /// by hand — with `json!` in a test, or by a future caller assembling one
+    /// — carries none of that protection, and nothing here checks for it.
+    ///
     /// `restore_document` returns `None` when a restored key would collide
     /// with one already in its object — the one way its recursion can fail.
     /// The sweep is not allowed to propagate that failure: refusing here would
