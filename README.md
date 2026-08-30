@@ -286,6 +286,15 @@ would need re-serializing, because the parse that reaches its leaves collapses t
 members before any restoring happens, and no reader agrees with another about which one
 survived. Both are still places a placeholder can reach the client from.
 
+**Both are answers the second clause gives, and the first clause gives neither.** The same two
+shapes inside a field the gateway describes — `arguments` a client dispatches on, `content` it
+parses — refuse the response with a 502 instead, under the class `mapping_lossy_document`.
+Leaving the bytes there is not the harmless answer it is elsewhere: those bytes still hold the
+placeholder, which is the one thing the first clause promises they will not. Serving them
+re-serialized is worse again, since it hands a client a document to execute with a member
+dropped or a key renamed. So neither is served, and the rule the two clauses share is the
+narrower one: what cannot be re-serialized faithfully is never guessed at.
+
 Two things it does not scan, and both are worth knowing before you rely on *no text this
 gateway scans is forwarded unmasked* above — a claim about the way up, which the two paragraphs
 before this one are not. **Image and audio parts are forwarded untouched**, including a
@@ -626,8 +635,10 @@ and a 502 can mean either the provider or this gateway — so the classes that
 mean *a defect here* are worth knowing by name: `shape_pointer` (a pointer this
 gateway produced did not resolve in a body it had already walked),
 `mapping_unknown_placeholder`, `mapping_bad_span`, `mapping_mask_mismatch` and
-`mapping_placeholder_key`. `shape_response` and `upstream_failed` are the
-provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
+`mapping_placeholder_key`. `shape_response`, `upstream_failed` and
+`mapping_lossy_document` (a document the provider sent that cannot be restored
+without dropping a member or renaming a key of it, refused rather than served
+changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
 `mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
 `tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
 `session_disabled` and `session_no_credential` are the caller's;

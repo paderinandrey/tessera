@@ -98,6 +98,15 @@ impl ProxyError {
             // be given a status here, as `audit_class` already makes it be
             // given a class: a wildcard turns a variant somebody forgot into
             // a silent 502.
+            //
+            // `Unrestorable` belongs in this arm and not in the 400 above, and
+            // the two documents it is raised for say why: a serialized document
+            // with two members of the same name, and one whose restored keys
+            // would collide. Both are *the upstream's* bytes — the caller's
+            // request is well formed, and there is nothing smaller or
+            // differently shaped for them to send that would change the
+            // answer. It is this gateway declining to serve a response it
+            // cannot serve faithfully, which is what 502 is for.
             ProxyError::Shape(ShapeError::Response(_))
             | ProxyError::Shape(ShapeError::Pointer(_))
             | ProxyError::Detector(_)
@@ -105,6 +114,7 @@ impl ProxyError {
             | ProxyError::Mapping(MappingError::BadSpan(_))
             | ProxyError::Mapping(MappingError::MaskCountMismatch(_))
             | ProxyError::Mapping(MappingError::PlaceholderKey(_))
+            | ProxyError::Mapping(MappingError::Unrestorable(_))
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -152,6 +162,15 @@ impl ProxyError {
             ProxyError::Mapping(MappingError::TooLarge) => "mapping_too_large",
             ProxyError::Mapping(MappingError::MaskCountMismatch(_)) => "mapping_mask_mismatch",
             ProxyError::Mapping(MappingError::PlaceholderKey(_)) => "mapping_placeholder_key",
+            // Named for the loss that was about to be taken rather than for
+            // the variant, because the variant's name is already spoken for
+            // one level down: `stream_unrestorable` is `MappingError::Unknown`
+            // on the streamed path, and a second class one word longer would
+            // read as its document-shaped sibling when it is a different
+            // failure entirely. `lossy_document` is what the code calls the
+            // question, so the class and the seam that raises it grep to each
+            // other.
+            ProxyError::Mapping(MappingError::Unrestorable(_)) => "mapping_lossy_document",
             ProxyError::Upstream(_) => "upstream_failed",
             ProxyError::Session(SessionError::BadId) => "session_bad_id",
             ProxyError::Session(SessionError::Disabled) => "session_disabled",
@@ -1038,6 +1057,16 @@ async fn handle(
     // is the second, which exists because re-serializing that string dropped a
     // member the upstream sent.
     //
+    // **Both exceptions stop at the slot loop below.** They are the *sweep's*
+    // answers, and the loop overwrites the sweep wherever the two address the
+    // same bytes: a slot carrying either shape refuses the whole response
+    // rather than serving it, because leaving those bytes in a described field
+    // leaves the placeholder in them. So the two sentences above are about a
+    // field no slot addresses, and `restore_sweep`'s doc says the same. The
+    // refusal is `MappingError::Unrestorable`, and
+    // `a_nested_document_that_cannot_be_restored_faithfully_refuses_the_response`
+    // is what holds the line between the two answers.
+    //
     // `upstream` came out of `from_slice` above, which is the parse
     // `restore_sweep` requires: its recursion is bounded by nothing else.
     let mut restored = mapping.restore_sweep(&upstream, &provenance);
@@ -1046,9 +1075,23 @@ async fn handle(
         .map_err(as_response_error)?
     {
         match slot {
+            // `restore_in_string_strictly` rather than `restore`, and the
+            // reason is the same one the `Json` arm has: this loop overwrites
+            // the sweep's answer wherever the two overlap, so a text slot that
+            // takes the plain call takes back the escaping the sweep had
+            // already applied to the same string. A text slot is prose most of
+            // the time and the two calls then agree byte for byte — but
+            // `content` under `response_format: json_object` is a serialized
+            // document the client parses, and a restored value carrying a `"`
+            // substituted into it as text closes the string it lands in. Same
+            // hazard, same door, same token policy: strict either way.
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(&upstream, &pointer)?;
-                write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
+                write_pointer(
+                    &mut restored,
+                    &pointer,
+                    &mapping.restore_in_string_strictly(&text)?,
+                )?;
             }
             // Restored whole rather than leaf by leaf: nothing here has to
             // agree with a detector about positions, so the walk that already
@@ -2604,10 +2647,22 @@ mod tests {
         // members of the same name — which is narrower than what a streamed
         // event gets on every count. The clause belongs here like it belongs
         // everywhere else the promise is written — a stream restores its event
-        // whole and has neither exception, since neither `restore_document`
-        // nor `restore_in_string` is on its path, so stating the buffered rule
+        // whole and has neither exception, so stating the buffered rule
         // without it understates the distance between the two paths this
         // comment exists to draw.
+        //
+        // **The reason has changed and the conclusion has not, which is why it
+        // is restated rather than left.** This used to read "since neither
+        // `restore_document` nor `restore_in_string` is on its path", and both
+        // halves are now false: the escaping rule and the recursion moved into
+        // `restore_in_string_with`, which a streamed event *does* enter, via
+        // the `restore_value` that restores everything in it the slots do not
+        // address. What keeps the two exceptions off this path is the token
+        // policy rather than the absence of the walk — `restore_value` is
+        // strict, so a document it cannot re-serialize faithfully raises
+        // `MappingError::Unrestorable` and the stream ends, exactly as an
+        // unmappable token already ends it. Neither exception, for a different
+        // reason than before.
         //
         // So there is nothing to refuse here, which is just as well: a stream
         // cannot refuse after its first bytes have gone out — the position
@@ -2940,6 +2995,191 @@ mod tests {
             returned["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             r#"{"path":"/home/Weber"}"#,
             "the client executes this, so it has to be the real value"
+        );
+    }
+
+    /// A detector that finds the whole of `text` wherever it appears, so a test
+    /// can choose a value whose characters matter — one carrying a `"`, which
+    /// is what makes restoration into JSON *text* unsafe.
+    ///
+    /// Such a value is not exotic: the detector reads third-party content, and
+    /// a name, an address or a quoted line in it can carry a quote. The caller
+    /// never has to have written it.
+    async fn detector_finding_all_of(text: &str) -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        let end = text.chars().count();
+        // The body carries `text` JSON-escaped, so the mock matches on a
+        // fragment that survives escaping rather than on the value itself.
+        let fragment: String = text.chars().take_while(|c| *c != '"').collect();
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(body_string_contains(fragment))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": [{"entity_type": "PERSON", "start": 0, "end": end,
+                           "confidence": 1.0, "recognizer": "ner:fake",
+                           "tier": 2, "boosted": false}],
+                "layers_run": ["ner"]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["ner"]})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_serialized_document_inside_arguments_is_restored_without_injecting_into_it() {
+        // The described path's half of the escaping rule. `arguments` is a
+        // string holding a document, so the slot loop parses it and restores
+        // its leaves — and a leaf that is *itself* a serialized document was
+        // restored as plain text, straight into JSON the client then parses
+        // and executes. A value carrying a quote closes the string it lands
+        // in, and everything after the quote becomes structure.
+        //
+        // The sweep already got this right and the slot loop overwrote its
+        // answer, which is why the bug survived the sweep landing.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": r#"{"nested":"{\"name\":\"[PERSON_1]\"}"}"#}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let returned: Value = serde_json::from_str(&body).expect("a JSON body");
+        let arguments = returned["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments reach the client as a string");
+        let arguments: Value =
+            serde_json::from_str(arguments).expect("the arguments the client executes still parse");
+        let nested = arguments["nested"]
+            .as_str()
+            .expect("the nested document is still a string");
+        let nested: Value = serde_json::from_str(nested)
+            .expect("the nested document the client parses is still JSON");
+        assert_eq!(
+            nested["name"], payload,
+            "the value belongs in the leaf it was substituted into: {nested}"
+        );
+        assert!(
+            nested.get("admin").is_none(),
+            "restoration wrote a field the upstream never sent: {nested}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_serialized_document_in_content_is_restored_without_injecting_into_it() {
+        // The same overwrite, one slot kind over. `content` is a text slot, so
+        // the loop used to restore it with plain `restore` — and under
+        // `response_format: json_object` a text slot is a document the client
+        // parses. The sweep had already restored it structurally; the loop
+        // overwrote that with the textual answer, exactly as it did for
+        // `arguments`.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant",
+                 "content": r#"{"name":"[PERSON_1]"}"#}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let returned: Value = serde_json::from_str(&body).expect("a JSON body");
+        let content = returned["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content reaches the client as a string");
+        let content: Value =
+            serde_json::from_str(content).expect("the document the client parses is still JSON");
+        assert_eq!(
+            content["name"], payload,
+            "the value belongs in the leaf it was substituted into: {content}"
+        );
+        assert!(
+            content.get("admin").is_none(),
+            "restoration wrote a field the upstream never sent: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_document_that_cannot_be_restored_faithfully_refuses_the_response() {
+        // The other half of the described path's answer, and the only place
+        // this fix can make something fail that used to succeed.
+        //
+        // The nested document carries two members of the same name, so the
+        // parse the escaping rule needs has already lost one before this
+        // gateway sees it. On the sweep that costs restoration and no bytes:
+        // `a_serialized_document_with_duplicate_members_reaches_the_client_intact`
+        // is that case, on `refusal`, and it still passes. Here the same
+        // document sits inside `arguments`, where leaving the bytes leaves the
+        // placeholder in a field the client dispatches on, and substituting
+        // anyway drops a member from a document it executes. So the response is
+        // refused, which is what this path already does with a token it cannot
+        // map.
+        //
+        // `Martina "Weber"` carries the quote that makes the restored value
+        // need escaping. Without it the textual path answers, the bytes survive
+        // and nothing refuses — which is why this is unreachable on the
+        // overwhelming majority of traffic.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false}
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f",
+             "arguments":
+                 r#"{"nested":"{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"[PERSON_1]\"}"}"#
+            }}]}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Martina \"Weber\""}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !body.contains("[PERSON_1]"),
+            "the refusal handed back the placeholder it refused over: {body}"
+        );
+        assert!(
+            !body.contains("Weber"),
+            "the refusal named the value it was protecting: {body}"
+        );
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the request was masked, then refused");
+        assert_eq!(lines[1]["result"], "refused");
+        assert_eq!(
+            lines[1]["error"], "mapping_lossy_document",
+            "the journal has to name this failure as its own class: {:?}",
+            lines[1]
         );
     }
 
@@ -7258,6 +7498,8 @@ mod tests {
             ProxyError::Mapping(MappingError::TooLarge).audit_class(),
             ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
             ProxyError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+            ProxyError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
             ProxyError::Upstream("reset".to_owned()).audit_class(),
             ProxyError::Session(SessionError::BadId).audit_class(),

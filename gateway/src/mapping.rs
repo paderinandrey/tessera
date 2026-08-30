@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::fmt;
 
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -62,6 +63,32 @@ pub enum MappingError {
              with it"
     )]
     PlaceholderKey(String),
+    /// A serialized document inside a described field that cannot be restored
+    /// without changing what the upstream sent. Carries a fixed phrase naming
+    /// which of the two cases it is — the same `&'static str` treatment as
+    /// `MaskCountMismatch`, and for the same reason: two sites, one class, and
+    /// nothing in it that a response could have written.
+    ///
+    /// **Only reachable once a value needing escaping is already going in.** A
+    /// document restores textually and keeps every member it came with when no
+    /// inserted value carries a `"`, a `\` or a control character, and that is
+    /// the overwhelming majority; the parse that loses a member happens only
+    /// when the alternative is corrupting the document instead.
+    ///
+    /// **Why this refuses where the sweep leaves it.** The sweep's fallback is
+    /// to serve the bytes it was given, which costs restoration and corrupts
+    /// nothing. That fallback is not available to a described field: the bytes
+    /// still hold the placeholder, and a placeholder reaching a client from a
+    /// field it dispatches on is what this path exists to prevent. Serving the
+    /// document restored-but-changed is the other alternative and it is worse —
+    /// a member dropped, or a key silently renamed, in `arguments` a client
+    /// executes. So it refuses, exactly as it refuses a token it cannot map.
+    #[error(
+        "a serialized document in the upstream response cannot be restored without changing \
+             what the upstream sent ({0}); the response is refused rather than served \
+             corrupted or with a placeholder in it"
+    )]
+    Unrestorable(&'static str),
 }
 
 /// The longest entity type that can be written as a placeholder.
@@ -373,9 +400,17 @@ impl Mapping {
     ///
     /// A caller handing this a value assembled in memory rather than parsed has
     /// neither protection and needs its own bound.
+    ///
+    /// **Its string arm is `restore_in_string_strictly`, not `restore`, and the
+    /// difference is the escaping rule.** A leaf here can be a *serialized*
+    /// document — `arguments` inside `arguments`, an error envelope quoting a
+    /// body back — and substituting a value carrying a `"` into one as text
+    /// closes the string it lands in. That is the same hazard the sweep has,
+    /// answered by the same code; what differs is the token policy, which stays
+    /// strict here. See `Restoration`.
     pub fn restore_value(&self, value: &Value) -> Result<Value, MappingError> {
         Ok(match value {
-            Value::String(text) => Value::String(self.restore(text)?),
+            Value::String(text) => Value::String(self.restore_in_string_strictly(text)?),
             Value::Array(items) => Value::Array(
                 items
                     .iter()
@@ -467,8 +502,57 @@ impl Mapping {
     /// Restore inside one string, leniently and without breaking a document the
     /// string may be.
     ///
-    /// **Lenient**: it never fails. A token this request did not issue, or one
-    /// the caller also wrote, is left exactly as it stands — see `Provenance`.
+    /// **Lenient**: it never fails, and it fails to fail *by type* — `Lenient`
+    /// names `Infallible` as its error, so the shared code below is the same
+    /// code the strict path runs and the leniency is still unforgeable here.
+    /// A token this request did not issue, or one the caller also wrote, is
+    /// left exactly as it stands — see `Provenance`.
+    ///
+    /// **`cfg(test)`, because the sweep stopped needing a door of its own.**
+    /// `restore_document_with` is generic over the rule and calls
+    /// `restore_in_string_with` directly, so production enters the lenient path
+    /// once, at `restore_sweep`, over a whole body. What remains here is the
+    /// per-string contract those tests state — `Lenient` is private, and a test
+    /// constructing it inline would state the rule in the shared function's
+    /// vocabulary rather than the sweep's. Deleting it would take the sweep's
+    /// per-string cases with it or rewrite fifteen of them for no gain.
+    #[cfg(test)]
+    pub fn restore_in_string(&self, text: &str, provenance: &Provenance) -> String {
+        self.restore_in_string_with(text, &Lenient(provenance))
+            // There is no arm to write: `Infallible` has no variants, so this
+            // is the compiler agreeing that the sweep cannot refuse.
+            .unwrap_or_else(|error| match error {})
+    }
+
+    /// Restore inside one string, strictly: the described path's door onto the
+    /// same code, with `Strict`'s token policy instead of `Lenient`'s.
+    ///
+    /// This is what `restore_value`'s string arm calls and what the slot loop's
+    /// text slots call, and it is the whole of the fix for the described path:
+    /// before it, `arguments` was parsed once and its leaves restored as plain
+    /// text, so a leaf that was *itself* a serialized document took the value
+    /// unescaped and the client executed whatever the value's quotes made of
+    /// it.
+    ///
+    /// **What it does not take from the sweep is the leniency.** An unmappable
+    /// token still raises `MappingError::Unknown` here, at every depth. What it
+    /// takes is the escaping rule and the recursion, which are properties of
+    /// JSON and not of this gateway's provenance policy.
+    ///
+    /// **The two documents that cannot be re-serialized faithfully refuse here
+    /// rather than being left.** On the sweep, leaving one costs coverage and
+    /// changes no bytes; the token stays, which is the lenient answer to
+    /// everything. On this path leaving one would serve a placeholder from a
+    /// described field, which is the one outcome this path exists to prevent —
+    /// and substituting anyway is the corruption it also exists to prevent. So
+    /// the third answer is the only one left, and it is the answer this path
+    /// already gives to a token it cannot map: refuse. See
+    /// `MappingError::Unrestorable`.
+    pub fn restore_in_string_strictly(&self, text: &str) -> Result<String, MappingError> {
+        self.restore_in_string_with(text, &Strict)
+    }
+
+    /// The escaping rule both paths share, and the reason it is one function.
     ///
     /// **The rule is about the inserted value first and the string's shape
     /// second, and in that order it is exact.** Substituting into JSON *text*
@@ -485,41 +569,60 @@ impl Mapping {
     ///
     /// **Reformatting is the price; losing a member is not.** That parse is
     /// lossy on one input — an object with two members of the same name — and
-    /// lossy before this code sees anything, so no later step can undo it. A
-    /// document carrying one is left exactly as it came, restoration and all:
-    /// `carries_duplicate_members` is the test, and it runs behind the
-    /// escaping test rather than in front of it, so a document is only ever
-    /// left for a loss it was actually about to take. A value needing no
-    /// escaping still substitutes into such a document and keeps both members,
-    /// because nothing is ever re-serialized on that path.
+    /// lossy before this code sees anything, so no later step can undo it. What
+    /// the two paths do about that is the one thing they do not share, and it
+    /// is `Restoration::lossy_document`'s to answer: the sweep leaves the
+    /// string exactly as it came, restoration and all, and the described path
+    /// refuses. `carries_duplicate_members` is the test either way, and it runs
+    /// behind the escaping test rather than in front of it, so a document is
+    /// only ever left — or refused — for a loss it was actually about to take.
+    /// A value needing no escaping still substitutes into such a document and
+    /// keeps both members, because nothing is ever re-serialized on that path.
     ///
     /// Testing that the result still *parses* is not enough and was tried:
     /// restoring a token in `{"name":"[PERSON_1]"}` to `x","admin":true,...`
     /// yields **valid** JSON carrying fields nobody sent, which a client's tool
     /// then acts on.
-    pub fn restore_in_string(&self, text: &str, provenance: &Provenance) -> String {
+    ///
+    /// **The flat scan decides whether the parse happens, and that bounds what
+    /// this rule can see.** A token whose characters the enclosing document
+    /// escaped — `[PERSON_1]` in the bytes, `[PERSON_1]` after a parse —
+    /// is not a placeholder to `pieces`, so nothing needs escaping, no parse
+    /// follows and the string is returned as it stands. That is the behaviour
+    /// both paths had before this function existed, and it is unchanged by it:
+    /// closing it means parsing every string that might be JSON, which is the
+    /// byte-for-byte preservation above given up for every response.
+    fn restore_in_string_with<R: Restoration>(
+        &self,
+        text: &str,
+        rule: &R,
+    ) -> Result<String, R::Error> {
         let mut out = String::with_capacity(text.len());
         let mut needs_escaping = false;
         for piece in pieces(text) {
             match piece {
                 Piece::Text(run) => out.push_str(run),
-                Piece::Placeholder(candidate) => match self.by_placeholder.get(candidate) {
-                    Some(value) if provenance.restorable(candidate) => {
-                        needs_escaping |= value.chars().any(json_string_unsafe);
-                        out.push_str(value);
-                    }
-                    _ => out.push_str(candidate),
-                },
+                Piece::Placeholder(candidate) => {
+                    // Asked of whatever the rule returns, including the token
+                    // `Lenient` hands back unrestored: a placeholder is bracket,
+                    // upper-case, underscore and digits by `placeholder_type`'s
+                    // grammar, so a left token can never answer `true` here and
+                    // the uniform question is the same question the two arms
+                    // used to ask separately.
+                    let value = rule.token(self, candidate)?;
+                    needs_escaping |= value.chars().any(json_string_unsafe);
+                    out.push_str(value);
+                }
             }
         }
         if !needs_escaping {
-            return out;
+            return Ok(out);
         }
         // The substitution inserted a character that can close a string. If the
         // original was a document, redo it structurally so the value lands in a
         // leaf and is escaped on the way out.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
-            return out;
+            return Ok(out);
         };
         // The parse above is lossy in exactly one way, and it happens before
         // anything here gets to look at the document. Two members of the same
@@ -527,22 +630,27 @@ impl Mapping {
         // document the upstream did not send — a string forwarded byte for
         // byte before this sweep existed, and a parser differential the moment
         // the client's reader keeps the first member where `serde_json` keeps
-        // the last. Nothing below can put the lost member back, so the string
-        // is left exactly as it came: restoration lost for this one string,
-        // no bytes changed. Same rule as the collision arm of
-        // `restore_document` — what cannot be restored faithfully is left.
+        // the last. Nothing below can put the lost member back, so the rule
+        // decides: the sweep leaves the string exactly as it came — restoration
+        // lost for this one string, no bytes changed — and the described path
+        // refuses, because leaving it there would be leaving a placeholder in a
+        // field the client executes. Same shape as the collision arm of
+        // `restore_document_with`: what cannot be restored faithfully is not
+        // restored unfaithfully.
         if carries_duplicate_members(text) {
-            return text.to_owned();
+            rule.lossy_document("two members of the same name")?;
+            return Ok(text.to_owned());
         }
-        let restored = self.restore_document(&document, provenance);
+        let restored = self.restore_document_with(&document, rule)?;
         // A collision inside may have left every restorable token where it
-        // stood — see `restore_document`'s object arm. Nothing changed, so the
+        // stood — see `restore_document_with`'s object arm, which only reaches
+        // that fallback under a rule that tolerates it. Nothing changed, so the
         // caller gets back the bytes it gave rather than a re-serialized
         // equivalent of them.
         if restored == document {
-            return text.to_owned();
+            return Ok(text.to_owned());
         }
-        serde_json::to_string(&restored).unwrap_or(out)
+        Ok(serde_json::to_string(&restored).unwrap_or(out))
     }
 
     /// The recursion, which fixes escaping and **does not extend the key rule**.
@@ -554,6 +662,16 @@ impl Mapping {
     /// served. Additivity decides it: the key is restored exactly as today's
     /// substitution restores it, and the key rule keeps the depth it has.
     ///
+    /// **That argument is why the strict path shares this walk rather than
+    /// growing its own.** `restore_value`'s key rule — a key that is or carries
+    /// a placeholder refuses — belongs to the layer the caller parsed, where a
+    /// key is a key in the document the client dispatches on. Down here a "key"
+    /// was a run of characters inside a string one layer up, and the same
+    /// additivity that keeps the sweep from refusing on it keeps the described
+    /// path from refusing on it too: the response is served today. So the key
+    /// rule stops where it stops on both paths, and what crosses the boundary
+    /// is the escaping.
+    ///
     /// **Unbounded recursion, and `restore_value`'s note does not transfer.**
     /// Neither of its two protections covers this walk, because this one has a
     /// second axis.
@@ -561,7 +679,8 @@ impl Mapping {
     /// That walk is bounded by a single `serde_json` parse: everything it sees
     /// came from one `from_str`, whose depth limit — 128 today, measured, and a
     /// dependency's promise rather than ours — caps the tree. This walk
-    /// *re-enters* the parser. The `Value::String` arm calls `restore_in_string`,
+    /// *re-enters* the parser. The `Value::String` arm calls
+    /// `restore_in_string_with`,
     /// which parses again whenever the string it just restored into needs
     /// escaping, and that parse gets a fresh budget. So the bound is 128 × the
     /// number of nested **serialized** documents, not 128. Its other protection
@@ -581,45 +700,54 @@ impl Mapping {
     /// paying the escaping cost has removed it. And as in `restore_value`: a
     /// value assembled in memory rather than parsed has no protection at all,
     /// which is why this stays private.
-    fn restore_document(&self, value: &Value, provenance: &Provenance) -> Value {
-        match value {
-            Value::String(text) => Value::String(self.restore_in_string(text, provenance)),
+    fn restore_document_with<R: Restoration>(
+        &self,
+        value: &Value,
+        rule: &R,
+    ) -> Result<Value, R::Error> {
+        Ok(match value {
+            Value::String(text) => Value::String(self.restore_in_string_with(text, rule)?),
             Value::Array(items) => Value::Array(
                 items
                     .iter()
-                    .map(|item| self.restore_document(item, provenance))
-                    .collect(),
+                    .map(|item| self.restore_document_with(item, rule))
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
             Value::Object(fields) => {
                 let mut out = serde_json::Map::with_capacity(fields.len());
                 for (key, item) in fields {
-                    let restored = self.restore_in_string(key, provenance);
+                    let restored = self.restore_in_string_with(key, rule)?;
                     // A map cannot hold two identical keys, so a restored key
                     // landing on one already present would silently drop a
                     // field — a tool argument lost, where today's textual
                     // substitution serves both. Substituting instead yields
                     // duplicate property names, whose meaning is ambiguous. So
-                    // this object is handed back exactly as it came.
+                    // the rule decides between the two answers that remain:
+                    // the sweep hands this object back exactly as it came, and
+                    // the described path refuses, because handing it back there
+                    // hands back the placeholder in it.
                     //
-                    // **Exactly this object, and nothing above it.** The
-                    // ambiguity is a fact about one map's key set, and the
-                    // fields around it are not implicated by it. Reporting the
-                    // collision upwards instead — which is what returning
-                    // `None` from here did — made one such object an off
-                    // switch for the whole body: a `meta` object with a
-                    // colliding key left `refusal` holding the placeholder
-                    // that #31 is about. `Value` rather than `Option<Value>`
-                    // is what makes that unrepresentable; the fallback has no
-                    // way to travel.
+                    // **Exactly this object, and nothing above it** — on the
+                    // path that takes the fallback. The ambiguity is a fact
+                    // about one map's key set, and the fields around it are not
+                    // implicated by it. Reporting the collision upwards instead
+                    // — which is what returning `None` from here did — made one
+                    // such object an off switch for the whole body: a `meta`
+                    // object with a colliding key left `refusal` holding the
+                    // placeholder that #31 is about. A refusal *does* travel,
+                    // and on the strict path that is correct rather than an off
+                    // switch: it costs the response, not the restoration, and a
+                    // refused response carries no placeholder either.
                     if out.contains_key(&restored) {
-                        return value.clone();
+                        rule.lossy_document("a restored key colliding with one already present")?;
+                        return Ok(value.clone());
                     }
-                    out.insert(restored, self.restore_document(item, provenance));
+                    out.insert(restored, self.restore_document_with(item, rule)?);
                 }
                 Value::Object(out)
             }
             other => other.clone(),
-        }
+        })
     }
 
     /// The lenient pass over a whole response body.
@@ -631,7 +759,7 @@ impl Mapping {
     ///
     /// **`value` must have come from `serde_json::from_str` or
     /// `serde_json::from_slice`, not be assembled in memory.** This is the
-    /// public door onto `restore_document`'s recursion, which is unbounded on
+    /// public door onto `restore_document_with`'s recursion, which is unbounded on
     /// its own terms — what bounds it is that everything it walks was
     /// produced by one parse, whose own recursion limit (128, measured, a
     /// dependency's promise rather than ours) caps the depth. A `Value` built
@@ -648,7 +776,7 @@ impl Mapping {
     ///
     /// A string that *is* a serialized document with two members of the same
     /// name is left whole, because the parse that would restore it collapses
-    /// those two before restoration begins — see `restore_in_string`. The unit
+    /// those two before restoration begins — see `restore_in_string_with`. The unit
     /// of the loss is the string, not the object, because by the time an
     /// object could be identified the member is already gone. Everything
     /// outside that string still restores.
@@ -659,8 +787,99 @@ impl Mapping {
     /// clauses or not at all — it was once stated without the first, while
     /// that fallback was body-wide, and the sentence read as a guarantee the
     /// code could switch off from anywhere.
+    ///
+    /// **Both exceptions are the sweep's, and neither is the described path's.**
+    /// They are `Lenient`'s answers to `Restoration::lossy_document`; `Strict`
+    /// refuses at both, so a described field is never served from one of these
+    /// documents at all. The promise above is about what a *client receives on
+    /// a 200 from a field no slot addresses*, and that is where it should stay
+    /// stated.
     pub fn restore_sweep(&self, value: &Value, provenance: &Provenance) -> Value {
-        self.restore_document(value, provenance)
+        self.restore_document_with(value, &Lenient(provenance))
+            .unwrap_or_else(|error| match error {})
+    }
+}
+
+/// What the two restoration paths do *not* share, which is a shorter list than
+/// what they do.
+///
+/// The escaping rule and the recursion under it are facts about JSON: a value
+/// carrying a `"`, a `\` or a control character cannot be substituted into JSON
+/// *text*, and a string that is a serialized document has to be reopened for
+/// the value to land in a leaf. Neither fact knows anything about which tokens
+/// this gateway may claim. So they live in `restore_in_string_with` and
+/// `restore_document_with`, once, and this trait carries the two questions whose
+/// answers genuinely differ.
+///
+/// **The token policy.** The sweep is lenient and provenance-gated: a token this
+/// request did not issue, or one the caller also wrote, is left as it stands and
+/// nothing fails. The described path is strict: a token it cannot map raises
+/// `MappingError::Unknown` and the response is refused. That refusal is the
+/// guarantee the described path exists for, and leniency reaching it would be
+/// this gateway serving its own placeholder from a field a client dispatches on.
+///
+/// **What to do with a document that cannot be re-serialized faithfully.** Two
+/// of those exist — a restored key colliding with one already present, and two
+/// members of the same name that the parse already collapsed. The sweep leaves
+/// the bytes it was given, which loses restoration and corrupts nothing. The
+/// described path cannot: leaving the bytes there leaves the placeholder in
+/// them. It refuses.
+///
+/// **The error type is where the leniency is nailed down.** `Lenient::Error` is
+/// `Infallible`, so the shared code compiles to a sweep that has no way to fail
+/// — the property `restore_sweep`'s signature used to carry alone, now carried
+/// through a trait rather than through a second copy of the walk.
+trait Restoration {
+    type Error;
+
+    /// What one placeholder-shaped token becomes. The returned text is
+    /// substituted as-is, and `restore_in_string_with` asks it whether it needs
+    /// escaping — including when it is the token itself.
+    fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, Self::Error>;
+
+    /// Called when restoring a document would change what the upstream sent,
+    /// with a fixed phrase naming which of the two cases it is. Returning `Ok`
+    /// means the caller falls back to the bytes it was given; returning `Err`
+    /// refuses the response.
+    fn lossy_document(&self, cause: &'static str) -> Result<(), Self::Error>;
+}
+
+/// The sweep's policy: provenance-gated, and infallible by type.
+struct Lenient<'a>(&'a Provenance);
+
+impl Restoration for Lenient<'_> {
+    type Error = Infallible;
+
+    fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, Infallible> {
+        Ok(match mapping.by_placeholder.get(candidate) {
+            Some(value) if self.0.restorable(candidate) => value,
+            // Not ours, or ours and also the caller's. Either way the token is
+            // the answer, and `Infallible` says the sweep has no other one.
+            _ => candidate,
+        })
+    }
+
+    fn lossy_document(&self, _cause: &'static str) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+/// The described path's policy: every token maps or the response is refused.
+struct Strict;
+
+impl Restoration for Strict {
+    type Error = MappingError;
+
+    fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, MappingError> {
+        mapping
+            .by_placeholder
+            .get(candidate)
+            .map(String::as_str)
+            .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))
+    }
+
+    fn lossy_document(&self, cause: &'static str) -> Result<(), MappingError> {
+        Err(MappingError::Unrestorable(cause))
     }
 }
 

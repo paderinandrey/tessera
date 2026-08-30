@@ -218,8 +218,41 @@ A leaf inside a document may itself be a string holding serialized JSON, and
 restoring *that* leaf naively is the same injection one level down. This is not
 only the sweep's problem: a described `arguments` is restored with
 `restore_value` over the parsed document, and a nested serialized document inside
-it is a plain string to that walk. The condition above applies at every depth,
-which fixes the sweep and the existing `embedded: true` path in one rule.
+it is a plain string to that walk. The condition above applies at every depth.
+
+**"In one rule" is what this said, and one rule was not enough to reach both
+paths.** The sentence claimed the recursion fixed the sweep and the existing
+`embedded: true` path together; as built it fixed only the sweep. The sweep and
+the slot loop both run, the loop overwrites the sweep's answer wherever the two
+address the same bytes, and the loop's `restore_value` kept a string arm calling
+plain `restore` — so a described `arguments` had its safe result computed and
+then replaced by the injecting one. The claim was not a description of the code
+at any point.
+
+What reaches both paths is one rule and *two* policies, which is what is now
+built. The escaping condition and the recursion under it are facts about JSON,
+so they live in one function that both paths enter (`restore_in_string_with`,
+over `restore_document_with`). The token policy is not a fact about JSON and does
+not cross: the sweep stays lenient and provenance-gated, and `restore_value`
+stays strict and still raises `Unknown` on a token it cannot map. A
+`Restoration` trait carries the difference; `Lenient`'s error type is
+`Infallible`, so the shared code compiles to a sweep with no way to fail. The
+text slots take the same door as `restore_value` for the same reason — the loop
+overwrites the sweep there too, and `content` under `response_format:
+json_object` is a document the client parses.
+
+**The two documents that cannot be re-serialized faithfully part company there,
+and that is the one behaviour this adds rather than fixes.** A restored key
+colliding with one already present, and a document the parse already collapsed
+two members of: the sweep leaves the bytes, which costs restoration and corrupts
+nothing. A described field cannot take that answer, because those bytes still
+hold the placeholder and a placeholder reaching a client from a field it
+dispatches on is what the strict path exists to prevent — and substituting
+anyway is the corruption it also exists to prevent. So it refuses, with
+`MappingError::Unrestorable`, a 502, and the journal class
+`mapping_lossy_document`. This is reachable only once a value needing escaping is
+already going in, which is why it does not narrow what succeeds today in any
+case the suite or the promise describes.
 
 A weaker remedy was tried first and is recorded because it looks sufficient and
 is not: *substitute, and keep the original if the string parsed as JSON before
@@ -352,21 +385,39 @@ keys would collide, and a string that is itself a serialized document carrying
 two members of the same name. #32 restores the unqualified first half; the
 second clause is the cost of never dropping a field.
 
+**The exception belongs to the second clause only, and the embedded fix is what
+made that distinction real.** Both shapes are answers the *sweep* gives. Inside a
+field the gateway describes the same two shapes refuse the response — 502,
+`mapping_lossy_document` — because serving them as they came would serve the
+placeholder the first clause promises the client will not see, and serving them
+re-serialized would hand a client a document to execute with a member missing.
+So the first clause has no exception, which is a strengthening rather than a
+narrowing, and the sites below state the exception under "elsewhere" or state it
+wrongly.
+
 **The sentence that used to close this paragraph — "and it is stated wherever
 the promise is stated" — was false at the moment it was written**, since this
 paragraph listed only the collision exception while claiming the synchronisation
 it was breaking. A claim about other files is not evidence about them. The
 promise has seven live sites: `README.md`, `docs/frontend-handoff.md`,
-`restore_sweep`'s doc, `restore_in_string`'s doc, `proxy::handle`'s comment above
-the sweep, `a_streamed_block_restores_the_fields_no_slot_addresses`, and this
-paragraph. (The step list in `docs/superpowers/plans/` is an eighth occurrence
-and is deliberately left stale: it is a historical instruction, not a live
-claim.) Three separate rounds each corrected the sites sharing the correcting
-reader's vocabulary and missed the one that stated the claim in its own words —
-first the streamed-path comment, then the handoff paragraph, then this one. So:
-when the clause changes, enumerate the sites and search on the *unchanging* half
-of the promise. Sweeping for the wording you are replacing finds only the sites
-that already agree with you.
+`restore_sweep`'s doc, `restore_in_string_with`'s doc, `proxy::handle`'s comment
+above the sweep, `a_streamed_block_restores_the_fields_no_slot_addresses`, and
+this paragraph. (The step list in `docs/superpowers/plans/` is an eighth
+occurrence and is deliberately left stale: it is a historical instruction, not a
+live claim.) Three separate rounds each corrected the sites sharing the
+correcting reader's vocabulary and missed the one that stated the claim in its
+own words — first the streamed-path comment, then the handoff paragraph, then
+this one. So: when the clause changes, enumerate the sites and search on the
+*unchanging* half of the promise. Sweeping for the wording you are replacing
+finds only the sites that already agree with you.
+
+The fourth site moved and the enumeration above is corrected rather than
+appended to: the exception clause was stated on `restore_in_string`, and the
+embedded fix split that function into a lenient door, a strict door
+(`restore_in_string_strictly`) and the shared `restore_in_string_with` that
+carries the rule. The clause went with the rule. A reader who greps for the
+function name in this list and finds a three-line wrapper has found the wrong
+site, which is the failure mode this list exists to prevent.
 
 ### Two limits of the issued set, found by attacking it here
 

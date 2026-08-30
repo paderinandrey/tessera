@@ -82,6 +82,15 @@ impl StreamError {
             StreamError::Mapping(MappingError::TooLarge) => "stream_too_large",
             StreamError::Mapping(MappingError::MaskCountMismatch(_)) => "stream_mask_mismatch",
             StreamError::Mapping(MappingError::PlaceholderKey(_)) => "stream_placeholder_key",
+            // Not `stream_unrestorable_document`, though the variant is
+            // `Unrestorable` and the parallel would be tidier. The short name
+            // above is already this enum's word for `MappingError::Unknown`,
+            // so a sibling one word longer would read as "the unknown-token
+            // failure, in a document" to the only reader who matters here —
+            // somebody holding a journal line and no source. What actually
+            // happened is that restoring the document would have dropped a
+            // member or renamed a key, so the class says that.
+            StreamError::Mapping(MappingError::Unrestorable(_)) => "stream_lossy_document",
             StreamError::Shape(ShapeError::Request(_)) => "stream_shape_request",
             StreamError::Shape(ShapeError::Response(_)) => "stream_shape_response",
             StreamError::Shape(ShapeError::Pointer(_)) => "stream_shape_pointer",
@@ -789,6 +798,8 @@ mod audit_class_tests {
             StreamError::Mapping(MappingError::TooLarge).audit_class(),
             StreamError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
             StreamError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+            StreamError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
             StreamError::Shape(ShapeError::Request("messages")).audit_class(),
             StreamError::Shape(ShapeError::Response("choices")).audit_class(),
