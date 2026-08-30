@@ -129,11 +129,33 @@ served today would come back malformed. This is exactly the argument used below
 for keeping Anthropic's unknown blocks refused, and OpenAI's unknown fields need
 it too.
 
-**So an undescribed string that parses as a JSON object or array is restored
-structurally** — parsed, restored leaf by leaf, re-serialized — which is the
-`embedded: true` handling a described document already gets. If nothing inside it
-changed, the original string is kept byte for byte, so a document carrying none
-of our tokens is never reformatted.
+**So the rule is about the inserted value first, and the string's shape second,
+and in that order it is exact.**
+
+Substituting into JSON *text* is byte-safe precisely when the inserted value
+carries no `"`, no `\` and no control character: without a quote the string
+cannot be closed, and a comma or a brace inside a JSON string is an ordinary
+character. **A value that needs no escaping is substituted in place**, whatever
+the surrounding string is, and the document's formatting is preserved exactly.
+
+**A value that does need escaping, into a string that parses as JSON, forces
+structural restoration** — parsed, restored leaf by leaf, re-serialized, the
+`embedded: true` handling a described document already gets. Reformatting is the
+price of not corrupting, and it is paid only in that case. Into a string that is
+*not* JSON there is no structure to break, so the substitution stands.
+
+**"Parses as JSON" means any JSON value, not only an object or an array.** An
+undescribed field may carry the serialized scalar `"[PERSON_1]"`, which is a
+complete JSON document, and a naive substitution breaks it exactly as it breaks
+an object. A draft of this rule said "object or array" and missed that.
+
+**And the rule is recursive, which is a defect in the path that already ships.**
+A leaf inside a document may itself be a string holding serialized JSON, and
+restoring *that* leaf naively is the same injection one level down. This is not
+only the sweep's problem: a described `arguments` is restored with
+`restore_value` over the parsed document, and a nested serialized document inside
+it is a plain string to that walk. The condition above applies at every depth,
+which fixes the sweep and the existing `embedded: true` path in one rule.
 
 A weaker remedy was tried first and is recorded because it looks sufficient and
 is not: *substitute, and keep the original if the string parsed as JSON before
@@ -209,16 +231,26 @@ That is the same templating client #32 is filed for, one step further in, and it
 would have been a regression: today an undescribed field leaves the literal
 alone.
 
-**So the condition has two halves, and both come from the mask pass:**
+**So the condition has two halves:**
 
-- the token is in the **issued** set — `placeholder_for` returned it this
-  request; **and**
-- the token is **not** among the placeholder-shaped literals the caller's own
-  text carried this request.
+- the token is in the **issued** set — `placeholder_for` returned it during this
+  request's mask pass; **and**
+- the token is **not** among the placeholder-shaped literals the request's own
+  body carried.
 
-The second set is observable even where the reservation fails, which is the
-point: `reserve_literals` *sees* the caller's literal whether or not it can map
-it to itself, and failing to insert does not stop us noticing. A token in both
+**The second set must be built by walking the whole original request body, not
+by reusing `reserve_literals`**, and getting that wrong would break tool
+dispatch. `mask_all` reserves only inside provider-selected slots, and dispatch
+strings are deliberately not slots. So a request can mask `Martina Weber` to
+`[PERSON_1]` while carrying a tool name `lookup_[PERSON_1]`: the literal sits in
+a field nothing reserves, the issued set contains the token anyway, and a sweep
+trusting the issued set alone would echo the tool name back as
+`lookup_Martina Weber` — a broken call the client cannot diagnose.
+
+The walk therefore covers **every string in the request as it arrived**,
+including dispatch fields, fields no slot addresses, and fields the masker
+deliberately never scans. It is looking for a lexical shape, not for meaning, so
+it needs no provider knowledge and nothing may be exempt from it. A token in both
 sets is ambiguous by construction and is **left**.
 
 **So the sweep does not wait for #32 to be useful.** #32 is still needed, for the
