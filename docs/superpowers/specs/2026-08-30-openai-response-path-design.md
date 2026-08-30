@@ -281,8 +281,29 @@ then #32 — is deliberate.
 
 The README's promise is narrowed to match: a placeholder issued by this gateway
 does not reach the client **from a field the gateway describes**, and elsewhere
-everything with a mapping is restored. #32 is what restores the unqualified
-sentence, and the README says so.
+everything this request issued and the caller did not write is restored. #32 is
+what restores the unqualified sentence, and the README says so.
+
+### Two limits of the issued set, found by attacking it here
+
+Neither is reachable today. Both are properties of the discriminator rather than
+of this implementation, so they belong beside it rather than in a commit message.
+
+**It assumes the client echoes the conversation.** The set is built from what
+*this request* masked, which works because a client resends its history and the
+same value is masked again each turn. An API that keeps conversation state on the
+provider's side — a request carrying an identifier instead of the prior turns —
+would leave the set empty while the model still answers with a token it
+remembers, and the sweep would leave it. This gateway serves no such endpoint, so
+it is a premise to record rather than a hole to plug, and adding one would
+require revisiting this.
+
+**One token can get two treatments in one response.** A described field restores
+strictly from the table, ambiguity included, which is today's behaviour and is
+not changed here. The same token in an undescribed field is left. So a client can
+see the value in `content` and the token in `refusal`. Making them agree means
+either weakening the described path — a regression — or #32. Recorded, because a
+reader meeting it should find it described rather than discover it.
 
 ## Anthropic's response-side refusals stay
 
