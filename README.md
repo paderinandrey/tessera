@@ -268,16 +268,23 @@ for the placeholders *this request* issued, and the slot loop then overwrites wh
 with its own strict result, so a field nobody described is restored rather than forwarded. The
 promise, in both its clauses: **a placeholder issued by this gateway does not reach the client
 from a field the gateway describes. Elsewhere everything this request issued and the caller did
-not write is restored, except inside an object whose restored keys would collide**, which is
-served exactly as it came. Both clauses are load-bearing and neither is decoration. The sweep
-will not claim a token the *caller* wrote itself, because a caller that puts `[PERSON_1]` into
-a later turn of a session and has the model echo it back has to get its own text returned
-rather than turn one's value; a token that is both issued and written is ambiguous by
-construction and is left alone, and #32 is what separates the two and lets the first sentence
-be stated without its qualification. And an object whose restored keys would collide —
+not write is restored, except where restoring it would drop something the upstream sent**,
+which is served exactly as it came. Both clauses are load-bearing and neither is decoration.
+The sweep will not claim a token the *caller* wrote itself, because a caller that puts
+`[PERSON_1]` into a later turn of a session and has the model echo it back has to get its own
+text returned rather than turn one's value; a token that is both issued and written is
+ambiguous by construction and is left alone, and #32 is what separates the two and lets the
+first sentence be stated without its qualification.
+
+The second clause covers two cases, and both are the same rule — what cannot be re-serialized
+faithfully is left, never guessed at. An object whose restored keys would collide —
 `{"[PERSON_1]": "a", "Weber": "b"}`, where restoring the key would drop one of the two fields —
-keeps every key and value it arrived with, which is one object rather than the body around it
-but is still a place a placeholder can reach the client from.
+keeps every key and value it arrived with, which is one object rather than the body around it.
+And a string that is itself a serialized document with two members of the same name —
+`{"mode":"safe","mode":"admin","name":"[PERSON_1]"}` — is left whole whenever restoring it
+would need re-serializing, because the parse that reaches its leaves collapses those two
+members before any restoring happens, and no reader agrees with another about which one
+survived. Both are still places a placeholder can reach the client from.
 
 Two things it does not scan, and both are worth knowing before you rely on *no text this
 gateway scans is forwarded unmasked* above — a claim about the way up, which the two paragraphs
