@@ -529,6 +529,34 @@ impl Mapping {
     /// `arguments` is text to `restore_value` now, is substituted, and is
     /// served. Additivity decides it: the key is restored exactly as today's
     /// substitution restores it, and the key rule keeps the depth it has.
+    ///
+    /// **Unbounded recursion, and `restore_value`'s note does not transfer.**
+    /// Neither of its two protections covers this walk, because this one has a
+    /// second axis.
+    ///
+    /// That walk is bounded by a single `serde_json` parse: everything it sees
+    /// came from one `from_str`, whose depth limit — 128 today, measured, and a
+    /// dependency's promise rather than ours — caps the tree. This walk
+    /// *re-enters* the parser. The `Value::String` arm calls `restore_in_string`,
+    /// which parses again whenever the string it just restored into needs
+    /// escaping, and that parse gets a fresh budget. So the bound is 128 × the
+    /// number of nested **serialized** documents, not 128. Its other protection
+    /// misses for the same reason: the request-direction refusal past
+    /// `MAX_JSON_DEPTH` counts document depth, and a serialized document inside
+    /// a string is one string to `walk` — these layers are invisible to it.
+    ///
+    /// What bounds the layer count is the input, and the growth was measured
+    /// rather than assumed: each layer escapes the one below, so its backslashes
+    /// double. Wrapping a scalar N times costs `4 * 2^N + 8` bytes — 131,080 at
+    /// fifteen layers, and the per-layer ratio is 2.000 by layer thirteen. Forty
+    /// layers is four terabytes. A body deep enough to exhaust the stack cannot
+    /// be transmitted.
+    ///
+    /// That exponential cost is the *whole* protection, and nothing here caps
+    /// body size, so a caller that finds a way to re-enter this walk without
+    /// paying the escaping cost has removed it. And as in `restore_value`: a
+    /// value assembled in memory rather than parsed has no protection at all,
+    /// which is why this stays private.
     fn restore_document(&self, value: &Value, provenance: &Provenance) -> Option<Value> {
         Some(match value {
             Value::String(text) => Value::String(self.restore_in_string(text, provenance)),
@@ -4484,6 +4512,30 @@ mod tests {
             mapping.restore_in_string(&document, &provenance),
             document,
             "neither field may be lost"
+        );
+    }
+
+    #[test]
+    fn a_collision_refuses_the_whole_string_from_however_deep_it_is_found() {
+        // The refusal has to travel. The collision above is at the top level,
+        // so it returns from the same call the caller made; here it is under an
+        // array under an object, so both propagation points carry it — and an
+        // implementation that swallowed `None` at either would drop the object
+        // that could not be restored, or serve a re-serialized document in
+        // place of the untouched string, while every other test still passed.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"wrapper\":[{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}]}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "the string comes back exactly as it came, not merely intact"
         );
     }
 }
