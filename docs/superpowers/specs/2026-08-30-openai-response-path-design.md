@@ -129,10 +129,21 @@ served today would come back malformed. This is exactly the argument used below
 for keeping Anthropic's unknown blocks refused, and OpenAI's unknown fields need
 it too.
 
-**So the sweep leaves a string it would break.** After substituting, if the
-string parsed as JSON before and does not after, the original is kept. That is a
-check on the outcome rather than a guess about which strings are documents: it
-never reformats a document it understood, and it never emits one it broke.
+**So an undescribed string that parses as a JSON object or array is restored
+structurally** — parsed, restored leaf by leaf, re-serialized — which is the
+`embedded: true` handling a described document already gets. If nothing inside it
+changed, the original string is kept byte for byte, so a document carrying none
+of our tokens is never reformatted.
+
+A weaker remedy was tried first and is recorded because it looks sufficient and
+is not: *substitute, and keep the original if the string parsed as JSON before
+and does not after.* **That check passes a corrupted document.** Restoring
+`[PERSON_1]` inside `{"name":"[PERSON_1]"}` to a value such as
+`x","admin":true,"unused":"y` yields **valid** JSON carrying fields nobody sent.
+Both parses succeed, the check is satisfied, and the gateway emits a document it
+injected into — worse than a malformed one, because a client's tool will act on
+it. Structural restoration cannot do this: the value lands in a leaf and is
+escaped on the way out.
 
 With that, an unknown field degrades to correct-or-untouched instead of to a
 leak — the same inversion applied four times during the tool-traffic slice, where
@@ -186,10 +197,34 @@ The two cases it separates, which no lookup can:
   issued it, so it is not in the set. The model echoes it. **Left**, and the
   client gets its own literal back, exactly as today.
 
+**The issued set alone is not enough, and the counterexample is worth keeping.**
+A caller can, in one request, both send a value that masks to `[PERSON_1]` **and**
+write the literal `[PERSON_1]` themselves. The first puts the token in the issued
+set; the second travels up untouched, because `reserve_literals` cannot claim a
+key the session already owns. The provider echoes both, and **they are the same
+bytes** — restoring is right for one occurrence and wrong for the other, with
+nothing in the response to tell them apart.
+
+That is the same templating client #32 is filed for, one step further in, and it
+would have been a regression: today an undescribed field leaves the literal
+alone.
+
+**So the condition has two halves, and both come from the mask pass:**
+
+- the token is in the **issued** set — `placeholder_for` returned it this
+  request; **and**
+- the token is **not** among the placeholder-shaped literals the caller's own
+  text carried this request.
+
+The second set is observable even where the reservation fails, which is the
+point: `reserve_literals` *sees* the caller's literal whether or not it can map
+it to itself, and failing to insert does not stop us noticing. A token in both
+sets is ambiguous by construction and is **left**.
+
 **So the sweep does not wait for #32 to be useful.** #32 is still needed, for the
-narrower case this cannot reach: a token this request *did* issue, whose mapping
-the session has since lost. That one is left rather than refused, which is what
-"deliberately does not close" below is about.
+two cases this cannot reach: a token this request issued whose mapping the
+session has since lost, and the ambiguous overlap above, which stops being
+ambiguous once a token carries provenance a caller cannot write.
 
 **The general form, which is worth more than the four carve-outs it replaces:
 outside a described field, neither refusing nor restoring may rest on a lookup.**
@@ -272,13 +307,18 @@ The standard is mutation: break the invariant, run the **named** test, check
    the caller's own literal echoed into `refusal` comes back as the caller wrote
    it, and a token this request *did* issue and send up comes back restored.
    Mutating the issued-set check to a plain table lookup fails the first.
-7. **An undescribed string holding serialized JSON survives.** A value whose
-   restoration would insert a quote, a backslash or a newline into it must leave
-   it byte-identical rather than malformed.
-8. **Provider parity.** One response shape driven through **both** providers,
+7. **An undescribed string holding serialized JSON is restored structurally**,
+   and the test that matters is the **injection**, not the malformity: restoring
+   a token inside `{"name":"[PERSON_1]"}` to `x","admin":true,"unused":"y` must
+   yield a document with one field, not three. Asserting only that the result
+   still parses passes the corrupted case, which is why the weaker remedy was
+   rejected.
+8. **A document carrying none of our tokens is byte-identical**, so structural
+   restoration never reformats what it did not change.
+9. **Provider parity.** One response shape driven through **both** providers,
    asserting the same treatment.
 
-Item 8 is the only test here that catches the **class** rather than the instance.
+Item 9 is the only test here that catches the **class** rather than the instance.
 The others prove these two fields are fixed; that one exists so the next pair
 does not diverge again — which is how this bug, and three like it, were made.
 
