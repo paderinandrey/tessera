@@ -586,6 +586,27 @@ impl Mapping {
             other => other.clone(),
         })
     }
+
+    /// The lenient pass over a whole response body.
+    ///
+    /// Infallible by type, which is the design's leniency written where it
+    /// cannot be forgotten: **nothing in the sweep refuses**, including a
+    /// placeholder-shaped key of either kind. Strictness lives in the slot path
+    /// that runs after this and overwrites what it addresses.
+    ///
+    /// `restore_document` returns `None` when a restored key would collide
+    /// with one already in its object — the one way its recursion can fail.
+    /// The sweep is not allowed to propagate that failure: refusing here would
+    /// mean sending the client nothing, which is worse than the untouched
+    /// document `restore_document` was already declining to touch further.
+    /// So a `None` falls back to the value exactly as it arrived — every field
+    /// still present, just not restored — which keeps the same promise the
+    /// caller gets everywhere else in the sweep: nothing is silently dropped.
+    #[allow(dead_code)]
+    pub fn restore_sweep(&self, value: &Value, provenance: &Provenance) -> Value {
+        self.restore_document(value, provenance)
+            .unwrap_or_else(|| value.clone())
+    }
 }
 
 /// Characters that can end a JSON string or start an escape, so a value
@@ -4536,6 +4557,39 @@ mod tests {
             mapping.restore_in_string(&document, &provenance),
             document,
             "the string comes back exactly as it came, not merely intact"
+        );
+    }
+
+    #[test]
+    fn the_sweep_restores_every_string_and_never_fails() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let body = json!({
+            "choices": [{"message": {
+                "content": format!("hello {token}"),
+                "refusal": format!("I cannot help with {token}"),
+                "annotations": [{"url_citation": {"title": format!("{token} page")}}],
+            }}],
+            // A key, and a token nobody issued: both untouched, and neither
+            // refuses. `restore_value` would have raised PlaceholderKey here.
+            "trace": {"[PERSON_9]": "invented [ORG_4]"}
+        });
+
+        assert_eq!(
+            mapping.restore_sweep(&body, &provenance),
+            json!({
+                "choices": [{"message": {
+                    "content": "hello Martina Weber",
+                    "refusal": "I cannot help with Martina Weber",
+                    "annotations": [{"url_citation": {"title": "Martina Weber page"}}],
+                }}],
+                "trace": {"[PERSON_9]": "invented [ORG_4]"}
+            })
         );
     }
 }
