@@ -126,15 +126,28 @@ unknown thing had to land in the safe branch rather than the hole.
 
 ### Leniency, and exactly where it stops
 
-In the sweep, a token with no mapping is **left in place**. It does not refuse.
+**Nothing in the sweep refuses.** A token with no mapping is left in place, and
+so is a placeholder-shaped key of either kind. Strictness exists only inside a
+described field, where it exists today and does not move.
 
-The rule about placeholder-shaped **keys** has two halves and they are treated
-differently, because one is decidable and the other is not:
+**The rule is that simple because every attempt to make it subtler was wrong, and
+wrong the same way three times.** Each draft of this spec tried to keep some
+strictness in the sweep, and each time the strictness rested on treating a
+successful `by_placeholder` lookup as proof that a token is ours. It is not
+proof, and #32 is the issue that says so: in a multi-turn session, turn one maps
+`[PERSON_1]`, and a later caller can legitimately write `owner[PERSON_1]` — as a
+value or as a key — which `reserve_literals` cannot map to itself because the
+session already owns the token. The lookup then answers "ours" about a string the
+caller wrote.
 
-- a key that **carries** a token proven to be ours, by lookup, **still refuses**
-  — decidable, and it stays strict everywhere;
-- a key that merely **is** placeholder-shaped refuses only inside a described
-  slot, as today. In the sweep it is left.
+So a refusal built on that lookup would reject a paid response that is served
+today, which is the additivity guarantee broken by the mechanism meant to
+strengthen it.
+
+**The general form, which is worth more than the three carve-outs it replaces:
+outside a described field, nothing is strict until #32 supplies provenance the
+caller cannot forge.** Inside a described field, everything strict today stays
+strict — including both key rules, unchanged.
 
 ## What this deliberately does not close
 
@@ -192,10 +205,12 @@ The standard is mutation: break the invariant, run the **named** test, check
    placeholder-shaped token in an undescribed field is **served**, not refused.
    "The suite stayed green" only covers what the suite already tests.
 3. **Embedded document integrity.** A restored value containing a quote, a
-   backslash and a newline inside `arguments` must produce valid JSON. **This is
-   also the test that proves the ordering**: mutating the sweep to run first
-   fails it, and mutating it to run first also fails a strictness test in a
-   described field. The order is held from both sides.
+   backslash and a newline inside `arguments` must produce valid JSON. **The
+   mutation is moving the sweep to run *after* the slots** — it then scans the
+   re-serialized `arguments` string and corrupts its JSON with the inserted
+   characters. An earlier draft of this section had the mutation the other way
+   round, left over from an earlier draft of the design; the order it describes
+   is now the shipped one.
 4. **The multi-turn session case**, which is what killed the idempotence
    argument. Turn one issues `[PERSON_1]`; a later request legitimately contains
    that literal in a described field; the client must receive its own literal
