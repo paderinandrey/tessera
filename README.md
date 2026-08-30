@@ -234,11 +234,18 @@ shape the gateway has no rule for, including Anthropic's
 extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
 OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
 span the detector reports at a position that cannot be applied — inverted, past the end of the
-text, or overlapping another; and a placeholder in the response that no
-mapping knows — each of these ends the request. Once a stream has begun there is nothing
+text, or overlapping another; and a placeholder that no mapping knows in a response field this
+gateway *describes* — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. No text
 this gateway scans is forwarded unmasked. No error body or log line carries the submitted
 text.
+
+That last refusal used to be stated without the qualification, and it was true because the
+gateway looked nowhere else. It looks everywhere now — see the next section — and an unknown
+token in a field nobody describes is deliberately *served* rather than refused. Refusing on
+it would turn a response forwarded verbatim yesterday into a 502 today, which is a request
+that succeeds starting to fail; the gain in coverage is not worth paying for in traffic that
+already works.
 
 Restoration is narrower than that, and the difference is measured rather than assumed.
 Anthropic's response path is a closed list of block *types* — a block whose type it cannot read

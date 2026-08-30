@@ -14,9 +14,21 @@ is generated from the server and CI fails if it drifts (`make openapi`, then
 Tessera pseudonymizes personal data before it reaches an LLM provider. A gateway
 sits in front of the provider's API, replaces values it finds with placeholders
 like `[PERSON_1]`, forwards the masked request, and restores the real values in
-the response. The model never sees the data; the client never sees a
-placeholder. Sold to regulated European buyers, for whom the audit journal is
+the response. Sold to regulated European buyers, for whom the audit journal is
 part of the product.
+
+This paragraph used to end "the model never sees the data; the client never sees
+a placeholder", and both halves were false. Upward: no *text* the gateway scans
+reaches the provider unmasked, but image and audio parts are forwarded untouched
+— nothing here reads pixels, so a photograph of an identity document goes up as
+the client sent it. Downward: a placeholder issued by the gateway does not reach
+the client from a field the gateway describes, and elsewhere everything a
+request issued and the caller did not write is restored, *except inside an
+object whose restored keys would collide*, which is served exactly as it came.
+None of that is your surface — you are building against the detector, for the
+reasons below — but it is the sentence a buyer will quote back, so do not
+restore the short version of it. `README.md` states both directions with their
+qualifications and is the place to correct if they change.
 
 ## Which service you talk to, and why not the other one
 
