@@ -23,12 +23,17 @@ reaches the provider unmasked, but image and audio parts are forwarded untouched
 — nothing here reads pixels, so a photograph of an identity document goes up as
 the client sent it. Downward: a placeholder issued by the gateway does not reach
 the client from a field the gateway describes, and elsewhere everything a
-request issued and the caller did not write is restored, *except inside an
-object whose restored keys would collide*, which is served exactly as it came.
+request issued and the caller did not write is restored, *except where restoring
+it would drop something the provider sent*, which is served exactly as it came.
+That exception has two shapes and one rule — an object whose restored keys would
+collide, and a string that is itself a serialized document carrying two members
+of the same name — and in both the gateway cannot put the value back without
+losing a field, so it leaves the bytes alone and gives up the restoration.
 None of that is your surface — you are building against the detector, for the
 reasons below — but it is the sentence a buyer will quote back, so do not
-restore the short version of it. `README.md` states both directions with their
-qualifications and is the place to correct if they change.
+restore the short version of it, and do not drop a clause from it. `README.md`
+states both directions with their qualifications and is the place to correct if
+they change.
 
 ## Which service you talk to, and why not the other one
 

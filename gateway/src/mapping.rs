@@ -721,16 +721,26 @@ impl<'de> Deserialize<'de> for DuplicateScan {
 
 struct DuplicateScanVisitor;
 
-/// Every scalar arm answers `false` identically, and writing them out is the
-/// point: what serde supplies in place of a missing one is an "invalid type"
-/// error, and an error here means a document this gateway can no longer verify.
+/// Every scalar arm answers `false` identically, and the list is short because
+/// serde's own defaults do half the work: `visit_borrowed_str`, `visit_string`
+/// and `visit_char` forward to `visit_str`, `visit_i8`/`i16`/`i32` forward to
+/// `visit_i64`, `visit_u8`/`u16`/`u32` to `visit_u64`, and `visit_f32` to
+/// `visit_f64`. So the arms here are not the set the reader calls —
+/// `deserialize_any` hands a borrowed string to `visit_borrowed_str`, and this
+/// scan sees it only through that forward — they are the set every other
+/// method funnels into.
 ///
-/// The arms are exactly the ones `serde_json`'s `deserialize_any` can reach.
-/// It has no path to `visit_i128`/`visit_u128` — an integer too wide for
-/// `i64`/`u64` is handed over as `f64` — nor to `visit_none`/`visit_some`,
-/// since `null` arrives as `visit_unit`. Arms for those would be unreachable
-/// code claiming to be a safety net; `carries_duplicate_members` is where that
-/// net actually is.
+/// **What the net rests on is that no default arm returns `Ok`.** Each one
+/// either forwards into an arm implemented here or returns an "invalid type"
+/// error, and `carries_duplicate_members` reads an error as `true`. There is
+/// no third case, so a JSON type this visitor does not handle cannot be
+/// mistaken for a document with no duplicates — the property is closed by the
+/// trait, not by remembering to list an arm.
+///
+/// `visit_i128`/`visit_u128` and `visit_none`/`visit_some` are therefore left
+/// out twice over: `deserialize_any` has no path to them — an integer too wide
+/// for `i64`/`u64` arrives as `f64`, and `null` arrives as `visit_unit` — and
+/// were that to change, their defaults error rather than pass.
 macro_rules! scalar_arms {
     ($($name:ident($type:ty)),* $(,)?) => {
         $(
