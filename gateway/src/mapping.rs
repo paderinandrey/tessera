@@ -463,6 +463,107 @@ impl Mapping {
         }
         Ok(result)
     }
+
+    /// Restore inside one string, leniently and without breaking a document the
+    /// string may be.
+    ///
+    /// **Lenient**: it never fails. A token this request did not issue, or one
+    /// the caller also wrote, is left exactly as it stands — see `Provenance`.
+    ///
+    /// **The rule is about the inserted value first and the string's shape
+    /// second, and in that order it is exact.** Substituting into JSON *text*
+    /// is byte-safe precisely when the value carries no `"`, no `\` and no
+    /// control character: without a quote the string cannot be closed, and a
+    /// comma or a brace inside a JSON string is an ordinary character. So a
+    /// value needing no escaping is substituted whatever it sits in, and the
+    /// document's formatting survives byte for byte.
+    ///
+    /// A value that *does* need escaping, into a string that parses as JSON,
+    /// forces parse-and-re-serialize. Reformatting is the price of not
+    /// corrupting and is paid only there. Into a string that is not JSON there
+    /// is no structure to break.
+    ///
+    /// Testing that the result still *parses* is not enough and was tried:
+    /// restoring a token in `{"name":"[PERSON_1]"}` to `x","admin":true,...`
+    /// yields **valid** JSON carrying fields nobody sent, which a client's tool
+    /// then acts on.
+    #[allow(dead_code)]
+    pub fn restore_in_string(&self, text: &str, provenance: &Provenance) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut needs_escaping = false;
+        for piece in pieces(text) {
+            match piece {
+                Piece::Text(run) => out.push_str(run),
+                Piece::Placeholder(candidate) => match self.by_placeholder.get(candidate) {
+                    Some(value) if provenance.restorable(candidate) => {
+                        needs_escaping |= value.chars().any(json_string_unsafe);
+                        out.push_str(value);
+                    }
+                    _ => out.push_str(candidate),
+                },
+            }
+        }
+        if !needs_escaping {
+            return out;
+        }
+        // The substitution inserted a character that can close a string. If the
+        // original was a document, redo it structurally so the value lands in a
+        // leaf and is escaped on the way out.
+        // `restore_document` returns None when a restored key would collide
+        // with one already in the map; the whole string is then left as it
+        // came, because losing a field is worse than losing a restoration.
+        match serde_json::from_str::<Value>(text) {
+            Ok(document) => match self.restore_document(&document, provenance) {
+                Some(restored) => serde_json::to_string(&restored).unwrap_or(out),
+                None => text.to_owned(),
+            },
+            Err(_) => out,
+        }
+    }
+
+    /// The recursion, which fixes escaping and **does not extend the key rule**.
+    ///
+    /// Parsing a nested serialized document promotes strings into key positions
+    /// that were plain text a moment earlier. Refusing there would reject a
+    /// response served today — `{"[PERSON_1]":"ok"}` inside a described
+    /// `arguments` is text to `restore_value` now, is substituted, and is
+    /// served. Additivity decides it: the key is restored exactly as today's
+    /// substitution restores it, and the key rule keeps the depth it has.
+    fn restore_document(&self, value: &Value, provenance: &Provenance) -> Option<Value> {
+        Some(match value {
+            Value::String(text) => Value::String(self.restore_in_string(text, provenance)),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.restore_document(item, provenance))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Value::Object(fields) => {
+                let mut out = serde_json::Map::with_capacity(fields.len());
+                for (key, item) in fields {
+                    let restored = self.restore_in_string(key, provenance);
+                    // A map cannot hold two identical keys, so a restored key
+                    // landing on one already present would silently drop a
+                    // field — a tool argument lost, where today's textual
+                    // substitution serves both. Substituting instead yields
+                    // duplicate property names, whose meaning is ambiguous. So
+                    // the caller gets the document exactly as it came.
+                    if out.contains_key(&restored) {
+                        return None;
+                    }
+                    out.insert(restored, self.restore_document(item, provenance)?);
+                }
+                Value::Object(out)
+            }
+            other => other.clone(),
+        })
+    }
+}
+
+/// Characters that can end a JSON string or start an escape, so a value
+/// carrying one cannot be substituted into JSON text byte-safely.
+fn json_string_unsafe(character: char) -> bool {
+    character == '"' || character == '\\' || character.is_control()
 }
 
 /// Which tokens in a response this gateway may claim as its own.
@@ -4246,6 +4347,143 @@ mod tests {
                 "[IBAN_3]".to_owned(),
                 "[PERSON_4]".to_owned(),
             ])
+        );
+    }
+
+    #[test]
+    fn a_value_needing_no_escaping_is_substituted_in_place_and_keeps_formatting() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        // A document with formatting the client may be comparing byte for byte.
+        let document = format!("{{\"name\": \"{token}\",  \"ok\": 1}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            "{\"name\": \"Martina Weber\",  \"ok\": 1}",
+            "a value with no quote, backslash or control character cannot close \
+             a string, so the substitution stands and the spacing survives"
+        );
+    }
+
+    #[test]
+    fn a_value_needing_escaping_cannot_inject_fields_into_a_document() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        // The injection: a value carrying a quote and a comma.
+        let hostile = "x\",\"admin\":true,\"unused\":\"y";
+        let token = mapping
+            .mask(hostile, &[span("PERSON", 0, hostile.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("{{\"name\":\"{token}\"}}"), &provenance);
+        let parsed: Value = serde_json::from_str(&restored).expect("still a document");
+        assert_eq!(
+            parsed,
+            json!({"name": hostile}),
+            "one field carrying the value, not three: the assertion is the \
+             injection, not the parse — a corrupted document parses"
+        );
+    }
+
+    #[test]
+    fn a_serialized_scalar_is_a_document_too() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let hostile = "Martina \"Weber\"";
+        let token = mapping
+            .mask(hostile, &[span("PERSON", 0, hostile.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("\"{token}\""), &provenance);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored).expect("still a document"),
+            json!(hostile)
+        );
+    }
+
+    #[test]
+    fn a_token_this_request_did_not_issue_is_left_where_it_stands() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        // Issued, and also written by the caller: ambiguous, so left.
+        let provenance =
+            Provenance::new(mapping.issued(), HashSet::from(["[PERSON_1]".to_owned()]));
+        assert_eq!(
+            mapping.restore_in_string("see [PERSON_1] and [ORG_9]", &provenance),
+            "see [PERSON_1] and [ORG_9]"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_key_inside_a_nested_document_is_restored_as_it_is_today() {
+        // The key rule keeps the depth it has. Refusing here would reject a
+        // response served today: this string is text to `restore_value` now,
+        // is substituted, and is served. Additivity decides it.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("{{\"{token}\":\"ok\"}}"), &provenance);
+        assert_eq!(restored, "{\"Martina Weber\":\"ok\"}");
+    }
+
+    #[test]
+    fn a_placeholder_key_is_restored_in_the_structural_path_too() {
+        // The test above never reaches `restore_document`: its value needs no
+        // escaping, so the textual path answers and the key is substituted
+        // there. This one carries a quote, so the structural path is the one
+        // taken — and the key rule has to keep its depth on that path as well,
+        // which is where an implementation would be tempted to reuse
+        // `restore_value`'s refusal.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("{{\"{token}\":\"ok\"}}"), &provenance);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored).expect("still a document"),
+            json!({value: "ok"}),
+            "restored, and escaped by the serializer rather than by hand"
+        );
+    }
+
+    #[test]
+    fn a_restored_key_that_would_collide_leaves_the_document_untouched() {
+        // A map cannot hold two identical keys, so structural restoration
+        // would silently drop one — a tool argument lost, where a textual
+        // substitution today serves both. Substituting instead yields
+        // duplicate property names, whose meaning is ambiguous. So the string
+        // is left exactly as it came.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        // A value needing escaping, so the structural path is the one taken.
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "neither field may be lost"
         );
     }
 }
