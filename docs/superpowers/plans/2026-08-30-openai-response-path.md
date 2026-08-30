@@ -865,8 +865,18 @@ so neither pass reads the other's output."
     async fn a_caller_writing_a_session_owned_literal_gets_its_own_text_back() {
         // Turn one issues [PERSON_1]. Turn two's caller writes that literal
         // themselves; the provider echoes it. The client must receive what it
-        // wrote, not turn one's value. This is the test that fails if the sweep
-        // is ever moved after the slots.
+        // wrote, not turn one's value.
+        //
+        // **This is NOT the ordering pin, though an earlier draft of this plan
+        // said it was.** Measured: it passes with the sweep on either side of
+        // the slot loop. The reason is structural — a token inside a value
+        // masked from *this* request is necessarily also in this request's
+        // `written` set, because the value is a substring of a body string and
+        // `placeholder_literals` exempts nothing, so `restorable` excludes it
+        // and the sweep leaves it alone either way. The hazard needs a value
+        // that entered the table in an *earlier* turn, which `written` cannot
+        // describe. `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`
+        // in Task 6 is the test that actually fails when the sweep moves.
         //
         // It also pins a divergence the spec records deliberately: the same
         // token is restored in `content` (described, strict, ambiguity
