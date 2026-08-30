@@ -485,11 +485,14 @@ Expected: FAIL to compile — `restore_in_string` does not exist.
         // The substitution inserted a character that can close a string. If the
         // original was a document, redo it structurally so the value lands in a
         // leaf and is escaped on the way out.
+        // `restore_document` returns None when a restored key would collide
+        // with one already in the map; the whole string is then left as it
+        // came, because losing a field is worse than losing a restoration.
         match serde_json::from_str::<Value>(text) {
-            Ok(document) => {
-                let restored = self.restore_document(&document, provenance);
-                serde_json::to_string(&restored).unwrap_or(out)
-            }
+            Ok(document) => match self.restore_document(&document, provenance) {
+                Some(restored) => serde_json::to_string(&restored).unwrap_or(out),
+                None => text.to_owned(),
+            },
             Err(_) => out,
         }
     }
@@ -502,28 +505,34 @@ Expected: FAIL to compile — `restore_in_string` does not exist.
     /// `arguments` is text to `restore_value` now, is substituted, and is
     /// served. Additivity decides it: the key is restored exactly as today's
     /// substitution restores it, and the key rule keeps the depth it has.
-    fn restore_document(&self, value: &Value, provenance: &Provenance) -> Value {
-        match value {
+    fn restore_document(&self, value: &Value, provenance: &Provenance) -> Option<Value> {
+        Some(match value {
             Value::String(text) => Value::String(self.restore_in_string(text, provenance)),
             Value::Array(items) => Value::Array(
                 items
                     .iter()
                     .map(|item| self.restore_document(item, provenance))
-                    .collect(),
+                    .collect::<Option<Vec<_>>>()?,
             ),
-            Value::Object(fields) => Value::Object(
-                fields
-                    .iter()
-                    .map(|(key, item)| {
-                        (
-                            self.restore_in_string(key, provenance),
-                            self.restore_document(item, provenance),
-                        )
-                    })
-                    .collect(),
-            ),
+            Value::Object(fields) => {
+                let mut out = serde_json::Map::with_capacity(fields.len());
+                for (key, item) in fields {
+                    let restored = self.restore_in_string(key, provenance);
+                    // A map cannot hold two identical keys, so a restored key
+                    // landing on one already present would silently drop a
+                    // field — a tool argument lost, where today's textual
+                    // substitution serves both. Substituting instead yields
+                    // duplicate property names, whose meaning is ambiguous. So
+                    // the caller gets the document exactly as it came.
+                    if out.contains_key(&restored) {
+                        return None;
+                    }
+                    out.insert(restored, self.restore_document(item, provenance)?);
+                }
+                Value::Object(out)
+            }
             other => other.clone(),
-        }
+        })
     }
 ```
 
@@ -546,7 +555,52 @@ Expected: PASS.
 
 1. Make `json_string_unsafe` return `false` always — the structural path becomes unreachable. Expected: `a_value_needing_escaping_cannot_inject_fields_into_a_document` fails with three fields where one was asserted. **This is the mutation the integrity property rests on.**
 2. Drop `provenance.restorable(candidate)` from the guard. Expected: `a_token_this_request_did_not_issue_is_left_where_it_stands` fails.
-3. In `restore_document`'s object arm, replace the restored key with `key.clone()`. Expected: nothing fails, and that is the finding to record — the key behaviour at depth has no test yet. Write one asserting today's behaviour (the key **is** substituted) and re-run the mutation.
+3. In `restore_document`'s object arm, replace the restored key with `key.clone()`. Expected: **the test below fails** — write it first; without it an implementation could reuse `restore_value`'s key check, regress the nested-key case to a refusal, and still pass every other test in this plan.
+
+```rust
+    #[test]
+    fn a_placeholder_key_inside_a_nested_document_is_restored_as_it_is_today() {
+        // The key rule keeps the depth it has. Refusing here would reject a
+        // response served today: this string is text to `restore_value` now,
+        // is substituted, and is served. Additivity decides it.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored =
+            mapping.restore_in_string(&format!("{{\"{token}\":\"ok\"}}"), &provenance);
+        assert_eq!(restored, "{\"Martina Weber\":\"ok\"}");
+    }
+
+    #[test]
+    fn a_restored_key_that_would_collide_leaves_the_document_untouched() {
+        // A map cannot hold two identical keys, so structural restoration
+        // would silently drop one — a tool argument lost, where a textual
+        // substitution today serves both. Substituting instead yields
+        // duplicate property names, whose meaning is ambiguous. So the string
+        // is left exactly as it came.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        // A value needing escaping, so the structural path is the one taken.
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "neither field may be lost"
+        );
+    }
+```
+
+4. Remove the collision check. Expected: `a_restored_key_that_would_collide_leaves_the_document_untouched` fails with one field where two were sent.
 
 - [ ] **Step 6: Full verification and commit**
 

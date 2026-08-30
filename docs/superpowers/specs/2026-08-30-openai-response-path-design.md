@@ -149,6 +149,18 @@ undescribed field may carry the serialized scalar `"[PERSON_1]"`, which is a
 complete JSON document, and a naive substitution breaks it exactly as it breaks
 an object. A draft of this rule said "object or array" and missed that.
 
+**A restored key that collides keeps the original string.** A nested document
+can carry both the key `"[PERSON_1]"` and the key that token restores to.
+Structural restoration builds a map, which cannot hold both, so one would be
+**silently discarded** — a tool argument lost, where today's textual substitution
+serves both. Neither restoring nor substituting is safe there: substitution
+yields duplicate property names, whose meaning is ambiguous.
+
+So on a collision the whole string is left exactly as the provider sent it. That
+loses restoration for that one document, refuses nothing, and cannot lose a
+field. It is the same rule the sweep follows everywhere else: what cannot be
+restored safely is left, not guessed at.
+
 **The recursion fixes escaping and does not extend the key rule.** Parsing a
 nested serialized document promotes strings into *key* positions that were plain
 text a moment earlier, and applying the strict key rule to them would refuse a
