@@ -116,13 +116,27 @@ Strict here would let a model kill a paid-for answer by writing bracket-shaped
 text into a field this gateway does not care about. That is the trade, made
 deliberately, and #32 is what removes the need for it.
 
-**The structural win**, stated carefully because an earlier draft overstated it.
-A description still decides how strictly a field is treated, and that does not
-change. What changes is what a *missing* description costs: today it means the
-field is not restored at all, and after this it means the field is restored
-leniently. An unknown field degrades to naive-but-correct instead of to a leak —
-the same inversion applied four times during the tool-traffic slice, where an
-unknown thing had to land in the safe branch rather than the hole.
+**The structural win**, stated carefully because two earlier drafts overstated
+it. A description still decides how strictly a field is treated, and that does
+not change. What changes is what a *missing* description costs: today the field
+is not restored at all, and after this it is restored leniently.
+
+**"Naive" is not the same as "correct", and one case proves it.** An undescribed
+field may itself be a *string holding serialized JSON* — the same shape as
+`arguments`, which is why that one has a slot. Substituting a value containing a
+quote, a backslash or a newline into such a string corrupts it, so a response
+served today would come back malformed. This is exactly the argument used below
+for keeping Anthropic's unknown blocks refused, and OpenAI's unknown fields need
+it too.
+
+**So the sweep leaves a string it would break.** After substituting, if the
+string parsed as JSON before and does not after, the original is kept. That is a
+check on the outcome rather than a guess about which strings are documents: it
+never reformats a document it understood, and it never emits one it broke.
+
+With that, an unknown field degrades to correct-or-untouched instead of to a
+leak — the same inversion applied four times during the tool-traffic slice, where
+an unknown thing had to land in the safe branch rather than the hole.
 
 ### Leniency, and exactly where it stops
 
@@ -144,10 +158,44 @@ So a refusal built on that lookup would reject a paid response that is served
 today, which is the additivity guarantee broken by the mechanism meant to
 strengthen it.
 
-**The general form, which is worth more than the three carve-outs it replaces:
-outside a described field, nothing is strict until #32 supplies provenance the
-caller cannot forge.** Inside a described field, everything strict today stays
-strict — including both key rules, unchanged.
+**And removing the refusals is not enough, which is the fourth instance of the
+same class and the one that comes from the other side.** *Restoring* on a
+successful lookup is equally an appeal to provenance. If turn one owns
+`[PERSON_1]` and this request's caller writes that literal themselves, the
+provider echoes the caller's own text into `refusal`, and a sweep that restores
+whatever it can look up replaces it with turn one's person. Today the caller gets
+its text back. That is corruption, not a missing improvement.
+
+### What the sweep may restore: tokens this request issued
+
+The discriminator is not "is this token in the session table" — that is the
+lookup, and it is not provenance. It is **did this request's masking issue this
+token for a value it masked**.
+
+That set is exact and available by construction: it is what `placeholder_for`
+returned during this request's mask pass. It says nothing about the session's
+history and cannot be forged by a caller, because a caller's own literal never
+reaches `placeholder_for` — `reserve_literals` is the only thing that sees it.
+
+The two cases it separates, which no lookup can:
+
+- this request masked `Martina Weber` and sent `[PERSON_1]` up, whether the token
+  was allocated now or reused from turn one. The model echoes it. **Restored** —
+  this is the ordinary case and the whole point of the sweep;
+- this request's caller wrote `[PERSON_1]` as their own text. Masking never
+  issued it, so it is not in the set. The model echoes it. **Left**, and the
+  client gets its own literal back, exactly as today.
+
+**So the sweep does not wait for #32 to be useful.** #32 is still needed, for the
+narrower case this cannot reach: a token this request *did* issue, whose mapping
+the session has since lost. That one is left rather than refused, which is what
+"deliberately does not close" below is about.
+
+**The general form, which is worth more than the four carve-outs it replaces:
+outside a described field, neither refusing nor restoring may rest on a lookup.**
+Refusals are gone there, restorations are limited to tokens this request issued,
+and inside a described field everything strict today stays strict — including
+both key rules, unchanged.
 
 ## What this deliberately does not close
 
@@ -217,12 +265,20 @@ The standard is mutation: break the invariant, run the **named** test, check
    back, not turn one's value. This is the test that fails if the sweep is ever
    moved after the slots, and it is the reason the order is what it is rather
    than a preference.
-5. **The decidable key half stays strict** in an undescribed field; the
-   undecidable half is left.
-6. **Provider parity.** One response shape driven through **both** providers,
+5. **Nothing outside a described field refuses**, either key rule included, and
+   an earlier draft of this item required the opposite. A placeholder-shaped key
+   in an undescribed field is served.
+6. **A token this request did not issue is left**, both directions in one pair:
+   the caller's own literal echoed into `refusal` comes back as the caller wrote
+   it, and a token this request *did* issue and send up comes back restored.
+   Mutating the issued-set check to a plain table lookup fails the first.
+7. **An undescribed string holding serialized JSON survives.** A value whose
+   restoration would insert a quote, a backslash or a newline into it must leave
+   it byte-identical rather than malformed.
+8. **Provider parity.** One response shape driven through **both** providers,
    asserting the same treatment.
 
-Item 6 is the only test here that catches the **class** rather than the instance.
+Item 8 is the only test here that catches the **class** rather than the instance.
 The others prove these two fields are fixed; that one exists so the next pair
 does not diverge again — which is how this bug, and three like it, were made.
 
