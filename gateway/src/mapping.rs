@@ -196,12 +196,10 @@ impl Mapping {
     ///
     /// Do not delete it on the grounds that it clears nothing. The one thing it
     /// must not say is that the clone arrives dirty; it does not.
-    #[allow(dead_code)]
     pub fn begin_request(&mut self) {
         self.issued.clear();
     }
 
-    #[allow(dead_code)]
     pub fn issued(&self) -> HashSet<String> {
         self.issued.clone()
     }
@@ -487,7 +485,6 @@ impl Mapping {
     /// restoring a token in `{"name":"[PERSON_1]"}` to `x","admin":true,...`
     /// yields **valid** JSON carrying fields nobody sent, which a client's tool
     /// then acts on.
-    #[allow(dead_code)]
     pub fn restore_in_string(&self, text: &str, provenance: &Provenance) -> String {
         let mut out = String::with_capacity(text.len());
         let mut needs_escaping = false;
@@ -611,7 +608,6 @@ impl Mapping {
     /// So a `None` falls back to the value exactly as it arrived — every field
     /// still present, just not restored — which keeps the same promise the
     /// caller gets everywhere else in the sweep: nothing is silently dropped.
-    #[allow(dead_code)]
     pub fn restore_sweep(&self, value: &Value, provenance: &Provenance) -> Value {
         self.restore_document(value, provenance)
             .unwrap_or_else(|| value.clone())
@@ -634,7 +630,6 @@ fn json_string_unsafe(character: char) -> bool {
 /// them.
 ///
 /// So provenance is built from this request and nothing else.
-#[allow(dead_code)]
 pub struct Provenance {
     /// Tokens `placeholder_for` returned during this request's mask pass. A
     /// caller's literal never reaches `placeholder_for` — `reserve_literals` is
@@ -651,7 +646,6 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    #[allow(dead_code)]
     pub fn new(issued: HashSet<String>, written: HashSet<String>) -> Self {
         Self { issued, written }
     }
@@ -660,7 +654,6 @@ impl Provenance {
     /// ambiguous by construction: the two occurrences reach the response as the
     /// same bytes, and nothing distinguishes them. Left, which loses coverage
     /// and corrupts nothing. #32 is what separates them.
-    #[allow(dead_code)]
     pub fn restorable(&self, token: &str) -> bool {
         self.issued.contains(token) && !self.written.contains(token)
     }
@@ -2102,7 +2095,6 @@ impl<'a> Iterator for Pieces<'a> {
 /// is how `lookup_[PERSON_1]` in a tool name — dispatch, and deliberately not a
 /// slot — would have been missed, and the echoed name restored to
 /// `lookup_Martina Weber`.
-#[allow(dead_code)]
 pub fn placeholder_literals(value: &Value) -> HashSet<String> {
     let mut found = HashSet::new();
     collect_literals(value, &mut found);

@@ -13,7 +13,7 @@ use crate::audit::{Detected, Record};
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping;
-use crate::mapping::{Mapping, MappingError, Span};
+use crate::mapping::{Mapping, MappingError, Provenance, Span};
 use crate::provider::{
     as_response_error, read_document, read_pointer, write_document, write_pointer, Anthropic,
     OpenAi, Provider, ShapeError, Slot,
@@ -856,6 +856,9 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
+            // On the clone, so the boundary is this request's. The session's
+            // own copy never carries an issuance record to clear.
+            work.begin_request();
             let (masked, found) = mask_all(
                 provider.name(),
                 &state.detector,
@@ -886,6 +889,7 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
+            work.begin_request();
             let (masked, found) = mask_all(
                 provider.name(),
                 &state.detector,
@@ -902,6 +906,16 @@ async fn handle(
             (masked, work)
         }
     };
+
+    // Which tokens in the response this gateway may claim as its own. Both
+    // arms above leave `mapping` holding this request's issuance, so it is
+    // read here rather than threaded out of the match.
+    //
+    // Built from the request as it arrived, before anything rewrote it:
+    // `masked` carries the placeholders this request just issued, and reading
+    // the literals off that would put every one of them in both sets and leave
+    // nothing restorable at all.
+    let provenance = Provenance::new(mapping.issued(), mapping::placeholder_literals(&body));
 
     // Only what is masked leaves the process.
     let mut request = state.upstream.post(format!(
@@ -997,7 +1011,25 @@ async fn handle(
     // `arguments` is the live case — models do it — and without this the caller
     // would be told the request they sent was malformed and would go looking
     // for it there forever.
-    let mut restored = upstream.clone();
+    //
+    // The sweep runs on the untouched upstream body and the slots below are
+    // computed from that same body, so neither pass reads the other's output
+    // and no value is restored twice. Sweeping the *result* would corrupt a
+    // multi-turn session: strict restoration puts back a stored value carrying
+    // a literal the caller wrote in an earlier turn, and `written` describes
+    // only this request, so a second pass reads that literal as a token this
+    // request issued and overwrites the caller's own text with this turn's
+    // value. That case is
+    // `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`,
+    // and it is the only test in the suite that catches this ordering.
+    //
+    // Order matters the other way too: sweeping and stopping would make
+    // `content` lenient, so an unmappable token there would be served instead
+    // of refusing. The slot loop's strict result wins wherever the two overlap.
+    //
+    // `upstream` came out of `from_slice` above, which is the parse
+    // `restore_sweep` requires: its recursion is bounded by nothing else.
+    let mut restored = mapping.restore_sweep(&upstream, &provenance);
     for slot in provider
         .response_pointers(&upstream)
         .map_err(as_response_error)?
@@ -2335,14 +2367,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_and_a_citation_title_reach_the_client_restored() {
+        // Issue #31's two fields, asserted on what the CLIENT received.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "I cannot help with [PERSON_1]",
+                "annotations": [{"url_citation": {"title": "[PERSON_1] page"}}]
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains("[PERSON_1]"),
+            "a placeholder reached the client: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_nobody_issued_in_an_undescribed_field_is_served_not_refused() {
+        // Additivity, tested rather than asserted. "The suite stayed green"
+        // only covers what the suite already tests.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "invented [PERSON_9]"
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["refusal"],
+            "invented [PERSON_9]"
+        );
+    }
+
+    #[tokio::test]
     async fn a_streamed_block_restores_the_fields_no_slot_addresses() {
-        // The streamed path does **not** have the gap the buffered one had, and
-        // this pins the reason rather than the absence. `proxy::serve` starts
-        // from the upstream body and writes only the slots, so an undescribed
-        // field travels verbatim; `stream::handle` restores the whole event and
-        // *then* rewrites the slots, so an undescribed field is restored like
-        // any other string. Same shape, opposite outcome: the `cited_text` that
+        // The streamed path never had the gap the buffered one had, and this
+        // pins the reason rather than the absence. `stream::handle` restores
+        // the whole event and *then* rewrites the slots, so an undescribed
+        // field is restored like any other string: the `cited_text` that
         // reaches the client here is `Weber`, not `[PERSON_1]`.
+        //
+        // `proxy::handle` used to start from the upstream body and write only
+        // the slots, which is why the same shape reached a buffered client
+        // verbatim. It now sweeps first, so the two paths agree on this case.
+        // They are not the same rule: the buffered sweep restores only what
+        // this request issued and the caller did not write, which is narrower
+        // than what a streamed event gets.
         //
         // So there is nothing to refuse here, which is just as well: a stream
         // cannot refuse after its first bytes have gone out — the position
@@ -4541,6 +4637,76 @@ mod tests {
         assert!(
             second.contains("[PERSON_1]"),
             "the second turn renamed the same person: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number() {
+        // Why the sweep runs on the upstream body and not on the slot loop's
+        // result. Turn one's caller writes `[PERSON_3]` themselves inside a
+        // message the detector spans whole, so the session stores a *value*
+        // carrying that literal. `reserve_literals` maps it to itself for that
+        // one request and `absorb` does not carry the self-map, while `next`
+        // only ever climbs — so by turn three `[PERSON_3]` is free, and turn
+        // three issues it for `Braun`.
+        //
+        // Restoring `content` strictly puts turn one's stored value back,
+        // literal and all. A sweep over *that* would read the literal as a
+        // token this request issued and hand the client `Braun Weber`.
+        // Sweeping the untouched upstream body cannot: what the response
+        // carries is `[PERSON_1]`, which this request did not issue.
+        use wiremock::matchers::body_string_contains;
+        let detector = MockServer::start().await;
+        let span = |end: usize| {
+            json!({"spans": [{"entity_type": "PERSON", "start": 0, "end": end,
+                              "confidence": 1.0, "recognizer": "ner:fake",
+                              "tier": 2, "boosted": false}],
+                   "layers_run": ["deterministic"]})
+        };
+        for (text, end) in [("[PERSON_3] Weber", 16), ("Meier", 5), ("Braun", 5)] {
+            Mock::given(method("POST"))
+                .and(path("/detect"))
+                .and(body_string_contains(text))
+                .respond_with(ResponseTemplate::new(200).set_body_json(span(end)))
+                .mount(&detector)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        let mut served = String::new();
+        for text in ["[PERSON_3] Weber", "Meier", "Braun"] {
+            let (status, body) = call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": [{"role": "user", "content": text}]}),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            served = body;
+        }
+
+        assert!(
+            served.contains("[PERSON_3] Weber"),
+            "the caller's own literal was overwritten: {served}"
+        );
+        assert!(
+            !served.contains("Braun"),
+            "a value this turn issued was restored into an earlier turn's text: {served}"
         );
     }
 
