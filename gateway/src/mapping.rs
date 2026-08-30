@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -431,6 +431,48 @@ impl Mapping {
             }
         }
         Ok(result)
+    }
+}
+
+/// Which tokens in a response this gateway may claim as its own.
+///
+/// A `by_placeholder` lookup is **not** provenance: a session outlives a
+/// request, so a token turn one issued is in the table when turn three's caller
+/// writes that same literal themselves. Restoring on the lookup would hand the
+/// client turn one's value in place of its own text, and refusing on it would
+/// reject a response that is served today. Both were tried; the spec records
+/// them.
+///
+/// So provenance is built from this request and nothing else.
+#[allow(dead_code)]
+pub struct Provenance {
+    /// Tokens `placeholder_for` returned during this request's mask pass. A
+    /// caller's literal never reaches `placeholder_for` — `reserve_literals` is
+    /// the only thing that sees one — so this set cannot be forged from the
+    /// request body.
+    issued: HashSet<String>,
+    /// Placeholder-shaped tokens the request body carried, from **every**
+    /// string in it. Not from `reserve_literals`: that runs only inside
+    /// provider-selected slots, and dispatch strings are deliberately not
+    /// slots, so a tool name `lookup_[PERSON_1]` would be invisible to it and
+    /// the echoed name would come back as `lookup_Martina Weber` — a broken
+    /// call the client cannot diagnose.
+    written: HashSet<String>,
+}
+
+impl Provenance {
+    #[allow(dead_code)]
+    pub fn new(issued: HashSet<String>, written: HashSet<String>) -> Self {
+        Self { issued, written }
+    }
+
+    /// Whether the sweep may restore this token. A token in both sets is
+    /// ambiguous by construction: the two occurrences reach the response as the
+    /// same bytes, and nothing distinguishes them. Left, which loses coverage
+    /// and corrupts nothing. #32 is what separates them.
+    #[allow(dead_code)]
+    pub fn restorable(&self, token: &str) -> bool {
+        self.issued.contains(token) && !self.written.contains(token)
     }
 }
 
@@ -4056,5 +4098,22 @@ mod tests {
             "a number is copied through untouched — examined by the detector, \
              never rewritten by the rebuild"
         );
+    }
+
+    #[test]
+    fn a_token_is_restorable_only_if_this_request_issued_it_and_the_caller_did_not_write_it() {
+        let issued = HashSet::from(["[PERSON_1]".to_owned(), "[IBAN_2]".to_owned()]);
+        let written = HashSet::from(["[PERSON_1]".to_owned(), "[ORG_9]".to_owned()]);
+        let provenance = Provenance::new(issued, written);
+
+        // Issued and not written: the ordinary case, and the whole point.
+        assert!(provenance.restorable("[IBAN_2]"));
+        // Issued *and* written: the two occurrences are the same bytes in the
+        // response, so neither can be told from the other. Left.
+        assert!(!provenance.restorable("[PERSON_1]"));
+        // Written only: the caller's own literal.
+        assert!(!provenance.restorable("[ORG_9]"));
+        // Neither: the model invented it.
+        assert!(!provenance.restorable("[PERSON_7]"));
     }
 }
