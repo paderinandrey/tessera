@@ -515,7 +515,7 @@ impl Mapping {
     /// per-string contract those tests state — `Lenient` is private, and a test
     /// constructing it inline would state the rule in the shared function's
     /// vocabulary rather than the sweep's. Deleting it would take the sweep's
-    /// per-string cases with it or rewrite fifteen of them for no gain.
+    /// per-string cases with it or rewrite thirteen of them for no gain.
     #[cfg(test)]
     pub fn restore_in_string(&self, text: &str, provenance: &Provenance) -> String {
         self.restore_in_string_with(text, &Lenient(provenance))
@@ -566,6 +566,19 @@ impl Mapping {
     /// forces parse-and-re-serialize. Reformatting is the price of not
     /// corrupting and is paid only there. Into a string that is not JSON there
     /// is no structure to break.
+    ///
+    /// **That price was argued for the sweep and is now paid in described
+    /// fields too, which is worth stating in the terms a client sees.** A
+    /// `content` that parses as JSON and takes a value needing escaping reaches
+    /// the client re-serialized — key order is `serde_json::Map`'s, not the
+    /// model's, and insignificant whitespace is gone — where before this it was
+    /// byte-preserved. The trade is unchanged and the reasoning is the same one
+    /// as for the sweep: byte preservation is worth having and is what the
+    /// escaping test exists to keep, but it cannot be kept for the one input
+    /// where keeping it means emitting a document this gateway injected into.
+    /// It is not a widening of the price so much as a correction to who pays
+    /// it: the described path was never byte-preserving on this input either,
+    /// it was corrupting.
     ///
     /// **Reformatting is the price; losing a member is not.** That parse is
     /// lossy on one input — an object with two members of the same name — and

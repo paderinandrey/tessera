@@ -136,6 +136,30 @@ pub const MAX_HELD: usize = 64;
 /// matching `[TYPE_N]` contains no `[`, so only the text from the last `[` with
 /// no `]` after it can begin one; everything before that point is complete and
 /// is emitted restored.
+///
+/// **What it does not do: the escaping rule.** `push` and `finish` call
+/// `Mapping::restore`, which substitutes as text. The buffered path stopped
+/// doing that — a `content` that is a serialized document, under
+/// `response_format: json_object`, is restored structurally there so a value
+/// carrying a `"` lands in a leaf instead of closing the string it was
+/// substituted into. This buffer has no way to do the same. That protection is
+/// a parse of the whole string; what arrives here is a fragment of one, and
+/// `safe_prefix_len` holds text back only far enough not to split a
+/// placeholder, so the boundary it releases on is a `[` and has no relation to
+/// where a document begins or ends. Restoring the fragment `{"name":"` proves
+/// nothing about the document it will become at the client.
+///
+/// **So the two paths differ here, deliberately and not silently.** The
+/// `arguments` case — the one the recursion was written for — cannot reach this
+/// buffer at all: `reject_streamed_tools` refuses `stream: true` on a request
+/// carrying tool traffic. What remains open is a JSON-mode `content` on a
+/// streamed completion. Closing it means buffering a whole run before emitting
+/// any of it, which is the thing streaming exists not to do, or teaching this
+/// buffer to track JSON structure across fragments — a parser of our own beside
+/// the one `serde_json` already has, on the path where a mistake is
+/// unrecoverable because the bytes have gone out. Neither is worth it for the
+/// case; it is recorded rather than fixed. `proxy::handle`'s text-slot arm says
+/// the same from the side that is closed.
 pub struct RestoreBuffer<'a> {
     mapping: &'a Mapping,
     held: String,

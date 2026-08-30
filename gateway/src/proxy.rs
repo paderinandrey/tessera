@@ -1085,6 +1085,30 @@ async fn handle(
             // document the client parses, and a restored value carrying a `"`
             // substituted into it as text closes the string it lands in. Same
             // hazard, same door, same token policy: strict either way.
+            //
+            // **The streamed twin of this line does not get this protection,
+            // and the reason is that it cannot.** A streamed `content` is
+            // restored by `RestoreBuffer`, fragment by fragment, with plain
+            // `restore` — so the `response_format: json_object` case above is
+            // closed here and open there. It is not an oversight to fix by
+            // routing that call through the strict door: the protection is a
+            // parse of the whole string, a delta is a fragment of one, and the
+            // buffer holds text back only far enough not to split a placeholder
+            // (`safe_prefix_len`, which looks for `[`), so what it releases is
+            // an arbitrary prefix with no relation to a document boundary. See
+            // `RestoreBuffer`, which says the same from the other side.
+            //
+            // **What is closed there is the `arguments` half, by a different
+            // mechanism.** `reject_streamed_tools` refuses `stream: true` on
+            // any request carrying tool traffic, so a described `arguments` —
+            // the case the whole recursion was written for — never streams at
+            // all. The residue is a JSON-mode `content` on a streamed
+            // completion, where a value carrying a `"` can still reach the
+            // client mid-document. Two other things sit near that path and
+            // neither closes it: the hold-back buffer is about placeholders and
+            // not documents, and the slot blanking in `stream::handle` is what
+            // routes delta text *away* from the escaping-aware `restore_value`
+            // in the first place.
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(&upstream, &pointer)?;
                 write_pointer(
