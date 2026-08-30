@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
-use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 /// A span as the detector reports it: offsets are in characters, not bytes.
@@ -481,6 +483,16 @@ impl Mapping {
     /// corrupting and is paid only there. Into a string that is not JSON there
     /// is no structure to break.
     ///
+    /// **Reformatting is the price; losing a member is not.** That parse is
+    /// lossy on one input — an object with two members of the same name — and
+    /// lossy before this code sees anything, so no later step can undo it. A
+    /// document carrying one is left exactly as it came, restoration and all:
+    /// `carries_duplicate_members` is the test, and it runs behind the
+    /// escaping test rather than in front of it, so a document is only ever
+    /// left for a loss it was actually about to take. A value needing no
+    /// escaping still substitutes into such a document and keeps both members,
+    /// because nothing is ever re-serialized on that path.
+    ///
     /// Testing that the result still *parses* is not enough and was tried:
     /// restoring a token in `{"name":"[PERSON_1]"}` to `x","admin":true,...`
     /// yields **valid** JSON carrying fields nobody sent, which a client's tool
@@ -509,6 +521,19 @@ impl Mapping {
         let Ok(document) = serde_json::from_str::<Value>(text) else {
             return out;
         };
+        // The parse above is lossy in exactly one way, and it happens before
+        // anything here gets to look at the document. Two members of the same
+        // name collapse into one, so re-serializing hands the client a
+        // document the upstream did not send — a string forwarded byte for
+        // byte before this sweep existed, and a parser differential the moment
+        // the client's reader keeps the first member where `serde_json` keeps
+        // the last. Nothing below can put the lost member back, so the string
+        // is left exactly as it came: restoration lost for this one string,
+        // no bytes changed. Same rule as the collision arm of
+        // `restore_document` — what cannot be restored faithfully is left.
+        if carries_duplicate_members(text) {
+            return text.to_owned();
+        }
         let restored = self.restore_document(&document, provenance);
         // A collision inside may have left every restorable token where it
         // stood — see `restore_document`'s object arm. Nothing changed, so the
@@ -613,17 +638,147 @@ impl Mapping {
     /// by hand — with `json!` in a test, or by a future caller assembling one
     /// — carries none of that protection, and nothing here checks for it.
     ///
-    /// **What the sweep restores is not everything, and the exception is an
-    /// object.** A restored key that would collide with one already in its own
-    /// map leaves *that map* exactly as it arrived — every field present, none
-    /// of them restored, keys included. Everything outside it still restores.
+    /// **What the sweep restores is not everything, and there are two
+    /// exceptions. Both are places this gateway cannot re-serialize what it
+    /// was given, and both are left rather than guessed at.**
+    ///
+    /// A restored key that would collide with one already in its own map
+    /// leaves *that map* exactly as it arrived — every field present, none of
+    /// them restored, keys included. Everything outside it still restores.
+    ///
+    /// A string that *is* a serialized document with two members of the same
+    /// name is left whole, because the parse that would restore it collapses
+    /// those two before restoration begins — see `restore_in_string`. The unit
+    /// of the loss is the string, not the object, because by the time an
+    /// object could be identified the member is already gone. Everything
+    /// outside that string still restores.
+    ///
     /// So the promise is: every token this request issued and the caller did
-    /// not write is restored, except inside an object whose keys are ambiguous.
-    /// State it with that clause or not at all — it was once stated without,
-    /// while the fallback was body-wide, and the sentence read as a guarantee
-    /// the code could switch off from anywhere.
+    /// not write is restored, except inside an object whose keys are ambiguous
+    /// and inside a serialized document whose members are. State it with both
+    /// clauses or not at all — it was once stated without the first, while
+    /// that fallback was body-wide, and the sentence read as a guarantee the
+    /// code could switch off from anywhere.
     pub fn restore_sweep(&self, value: &Value, provenance: &Provenance) -> Value {
         self.restore_document(value, provenance)
+    }
+}
+
+/// Whether any object anywhere in `text` carries two members of the same name,
+/// which is exactly the condition under which a `Value` round trip loses one.
+///
+/// **`text` must already have parsed as a `Value`.** The caller has that parse
+/// in hand; this is a second pass over the same bytes, and the precondition is
+/// what makes the error case below decidable.
+///
+/// **`serde_json::from_str::<Value>` cannot answer this**: it inserts into a
+/// `Map`, and the second insert overwrites the first, so by the time there is a
+/// `Value` to inspect the evidence is gone. What answers it is a visitor that
+/// sees member names as the parser hands them over, one at a time, before any
+/// map exists to collapse them.
+///
+/// **The answer travels in the value; an error means something else entirely.**
+/// Reporting a duplicate by *failing* the deserialization would mean telling a
+/// genuine duplicate apart from a syntax error by sniffing a message — wrong
+/// the day that message changes, and wrong in the expensive direction, since a
+/// document with no duplicates left unrestored quietly shrinks the coverage
+/// this sweep exists to add. So the visitor accepts every JSON value there is
+/// and carries a `bool` out of the whole walk.
+///
+/// That leaves `Err` free to mean the only thing it can mean under the
+/// precondition: **this scan and the `Value` parse disagreed about bytes they
+/// both read** — a visitor arm missing for some JSON type, nothing a caller can
+/// send. `true` is the answer to that, so the defect costs restoration on the
+/// documents it touches and shows up as coverage falling away, rather than
+/// being read as "no duplicates" and handing the collapsing path a document it
+/// must not have. `every_json_type_survives_the_duplicate_scan` is what says
+/// the case is empty today.
+///
+/// **Exact in both directions.** A duplicate is reported precisely when two
+/// members of one object have equal names after unescaping, and that is
+/// precisely when `Map::insert` overwrites: the map is keyed by `String`, and
+/// `next_key::<String>` unescapes exactly as the map's own parse does. So
+/// `"a"` twice and `"a"` beside `"a"` are both duplicates, and both would
+/// lose a member. Nothing else is reported.
+///
+/// **Depth is bounded by the same parse.** This walk recurses through
+/// `next_element` and `next_value`, both of which re-enter
+/// `Deserializer::deserialize_any`, where `serde_json`'s recursion limit — the
+/// same 128 that bounds the `Value` parse — is enforced. It adds no reach that
+/// `restore_document`'s note does not already describe.
+fn carries_duplicate_members(text: &str) -> bool {
+    serde_json::from_str::<DuplicateScan>(text).map_or(true, |scan| scan.0)
+}
+
+/// The walk's answer: `true` if some object below carried a repeated name.
+struct DuplicateScan(bool);
+
+impl<'de> Deserialize<'de> for DuplicateScan {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(DuplicateScanVisitor)
+    }
+}
+
+struct DuplicateScanVisitor;
+
+/// Every scalar arm answers `false` identically, and writing them out is the
+/// point: what serde supplies in place of a missing one is an "invalid type"
+/// error, and an error here means a document this gateway can no longer verify.
+///
+/// The arms are exactly the ones `serde_json`'s `deserialize_any` can reach.
+/// It has no path to `visit_i128`/`visit_u128` — an integer too wide for
+/// `i64`/`u64` is handed over as `f64` — nor to `visit_none`/`visit_some`,
+/// since `null` arrives as `visit_unit`. Arms for those would be unreachable
+/// code claiming to be a safety net; `carries_duplicate_members` is where that
+/// net actually is.
+macro_rules! scalar_arms {
+    ($($name:ident($type:ty)),* $(,)?) => {
+        $(
+            fn $name<E: serde::de::Error>(self, _value: $type) -> Result<Self::Value, E> {
+                Ok(DuplicateScan(false))
+            }
+        )*
+    };
+}
+
+impl<'de> Visitor<'de> for DuplicateScanVisitor {
+    type Value = DuplicateScan;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    scalar_arms!(
+        visit_bool(bool),
+        visit_i64(i64),
+        visit_u64(u64),
+        visit_f64(f64),
+        visit_str(&str),
+    );
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateScan(false))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Self::Value, A::Error> {
+        let mut duplicate = false;
+        while let Some(item) = items.next_element::<DuplicateScan>()? {
+            duplicate |= item.0;
+        }
+        Ok(DuplicateScan(duplicate))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<Self::Value, A::Error> {
+        let mut duplicate = false;
+        let mut seen = HashSet::new();
+        while let Some(key) = fields.next_key::<String>()? {
+            duplicate |= !seen.insert(key);
+            // Every value is walked even once a duplicate is known: the
+            // deserializer must be drained to stay in step with the input, and
+            // draining it is the walk.
+            duplicate |= fields.next_value::<DuplicateScan>()?.0;
+        }
+        Ok(DuplicateScan(duplicate))
     }
 }
 
@@ -4547,6 +4702,164 @@ mod tests {
             mapping.restore_in_string(&document, &provenance),
             document,
             "neither field may be lost"
+        );
+    }
+
+    /// A mapping whose one token restores to a value carrying a quote, so
+    /// every caller of this takes the structural path rather than the textual
+    /// one. Returned with a `Provenance` that claims the token.
+    fn structural_mapping() -> (Mapping, Provenance, String) {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        (mapping, provenance, token)
+    }
+
+    #[test]
+    fn a_document_carrying_duplicate_members_is_left_exactly_as_it_came() {
+        // The parse that opens the structural path collapses two members of
+        // the same name before anything here sees them, and no later step can
+        // put the lost one back. Re-serializing would change bytes a client
+        // was forwarded unaltered before this sweep existed — and change them
+        // in a way two readers disagree about, since `serde_json` keeps the
+        // last member and a reader that keeps the first sees a different
+        // document. So this one is left, restoration and all.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "a member was collapsed on the way through"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_member_is_found_wherever_it_sits() {
+        // The scan is a whole-document walk, not a look at the top level: the
+        // duplicate here is under an array under an object, and the tokens
+        // around it are what an implementation that only checked the outermost
+        // map would happily have restored.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document =
+            format!("{{\"note\":\"{token}\",\"wrapper\":[{{\"a\":1,\"b\":2,\"a\":3}}]}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "a duplicate below the top level was walked past"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_that_only_two_spellings_share_is_found_too() {
+        // `\u0061` and `a` are different bytes and the same member name. The
+        // map that a parse builds is keyed by the unescaped string, so it
+        // collapses these two exactly as it collapses a literal repeat — and
+        // the scan reads keys through the same unescaping, so it sees them.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"\\u0061\":1,\"a\":2,\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "two spellings of one member name collapsed into one field"
+        );
+    }
+
+    #[test]
+    fn a_repeated_name_that_is_not_a_duplicate_member_still_restores() {
+        // The false-positive case, and the expensive one: leaving documents
+        // alone that lose nothing to a round trip would quietly shrink the
+        // coverage this sweep exists to add. Every `id` here is in a different
+        // object, `id` also appears as an array element and as a value, and
+        // the nesting repeats the name at three depths. None of it is a
+        // duplicate member and all of it must restore.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!(
+            "{{\"id\":\"{token}\",\"peer\":{{\"id\":\"x\",\"peer\":{{\"id\":\"y\"}}}},\
+             \"tags\":[\"id\",\"id\"],\"label\":\"id\",\"rows\":[{{\"id\":1}},{{\"id\":2}}]}}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&mapping.restore_in_string(&document, &provenance))
+                .expect("still a document"),
+            json!({
+                "id": "Martina \"Weber\"",
+                "peer": {"id": "x", "peer": {"id": "y"}},
+                "tags": ["id", "id"],
+                "label": "id",
+                "rows": [{"id": 1}, {"id": 2}]
+            }),
+            "a document that loses nothing to a round trip was left unrestored"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_member_costs_nothing_when_no_value_needs_escaping() {
+        // The scan sits behind the escaping test, where the structural path
+        // begins, so a document is only ever left for a duplicate it was about
+        // to lose. This value carries no quote, backslash or control
+        // character, the textual path answers, and both members survive
+        // because nothing was ever re-serialized — which is also the older
+        // behaviour this fix is restoring, arrived at the cheap way.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            "{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"Martina Weber\"}",
+            "restored in place, both members kept, formatting untouched"
+        );
+    }
+
+    #[test]
+    fn text_the_duplicate_scan_cannot_walk_is_reported_as_a_duplicate() {
+        // The direction the safety net runs in, pinned where the test above
+        // cannot reach it. `restore_in_string` never asks this question of
+        // bytes that failed to parse — it has the `Value` in hand before it
+        // asks — so the only way a walk fails there is a defect in the walk
+        // itself, and the answer to a defect has to be the side that costs a
+        // restoration rather than the side that hands the collapsing path a
+        // document nobody checked. Answering `false` here reads every future
+        // defect as "no duplicates" and puts this whole fix back.
+        assert!(carries_duplicate_members("{\"unterminated\": "));
+        assert!(carries_duplicate_members("not json at all"));
+    }
+
+    #[test]
+    fn every_json_type_survives_the_duplicate_scan() {
+        // `carries_duplicate_members` answers `true` when its walk disagrees
+        // with the parse the caller already made, because the alternative —
+        // reading a defect as "no duplicates" — hands the collapsing path a
+        // document it must not have. That makes a missing visitor arm safe,
+        // and this is what says the case is empty today: one document
+        // carrying every type `serde_json`'s `deserialize_any` can produce,
+        // including the integers at both ends of `i64`/`u64` and one past
+        // them that arrives as a float. A `true` here is an arm that is gone.
+        let document = "{\"null\":null,\"yes\":true,\"no\":false,\
+             \"neg\":-9223372036854775808,\"big\":18446744073709551615,\
+             \"wider\":184467440737095516150,\"float\":1.5,\"exp\":1e308,\
+             \"text\":\"plain\",\"escaped\":\"a\\\"b\\u0063\",\
+             \"empty_array\":[],\"empty_object\":{},\
+             \"mixed\":[null,true,1,-1,1.5,\"s\",[],{},{\"deep\":[{\"deeper\":null}]}]}";
+        assert!(
+            serde_json::from_str::<Value>(document).is_ok(),
+            "the fixture stopped being a document"
+        );
+        assert!(
+            !carries_duplicate_members(document),
+            "the scan could not walk a type the parse accepted, so every \
+             document carrying that type now goes unrestored"
         );
     }
 

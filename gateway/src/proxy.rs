@@ -1027,12 +1027,16 @@ async fn handle(
     // `content` lenient, so an unmappable token there would be served instead
     // of refusing. The slot loop's strict result wins wherever the two overlap.
     //
-    // **The sweep does not reach everywhere, and the exception is an object.**
+    // **The sweep does not reach everywhere, and there are two exceptions.**
     // An object whose restored keys would collide keeps the keys and values it
-    // came with, so a placeholder can still reach the client from inside one —
-    // see `restore_sweep`. Everything around it restores;
-    // `a_colliding_key_costs_its_own_object_and_nothing_around_it` is what
-    // holds the exception to that size, having once been the whole body.
+    // came with, and a string that is a serialized document with two members
+    // of the same name is left whole — see `restore_sweep`. A placeholder can
+    // still reach the client from inside either, and everything around them
+    // restores. `a_colliding_key_costs_its_own_object_and_nothing_around_it`
+    // holds the first to its size, having once been the whole body;
+    // `a_serialized_document_with_duplicate_members_reaches_the_client_intact`
+    // is the second, which exists because re-serializing that string dropped a
+    // member the upstream sent.
     //
     // `upstream` came out of `from_slice` above, which is the parse
     // `restore_sweep` requires: its recursion is bounded by nothing else.
@@ -2446,6 +2450,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_serialized_document_with_duplicate_members_reaches_the_client_intact() {
+        // The structural path parses the string it is restoring into, and a
+        // parse collapses two members of the same name before anything this
+        // gateway wrote gets to look at them. Re-serializing then hands the
+        // client a document with one `mode` where the upstream sent two — a
+        // payload forwarded byte for byte before the sweep existed, and a
+        // parser differential for any client whose reader keeps the *first*
+        // member rather than the last.
+        //
+        // `Martina "Weber"` carries a quote, so the restored value needs
+        // escaping and the structural path is the one taken. With a value
+        // needing none the textual path answers and the bytes survive anyway.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false}
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"[PERSON_1]\"}"
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Martina \"Weber\""}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["refusal"],
+            json!("{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"[PERSON_1]\"}"),
+            "the duplicate member was collapsed on the way through: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_token_nobody_issued_in_an_undescribed_field_is_served_not_refused() {
         // Additivity, tested rather than asserted. "The suite stayed green"
         // only covers what the suite already tests.
@@ -2550,13 +2598,16 @@ mod tests {
         // the slots, which is why the same shape reached a buffered client
         // verbatim. It now sweeps first, so the two paths agree on this case.
         // They are not the same rule: the buffered sweep restores only what
-        // this request issued and the caller did not write, *except inside an
-        // object whose restored keys would collide*, which is narrower than
-        // what a streamed event gets on both counts. The clause belongs here
-        // like it belongs everywhere else the promise is written — a stream
-        // restores its event whole and has no such exception, so stating the
-        // buffered rule without it understates the distance between the two
-        // paths this comment exists to draw.
+        // this request issued and the caller did not write, *except where
+        // restoring it would drop something the upstream sent* — an object
+        // whose restored keys would collide, or a serialized document with two
+        // members of the same name — which is narrower than what a streamed
+        // event gets on every count. The clause belongs here like it belongs
+        // everywhere else the promise is written — a stream restores its event
+        // whole and has neither exception, since neither `restore_document`
+        // nor `restore_in_string` is on its path, so stating the buffered rule
+        // without it understates the distance between the two paths this
+        // comment exists to draw.
         //
         // So there is nothing to refuse here, which is just as well: a stream
         // cannot refuse after its first bytes have gone out — the position
