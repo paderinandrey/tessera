@@ -679,8 +679,12 @@ impl Mapping {
         // substitution cannot create structure whatever the text is, so prose
         // keeps the answer it has always had — which is the overwhelming
         // majority of this branch, since the quote is usually in the *value*
-        // and not in the text around it. With one, and no parse, nothing here
-        // can tell corruption from prose, so the rule decides.
+        // and not in the text around it.
+        //
+        // With one, `begins_like_a_document` decides, and it knows a second
+        // exact case: a text that *opens* with a placeholder is prose to every
+        // reader, which is what masked prose usually looks like. Past those two
+        // nothing here can tell corruption from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
             if holds_no_string(text) || !begins_like_a_document(text) {
                 return Ok(out);
@@ -1151,14 +1155,35 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
 /// replacing the other: a text with no quote at all is safe even when it does
 /// begin with a brace.
 ///
+/// **A leading `[` that opens a placeholder is prose punctuation, not
+/// structure**, and this is the one case where the first byte lies. Masked text
+/// routinely *begins* with a mask — `[PERSON_1] said "hello"` — so the byte test
+/// alone called the most ordinary sentence this gateway produces a document,
+/// and a value needing escaping then cost it a 502.
+///
+/// The exemption is exact rather than a second guess at prose. A token can only
+/// sit inside a string in a document, so at the top it is not our reader being
+/// strict: `[PERSON_1]` is an array holding a bare word, which is a value in no
+/// JSON reader, lenient ones included. The question is asked through `pieces`,
+/// the same reading `restore` uses, so the two cannot drift about what a token
+/// is — and it is asked of the *shape*, not of the mapping, since an unmapped
+/// token proves the text is prose exactly as well as a mapped one does.
+///
+/// It closes the case that occurs, not the class. A text opening with a literal
+/// `"` or `{` still takes the rule, and prose does sometimes open with a
+/// quotation. Those keep the conservative answer because no equally exact
+/// argument is available for them, and inventing one is how the first byte came
+/// to be trusted in the first place.
+///
 /// Trimming is `trim_start`, which removes more than JSON's four whitespace
 /// characters. That is the conservative direction: a text opening with U+00A0
 /// is no document to any reader, and calling it one only costs restoration.
 fn begins_like_a_document(text: &str) -> bool {
-    matches!(
-        text.trim_start().as_bytes().first(),
-        Some(b'{' | b'[' | b'"')
-    )
+    let text = text.trim_start();
+    if matches!(pieces(text).next(), Some(Piece::Placeholder(_))) {
+        return false;
+    }
+    matches!(text.as_bytes().first(), Some(b'{' | b'[' | b'"'))
 }
 
 /// Whether these bytes contain no `"` at all, which is what makes an unescaped
@@ -5392,6 +5417,53 @@ mod tests {
                 Err(MappingError::Unrestorable(_))
             ),
             "a described document this reader cannot parse was substituted into anyway"
+        );
+    }
+
+    #[test]
+    fn prose_that_opens_with_a_placeholder_and_quotes_something_still_restores() {
+        // The residue the first-byte test left behind, and the likeliest shape
+        // of all: masked prose usually *begins* with its mask, so `[` is the
+        // ordinary first character of a restored `content`, not a rare one.
+        // With a quote anywhere in the sentence and a value needing escaping,
+        // that sentence took the strict door and became a 502 on a plain chat
+        // completion.
+        //
+        // `[PERSON_1] said "hello"` is an array holding a bare word. No reader
+        // accepts it, so nothing here can be corrupted by substituting into it.
+        let (mapping, provenance, token) = structural_mapping();
+        let text = format!("{token} said \"hello\"");
+
+        assert_eq!(
+            mapping.restore_in_string(&text, &provenance),
+            "Martina \"Weber\" said \"hello\"",
+            "prose opening with a placeholder lost its restoration"
+        );
+        assert_eq!(
+            mapping
+                .restore_value(&json!({ "arguments": text }))
+                .expect("prose opening with a placeholder refused the response"),
+            json!({ "arguments": "Martina \"Weber\" said \"hello\"" }),
+            "the described door disagreed with the lenient one about the same text"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_document_whose_first_value_is_a_placeholder_string_still_refuses() {
+        // The width of the exemption above. `["` is a `[` that opens an array,
+        // not one that opens a token, and `pieces` reports the difference: the
+        // first piece here is text. So a document this reader rejects and a
+        // client may accept keeps the conservative answer, and the exemption
+        // cannot be widened into it by accident.
+        let (mapping, _provenance, token) = structural_mapping();
+        let document = format!("[\"{token}\",1e999]");
+
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": document })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a document opening with an array was substituted into as if it were prose"
         );
     }
 
