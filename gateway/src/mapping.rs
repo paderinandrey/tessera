@@ -681,10 +681,12 @@ impl Mapping {
         // majority of this branch, since the quote is usually in the *value*
         // and not in the text around it.
         //
-        // With one, `begins_like_a_document` decides, and it knows a second
-        // exact case: a text that *opens* with a placeholder is prose to every
-        // reader, which is what masked prose usually looks like. Past those two
-        // nothing here can tell corruption from prose, so the rule decides.
+        // With one, `begins_like_a_document` decides it by a race between the
+        // first structure and the first word, skipping our own tokens on the
+        // way. That reading needs no list of what a reader ignores before the
+        // document starts — the list is on the unsafe side of the error, as a
+        // byte order mark proved. Where structure wins, nothing here can tell
+        // corruption from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
             if holds_no_string(text) || !begins_like_a_document(text) {
                 return Ok(out);
@@ -1141,49 +1143,66 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
 /// Whether these bytes could be a JSON document with one of our tokens inside
 /// it — the question `holds_no_string` asks, asked better.
 ///
-/// A placeholder can only appear inside a string, and a JSON document that
-/// contains a string is an object, an array, or a string. So a document that
-/// could hold our token begins, after whitespace, with `{`, `[` or `"`, and a
-/// text that begins with anything else is prose whatever this reader thinks of
-/// it. `Der Bericht "Q3" nennt [PERSON_1].` begins with `D`.
+/// **The reading is a race, not a look at the first byte.** Walk the text
+/// skipping our own tokens, and let whichever arrives first decide: a `{`, `[`
+/// or `"` means a document may begin here, and an alphanumeric means a word got
+/// there first and this is prose. Neither arriving is prose too — a text with
+/// no structure in it at all.
+///
+/// **Why a race and not a prefix test.** A document holding our token begins
+/// with `{`, `[` or `"` *after whatever the reader ignores first*, and what a
+/// reader ignores is the part we cannot enumerate. This function used to trim
+/// whitespace and read one byte, which read `\u{FEFF}{"name":"[PERSON_1]"}` —
+/// a BOM and then a document — as prose, because `char::is_whitespace` is false
+/// for U+FEFF and `serde_json` refuses the text outright. The substitution then
+/// went out unescaped and a value of `x","admin":true,"pad":"` injected a
+/// member into a document every BOM-skipping reader parses. Adding U+FEFF to a
+/// trim list would have fixed that text and left the next one, and the list is
+/// on the unsafe side of the error: a character missing from it is a
+/// substitution emitted, not a restoration lost.
+///
+/// The race needs no such list. It **skips everything that is neither
+/// structure nor a word**, so an ignorable prefix of any composition — a BOM,
+/// a zero-width joiner, a control character, something not yet invented — is
+/// simply passed over and the decision falls to the `{` behind it.
+///
+/// **Our own tokens are skipped rather than raced.** A `[` that opens a
+/// placeholder is prose punctuation: `[PERSON_1] said "hello"` is an array
+/// holding a bare word, a value in no JSON reader, lenient ones included, so it
+/// is not this reader being strict. Masked text routinely *begins* with its
+/// mask, which is why the first byte lied about the most ordinary sentence this
+/// gateway produces. The skipping is done by `pieces`, the same reading
+/// `restore` uses, so the two cannot drift about what a token is, and it asks
+/// the *shape* rather than the mapping, since an unmapped token proves the text
+/// is prose exactly as well as a mapped one.
 ///
 /// **This is what keeps ordinary traffic off the refusal.** `holds_no_string`
 /// alone tested for a `"` anywhere in the text, so prose quoting anything at
 /// all — a report title, a line the model is citing back — fell through to the
 /// rule and cost a 502 on a plain chat completion, since every `Slot::Text`
-/// takes the strict door. The two questions are kept as an `||` rather than one
-/// replacing the other: a text with no quote at all is safe even when it does
-/// begin with a brace.
+/// takes the strict door. `Der Bericht "Q3" nennt [PERSON_1].` reaches `D`
+/// before it reaches that quote. The two questions are kept as an `||` rather
+/// than one replacing the other: `{[PERSON_1]}` has no quote to close and is
+/// safe even though structure wins its race.
 ///
-/// **A leading `[` that opens a placeholder is prose punctuation, not
-/// structure**, and this is the one case where the first byte lies. Masked text
-/// routinely *begins* with a mask — `[PERSON_1] said "hello"` — so the byte test
-/// alone called the most ordinary sentence this gateway produces a document,
-/// and a value needing escaping then cost it a 502.
-///
-/// The exemption is exact rather than a second guess at prose. A token can only
-/// sit inside a string in a document, so at the top it is not our reader being
-/// strict: `[PERSON_1]` is an array holding a bare word, which is a value in no
-/// JSON reader, lenient ones included. The question is asked through `pieces`,
-/// the same reading `restore` uses, so the two cannot drift about what a token
-/// is — and it is asked of the *shape*, not of the mapping, since an unmapped
-/// token proves the text is prose exactly as well as a mapped one does.
-///
-/// It closes the case that occurs, not the class. A text opening with a literal
-/// `"` or `{` still takes the rule, and prose does sometimes open with a
-/// quotation. Those keep the conservative answer because no equally exact
-/// argument is available for them, and inventing one is how the first byte came
-/// to be trusted in the first place.
-///
-/// Trimming is `trim_start`, which removes more than JSON's four whitespace
-/// characters. That is the conservative direction: a text opening with U+00A0
-/// is no document to any reader, and calling it one only costs restoration.
+/// **What it still refuses is stated rather than hidden.** Prose whose first
+/// visible character is structural — an opening quotation, `"Hallo", sagte
+/// [PERSON_1]` — loses its restoration, and so does a label before a quote,
+/// `[PERSON_1]: "hello"`. Both are the conservative answer to a text this
+/// reader cannot parse, and both cost restoration rather than correctness.
 fn begins_like_a_document(text: &str) -> bool {
-    let text = text.trim_start();
-    if matches!(pieces(text).next(), Some(Piece::Placeholder(_))) {
-        return false;
+    for piece in pieces(text) {
+        let Piece::Text(run) = piece else { continue };
+        for character in run.chars() {
+            if matches!(character, '{' | '[' | '"') {
+                return true;
+            }
+            if character.is_alphanumeric() {
+                return false;
+            }
+        }
     }
-    matches!(text.as_bytes().first(), Some(b'{' | b'[' | b'"'))
+    false
 }
 
 /// Whether these bytes contain no `"` at all, which is what makes an unescaped
@@ -5418,6 +5437,62 @@ mod tests {
             ),
             "a described document this reader cannot parse was substituted into anyway"
         );
+    }
+
+    #[test]
+    fn a_document_behind_a_byte_order_mark_is_not_read_as_prose() {
+        // The hole the first-byte reading left, and the reason the reading is
+        // now a race. `char::is_whitespace` is false for U+FEFF, so `trim_start`
+        // left it, the first byte was neither `{` nor `[` nor `"`, and a
+        // document `serde_json` refuses outright was called prose. The
+        // substitution then went out unescaped.
+        //
+        // The value is the injection rather than a value that merely needs
+        // escaping: before this, the client received
+        // `{"name":"x","admin":true,"pad":""}` — a member it never sent, in a
+        // document every BOM-skipping reader parses.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",\"admin\":true,\"pad\":\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        let document = format!("\u{FEFF}{{\"name\":\"{token}\"}}");
+
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "a document behind a byte order mark was substituted into as prose"
+        );
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": document })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described document behind a byte order mark was served anyway"
+        );
+    }
+
+    #[test]
+    fn prose_whose_words_arrive_before_any_structure_still_restores() {
+        // The other half of the race, and what stops the fix above from
+        // refusing ordinary traffic. A bullet, an em dash, an emoji, a
+        // quotation later in the sentence — none of them is structure, and the
+        // word reaches the reader first in every one.
+        let (mapping, provenance, token) = structural_mapping();
+
+        for text in [
+            format!("- {token} said \"hi\""),
+            format!("\u{2014} {token} said \"hi\""),
+            format!("2024 war {token} in Bern, sagte \"X\""),
+        ] {
+            let restored = mapping.restore_in_string(&text, &provenance);
+            assert!(
+                restored.contains("Martina \"Weber\""),
+                "prose lost its restoration to the race: {text:?} -> {restored:?}"
+            );
+        }
     }
 
     #[test]
