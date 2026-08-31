@@ -1144,10 +1144,21 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
 /// it — the question `holds_no_string` asks, asked better.
 ///
 /// **The reading is a race, not a look at the first byte.** Walk the text
-/// skipping our own tokens, and let whichever arrives first decide: a `{`, `[`
-/// or `"` means a document may begin here, and an alphanumeric means a word got
-/// there first and this is prose. Neither arriving is prose too — a text with
-/// no structure in it at all.
+/// skipping our own tokens, and let whichever arrives first decide: a `"`, or a
+/// `{` or `[` that something can legally follow, means a document may begin
+/// here; an alphanumeric means a word got there first and this is prose.
+/// Neither arriving is prose too — a text with no structure in it at all.
+///
+/// **An opening bracket is asked what follows it**, which is the difference
+/// between `["a"]` and a checkbox. `pieces` reports `[x]` as text, because it
+/// is not one of ours, so a bullet list, a Markdown link and a footnote marker
+/// all put a `[` in front of the first word and the race went to structure —
+/// a 502 on described `content`, and the placeholder left standing by the
+/// lenient sweep. `continues_a_document` settles it with the JSON grammar and
+/// not with a reading of Markdown: `x` and `d` begin no value, so `[x]` and
+/// `[docs](…)` open no document. A bracket that *is* followed by a value —
+/// `[1]` in a footnote — keeps the conservative answer, because at that point
+/// the two are the same text.
 ///
 /// **Why a race and not a prefix test.** A document holding our token begins
 /// with `{`, `[` or `"` *after whatever the reader ignores first*, and what a
@@ -1185,24 +1196,65 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
 /// than one replacing the other: `{[PERSON_1]}` has no quote to close and is
 /// safe even though structure wins its race.
 ///
-/// **What it still refuses is stated rather than hidden.** Prose whose first
-/// visible character is structural — an opening quotation, `"Hallo", sagte
-/// [PERSON_1]` — loses its restoration, and so does a label before a quote,
-/// `[PERSON_1]: "hello"`. Both are the conservative answer to a text this
-/// reader cannot parse, and both cost restoration rather than correctness.
+/// **What it still refuses is stated rather than hidden.** Prose reaching a `"`
+/// before any word — an opening quotation, `"Hallo", sagte [PERSON_1]`, or a
+/// label before one, `[PERSON_1]: "hello"` — loses its restoration, as does a
+/// bracket that opens a value in prose that is not a document, `[1] Siehe
+/// [PERSON_1]`. A `"` cannot be asked what follows it the way a bracket can:
+/// every character may follow it, since it opens a string. All three are the
+/// conservative answer to a text this reader cannot parse, and all three cost
+/// restoration rather than correctness.
 fn begins_like_a_document(text: &str) -> bool {
+    let mut opened: Option<char> = None;
     for piece in pieces(text) {
-        let Piece::Text(run) = piece else { continue };
+        let Piece::Text(run) = piece else {
+            // A token of ours continues no document — unquoted it is neither a
+            // value nor a member name — so it answers a pending opener with
+            // "no" rather than completing it, and is otherwise passed over.
+            opened = None;
+            continue;
+        };
         for character in run.chars() {
-            if matches!(character, '{' | '[' | '"') {
-                return true;
+            if let Some(opener) = opened {
+                if character.is_whitespace() {
+                    continue;
+                }
+                opened = None;
+                if continues_a_document(opener, character) {
+                    return true;
+                }
+                // It did not, so this character has not been read yet: fall
+                // through and let it race like any other.
             }
-            if character.is_alphanumeric() {
-                return false;
+            match character {
+                '"' => return true,
+                '{' | '[' => opened = Some(character),
+                _ if character.is_alphanumeric() => return false,
+                _ => {}
             }
         }
     }
     false
+}
+
+/// Whether `next` can be the first non-whitespace character after `opener` in a
+/// JSON document.
+///
+/// This is the whole of what separates `[x]` from `["a"]`, and it is the JSON
+/// grammar rather than a reading of Markdown: an object's first token is a
+/// member name or its own end, an array's is a value or its own end, and a
+/// value begins with `{`, `[`, `"`, a `-`, a digit, or the first letter of
+/// `true`, `false` or `null`. Nothing here knows what a checkbox is; it knows
+/// that `x` continues no document, and a bullet, a link and a footnote marker
+/// all fall out of that.
+fn continues_a_document(opener: char, next: char) -> bool {
+    match opener {
+        '{' => matches!(next, '"' | '}'),
+        '[' => {
+            matches!(next, '{' | '[' | '"' | '-' | 't' | 'f' | 'n' | ']') || next.is_ascii_digit()
+        }
+        _ => false,
+    }
 }
 
 /// Whether these bytes contain no `"` at all, which is what makes an unescaped
@@ -5491,6 +5543,56 @@ mod tests {
             assert!(
                 restored.contains("Martina \"Weber\""),
                 "prose lost its restoration to the race: {text:?} -> {restored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_prose_whose_brackets_open_no_document_still_restores() {
+        // The regression the race shipped with. `pieces` reports `[x]` as text
+        // because it is not one of ours, so structure won the race against a
+        // checkbox, a link and every other bracket Markdown uses — and a
+        // described `content` carrying one became a 502 while the lenient
+        // sweep left the placeholder standing.
+        //
+        // The bracket is now asked what follows it, and the answer is the JSON
+        // grammar: `x` and `d` begin no value, so neither `[x]` nor
+        // `[docs](...)` opens a document. Nothing here knows what Markdown is.
+        let (mapping, provenance, token) = structural_mapping();
+
+        for text in [
+            format!("- [x] {token} said \"hi\""),
+            format!("[docs](https://x) nennt {token} und \"y\""),
+            format!("{{PERSON}} ist kein Dokument, sagte {token}: \"z\""),
+        ] {
+            let restored = mapping.restore_in_string(&text, &provenance);
+            assert!(
+                restored.contains("Martina \"Weber\""),
+                "bracketed prose lost its restoration: {text:?} -> {restored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bracket_that_opens_a_value_is_still_a_document() {
+        // The width of the exemption above, and the reason it is the grammar
+        // rather than a list of Markdown shapes. `["` and `[1` and `[t` all
+        // begin documents this reader may refuse and another may accept, so
+        // they keep the conservative answer even though the text around them
+        // reads like prose. A footnote marker is the price and it is named
+        // here so nobody reads the leniency as wider than it is.
+        let (mapping, _provenance, token) = structural_mapping();
+
+        for document in [
+            format!("[\"{token}\",1e999]"),
+            format!("[1] Siehe {token}, \"z\""),
+        ] {
+            assert!(
+                matches!(
+                    mapping.restore_value(&json!({ "arguments": document })),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a bracket opening a value was substituted into as prose: {document:?}"
             );
         }
     }
