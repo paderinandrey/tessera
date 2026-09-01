@@ -1136,9 +1136,10 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// The same inversion `structure_encloses_a_token` went through, for the same
 /// reason.
 ///
-/// So nothing is admitted that could be a delimiter in *any* dialect —
-/// `'` and a backtick are out along with `"` — and nothing whose meaning
-/// depends on a parser. `/` is out too, and it is the one whose cost was
+/// So nothing is admitted that could be a delimiter in any dialect **of the
+/// JSON family** — `'` and a backtick are out along with `"` — and nothing
+/// whose meaning depends on a parser. `/` is out too, and it is the one whose
+/// cost was
 /// measured rather than assumed: a German `Steuernummer` is spelled
 /// `21/815/08150` and e-mail local parts may carry a slash, so this was not
 /// free. It turned out to be nearly so, because a slash-bearing identifier
@@ -1160,6 +1161,16 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// nothing at all would help. `/` came out because it was cheap, not because
 /// removing it makes evaluation safe. A client that evals model output has a
 /// larger problem than this function.
+///
+/// **The same boundary excludes YAML, and saying so is the honest form of the
+/// claim.** `:`, `@`, `?` and `!` are all indicators there, and every one of
+/// them is on this list — `:` is in every timestamp, `@` in every e-mail
+/// address. Taking them off to cover a reader nobody in this path has would
+/// leave an allowlist that refuses the values this gateway exists to restore,
+/// which is the trade the measurement below the slash exists to prevent.
+/// **"A delimiter in any dialect at all" was the first draft of this sentence,
+/// and it was not true when written** — a claim about every format there is
+/// cannot be kept, and the family this gateway actually speaks can.
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
