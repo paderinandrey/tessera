@@ -611,7 +611,8 @@ impl Mapping {
     /// **And the fourth thing is not a loss but a refusal**: this reader can
     /// reject a text a client accepts — a document past its recursion limit, an
     /// exponent it calls out of range — and reading that as "not a document"
-    /// substitutes into one blind. `holds_no_string` is what stands there.
+    /// substitutes into one blind. `structure_encloses_a_token` is what stands
+    /// there.
     ///
     /// What the two paths do about all four is the one thing they do not share,
     /// and it is `Restoration::lossy_document`'s to answer: the sweep leaves the
@@ -653,7 +654,7 @@ impl Mapping {
                     // the uniform question is the same question the two arms
                     // used to ask separately.
                     let value = rule.token(self, candidate)?;
-                    needs_escaping |= value.chars().any(json_string_unsafe);
+                    needs_escaping |= !value.chars().all(json_string_inert);
                     out.push_str(value);
                 }
             }
@@ -673,21 +674,21 @@ impl Mapping {
         // reader refuses; emitting `out` for it injects exactly as it would
         // have into a document that parsed.
         //
-        // What *is* a proof is `holds_no_string`: our value can only close a
-        // string that exists, a placeholder can only sit inside a string in a
-        // document, and both need a `"` in these bytes. Without one the
-        // substitution cannot create structure whatever the text is, so prose
-        // keeps the answer it has always had — which is the overwhelming
-        // majority of this branch, since the quote is usually in the *value*
-        // and not in the text around it.
+        // A quote-free text used to be exempted here on the argument that our
+        // value can only close a string that exists and a string in JSON is
+        // delimited by `"`. The second half of that was a claim about a
+        // reader: `{'name':'[PERSON_1]'}` holds a string, holds our token in
+        // it, and holds no `"` at all. The exemption is gone and the escaping
+        // test carries that weight instead, as an allowlist rather than a
+        // blocklist — see `json_string_inert`.
         //
-        // With one, `structure_encloses_a_token` decides, by asking whether
+        // So `structure_encloses_a_token` decides alone, by asking whether
         // any container was opened before the token. Six readings before it
         // each made some claim about what another reader accepts, and six were
         // defeated in turn; this one makes none. Where a container was opened,
         // nothing here can tell corruption from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
-            if holds_no_string(text) || !structure_encloses_a_token(text) {
+            if !structure_encloses_a_token(text) {
                 return Ok(out);
             }
             rule.lossy_document("a string this gateway cannot parse but a client may")?;
@@ -1122,10 +1123,30 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
     }
 }
 
-/// Characters that can end a JSON string or start an escape, so a value
-/// carrying one cannot be substituted into JSON text byte-safely.
-fn json_string_unsafe(character: char) -> bool {
-    character == '"' || character == '\\' || character.is_control()
+/// Whether this character is one a value can carry into any JSON text without
+/// being able to end a string, start an escape, or break one.
+///
+/// **An allowlist, and the direction is the point.** This was the opposite —
+/// `"`, `\` and the control characters — and a value of
+/// `x','admin':true,'pad':'y` therefore counted as safe, went out by plain
+/// substitution, and turned `{'name':'[PERSON_1]'}` into a JSON5 object with a
+/// member the upstream never sent. A blocklist of delimiters is a claim about
+/// which characters open a string in the reader we do not have, and its
+/// omissions are injections; an allowlist's omissions are restorations lost.
+/// The same inversion `structure_encloses_a_token` went through, for the same
+/// reason.
+///
+/// So nothing is admitted that could be a delimiter in *any* dialect —
+/// `'` and a backtick are out along with `"` — and nothing whose meaning
+/// depends on a parser. What is left is what detected spans are actually made
+/// of: letters and digits in any script, and the punctuation that appears in
+/// names, addresses, e-mails, IBANs, phone numbers and dates.
+fn json_string_inert(character: char) -> bool {
+    character.is_alphanumeric()
+        || matches!(
+            character,
+            ' ' | '.' | ',' | '-' | '_' | '@' | '+' | '/' | ':' | ';' | '(' | ')' | '?' | '!'
+        )
 }
 
 /// Everything `parse → Value → to_string` does not carry, asked of the bytes
@@ -1171,8 +1192,9 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether any container was opened before one of our tokens — the question
-/// `holds_no_string` asks, asked better.
+/// Whether any container was opened before one of our tokens: the one test
+/// standing between a text this reader refuses and an unescaped substitution
+/// into it.
 ///
 /// **Seven versions of this guard have now been written, and this is the first
 /// that says nothing about a reader other than ours.** The six before it read
@@ -1241,27 +1263,6 @@ fn structure_encloses_a_token(text: &str) -> bool {
         }
     }
     false
-}
-
-/// Whether these bytes contain no `"` at all, which is what makes an unescaped
-/// substitution into them safe *without* knowing whether they are a document.
-///
-/// The argument is short and it is the whole of it. A value of ours can only
-/// close a string that is open, a placeholder can only appear inside a string
-/// in a JSON document — unquoted it is not a JSON value — and a string in JSON
-/// text is delimited by `"`. So a text with no `"` is either not a document or
-/// a document with no place for the token that got us here, and in both cases
-/// the characters we insert cannot create structure.
-///
-/// It is half the answer to a question the parse cannot answer — *this* reader
-/// refusing a text is not the client's reader refusing it — and
-/// `structure_encloses_a_token` is the other half and the larger one. This was the
-/// whole of it for one commit, and testing for a quote *anywhere* meant every
-/// sentence quoting anything at all fell through to the rule. Kept beside the
-/// other test rather than replaced by it: `{[PERSON_1]}` begins like a document
-/// and still has nothing our characters could close.
-fn holds_no_string(text: &str) -> bool {
-    !text.contains('"')
 }
 
 /// Whether some number in this document would come back from a `Value` round
@@ -5681,6 +5682,93 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_could_close_another_dialects_string_is_not_substituted_blind() {
+        // The escaping test was a blocklist — `"`, `\\`, the control
+        // characters — so a value made of single quotes counted as safe and
+        // never reached any of the checks below. `{'name':'[PERSON_1]'}` came
+        // back as `{'name':'x','admin':true,'pad':'y'}`: a valid JSON5 object
+        // carrying a member the upstream never sent, and the same with
+        // backticks.
+        //
+        // A blocklist of delimiters is a claim about which characters open a
+        // string in the reader we do not have. Its omissions are injections.
+        let value = "x','admin':true,'pad':'y";
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [format!("{{'name':'{token}'}}"), format!("[`{token}`]")] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "a value carrying another dialect's delimiter was substituted in blind"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected document: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_values_a_detected_span_is_made_of_still_take_the_plain_path() {
+        // The width of the allowlist, and the reason it is not simply
+        // "alphanumeric". An allowlist errs by refusing, so it has to admit
+        // what this gateway actually masks: names, addresses, e-mails, IBANs
+        // with their spaces, phone numbers with their `+`. If one of these
+        // stopped restoring inside an ordinary document, the inversion would
+        // have bought safety with the product.
+        for value in [
+            "Martina Weber",
+            "Bahnhofstr. 12, 8001 Zurich",
+            "CH93 0076 2011 6238 5295 7",
+            "a.b@c.de",
+            "+41 79 123 45 67",
+        ] {
+            let mut mapping = Mapping::default();
+            mapping.begin_request();
+            let token = mapping
+                .mask(value, &[span("PERSON", 0, value.chars().count())])
+                .unwrap();
+            let provenance = Provenance::new(mapping.issued(), HashSet::new());
+            let text = format!("{{'name':'{token}'}}");
+
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                format!("{{'name':'{value}'}}"),
+                "a value a span is really made of lost its restoration"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_carrying_an_apostrophe_in_its_value_still_restores() {
+        // `O'Brien` is now not inert, which is correct — it could close a
+        // single-quoted string — but it must not cost the sentence that has no
+        // string to close. The enclosure test is what saves it, and this is
+        // the pairing that keeps the inversion from being a refusal machine.
+        let value = "Martina O'Brien";
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        assert_eq!(
+            mapping.restore_in_string(&format!("Der Kunde {token} hat's bestaetigt."), &provenance),
+            "Der Kunde Martina O'Brien hat's bestaetigt.",
+            "prose with an apostrophe on both sides lost its restoration"
+        );
+    }
+
+    #[test]
     fn a_closer_inside_a_string_no_longer_reopens_the_substitution() {
         // The seventh finding, and the one that ended the counting. A `]`
         // inside a quoted string is not structural, so subtracting on it drove
@@ -5822,14 +5910,14 @@ mod tests {
     #[test]
     fn prose_that_quotes_something_of_its_own_still_restores() {
         // The regression the parse-failure guard shipped with, and the reason
-        // `structure_encloses_a_token` is beside `holds_no_string` rather than
-        // instead of it. Testing the text for a quote *anywhere* caught every
-        // sentence that quotes a report title, a heading, a line the model is
-        // citing back — and since every `Slot::Text` takes the strict door,
-        // that was a 502 on a plain chat completion whose `content` happened to
-        // carry a quotation mark and whose restored value carried one too.
+        // the guard asks about enclosure rather than about quotes. Testing the
+        // text for a quote *anywhere* caught every sentence that quotes a
+        // report title, a heading, a line the model is citing back — and since
+        // every `Slot::Text` takes the strict door, that was a 502 on a plain
+        // chat completion whose `content` happened to carry a quotation mark
+        // and whose restored value carried one too.
         //
-        // A document holding our token in a string begins with `{`, `[` or `"`.
+        // This sentence opens no container at all.
         // This begins with `D`.
         let (mapping, provenance, token) = structural_mapping();
 

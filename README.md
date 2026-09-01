@@ -292,9 +292,11 @@ attempts to know that were each defeated by the seventh thing. So the test is on
 bracket, `- [x] [PERSON_1] said "hi"` among it. The list is open on purpose; the rule is what
 holds. These are still places a placeholder can reach the client from.
 
-That last case is reached only when the value being restored carries a `"`, `\` or control
-character — which a detected span rarely does — so it is a narrow price for a guarantee that
-makes no assumption about the client's parser.
+That last case is reached only when the value being restored carries a character that could
+close a string in some dialect — a quote of either kind, a backtick, a backslash, a control
+character. Names, addresses, e-mails, IBANs and phone numbers do not, and take the plain path
+untouched; `O'Brien` does. So it is a narrow price for a guarantee that assumes nothing about
+the client's parser.
 
 **Leaving is an answer the second clause gives, and the first clause never gives it.** The same
 shapes inside a field the gateway describes — `arguments` a client dispatches on, `content` it
