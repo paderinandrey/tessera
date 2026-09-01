@@ -160,6 +160,16 @@ pub const MAX_HELD: usize = 64;
 /// unrecoverable because the bytes have gone out. Neither is worth it for the
 /// case; it is recorded rather than fixed. `proxy::handle`'s text-slot arm says
 /// the same from the side that is closed.
+///
+/// **`restore` here is the plain substitution and it never asks
+/// `json_string_inert`.** The buffered path asks, and answers a value that
+/// could close a string in some dialect by taking the structural route or
+/// refusing; this path has no structural route to take. So the case left open
+/// is wider than a value carrying a `"`: an apostrophe closes a string for a
+/// JSON5 reader just as well. The cheap way to close it is to refuse the
+/// request shape the way `reject_streamed_tools` refuses the other one — a
+/// change to what this gateway accepts rather than to how it restores, so it
+/// is filed as #36 rather than taken here.
 pub struct RestoreBuffer<'a> {
     mapping: &'a Mapping,
     held: String,

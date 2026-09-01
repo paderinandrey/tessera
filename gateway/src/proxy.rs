@@ -1139,8 +1139,10 @@ async fn handle(
             // any request carrying tool traffic, so a described `arguments` —
             // the case the whole recursion was written for — never streams at
             // all. The residue is a JSON-mode `content` on a streamed
-            // completion, where a value carrying a `"` can still reach the
-            // client mid-document. Two other things sit near that path and
+            // completion, where a value that is not inert can still reach the
+            // client mid-document — and "not inert" is wider than a `"`, since
+            // an apostrophe closes a string for a JSON5 reader just as well.
+            // Two other things sit near that path and
             // neither closes it: the hold-back buffer is about placeholders and
             // not documents, and the slot blanking in `stream::handle` is what
             // routes delta text *away* from the escaping-aware `restore_value`
