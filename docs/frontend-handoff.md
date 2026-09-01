@@ -29,7 +29,7 @@ That exception is one rule with several shapes — an object whose restored keys
 would collide, and a string that is itself a serialized document the gateway
 cannot write back as it came, whether because two members share a name, because
 a number carries more precision than the gateway's reader holds, or because that
-reader rejects a document a client would accept. In every one of them the
+reader cannot rule out that a client would read the string as a document. In every one of them the
 gateway cannot put the value back without changing something else, so it leaves
 the bytes alone and gives up the restoration. Quote the rule rather than the
 shapes: the list has grown twice. It

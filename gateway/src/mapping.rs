@@ -681,12 +681,11 @@ impl Mapping {
         // majority of this branch, since the quote is usually in the *value*
         // and not in the text around it.
         //
-        // With one, `structure_encloses_a_token` decides, by counting what is
-        // still open where the token sits. Five readings before it made a
-        // claim about what some other reader accepts, and five were defeated;
-        // counting brackets makes none. Where something is open around the
-        // token, nothing here can tell corruption from prose, so the rule
-        // decides.
+        // With one, `structure_encloses_a_token` decides, by asking whether
+        // any container was opened before the token. Six readings before it
+        // each made some claim about what another reader accepts, and six were
+        // defeated in turn; this one makes none. Where a container was opened,
+        // nothing here can tell corruption from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
             if holds_no_string(text) || !structure_encloses_a_token(text) {
                 return Ok(out);
@@ -1172,66 +1171,64 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether a container is still open where one of our tokens sits — the
-/// question `holds_no_string` asks, asked better.
+/// Whether any container was opened before one of our tokens — the question
+/// `holds_no_string` asks, asked better.
 ///
-/// **This is the sixth version of this guard and the first one that answers
-/// the question its name asks.** The five before it read the text from the
-/// front: the first byte, the first byte after whitespace, the first thing
-/// that is neither whitespace nor a token, then whether a container had ever
-/// been opened, then what was allowed to follow a `[`. Each was defeated by
-/// something the author had not met — a byte order mark, a Markdown checkbox,
-/// a comment, a JSON5 quote, `NaN`. Every one of them was a claim about **what
-/// some other reader accepts**, and this branch exists only for texts our own
-/// reader refuses and another accepts, so every such claim was a guess in the
-/// place where guessing is least affordable.
+/// **Seven versions of this guard have now been written, and this is the first
+/// that says nothing about a reader other than ours.** The six before it read
+/// the first byte; the first byte after whitespace; the first thing that is
+/// neither whitespace nor a token; whether a container had ever been opened,
+/// gated on a list of what may follow a `[`; the same with that list inverted;
+/// and finally a bracket count. Each was defeated by something its author had
+/// not met — a byte order mark, a Markdown checkbox, a comment, a JSON5 quote,
+/// `NaN`, and a `]` inside a string. **Every one of them was a claim about
+/// what some other reader accepts**, and this branch exists only for texts our
+/// own reader refuses and another accepts, so every such claim was a guess in
+/// the one place guessing cannot be afforded.
 ///
-/// The danger is exact and needs none of that. Our value's `"` closes the
-/// string the token sits in, and the members it then writes have to land in
-/// something. **So the question is whether anything is still open at the
-/// token**, which is bracket counting and nothing else: `{` and `[` open,
-/// `}` and `]` close, and the answer is read where the token is. A closer with
-/// nothing open is prose punctuation and closes nothing, so the count floors
-/// at zero.
+/// The danger itself is exact. Our value's `"` closes the string the token
+/// sits in, and the members it then writes have to land in something. So an
+/// opener before the token is the whole question: `{` or `[` anywhere ahead of
+/// it, and the substitution does not go out.
 ///
-/// **Nothing here reads a dialect, and that is the whole of the improvement.**
-/// A comment, a byte order mark, `NaN`, a single-quoted key, a trailing comma
-/// and anything not yet invented all sit *inside* a container that is open, so
-/// they are conservative without being recognised. `[/*metadata*/"[PERSON_1]"]`
-/// and `[NaN,"[PERSON_1]"]` are refused because their bracket is open at the
-/// token, not because this code knows what they are.
+/// **Closers are not counted, and that is the lesson rather than an
+/// oversight.** Subtracting on `}` and `]` is only correct for closers that
+/// are structural, and telling those from the ones inside a string means
+/// knowing which delimiters open a string in the reader we do not have — `"`,
+/// `'`, a backtick in some repairing parsers. `["]","[PERSON_1]",NaN]` drove a
+/// count to zero on a `]` inside a string and let an object into an array.
+/// That list would have been the seventh of its kind.
 ///
-/// **And Markdown falls out rather than being exempted.** A checkbox, a link,
-/// a footnote marker and a tag all *close* their bracket before the prose
-/// continues — `[x]`, `[docs](…)`, `[1]`, `[TODO]` — so nothing is open when
-/// the token arrives. The list of literals that used to keep `[true` enclosing
-/// while letting `[x` through is gone, along with the case comparison that
-/// went with it, and `[ ]`, `[note]` and `[1]` restore now where every earlier
-/// reading refused them.
+/// **Nothing here reads a dialect.** A comment, a byte order mark, `NaN`, a
+/// single-quoted key, a trailing comma, a quoted closer and whatever is
+/// invented next all sit after an opener, so they are conservative without
+/// being recognised. This is why the sequence stops here: there is no list to
+/// be found wanting.
 ///
 /// **Our own tokens are not containers.** A token's brackets are inside its
-/// `Piece::Placeholder` and never counted; the piece is where the count is
-/// read instead. `pieces` is the same reading `restore` uses, so the two
-/// cannot drift about what a token is.
+/// `Piece::Placeholder` and never looked at; the piece is where the question
+/// is asked instead, so a container opened past the token encloses nothing of
+/// ours. `pieces` is the same reading `restore` uses, so the two cannot drift
+/// about what a token is.
 ///
-/// **What it still refuses, stated rather than hidden.** A bracket left open
-/// in prose — `[see [PERSON_1]]`, or an unmatched `[` in a sentence — reads as
-/// enclosing, because at that point prose and a document are the same bytes.
-/// And a token inside a top-level string with no container can still have that
-/// string cut short by our value: that truncates a string and injects no
-/// member, there being nothing open for one to land in.
+/// **What it costs, stated rather than left to be found.** Markdown opens a
+/// bracket in front of ordinary text constantly — a checkbox, a link, a
+/// footnote — and closes it long before the token, and none of that is
+/// credited. The cost is bounded twice: this branch is only reached when the
+/// mapped value carries a `"`, `\` or control character, which a detected span
+/// rarely does, and on the lenient side the result is a restoration lost with
+/// the bytes untouched. Only a described field turns it into a refusal.
 fn structure_encloses_a_token(text: &str) -> bool {
-    let mut depth = 0usize;
+    let mut opened = false;
     for piece in pieces(text) {
         if let Piece::Placeholder(_) = piece {
             // Our own token's brackets are inside this piece and never counted:
             // a token is not a container, and `pieces` is what keeps that one
             // reading shared with `restore`.
             //
-            // **The count is read here and not after the loop.** A well-formed
-            // document balances to zero by its last byte, so asking at the end
-            // answers "nothing open" for every document there is.
-            if depth > 0 {
+            // **The question is asked here and not after the loop.** A
+            // container opened past the token encloses nothing of ours.
+            if opened {
                 return true;
             }
             continue;
@@ -1239,14 +1236,8 @@ fn structure_encloses_a_token(text: &str) -> bool {
         let Piece::Text(run) = piece else {
             unreachable!()
         };
-        for character in run.chars() {
-            match character {
-                '{' | '[' => depth += 1,
-                // A closer with nothing open is prose punctuation and closes
-                // nothing, so the floor is zero rather than a wrap.
-                '}' | ']' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
+        if run.contains(['{', '[']) {
+            opened = true;
         }
     }
     false
@@ -5690,37 +5681,70 @@ mod tests {
     }
 
     #[test]
-    fn markdown_prose_whose_brackets_open_no_document_still_restores() {
-        // The regression the race shipped with. `pieces` reports `[x]` as text
-        // because it is not one of ours, so structure won the race against a
-        // checkbox, a link and every other bracket Markdown uses — and a
-        // described `content` carrying one became a 502 while the lenient
-        // sweep left the placeholder standing.
+    fn a_closer_inside_a_string_no_longer_reopens_the_substitution() {
+        // The seventh finding, and the one that ended the counting. A `]`
+        // inside a quoted string is not structural, so subtracting on it drove
+        // the depth to zero before the token and let the substitution out into
+        // a JSON5 array. Wider than reported: the single-quoted form and the
+        // brace form did it too, and neither was named.
         //
-        // What separates them from a document is that Markdown closes its
-        // brackets before the prose continues, and a document does not close
-        // the one the token is inside. Nothing here knows what Markdown is,
-        // and nothing here holds a list of what may follow a bracket — two
-        // findings landed on that list before it was replaced by counting.
+        // Knowing which closers are structural means knowing which delimiters
+        // open a string in the reader we do not have — `"`, `'`, a backtick in
+        // some repairing parsers — and that list is what six earlier rounds
+        // were made of. So closers are not counted at all: an opener before
+        // the token is enough. It costs the Markdown case below and it makes
+        // no claim about anyone's reader.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",{\"admin\":true},\"pad";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [
+            format!("[\"]\",\"{token}\",NaN]"),
+            format!("['a]',\"{token}\",NaN]"),
+            format!("{{\"a\":\"}}\",\"b\":\"{token}\",\"c\":NaN}}"),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "a closer inside a string cleared the enclosure and let an object in"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected document: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_prose_pays_for_the_closers_not_being_counted() {
+        // The price, recorded rather than discovered later. Markdown puts a
+        // bracket in front of ordinary text constantly, and those brackets are
+        // closed long before the token — but proving a closer structural is
+        // the thing that cannot be done without a reader, so they buy nothing.
+        //
+        // What it costs is bounded twice over. It applies only when the mapped
+        // value carries a `"`, `\` or control character, which a detected span
+        // rarely does; and on the lenient side it is a restoration lost with
+        // the bytes untouched, not a refusal. Only a described field turns it
+        // into a 502.
         let (mapping, provenance, token) = structural_mapping();
 
         for text in [
-            format!("- [x] {token} said \"hi\""),
-            format!("[docs](https://x) nennt {token} und \"y\""),
-            // These three were conservative under every earlier reading and
-            // need no exemption under this one. `[TODO]`, `[note]` and `[1]`
-            // are closed before the token, and a closed bracket encloses
-            // nothing — no list of literals, no case comparison.
-            format!("[TODO] {token} sagte \"hi\""),
-            format!("[note] {token} sagte \"hi\""),
+            format!("- [x] {token} sagte \"hi\""),
+            format!("[docs](https://x) nennt {token} \"y\""),
             format!("[1] Siehe {token}, \"z\""),
-            format!("- [ ] {token} sagte \"hi\""),
-            format!("{{PERSON}} ist kein Dokument, sagte {token}: \"z\""),
         ] {
-            let restored = mapping.restore_in_string(&text, &provenance);
-            assert!(
-                restored.contains("Martina \"Weber\""),
-                "bracketed prose lost its restoration: {text:?} -> {restored:?}"
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "bracketed prose was substituted into after closers stopped counting"
             );
         }
     }

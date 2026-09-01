@@ -284,9 +284,17 @@ And a string that is itself a serialized document is left whole whenever restori
 need re-serializing and the gateway cannot write the document back as it came: two members of
 the same name — `{"mode":"safe","mode":"admin","name":"[PERSON_1]"}` — which the parse
 collapses before any restoring happens, a number carrying more precision than the double it is
-read into, or a document this gateway's reader rejects and a client's would accept. The list is
-open on purpose; the rule is what holds. These are still places a placeholder can reach the
-client from.
+read into, or a text this gateway cannot rule out being a document a client's reader would
+accept. That last one is wider than it sounds, and deliberately: ruling it out would mean
+knowing which prefixes, literals and quote characters some other parser tolerates, and six
+attempts to know that were each defeated by the seventh thing. So the test is only whether a
+`{` or `[` was opened before the placeholder — which also catches ordinary prose that opens a
+bracket, `- [x] [PERSON_1] said "hi"` among it. The list is open on purpose; the rule is what
+holds. These are still places a placeholder can reach the client from.
+
+That last case is reached only when the value being restored carries a `"`, `\` or control
+character — which a detected span rarely does — so it is a narrow price for a guarantee that
+makes no assumption about the client's parser.
 
 **Leaving is an answer the second clause gives, and the first clause never gives it.** The same
 shapes inside a field the gateway describes — `arguments` a client dispatches on, `content` it
