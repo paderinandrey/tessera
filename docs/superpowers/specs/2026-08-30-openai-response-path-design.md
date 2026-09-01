@@ -221,8 +221,37 @@ client's own parse undoes. Objects lose a member when two share a name.
 Numbers lose their lexeme. Key order and whitespace are the reformatting the
 section above already prices. That is every token class in the grammar, and
 `carries_duplicate_members` and `carries_an_unstable_number` are the two tests
-it leaves; `holds_no_string` is the third guard and answers the refusal case,
-which is not a loss but a reader disagreeing with a reader.
+it leaves. The third guard answers the refusal case, which is not a loss but a
+reader disagreeing with a reader — and it took nine attempts to write, which
+the section below records because the shape of the failure is the lesson.
+
+**The third guard was written nine times, and every version but the last made
+a claim it had no standing to make.** It decides whether an unescaped
+substitution may go into a text this reader refuses and another may accept, so
+every version that described *what the other reader accepts* was guessing in
+the one place guessing is unaffordable. In order, the reading was: the first
+byte; the first byte after whitespace; the first thing that is neither
+whitespace nor one of our tokens; whether a container had ever been opened,
+gated on a list of what may follow a `[`; that list inverted; a bracket count.
+They were defeated, in order, by a byte order mark, a Markdown checkbox, a
+comment, a JSON5 single quote, `NaN`, and a `]` inside a string.
+
+What ended it was asking only about bytes we hold: **was a `{` or `[` opened
+before the token**. Closers are not counted, because telling a structural
+closer from one inside a string means knowing which delimiters open a string in
+the reader we do not have. Nothing reads a dialect, so there is no list left to
+be found wanting — and the cost, Markdown prose that opens a bracket before the
+placeholder, is paid openly and fixed in a test.
+
+**A tenth finding then landed above all of it**, on the escaping test that
+decides whether any of this runs. It was a blocklist — `"`, `\`, control
+characters — so a value of `x','admin':true,'pad':'y` counted as safe and
+`{'name':'[PERSON_1]'}` came back as a JSON5 object carrying a member the
+upstream never sent. It is an allowlist now, `json_string_inert`, measured
+against the values this gateway actually masks; `holds_no_string` went with it,
+being the same claim one level up. The rule the whole sequence produces:
+**a predicate whose omissions cause injections must be inverted into one whose
+omissions cost restorations.**
 
 **The guards went on the wrong frame first, and that is worth recording because
 the mistake reads as coverage.** They were put in `restore_in_string_with`,

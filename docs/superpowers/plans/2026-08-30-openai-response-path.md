@@ -1,5 +1,11 @@
 # Closing OpenAI's Response Path — Implementation Plan
 
+> **Historical.** This plan is what was written before implementation, and its
+> code sketches are kept as written. Two of them name functions that no longer
+> exist: `json_string_unsafe` was inverted into `json_string_inert` and
+> `holds_no_string` was removed, both during the review rounds. See the design
+> document for why, and the git history for the sequence.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A placeholder this gateway issued stops reaching the client from response fields nobody described, without any request that succeeds today starting to fail.
