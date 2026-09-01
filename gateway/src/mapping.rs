@@ -721,6 +721,19 @@ impl Mapping {
         // rewriting takes none. Asking first would refuse a response over a
         // number in a string this pass was not going to touch.
         if restored == document {
+            // **Equality of two `Value`s says nothing about the text when the
+            // parse dropped part of it.** A token sitting in a member the parse
+            // collapsed is absent from both sides of that comparison, so
+            // "nothing changed" reads as "nothing to restore" when what
+            // happened is that the only thing to restore was hidden. Ask the
+            // bytes instead, and only where the round trip is known to lose:
+            // where it is faithful, a token still standing is one no mapping
+            // claims, and leaving it is what leniency means.
+            if carries_a_placeholder(text) {
+                if let Some(cause) = round_trip_loses(text) {
+                    rule.lossy_document(cause)?;
+                }
+            }
             return Ok(text.to_owned());
         }
         // Nothing is re-serialized in *this function* until the round trip is
@@ -1130,6 +1143,25 @@ fn json_string_unsafe(character: char) -> bool {
 ///
 /// The set is argued in `restore_in_string_with` from what a JSON text is made
 /// of. Adding to it here reaches both callers, which is the point.
+/// Whether these bytes carry a token shaped like one this gateway issues.
+///
+/// **Asked of the text, which is the whole reason it exists.** Every other way
+/// to ask this walks a parsed document, and a parse is exactly what can hide a
+/// token from the asker: `{"name":"[PERSON_1]","name":"fixed"}` collapses to one
+/// member before anything sees it, and the token that was in the other one is
+/// simply gone. So a caller holding a text and a `Value` cannot learn from the
+/// `Value` whether the text has something left to restore.
+///
+/// It reads the shape through `pieces` and not the mapping, so it answers
+/// `true` for a token this gateway never issued. That is the conservative
+/// direction and the ambiguity #32 exists to remove: until an issued token
+/// carries something a caller could not have written, a described field cannot
+/// tell ours from a stranger's, and the safe reading of a token in a document
+/// this reader cannot reproduce is that it is ours.
+pub(crate) fn carries_a_placeholder(text: &str) -> bool {
+    pieces(text).any(|piece| matches!(piece, Piece::Placeholder(_)))
+}
+
 pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
     if carries_duplicate_members(text) {
         return Some("two members of the same name");
@@ -5545,6 +5577,42 @@ mod tests {
                 "prose lost its restoration to the race: {text:?} -> {restored:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_placeholder_a_duplicate_member_hides_is_refused_rather_than_served() {
+        // The same hole one level below the slot loop, and not the one that
+        // was reported. `restore_in_string_with` returns the original text when
+        // the restoration changed nothing — correct, unless the parse is what
+        // made it change nothing. Here the only token sits in the member the
+        // parse discards, so both sides of that comparison are placeholder-free
+        // and the strict door answered `Ok` with `[PERSON_1]` still in the
+        // string.
+        //
+        // The lenient door is right to keep the bytes: that is the duplicate
+        // rule, restoration lost and nothing changed. The strict one cannot,
+        // because bytes kept there are a placeholder served.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",\"admin\":true,\"pad\":\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        let text = format!("{{\"name\":\"{token}\",\"name\":\"fixed\"}}");
+
+        assert_eq!(
+            mapping.restore_in_string(&text, &provenance),
+            text,
+            "the lenient sweep rewrote a document it cannot reproduce"
+        );
+        assert!(
+            matches!(
+                mapping.restore_in_string_strictly(&text),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described field served a placeholder the parse had hidden"
+        );
     }
 
     #[test]

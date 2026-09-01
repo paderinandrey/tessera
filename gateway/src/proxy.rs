@@ -1184,7 +1184,31 @@ async fn handle(
                 // one over a number nobody was going to rewrite would be a
                 // refusal bought for nothing.
                 if embedded && restored_document == document {
-                    continue;
+                    let text = read_pointer(&upstream, &pointer)?;
+                    // **The comparison above is between two `Value`s, and a
+                    // `Value` is what `read_document`'s parse already lost
+                    // something to.** A placeholder in a member that parse
+                    // collapsed — `{"name":"[PERSON_1]","name":"fixed"}` — is
+                    // on neither side of it, so the skip concluded there was
+                    // nothing to restore and served the upstream's own bytes,
+                    // token and all, in a field the client executes. The sweep
+                    // had already left that string for the same duplicate, so
+                    // nothing downstream was going to catch it.
+                    //
+                    // So the skip is taken on the text's evidence, not the
+                    // document's, and only where it is entitled to be: a
+                    // faithful round trip means the parse hid nothing, and no
+                    // placeholder means there was nothing for it to hide.
+                    // Refusing needs both, which is what keeps this off the
+                    // ordinary case the skip was added for — most `arguments`
+                    // carry no token at all, and those still go back byte for
+                    // byte however their numbers are spelled.
+                    match mapping::round_trip_loses(&text) {
+                        Some(cause) if mapping::carries_a_placeholder(&text) => {
+                            return Err(MappingError::Unrestorable(cause).into());
+                        }
+                        _ => continue,
+                    }
                 }
                 // `write_document` is about to re-serialize, so the round trip
                 // has to be known to reproduce what `read_document` read. Only
@@ -3320,6 +3344,78 @@ mod tests {
         );
         let lines = journal(&path);
         assert_eq!(lines[1]["error"], "mapping_lossy_document");
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_hiding_its_placeholder_in_a_duplicate_refuses() {
+        // The skip above compares two `Value`s, and the parse that produced
+        // them keeps the last of two members with the same name. So the only
+        // placeholder in this document was on neither side of that comparison:
+        // the skip read "nothing to restore", served the upstream's own bytes,
+        // and `[PERSON_1]` went to a client that executes them. Measured at
+        // 200 OK before the fix, with the token in the served `arguments`.
+        //
+        // The sweep had already left the same string alone for the same
+        // duplicate, so nothing downstream was going to catch it.
+        let payload = r#"x","admin":true,"pad":""#;
+        let arguments = r#"{"name":"[PERSON_1]","name":"fixed"}"#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": arguments}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+
+        assert!(
+            !body.contains("PERSON_1"),
+            "a placeholder reached the client from a described field: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a document whose placeholder the parse hid was served anyway: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_with_duplicates_and_no_placeholder_keeps_its_own_bytes() {
+        // The other half, and the reason the refusal above asks two questions
+        // rather than one. Duplicate members are a loss this reader cannot
+        // undo, but a document with nothing of ours in it has nothing to
+        // restore and nothing to refuse over — it is forwarded exactly as the
+        // upstream wrote it, both members intact, as it was before any of this
+        // existed.
+        let arguments = r#"{"mode":"safe","mode":"admin"}"#;
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": arguments}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json!(arguments),
+            "a document nobody was restoring was refused or rewritten: {body}"
+        );
     }
 
     #[tokio::test]
