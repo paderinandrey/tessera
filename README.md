@@ -293,10 +293,16 @@ bracket, `- [x] [PERSON_1] said "hi"` among it. The list is open on purpose; the
 holds. These are still places a placeholder can reach the client from.
 
 That last case is reached only when the value being restored carries a character that could
-close a string in some dialect — a quote of either kind, a backtick, a backslash, a control
-character. Names, addresses, e-mails, IBANs and phone numbers do not, and take the plain path
-untouched; `O'Brien` does. So it is a narrow price for a guarantee that assumes nothing about
-the client's parser.
+delimit something in some dialect — a quote of either kind, a backtick, a backslash, a control
+character, a slash. Names, addresses, e-mails, IBANs and phone numbers do not, and take the
+plain path untouched; `O'Brien` does, and so does a `Steuernummer` spelled `21/815/08150`.
+Neither loses anything inside a document that parses, where the restoration is structural and
+escaped, nor in ordinary prose, which opens no container — only in prose that opens one. So it
+is a narrow price for a guarantee that assumes nothing about the client's parser.
+
+That guarantee covers a client that **parses** the response as data. It does not cover one that
+**evaluates** it as code, and no rule of this kind could: under evaluation a comma or a colon is
+enough on its own.
 
 **Leaving is an answer the second clause gives, and the first clause never gives it.** The same
 shapes inside a field the gateway describes — `arguments` a client dispatches on, `content` it

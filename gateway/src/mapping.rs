@@ -1138,14 +1138,33 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 ///
 /// So nothing is admitted that could be a delimiter in *any* dialect —
 /// `'` and a backtick are out along with `"` — and nothing whose meaning
-/// depends on a parser. What is left is what detected spans are actually made
-/// of: letters and digits in any script, and the punctuation that appears in
-/// names, addresses, e-mails, IBANs, phone numbers and dates.
+/// depends on a parser. `/` is out too, and it is the one whose cost was
+/// measured rather than assumed: a German `Steuernummer` is spelled
+/// `21/815/08150` and e-mail local parts may carry a slash, so this was not
+/// free. It turned out to be nearly so, because a slash-bearing identifier
+/// lives in a document that *parses*, where the structural path restores it
+/// correctly, and in plain prose, which opens no container. What it loses is
+/// bracketed prose — the cost already paid by `structure_encloses_a_token`,
+/// extended to one more class of value.
+///
+/// What is left is what detected spans are actually made of: letters and
+/// digits in any script, and the punctuation that appears in names,
+/// addresses, e-mails, IBANs and phone numbers.
+///
+/// **Where the model stops, said plainly.** This covers a client that *parses*
+/// the text as data — JSON, JSON5, JSONC, a repairing parser — where a value
+/// sits inside a string and the ways out of a string are its delimiter, the
+/// escape, and a character the format forbids raw. It does not cover a client
+/// that *evaluates* the text as code, and it cannot: under evaluation `,`,
+/// `:`, `+`, `.` and a bare word are each enough, so no allowlist short of
+/// nothing at all would help. `/` came out because it was cheap, not because
+/// removing it makes evaluation safe. A client that evals model output has a
+/// larger problem than this function.
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
             character,
-            ' ' | '.' | ',' | '-' | '_' | '@' | '+' | '/' | ':' | ';' | '(' | ')' | '?' | '!'
+            ' ' | '.' | ',' | '-' | '_' | '@' | '+' | ':' | ';' | '(' | ')' | '?' | '!'
         )
 }
 
@@ -5677,6 +5696,64 @@ mod tests {
                     Err(MappingError::Unrestorable(_))
                 ),
                 "a described field served an injected array: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_could_delimit_a_regex_literal_is_not_inert() {
+        // `/` was allowlisted for dates and paths, and it delimits a regex
+        // literal: `{name:/[PERSON_1]/}` with a value of `x/,admin:true,pad:/y`
+        // came back `{name:/x/,admin:true,pad:/y/}`, an object with a member
+        // the upstream never sent.
+        //
+        // That shape needs a client that *evaluates* the text — no JSON
+        // family parser reads a regex literal — and evaluation is outside what
+        // `json_string_inert` can defend, since `,` and `:` would each be
+        // enough. The slash comes out because it costs almost nothing, which
+        // was measured, not because it makes evaluation safe.
+        let value = "x/,admin:true,pad:/y";
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        let text = format!("{{name:/{token}/}}");
+
+        assert_eq!(
+            mapping.restore_in_string(&text, &provenance),
+            text,
+            "a slash-delimited value was substituted in blind"
+        );
+    }
+
+    #[test]
+    fn a_slash_bearing_identifier_still_restores_where_it_actually_appears() {
+        // What taking the slash out costs, held to the measurement that
+        // justified it. A German `Steuernummer` carries two slashes and an
+        // e-mail local part may carry one, so this had to be checked rather
+        // than assumed: both still restore inside a document that parses,
+        // where the structural path escapes them, and in prose, which opens no
+        // container. Only bracketed prose loses them, which is the cost
+        // `structure_encloses_a_token` already carries.
+        for value in ["21/815/08150", "a/b@c.de"] {
+            let mut mapping = Mapping::default();
+            mapping.begin_request();
+            let token = mapping
+                .mask(value, &[span("PERSON", 0, value.chars().count())])
+                .unwrap();
+            let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+            assert_eq!(
+                mapping.restore_in_string(&format!("{{\"tax\":\"{token}\"}}"), &provenance),
+                format!("{{\"tax\":\"{value}\"}}"),
+                "an identifier with a slash stopped restoring inside a document"
+            );
+            assert_eq!(
+                mapping.restore_in_string(&format!("Die Nummer {token} gilt."), &provenance),
+                format!("Die Nummer {value} gilt."),
+                "an identifier with a slash stopped restoring in prose"
             );
         }
     }
