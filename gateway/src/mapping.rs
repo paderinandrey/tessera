@@ -681,14 +681,14 @@ impl Mapping {
         // majority of this branch, since the quote is usually in the *value*
         // and not in the text around it.
         //
-        // With one, `begins_like_a_document` decides it by a race between the
-        // first structure and the first word, skipping our own tokens on the
-        // way. That reading needs no list of what a reader ignores before the
-        // document starts — the list is on the unsafe side of the error, as a
-        // byte order mark proved. Where structure wins, nothing here can tell
-        // corruption from prose, so the rule decides.
+        // With one, `structure_encloses_a_token` decides, by asking whether a
+        // container was opened before the token rather than what the text
+        // begins with. Three readings of the prefix were defeated by three
+        // prefixes; the enclosure question has none to be defeated by. Where a
+        // container does enclose the token, nothing here can tell corruption
+        // from prose, so the rule decides.
         let Ok(document) = serde_json::from_str::<Value>(text) else {
-            if holds_no_string(text) || !begins_like_a_document(text) {
+            if holds_no_string(text) || !structure_encloses_a_token(text) {
                 return Ok(out);
             }
             rule.lossy_document("a string this gateway cannot parse but a client may")?;
@@ -1172,96 +1172,103 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether these bytes could be a JSON document with one of our tokens inside
-/// it — the question `holds_no_string` asks, asked better.
+/// Whether some container in these bytes could enclose one of our tokens —
+/// the question `holds_no_string` asks, asked better.
 ///
-/// **The reading is a race, not a look at the first byte.** Walk the text
-/// skipping our own tokens, and let whichever arrives first decide: a `"`, or a
-/// `{` or `[` that something can legally follow, means a document may begin
-/// here; an alphanumeric means a word got there first and this is prose.
-/// Neither arriving is prose too — a text with no structure in it at all.
+/// **It is about enclosure, not about how the text begins, and that is the
+/// fourth version of this guard rather than the first.** The three before it
+/// read a prefix: the first byte, then the first byte after whitespace, then
+/// the first thing that is neither whitespace nor a token. Each was defeated by
+/// a prefix its author had not met — a byte order mark, a Markdown checkbox, a
+/// comment — because **a prefix is exactly the part of a text whose reading
+/// differs between readers**, and this branch exists precisely for texts our
+/// reader refuses and another accepts. Recognising comments would have been the
+/// fourth patch to the wrong question, with single-quoted keys and trailing
+/// commas queued behind it.
 ///
-/// **An opening bracket is asked what follows it**, which is the difference
-/// between `["a"]` and a checkbox. `pieces` reports `[x]` as text, because it
-/// is not one of ours, so a bullet list, a Markdown link and a footnote marker
-/// all put a `[` in front of the first word and the race went to structure —
-/// a 502 on described `content`, and the placeholder left standing by the
-/// lenient sweep. `continues_a_document` settles it with the JSON grammar and
-/// not with a reading of Markdown: `x` and `d` begin no value, so `[x]` and
-/// `[docs](…)` open no document. A bracket that *is* followed by a value —
-/// `[1]` in a footnote — keeps the conservative answer, because at that point
-/// the two are the same text.
+/// So the prefix stops mattering. What makes the substitution dangerous is not
+/// where the text starts but whether our token can be sitting in a string
+/// inside a container: our value's `"` closes the string, and the members it
+/// then writes land in that container. **A container has to be opened before
+/// the token for that to happen**, so that is the whole question, and
+/// everything ahead of the opener — a comment, a BOM, a sentence, anything —
+/// is passed over without being understood.
 ///
-/// **Why a race and not a prefix test.** A document holding our token begins
-/// with `{`, `[` or `"` *after whatever the reader ignores first*, and what a
-/// reader ignores is the part we cannot enumerate. This function used to trim
-/// whitespace and read one byte, which read `\u{FEFF}{"name":"[PERSON_1]"}` —
-/// a BOM and then a document — as prose, because `char::is_whitespace` is false
-/// for U+FEFF and `serde_json` refuses the text outright. The substitution then
-/// went out unescaped and a value of `x","admin":true,"pad":"` injected a
-/// member into a document every BOM-skipping reader parses. Adding U+FEFF to a
-/// trim list would have fixed that text and left the next one, and the list is
-/// on the unsafe side of the error: a character missing from it is a
-/// substitution emitted, not a restoration lost.
+/// **The two openers are asked different questions, because they carry
+/// different risks.**
 ///
-/// The race needs no such list. It **skips everything that is neither
-/// structure nor a word**, so an ignorable prefix of any composition — a BOM,
-/// a zero-width joiner, a control character, something not yet invented — is
-/// simply passed over and the decision falls to the `{` behind it.
+/// A `{` counts as soon as it appears. It encloses whatever follows it however
+/// it continues — `{'a':'x',"b":"[PERSON_1]"}` is a document to a JSON5 reader
+/// with our token in a double-quoted string inside it — so asking what comes
+/// straight after the brace answers a question about the first member and not
+/// about the container. Prose almost never opens a brace; the cost is a code
+/// snippet quoted back with a name in it, and that is a restoration lost.
 ///
-/// **Our own tokens are skipped rather than raced.** A `[` that opens a
-/// placeholder is prose punctuation: `[PERSON_1] said "hello"` is an array
-/// holding a bare word, a value in no JSON reader, lenient ones included, so it
-/// is not this reader being strict. Masked text routinely *begins* with its
-/// mask, which is why the first byte lied about the most ordinary sentence this
-/// gateway produces. The skipping is done by `pieces`, the same reading
-/// `restore` uses, so the two cannot drift about what a token is, and it asks
-/// the *shape* rather than the mapping, since an unmapped token proves the text
-/// is prose exactly as well as a mapped one.
+/// A `[` is asked what follows it, by `continues_a_document`. Markdown opens
+/// brackets constantly — a checkbox, a link, a footnote marker — and those are
+/// ordinary traffic, not documents. `x` and `d` begin no JSON value, so `[x]`
+/// and `[docs](…)` enclose nothing. `[1]` does, and keeps the conservative
+/// answer, because at that point a footnote marker and an array are the same
+/// bytes.
 ///
-/// **This is what keeps ordinary traffic off the refusal.** `holds_no_string`
-/// alone tested for a `"` anywhere in the text, so prose quoting anything at
-/// all — a report title, a line the model is citing back — fell through to the
-/// rule and cost a 502 on a plain chat completion, since every `Slot::Text`
-/// takes the strict door. `Der Bericht "Q3" nennt [PERSON_1].` reaches `D`
-/// before it reaches that quote. The two questions are kept as an `||` rather
-/// than one replacing the other: `{[PERSON_1]}` has no quote to close and is
-/// safe even though structure wins its race.
+/// **Our own tokens are not openers and are where the question is asked.** A
+/// token unquoted is neither a value nor a member name, so it completes no
+/// bracket; and each time one is reached, the answer is whatever containers
+/// have been opened *so far*. A token before every container in the text is
+/// enclosed by none of them.
 ///
-/// **What it still refuses is stated rather than hidden.** Prose reaching a `"`
-/// before any word — an opening quotation, `"Hallo", sagte [PERSON_1]`, or a
-/// label before one, `[PERSON_1]: "hello"` — loses its restoration, as does a
-/// bracket that opens a value in prose that is not a document, `[1] Siehe
-/// [PERSON_1]`. A `"` cannot be asked what follows it the way a bracket can:
-/// every character may follow it, since it opens a string. All three are the
-/// conservative answer to a text this reader cannot parse, and all three cost
-/// restoration rather than correctness.
-fn begins_like_a_document(text: &str) -> bool {
-    let mut opened: Option<char> = None;
+/// **What this buys, beyond the finding that prompted it.** A text with no
+/// container at all now restores where every prefix reading refused it: an
+/// opening quotation, `"Hallo", sagte [PERSON_1]`, and a label before one,
+/// `[PERSON_1]: "hello"`. There is no structure for our value to inject into,
+/// so there never was a reason to refuse them.
+///
+/// **The residue, stated rather than hidden.** A token inside a top-level
+/// string with no container — `"… [PERSON_1] …"` as a whole document — can
+/// still have that string cut short by our value. That truncates a string; it
+/// injects no member, because there is no container for a member to land in.
+/// It is the same corruption prose already accepts, and the price of not
+/// refusing every quotation the model writes.
+fn structure_encloses_a_token(text: &str) -> bool {
+    let mut enclosed = false;
+    let mut opener: Option<()> = None;
     for piece in pieces(text) {
-        let Piece::Text(run) = piece else {
-            // A token of ours continues no document — unquoted it is neither a
-            // value nor a member name — so it answers a pending opener with
-            // "no" rather than completing it, and is otherwise passed over.
-            opened = None;
+        if let Piece::Placeholder(_) = piece {
+            // A token of ours completes no opener — unquoted it is neither a
+            // value nor a member name — and this is the point the question is
+            // asked at.
+            opener = None;
+            if enclosed {
+                return true;
+            }
             continue;
+        }
+        let Piece::Text(run) = piece else {
+            unreachable!()
         };
         for character in run.chars() {
-            if let Some(opener) = opened {
+            if opener.is_some() {
                 if character.is_whitespace() {
                     continue;
                 }
-                opened = None;
-                if continues_a_document(opener, character) {
-                    return true;
+                opener = None;
+                if continues_a_document(character) {
+                    enclosed = true;
                 }
-                // It did not, so this character has not been read yet: fall
-                // through and let it race like any other.
+                // It did not open one, so this character has not been read
+                // yet: fall through and let it be judged on its own.
             }
             match character {
-                '"' => return true,
-                '{' | '[' => opened = Some(character),
-                _ if character.is_alphanumeric() => return false,
+                // A brace encloses whatever follows it, however it continues:
+                // `{'a':'x',"b":"[PERSON_1]"}` is a document to a JSON5 reader
+                // and the token is in a double-quoted string inside it, so
+                // asking what comes straight after the brace answers the wrong
+                // question. Braces are also what prose almost never opens with.
+                '{' => enclosed = true,
+                // A bracket is asked, because Markdown opens with one
+                // constantly — a checkbox, a link, a footnote — and those are
+                // ordinary traffic rather than documents.
+                '[' => opener = Some(()),
                 _ => {}
             }
         }
@@ -1269,24 +1276,22 @@ fn begins_like_a_document(text: &str) -> bool {
     false
 }
 
-/// Whether `next` can be the first non-whitespace character after `opener` in a
+/// Whether `next` can be the first non-whitespace character after a `[` in a
 /// JSON document.
 ///
 /// This is the whole of what separates `[x]` from `["a"]`, and it is the JSON
-/// grammar rather than a reading of Markdown: an object's first token is a
-/// member name or its own end, an array's is a value or its own end, and a
-/// value begins with `{`, `[`, `"`, a `-`, a digit, or the first letter of
-/// `true`, `false` or `null`. Nothing here knows what a checkbox is; it knows
-/// that `x` continues no document, and a bullet, a link and a footnote marker
-/// all fall out of that.
-fn continues_a_document(opener: char, next: char) -> bool {
-    match opener {
-        '{' => matches!(next, '"' | '}'),
-        '[' => {
-            matches!(next, '{' | '[' | '"' | '-' | 't' | 'f' | 'n' | ']') || next.is_ascii_digit()
-        }
-        _ => false,
-    }
+/// grammar rather than a reading of Markdown: an array's first token is a value
+/// or its own end, and a value begins with `{`, `[`, `"`, a `-`, a digit, or
+/// the first letter of `true`, `false` or `null`. Nothing here knows what a
+/// checkbox is; it knows that `x` continues no document, and a bullet, a link
+/// and a footnote marker all fall out of that.
+///
+/// **Only the bracket is asked.** A brace encloses unconditionally in
+/// `structure_encloses_a_token`, so an arm for it here would be one no caller
+/// reaches — and a branch that reads as a guard while guarding nothing is worse
+/// than an absent one.
+fn continues_a_document(next: char) -> bool {
+    matches!(next, '{' | '[' | '"' | '-' | 't' | 'f' | 'n' | ']') || next.is_ascii_digit()
 }
 
 /// Whether these bytes contain no `"` at all, which is what makes an unescaped
@@ -1301,7 +1306,7 @@ fn continues_a_document(opener: char, next: char) -> bool {
 ///
 /// It is half the answer to a question the parse cannot answer — *this* reader
 /// refusing a text is not the client's reader refusing it — and
-/// `begins_like_a_document` is the other half and the larger one. This was the
+/// `structure_encloses_a_token` is the other half and the larger one. This was the
 /// whole of it for one commit, and testing for a quote *anywhere* meant every
 /// sentence quoting anything at all fell through to the rule. Kept beside the
 /// other test rather than replaced by it: `{[PERSON_1]}` begins like a document
@@ -5616,6 +5621,75 @@ mod tests {
     }
 
     #[test]
+    fn a_document_a_comment_hides_the_start_of_is_still_enclosing() {
+        // The fourth finding on this guard, and the one that ended the
+        // prefix-reading approach. `/*metadata*/{"name":"[PERSON_1]"}` is a
+        // document to a comment-tolerant reader — which is what agent
+        // frameworks use on tool arguments, because models emit malformed
+        // JSON — and the reading before this met `m` inside the comment and
+        // called the whole thing prose. The client received
+        // `{"name":"x","admin":true,"pad":""}`.
+        //
+        // Recognising comments would have been the fourth patch to a question
+        // about prefixes, with single-quoted keys and trailing commas behind
+        // it. The question is now about enclosure instead, and a prefix of any
+        // composition simply stops mattering: the brace is before the token,
+        // so the token may be inside a string inside a container, so the
+        // substitution does not go out.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",\"admin\":true,\"pad\":\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [
+            format!("/*metadata*/{{\"name\":\"{token}\"}}"),
+            format!("// note\n{{\"name\":\"{token}\"}}"),
+            format!("{{\"name\":\"{token}\",}}"),
+            // A JSON5 object whose first member is single-quoted. The brace
+            // encloses the token whatever follows the brace, which is why a
+            // brace is not asked the question a bracket is asked.
+            format!("{{'a':'x',\"b\":\"{token}\"}}"),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "a document behind a prefix this reader chokes on was injected into"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected document: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_no_container_reaches_still_restores() {
+        // The other side of the enclosure question, and what it buys. A
+        // quotation opening the text, and a label before one, were both
+        // refused by every prefix reading this guard has had — and neither has
+        // any container in it at all, so our value has no string inside a
+        // structure to close. They restore now.
+        let (mapping, provenance, token) = structural_mapping();
+
+        for text in [
+            format!("\"Hallo\", sagte {token}"),
+            format!("{token}: \"hello\""),
+        ] {
+            let restored = mapping.restore_in_string(&text, &provenance);
+            assert!(
+                restored.contains("Martina \"Weber\""),
+                "prose with no container lost its restoration: {text:?} -> {restored:?}"
+            );
+        }
+    }
+
+    #[test]
     fn markdown_prose_whose_brackets_open_no_document_still_restores() {
         // The regression the race shipped with. `pieces` reports `[x]` as text
         // because it is not one of ours, so structure won the race against a
@@ -5626,12 +5700,15 @@ mod tests {
         // The bracket is now asked what follows it, and the answer is the JSON
         // grammar: `x` and `d` begin no value, so neither `[x]` nor
         // `[docs](...)` opens a document. Nothing here knows what Markdown is.
+        //
+        // A brace gets no such question — see `structure_encloses_a_token` —
+        // so `{PERSON}` in prose is conservative again. It was never a traffic
+        // shape, and a text a JSON5 reader accepts is.
         let (mapping, provenance, token) = structural_mapping();
 
         for text in [
             format!("- [x] {token} said \"hi\""),
             format!("[docs](https://x) nennt {token} und \"y\""),
-            format!("{{PERSON}} ist kein Dokument, sagte {token}: \"z\""),
         ] {
             let restored = mapping.restore_in_string(&text, &provenance);
             assert!(
@@ -5715,7 +5792,7 @@ mod tests {
     #[test]
     fn prose_that_quotes_something_of_its_own_still_restores() {
         // The regression the parse-failure guard shipped with, and the reason
-        // `begins_like_a_document` is beside `holds_no_string` rather than
+        // `structure_encloses_a_token` is beside `holds_no_string` rather than
         // instead of it. Testing the text for a quote *anywhere* caught every
         // sentence that quotes a report title, a heading, a line the model is
         // citing back — and since every `Slot::Text` takes the strict door,
