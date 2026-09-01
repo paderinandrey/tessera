@@ -1204,12 +1204,14 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
 /// about the container. Prose almost never opens a brace; the cost is a code
 /// snippet quoted back with a name in it, and that is a restoration lost.
 ///
-/// A `[` is asked what follows it, by `continues_a_document`. Markdown opens
-/// brackets constantly — a checkbox, a link, a footnote marker — and those are
-/// ordinary traffic, not documents. `x` and `d` begin no JSON value, so `[x]`
-/// and `[docs](…)` enclose nothing. `[1]` does, and keeps the conservative
-/// answer, because at that point a footnote marker and an array are the same
-/// bytes.
+/// A `[` is asked what follows it, by `bracket_may_enclose`, because Markdown
+/// opens brackets constantly — a checkbox, a link, a footnote marker — and
+/// those are ordinary traffic, not documents. It is asked as a proof of prose
+/// and not as a list of what may follow a bracket: only a word that begins no
+/// JSON value takes the bracket out, so `[x]` and `[docs](…)` enclose nothing
+/// while a comment, a JSON5 quote and a digit all leave it enclosing. `[1]`
+/// keeps the conservative answer, because at that point a footnote marker and
+/// an array are the same bytes.
 ///
 /// **Our own tokens are not openers and are where the question is asked.** A
 /// token unquoted is neither a value nor a member name, so it completes no
@@ -1252,7 +1254,7 @@ fn structure_encloses_a_token(text: &str) -> bool {
                     continue;
                 }
                 opener = None;
-                if continues_a_document(character) {
+                if bracket_may_enclose(character) {
                     enclosed = true;
                 }
                 // It did not open one, so this character has not been read
@@ -1276,22 +1278,39 @@ fn structure_encloses_a_token(text: &str) -> bool {
     false
 }
 
-/// Whether `next` can be the first non-whitespace character after a `[` in a
-/// JSON document.
+/// Whether a `[` followed by `next` may be opening a container.
 ///
-/// This is the whole of what separates `[x]` from `["a"]`, and it is the JSON
-/// grammar rather than a reading of Markdown: an array's first token is a value
-/// or its own end, and a value begins with `{`, `[`, `"`, a `-`, a digit, or
-/// the first letter of `true`, `false` or `null`. Nothing here knows what a
-/// checkbox is; it knows that `x` continues no document, and a bullet, a link
-/// and a footnote marker all fall out of that.
+/// **Enclosing by default, and only a word takes it out.** This was a list of
+/// what strict JSON allows after a `[` — `{`, `[`, `"`, `-`, a digit, `]`, or
+/// the first letter of `true`, `false` or `null` — and that is the same mistake
+/// the prefix readings made, one frame smaller: a whitelist of what may follow
+/// a bracket is a claim about the reader, and this branch exists only for texts
+/// *our* reader refuses and another accepts. `[/*metadata*/"[PERSON_1]"]` is an
+/// array to a comment-tolerant reader and `['a',"[PERSON_1]"]` is one to JSON5,
+/// and both fell out of the list. Whatever came next would have too.
+///
+/// So the question is inverted into a proof of prose. Markdown is what puts a
+/// bracket in front of ordinary text — a checkbox, a link, a footnote — and
+/// what follows the bracket there is a **word**: `[x]`, `[docs](…)`,
+/// `[TODO]`. A letter that begins no JSON value is the one thing that cannot
+/// be the start of an array, so it is the only thing that takes the bracket
+/// out. Everything else — punctuation, a comment's `/`, a JSON5 `'`, a digit,
+/// whitespace — leaves it enclosing.
+///
+/// `t`, `f` and `n` stay in, because they begin `true`, `false` and `null`, and
+/// `[true,/*c*/"[PERSON_1]"]` is exactly the shape this is for. The comparison
+/// is case-sensitive, so `[TODO]` is still prose.
 ///
 /// **Only the bracket is asked.** A brace encloses unconditionally in
 /// `structure_encloses_a_token`, so an arm for it here would be one no caller
 /// reaches — and a branch that reads as a guard while guarding nothing is worse
 /// than an absent one.
-fn continues_a_document(next: char) -> bool {
-    matches!(next, '{' | '[' | '"' | '-' | 't' | 'f' | 'n' | ']') || next.is_ascii_digit()
+///
+/// The cost is named where it lands: an empty checkbox, `[ ]`, is a valid empty
+/// array and keeps the conservative answer, and so does a `[note]` link, `n`
+/// being `null`'s letter.
+fn bracket_may_enclose(next: char) -> bool {
+    !next.is_alphabetic() || matches!(next, 't' | 'f' | 'n')
 }
 
 /// Whether these bytes contain no `"` at all, which is what makes an unescaped
@@ -5690,6 +5709,45 @@ mod tests {
     }
 
     #[test]
+    fn an_array_behind_a_prefix_this_reader_rejects_is_still_enclosing() {
+        // The fifth finding, and the same mistake as the first four, one frame
+        // smaller: enclosure after a `[` was a list of what *strict* JSON
+        // allows there, and this branch exists only for texts our reader
+        // refuses and another accepts. A comment and a JSON5 string both fell
+        // out of the list, and the substitution put a whole object into an
+        // array the client executes.
+        //
+        // `[true,…]` was already conservative, `t` being `true`'s letter, and
+        // it stays that way — the inversion is not a loosening.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",{\"admin\":true},\"pad";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [
+            format!("[/*metadata*/\"{token}\"]"),
+            format!("['a',\"{token}\"]"),
+            format!("[true,/*c*/\"{token}\"]"),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "an object was injected into an array behind a prefix this reader rejects"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected array: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn markdown_prose_whose_brackets_open_no_document_still_restores() {
         // The regression the race shipped with. `pieces` reports `[x]` as text
         // because it is not one of ours, so structure won the race against a
@@ -5709,6 +5767,9 @@ mod tests {
         for text in [
             format!("- [x] {token} said \"hi\""),
             format!("[docs](https://x) nennt {token} und \"y\""),
+            // Upper case, so it is not `true`'s letter: the comparison that
+            // keeps `[true,…]` enclosing must not swallow a tag as well.
+            format!("[TODO] {token} sagte \"hi\""),
         ] {
             let restored = mapping.restore_in_string(&text, &provenance);
             assert!(
