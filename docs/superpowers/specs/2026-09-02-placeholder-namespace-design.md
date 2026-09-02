@@ -35,8 +35,8 @@ caller cannot have written, and provenance becomes a lookup.
 
 ```
 [PERSON_1]          a caller's literal — recognised, never restored
-[PERSON_1.7f3a]     issued by this session — restored
-[PERSON_1.0a1b]     issued by some other session — recognised, never restored
+[PERSON_1.3f7a2b91c4d5] issued by this session — restored
+[PERSON_1.0a1b7c33e2f1] issued by some other session — recognised, never restored
 ```
 
 The grammar accepts both forms. **Recognising a token and owning it are
@@ -60,24 +60,50 @@ for; and it puts the entropy in the position a model uses for coreference, where
 and `[PERSON_2]`. A uniform suffix leaves the index small and the noise in one
 place.
 
-### Salt length **[decided]**
+### Namespace width, and why the first answer was wrong **[decided, revised]**
 
-**Four lowercase hex characters — sixteen bits.**
+**Twelve lowercase hex characters — forty-eight bits.**
 
-The salt is an origin marker, not a secret, and the security boundary is
-elsewhere: a session is keyed by *(credential, session id)*, and
-`a_guessed_session_id_returns_no_other_callers_value` already holds that a
-caller with a different key reaches nothing. Someone able to brute-force the
-salt already holds the credential, and therefore already holds everything the
-session could restore.
+The first draft said sixteen bits, on the argument that the security boundary is
+the credential: a session is keyed by *(credential, session id)*, and
+`a_guessed_session_id_returns_no_other_callers_value` holds that a different key
+reaches nothing.
 
-What the salt has to survive is a caller writing bracket-token text of their own
-— a templating client, a prompt about placeholders, a tool argument echoing an
-earlier turn. Sixteen bits does that with room to spare, and it keeps the token
-five bytes longer rather than nine, which matters twice: for the streamed bound
-below, and for every model that has to read it.
+**That argument was wrong, and wrong in a way worth recording.** The property
+this namespace protects is the integrity of *the caller's own text*, and the
+caller holds the credential. The adversary is inside the boundary the argument
+appealed to. With sixteen bits, a request can carry every one of the 65 536
+candidates in about a megabyte of text; if the provider echoes them, the one
+that matches an existing mapping is restored, and the argument-substitution
+defect is back — **after** `written` has been deleted, which is what made the
+enumeration worth doing.
 
-Raising it is one constant if the threat model changes. Lowering it is not.
+Forty-eight bits is not enumerable within any request budget, and that is what
+pays for deleting `written`. The token grows to twenty-three bytes for a typical
+value, which the streamed bound absorbs and a model reads as one opaque suffix.
+
+### Derived, not minted **[decided, revised]**
+
+**The namespace is `SHA-256(session key)`, truncated — not a value minted per
+`Mapping`.**
+
+Minting per mapping fails on the path that produces the tokens this slice
+exists to refuse. Eviction removes a whole session; the next request with the
+same id constructs a fresh `Mapping`, which would mint a *different* namespace.
+A token from the evicted incarnation would then read as a stranger's, be left
+rather than refused, and reach the client — the exact case Task 6 claims to
+close, failing quietly.
+
+Derivation from the session key is stable across eviction and recreation, and
+`SessionKey` is already a salted fingerprint: `session::salt()` is thirty-two
+random bytes per process, mixed into the credential hash. So the namespace is
+unguessable for the same reason the key is, and the comment on that salt already
+carries the argument — *"sessions do not survive a restart in any case, so a
+salt that does not either costs nothing."*
+
+A request with **no** session still mints randomly. It lives one request, there
+is no recreation to be stable across, and nothing outlives it to be refused
+later.
 
 ## What it costs, before it is built
 
@@ -117,14 +143,14 @@ former does the arithmetic: `[` + 40 + `_` + 20 digits + `]` is 63 bytes. The
 bound is not a guess — it is what lets the streamed buffer release an unclosed
 `[` as ordinary text without ever orphaning a real token.
 
-A four-character salt and its delimiter make the worst case 68. **`MAX_HELD`
+A twelve-character namespace and its delimiter make the worst case 76. **`MAX_HELD`
 becomes 72**, and the arithmetic in both comments is restated rather than
 adjusted, because the next person to add a component to the token will read
 those comments and not this document.
 
 ### The journal records the unsalted token **[decided]**
 
-`[PERSON_1]`, not `[PERSON_1.7f3a]`.
+`[PERSON_1]`, not `[PERSON_1.3f7a2b91c4d5]`.
 
 The salt is transport. It exists so the response path can answer a question the
 journal never asks, and recording it would make two lines from two sessions
@@ -178,9 +204,6 @@ absent one — it reads as coverage.
 - **`reserve_literals`' self-mapping** and the skip-taken-numbers loop in
   `placeholder_for`. Both exist so an issued token cannot collide with a
   caller's literal. With a salt, no collision is possible.
-- **`key_is_unserveable`'s first arm.** `is_placeholder(key)` refuses any
-  bracket-shaped key; with ownership decidable, the question it was standing in
-  for can be asked directly.
 - **`Provenance` and both its sets**, per the section above, along with the
   request-wide walk that builds `written`.
 
@@ -189,9 +212,17 @@ matters: put the mechanism back, and no test should fail for a *reason that
 still exists*. A test that fails only because it asserts the old mechanism's
 presence is a test to rewrite, not a reason to keep the code.
 
-What is **not** deleted: `pieces`, `is_placeholder` and `placeholder_type`
-recognise tokens, which is still needed and now needed for a second reason —
-a stranger's token must be recognised precisely so it can be left.
+What is **not** deleted, and was on the list until review:
+**`key_is_unserveable`'s first arm.** It refuses *any* exact placeholder-shaped
+property key, and the containment arm that would remain refuses only keys this
+mapping maps. Deleting it moves a client from a refusal to a model-chosen
+property name — a response that refuses today ceasing to refuse, which this
+slice's own first constraint forbids and `AGENTS.md` asks to be stated rather
+than absorbed. It stays.
+
+Nor are `pieces`, `is_placeholder` and `placeholder_type`: they recognise
+tokens, which is still needed and now needed for a second reason — a stranger's
+token must be recognised precisely so it can be left.
 
 ## Tasks
 

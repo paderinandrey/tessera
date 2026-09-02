@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** An issued placeholder carries a per-session salt the caller cannot have written, so telling our token from the caller's stops being a question about shape and becomes a lookup.
+**Goal:** An issued placeholder carries a per-session namespace the caller cannot have written, so telling our token from the caller's stops being a question about shape and becomes a lookup.
 
-**Architecture:** `Mapping` gains a `salt` minted once per session and cloned into each request's working copy. The token grammar accepts both `[TYPE_N]` and `[TYPE_N.salt]`; recognising a token and owning it become two questions, and only ownership consults the salt. Ownership then replaces `Provenance`, and the mechanisms that existed to answer ownership by shape are deleted.
+**Architecture:** `Mapping` gains a `namespace` derived from the session key — stable across eviction, which minting would not be — and cloned into each request's working copy. The token grammar accepts both `[TYPE_N]` and `[TYPE_N.salt]`; recognising a token and owning it become two questions, and only ownership consults the salt. Ownership then replaces `Provenance`, and the mechanisms that existed to answer ownership by shape are deleted.
 
 **Tech Stack:** Rust (gateway), `getrandom` 0.2 (already a dependency), Python (detector evaluation harness).
 
@@ -12,14 +12,15 @@
 
 - **Nothing that refuses today may stop refusing.** New refusals are allowed and are the point; silently serving something previously refused is not.
 - **Every invariant is proved by mutation**: break it, run the *named* test, check *why* it failed, restore by **inverse text substitution** — never `git checkout`.
-- **Salt: four lowercase hex characters, two bytes of entropy.** Copied verbatim from the spec; do not choose a different length.
+- **Namespace: twelve lowercase hex characters, six bytes.** Copied verbatim from the spec; do not choose a different width. Sixteen bits was the first answer and was wrong — a caller can enumerate 65 536 candidates in about a megabyte of request text, and the caller is who this protects against.
+- **The namespace is derived from the session key, not minted per `Mapping`.** Minting fails across eviction, which is the path that produces the tokens Task 6 exists to refuse.
 - **No salt may reach a journal line.** The journal writes no token at all today, so this is a property to keep rather than a change to make — see Task 5.
-- **`stream::MAX_HELD` becomes 72.** Worst case is `[` + 40 + `_` + 20 digits + `.` + 4 + `]` = 68.
+- **`stream::MAX_HELD` becomes 80.** Worst case is `[` + 40 + `_` + 20 digits + `.` + 12 + `]` = 76.
 - Local gate for every task: `cargo test --manifest-path gateway/Cargo.toml`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
 ## File Structure
 
-- `gateway/src/mapping.rs` — the salt, the grammar, ownership, and the deletions. Already large; this slice does not split it, because every change lands on functions that must stay next to each other to be read.
+- `gateway/src/mapping.rs` — the namespace, the grammar, ownership, and the deletions. Already large; this slice does not split it, because every change lands on functions that must stay next to each other to be read.
 - `gateway/src/stream.rs` — one constant and two comments.
 - `gateway/src/proxy.rs` — the request-wide literal walk is deleted; the sweep's call site changes shape.
 - `gateway/src/audit.rs` — unchanged in behaviour; one test proves it.
@@ -44,7 +45,7 @@
 """Measure what a salted placeholder does to detection (#32).
 
 A later turn's text carries placeholders from earlier turns. This asks whether
-`[PERSON_1.7f3a]` changes what the detector finds, against `[PERSON_1]` and
+`[PERSON_1.3f7a2b91c4d5]` changes what the detector finds, against `[PERSON_1]` and
 against no token at all.
 
 Run from the repository root:
@@ -61,7 +62,7 @@ CORPUS = Path("evaluation/corpus")
 SHAPES = {
     "none": "",
     "bare": "[PERSON_1]",
-    "salted": "[PERSON_1.7f3a]",
+    "salted": "[PERSON_1.3f7a2b91c4d5]",
 }
 
 
@@ -150,35 +151,36 @@ git commit -m "eval: measure what a salted placeholder does to detection (#32)"
 
 ---
 
-### Task 2: Mint the salt and issue salted tokens
+### Task 2: Derive the namespace and issue tokens into it
 
 **Files:**
-- Modify: `gateway/src/mapping.rs` (the `Mapping` struct, `Default`, `placeholder_for`, `placeholder_type`)
+- Modify: `gateway/src/mapping.rs` (the `Mapping` struct, `Default`, `placeholder_for`, `placeholder_type`), `gateway/src/session.rs` (construct with `for_session`), `gateway/src/proxy.rs` (the sessionless path keeps `Mapping::new()`)
 
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `Mapping::with_salt(salt: &str) -> Mapping` — deterministic construction, for tests.
-  - `Mapping::salt(&self) -> &str`
-  - `fn placeholder_salt(candidate: &str) -> Option<&str>` — the salt a token carries, `None` for a bare token or a non-token.
+  - `Mapping::with_namespace(namespace: &str) -> Mapping` — deterministic construction, for tests.
+  - `Mapping::namespace(&self) -> &str`
+  - `Mapping::for_session(key: &SessionKey) -> Mapping` — the derived namespace.
+  - `fn placeholder_namespace(candidate: &str) -> Option<&str>` — the namespace a token carries, `None` for a bare token or a non-token.
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
 #[test]
 fn an_issued_token_carries_this_mappings_salt_and_a_callers_literal_does_not() {
-    let mut mapping = Mapping::with_salt("7f3a");
+    let mut mapping = Mapping::with_namespace("3f7a2b91c4d5");
     let token = mapping
         .mask("Martina Weber", &[span("PERSON", 0, 13)])
         .unwrap();
 
-    assert_eq!(token, "[PERSON_1.7f3a]", "an issued token lost its namespace");
-    assert_eq!(placeholder_salt(&token), Some("7f3a"));
+    assert_eq!(token, "[PERSON_1.3f7a2b91c4d5]", "an issued token lost its namespace");
+    assert_eq!(placeholder_namespace(&token), Some("3f7a2b91c4d5"));
     // Recognised, and not ours. Both halves matter: a stranger's token has to
     // be seen in order to be left alone deliberately.
     assert!(is_placeholder("[PERSON_1]"), "a bare token stopped being one");
-    assert_eq!(placeholder_salt("[PERSON_1]"), None);
-    assert_eq!(placeholder_type("[PERSON_1.7f3a]"), Some("PERSON"));
+    assert_eq!(placeholder_namespace("[PERSON_1]"), None);
+    assert_eq!(placeholder_type("[PERSON_1.3f7a2b91c4d5]"), Some("PERSON"));
 }
 
 #[test]
@@ -191,7 +193,7 @@ fn two_mappings_do_not_share_a_namespace() {
     let b = second.mask("Martina Weber", &[span("PERSON", 0, 13)]).unwrap();
 
     assert_ne!(a, b, "two mappings issued the same token");
-    assert_eq!(first.salt().len(), 4);
+    assert_eq!(first.namespace().len(), 12);
     assert!(first.salt().chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 }
 ```
@@ -199,22 +201,26 @@ fn two_mappings_do_not_share_a_namespace() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --manifest-path gateway/Cargo.toml -- an_issued_token_carries two_mappings_do_not_share`
-Expected: FAIL — `with_salt`, `salt` and `placeholder_salt` do not exist.
+Expected: FAIL — `with_namespace`, `namespace` and `placeholder_namespace` do not exist.
 
 - [ ] **Step 3: Add the salt to the struct**
 
 Remove `Default` from the derive list on `Mapping` and write it, so there is no way to construct a mapping without a namespace:
 
 ```rust
-/// Bytes of per-session salt: two, printed as four lowercase hex characters.
+/// Bytes of namespace: six, printed as twelve lowercase hex characters.
 ///
-/// The salt is an origin marker and not a secret — a session is keyed by
-/// *(credential, session id)*, and `a_guessed_session_id_returns_no_other_callers_value`
-/// already holds that a different key reaches nothing. What it has to survive
-/// is a caller writing bracket-token text of their own, and sixteen bits does
-/// that. Four characters rather than eight also keeps the token inside
-/// `stream::MAX_HELD` with room, which nine would not.
-const SALT_BYTES: usize = 2;
+/// **Sixteen bits was the first answer and it was wrong.** The reasoning was
+/// that a session is keyed by *(credential, session id)* and a different key
+/// reaches nothing — true, and beside the point. What this protects is the
+/// integrity of *the caller's own text*, and the caller holds the credential,
+/// so the adversary is inside the boundary that argument appealed to. A request
+/// can carry all 65 536 four-character candidates in about a megabyte; the one
+/// matching a mapping is restored, and the substitution defect is back.
+///
+/// Forty-eight bits is not enumerable within any request budget, and that is
+/// what pays for deleting the request-written provenance set.
+const NAMESPACE_BYTES: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct Mapping {
@@ -226,7 +232,7 @@ pub struct Mapping {
     /// The namespace this mapping issues into. Minted once and carried by
     /// every clone, so a request's working copy issues into its session's
     /// namespace and a token from turn one is still ours in turn three.
-    salt: String,
+    namespace: String,
 }
 
 impl Default for Mapping {
@@ -237,36 +243,63 @@ impl Default for Mapping {
             order: Vec::new(),
             next: 0,
             redacted: 0,
-            salt: mint_salt(),
+            namespace: mint_namespace(),
         }
     }
 }
 
-/// Four lowercase hex characters from the operating system's generator.
+/// Twelve lowercase hex characters from the operating system's generator, for
+/// a mapping with no session behind it.
 ///
-/// **A failure here is fatal on purpose.** The alternative to a random salt is
-/// a predictable one, and a predictable salt silently restores the defect this
-/// namespace exists to close — the gateway would keep running and keep
-/// corrupting a caller's own tokens. `Audit::open` takes the same line about
-/// evidence it cannot write.
-fn mint_salt() -> String {
-    let mut bytes = [0u8; SALT_BYTES];
+/// **A failure here is fatal on purpose.** The alternative to a random
+/// namespace is a predictable one, and a predictable namespace silently
+/// restores the defect this exists to close — the gateway would keep running
+/// and keep corrupting a caller's own tokens. `session::salt` takes the same
+/// line, in the same words, three files away.
+fn mint_namespace() -> String {
+    let mut bytes = [0u8; NAMESPACE_BYTES];
     getrandom::getrandom(&mut bytes)
         .expect("the operating system's random generator is unavailable");
+    hex(&bytes)
+}
+
+/// The namespace a session issues into: stable across eviction, because the
+/// key is.
+///
+/// **Minting per mapping fails on exactly the path Task 6 is written for.**
+/// Eviction removes a whole session; the next request with the same id builds a
+/// fresh `Mapping`, and a minted namespace would differ. A token from the
+/// evicted incarnation would then read as a stranger's — left rather than
+/// refused, and delivered to the client.
+///
+/// `SessionKey` is already a salted fingerprint: `session::salt()` is thirty-two
+/// random bytes per process mixed into the credential hash, so this is
+/// unguessable for the reason the key is, and no new secret is introduced.
+pub fn for_session(key: &SessionKey) -> Self {
+    let mut hasher = Sha256::new();
+    hasher.update(key.fingerprint());
+    hasher.update(key.id().as_bytes());
+    Self {
+        namespace: hex(&hasher.finalize()[..NAMESPACE_BYTES]),
+        ..Self::default()
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl Mapping {
     /// A mapping issuing into a named namespace. Tests only: production mints.
-    pub fn with_salt(salt: &str) -> Self {
+    pub fn with_namespace(namespace: &str) -> Self {
         Self {
-            salt: salt.to_owned(),
+            namespace: namespace.to_owned(),
             ..Self::default()
         }
     }
 
-    pub fn salt(&self) -> &str {
-        &self.salt
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 ```
@@ -287,16 +320,16 @@ In `placeholder_for`, change the minting line:
 /// The type name a placeholder carries, or `None` if the candidate is not one.
 ///
 /// **Both forms are placeholders**: `[PERSON_1]`, which only a caller writes,
-/// and `[PERSON_1.7f3a]`, which only this gateway issues. Recognising a token
+/// and `[PERSON_1.3f7a2b91c4d5]`, which only this gateway issues. Recognising a token
 /// and owning it are different questions, and this one is recognition —
-/// `placeholder_salt` is ownership. A stranger's token has to be recognised
+/// `placeholder_namespace` is ownership. A stranger's token has to be recognised
 /// precisely so that it can be left alone deliberately rather than by accident.
 fn placeholder_type(candidate: &str) -> Option<&str> {
     let inner = candidate
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))?;
     let inner = match inner.rsplit_once('.') {
-        Some((before, salt)) if is_salt_characters(salt) => before,
+        Some((before, namespace)) if is_namespace_characters(namespace) => before,
         _ => inner,
     };
     let (entity_type, number) = inner.rsplit_once('_')?;
@@ -310,27 +343,55 @@ fn placeholder_type(candidate: &str) -> Option<&str> {
 ///
 /// Asked of the token and not of the mapping, so that "is this well formed"
 /// and "is this ours" stay two questions with one answer each.
-pub(crate) fn placeholder_salt(candidate: &str) -> Option<&str> {
+pub(crate) fn placeholder_namespace(candidate: &str) -> Option<&str> {
     let inner = candidate
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))?;
-    let (before, salt) = inner.rsplit_once('.')?;
-    (is_salt_characters(salt) && placeholder_type(&format!("[{before}]")).is_some())
-        .then_some(salt)
+    let (before, namespace) = inner.rsplit_once('.')?;
+    (is_namespace_characters(namespace) && placeholder_type(&format!("[{before}]")).is_some())
+        .then_some(namespace)
 }
 
-/// Four lowercase hex characters, which is what `mint_salt` produces.
+/// Four lowercase hex characters, which is what `mint_namespace` produces.
 ///
 /// Exact rather than permissive: a token whose suffix is not a salt this
 /// gateway could have minted is a token with a dot in it, and reading that dot
 /// as a namespace would let a caller name one.
-fn is_salt_characters(salt: &str) -> bool {
-    salt.len() == SALT_BYTES * 2
-        && salt
+fn is_namespace_characters(namespace: &str) -> bool {
+    namespace.len() == NAMESPACE_BYTES * 2
+        && namespace
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 ```
+
+- [ ] **Step 5b: Construct session mappings through `for_session`**
+
+`session.rs` builds a mapping in two places — when a session is created and
+when one is recreated after eviction. Both become `Mapping::for_session(&key)`,
+and the key is already in scope at both. Add:
+
+```rust
+    #[test]
+    fn a_recreated_session_issues_into_the_same_namespace() {
+        // The path that produces the tokens Task 6 refuses. Eviction removes
+        // the session; the next request with the same id builds a fresh
+        // mapping, and a minted namespace would differ — so a token from the
+        // evicted incarnation would read as a stranger's and be delivered
+        // rather than refused.
+        let key = SessionKey::new(b"k1", "shared");
+        let first = Mapping::for_session(&key);
+        let second = Mapping::for_session(&key);
+        let other = Mapping::for_session(&SessionKey::new(b"k1", "different"));
+
+        assert_eq!(first.namespace(), second.namespace());
+        assert_ne!(first.namespace(), other.namespace());
+    }
+```
+
+Mutation: make `for_session` call `Self::default()` and ignore the key.
+Expected: `a_recreated_session_issues_into_the_same_namespace` FAILS on the
+first assertion. Restore by inverse text substitution.
 
 - [ ] **Step 6: Run the two new tests**
 
@@ -343,8 +404,8 @@ The suite asserts on literal token text in roughly 120 places across
 `mapping.rs`, `proxy.rs` and `stream.rs`. They must move, and the move is
 mechanical only where the mapping is deterministic.
 
-1. In `mapping.rs` tests, replace `Mapping::new()` with `Mapping::with_salt("7f3a")` **only** where the test asserts on token text.
-2. Rewrite the asserted literals: `[PERSON_1]` → `[PERSON_1.7f3a]`, and the same for every type and number.
+1. In `mapping.rs` tests, replace `Mapping::new()` with `Mapping::with_namespace("3f7a2b91c4d5")` **only** where the test asserts on token text.
+2. Rewrite the asserted literals: `[PERSON_1]` → `[PERSON_1.3f7a2b91c4d5]`, and the same for every type and number.
 3. In `proxy.rs` and `stream.rs` tests, the mapping is built inside the router. Add to the test module:
 
 ```rust
@@ -372,7 +433,7 @@ regression — report it rather than adjusting the test.
 
 - [ ] **Step 9: Mutation — the salt is not decoration**
 
-Change `mint_salt` to return `"0000".to_owned()` unconditionally. Run
+Change `mint_namespace` to return `"000000000000".to_owned()` unconditionally. Run
 `two_mappings_do_not_share_a_namespace`. Expected: FAIL, with the two tokens
 equal. Restore by inverse text substitution and re-run.
 
@@ -391,8 +452,8 @@ git commit -m "feat(gateway): issued placeholders carry a per-session salt (#32)
 - Modify: `gateway/src/stream.rs:124` and its doc comment; `gateway/src/mapping.rs`'s `MAX_ENTITY_TYPE` comment
 
 **Interfaces:**
-- Consumes: `SALT_BYTES` from Task 2.
-- Produces: `stream::MAX_HELD == 72`.
+- Consumes: `NAMESPACE_BYTES` from Task 2.
+- Produces: `stream::MAX_HELD == 80`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -403,8 +464,8 @@ git commit -m "feat(gateway): issued placeholders carry a per-session salt (#32)
         // unclosed `[` as ordinary text without ever orphaning a real token.
         // Arithmetic, not a sample, so that adding a component to the token
         // fails here rather than in a stream.
-        let longest = 1 + crate::mapping::MAX_ENTITY_TYPE + 1 + 20 + 1 + 4 + 1;
-        assert_eq!(longest, 68, "the token's worst case moved");
+        let longest = 1 + crate::mapping::MAX_ENTITY_TYPE + 1 + 20 + 1 + 12 + 1;
+        assert_eq!(longest, 76, "the token's worst case moved");
         assert!(
             longest <= MAX_HELD,
             "the longest issuable token no longer fits the held bound"
@@ -415,7 +476,7 @@ git commit -m "feat(gateway): issued placeholders carry a per-session salt (#32)
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `cargo test --manifest-path gateway/Cargo.toml -- the_longest_token_this_gateway_can_issue`
-Expected: FAIL — 68 > 64.
+Expected: FAIL — 76 > 64.
 
 - [ ] **Step 3: Raise the constant and restate both comments**
 
@@ -425,15 +486,15 @@ Expected: FAIL — 68 > 64.
 ///
 /// This is a bound on what the masker can issue, not a guess. The worst case is
 /// `[` + a name of `mapping::MAX_ENTITY_TYPE` + `_` + twenty digits + `.` + a
-/// four-character salt + `]`, which is 68 bytes;
+/// twelve-character namespace + `]`, which is 76 bytes;
 /// `the_longest_token_this_gateway_can_issue_fits_the_held_bound` does the
 /// arithmetic so that adding a component to the token fails there rather than
 /// orphaning a token in a stream.
-pub const MAX_HELD: usize = 72;
+pub const MAX_HELD: usize = 80;
 ```
 
 And in `mapping.rs`, replace the sentence computing 63 with the same arithmetic
-reaching 68. **Restate it; do not adjust the number in place** — the next
+reaching 76. **Restate it; do not adjust the number in place** — the next
 person to add a component reads that comment, not the plan.
 
 - [ ] **Step 4: Run the suite**
@@ -460,7 +521,7 @@ git commit -m "fix(gateway): the held bound had one byte of headroom and the sal
 - Modify: `gateway/src/mapping.rs` (`Provenance`, `Lenient`, `restore_sweep`, `restore_in_string`), `gateway/src/proxy.rs` (the sweep's call site and the request-wide literal walk)
 
 **Interfaces:**
-- Consumes: `placeholder_salt`, `Mapping::salt` from Task 2.
+- Consumes: `placeholder_namespace`, `Mapping::namespace` from Task 2.
 - Produces: `Mapping::owns(&self, candidate: &str) -> bool`; `restore_sweep(&self, value: &Value) -> Value` (the `Provenance` parameter is gone); `restore_in_string(&self, text: &str) -> String`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -470,7 +531,7 @@ git commit -m "fix(gateway): the held bound had one byte of headroom and the sal
 fn a_callers_own_literal_survives_a_turn_that_issued_the_same_bare_token() {
     // The defect, at the unit. Turn one issues for `Martina Weber`; turn two
     // carries the caller's own `[PERSON_1]`. Nothing may rewrite it.
-    let mut mapping = Mapping::with_salt("7f3a");
+    let mut mapping = Mapping::with_namespace("3f7a2b91c4d5");
     mapping.mask("Martina Weber", &[span("PERSON", 0, 13)]).unwrap();
 
     assert_eq!(
@@ -484,13 +545,13 @@ fn a_callers_own_literal_survives_a_turn_that_issued_the_same_bare_token() {
 fn another_sessions_token_is_left_alone() {
     // Ownership is not "well formed and salted". A token from a different
     // namespace is a stranger's, whatever it looks like.
-    let mut mapping = Mapping::with_salt("7f3a");
+    let mut mapping = Mapping::with_namespace("3f7a2b91c4d5");
     mapping.mask("Martina Weber", &[span("PERSON", 0, 13)]).unwrap();
 
-    assert!(!mapping.owns("[PERSON_1.0a1b]"));
+    assert!(!mapping.owns("[PERSON_1.0a1b7c33e2f1]"));
     assert_eq!(
-        mapping.restore_in_string("[PERSON_1.0a1b]"),
-        "[PERSON_1.0a1b]",
+        mapping.restore_in_string("[PERSON_1.0a1b7c33e2f1]"),
+        "[PERSON_1.0a1b7c33e2f1]",
         "a token from another session was restored"
     );
 }
@@ -501,7 +562,7 @@ fn a_token_this_turn_did_not_issue_still_restores() {
     // nor re-masks the value, and the model echoes the token anyway. Today
     // that comes back as a placeholder because the request's `issued` set does
     // not contain it.
-    let mut session = Mapping::with_salt("7f3a");
+    let mut session = Mapping::with_namespace("3f7a2b91c4d5");
     let token = session
         .mask("Martina Weber", &[span("PERSON", 0, 13)])
         .unwrap();
@@ -532,7 +593,7 @@ Expected: FAIL — `owns` does not exist and `restore_in_string` still takes a `
     /// not proof; the salt makes it proof, and both of its sets had nothing
     /// left to decide.
     pub fn owns(&self, candidate: &str) -> bool {
-        placeholder_salt(candidate) == Some(self.salt.as_str())
+        placeholder_namespace(candidate) == Some(self.namespace.as_str())
             && self.by_placeholder.contains_key(candidate)
     }
 ```
@@ -568,8 +629,14 @@ Expected: FAIL — `owns` does not exist and `restore_in_string` still takes a `
         let placeholder = format!("[{entity_type}_{}.{}]", self.next, self.salt);
 ```
 
-- `key_is_unserveable`'s first arm (`if is_placeholder(key) { return true; }`).
 - `proxy::mask_all`'s reservation pass over every slot.
+
+**`key_is_unserveable`'s first arm stays**, and was on this list until review.
+It refuses *any* exact placeholder-shaped property key; the containment arm that
+would remain refuses only keys this mapping maps. Deleting it moves a client
+from a refusal to a model-chosen property name — a response that refuses today
+ceasing to refuse, which the first global constraint forbids. Leave it, and
+leave its test alone.
 
 For each deletion, run the full suite. A test that fails **only** because it
 asserts the deleted mechanism exists is rewritten to assert the behaviour that
@@ -584,8 +651,8 @@ Expected: PASS.
 - [ ] **Step 7: Mutations — three, one per new test**
 
 1. Make `owns` ignore the salt (`self.by_placeholder.contains_key(candidate)` alone). Expected: `a_callers_own_literal_survives_a_turn_that_issued_the_same_bare_token` FAILS with the literal rewritten to `Martina Weber`.
-2. Make `owns` ignore the table (`placeholder_salt(candidate) == Some(self.salt.as_str())` alone). Expected: a test in the existing suite covering an unmapped token FAILS; if none does, add one asserting `!mapping.owns("[PERSON_9.7f3a]")`.
-3. Make `owns` compare only the salt's *presence* (`placeholder_salt(candidate).is_some()`). Expected: `another_sessions_token_is_left_alone` FAILS.
+2. Make `owns` ignore the table (`placeholder_namespace(candidate) == Some(self.namespace.as_str())` alone). Expected: a test in the existing suite covering an unmapped token FAILS; if none does, add one asserting `!mapping.owns("[PERSON_9.3f7a2b91c4d5]")`.
+3. Make `owns` compare only the namespace's *presence* (`placeholder_namespace(candidate).is_some()`). Expected: `another_sessions_token_is_left_alone` FAILS.
 
 Restore each by inverse text substitution and re-run.
 
@@ -616,7 +683,7 @@ as coverage, which this repository treats as worse than absent code.
 - Modify: `gateway/src/audit.rs` (test module only)
 
 **Interfaces:**
-- Consumes: `Mapping::with_salt` from Task 2.
+- Consumes: `Mapping::with_namespace` from Task 2.
 - Produces: nothing. No production code changes in this task.
 
 - [ ] **Step 1: Write the failing test**
@@ -629,7 +696,7 @@ as coverage, which this repository treats as worse than absent code.
         // per-session salt in a line would make two sessions incomparable and
         // put a per-session value in a log, so the claim is pinned here rather
         // than trusted.
-        let mut mapping = crate::mapping::Mapping::with_salt("7f3a");
+        let mut mapping = crate::mapping::Mapping::with_namespace("3f7a2b91c4d5");
         let token = mapping
             .mask("Martina Weber", &[span("PERSON", 0, 13)])
             .unwrap();
@@ -637,7 +704,7 @@ as coverage, which this repository treats as worse than absent code.
         let line = a_line_recording(&token);
 
         assert!(!line.contains(&token), "a journal line carried a token: {line}");
-        assert!(!line.contains("7f3a"), "a journal line carried a namespace: {line}");
+        assert!(!line.contains("3f7a2b91c4d5"), "a journal line carried a namespace: {line}");
         assert!(!line.contains("PERSON_1"), "a journal line carried a token body: {line}");
     }
 ```
@@ -688,11 +755,11 @@ fn a_token_this_namespace_issued_but_cannot_map_refuses_rather_than_reaching_the
     // no mapping — an evicted session, a stale turn. Leaving it puts a token
     // this gateway issued in front of the client, which is the one thing the
     // first clause promises it will not.
-    let mapping = Mapping::with_salt("7f3a");
+    let mapping = Mapping::with_namespace("3f7a2b91c4d5");
 
     assert!(
         matches!(
-            mapping.restore_sweep(&json!({"note": "[PERSON_9.7f3a]"})),
+            mapping.restore_sweep(&json!({"note": "[PERSON_9.3f7a2b91c4d5]"})),
             Err(MappingError::Unknown(_))
         ),
         "a token this namespace issued was served to the client"
@@ -701,9 +768,9 @@ fn a_token_this_namespace_issued_but_cannot_map_refuses_rather_than_reaching_the
     // own text, which is the defect this slice closed.
     assert_eq!(
         mapping
-            .restore_sweep(&json!({"note": "[PERSON_9.0a1b]"}))
+            .restore_sweep(&json!({"note": "[PERSON_9.0a1b7c33e2f1]"}))
             .expect("a stranger's token was refused"),
-        json!({"note": "[PERSON_9.0a1b]"})
+        json!({"note": "[PERSON_9.0a1b7c33e2f1]"})
     );
 }
 ```
@@ -725,7 +792,7 @@ Add the first as a private predicate and refuse on ours-but-unmapped:
     /// not. `owns` is this plus a mapping; the difference is exactly the case
     /// #31 had to leave and this slice can refuse.
     fn minted_here(&self, candidate: &str) -> bool {
-        placeholder_salt(candidate) == Some(self.salt.as_str())
+        placeholder_namespace(candidate) == Some(self.namespace.as_str())
     }
 ```
 
@@ -784,7 +851,7 @@ task.
 
 **Placeholders.** None: every code step carries the code.
 
-**Type consistency.** `placeholder_salt` returns `Option<&str>` and is used that
+**Type consistency.** `placeholder_namespace` returns `Option<&str>` and is used that
 way in Tasks 2, 4, 5 and 6. `owns` and `minted_here` are distinct by design and
 their difference is the subject of Task 6's test. `with_salt` is used in every
 deterministic test and never in production.
