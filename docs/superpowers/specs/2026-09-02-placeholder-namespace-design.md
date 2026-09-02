@@ -149,6 +149,26 @@ of leaving it, because "ours" is finally decidable. The README's promise loses
 its qualification: a placeholder this gateway issued does not reach the client,
 full stop, rather than *from a field the gateway describes*.
 
+## `Provenance` collapses, and that is the shape of the win
+
+#31 introduced `Provenance` — `issued ∧ ¬written` — because a lookup is not
+provenance while a session outlives a request. Its own doc comment names this
+slice as what separates the two sets.
+
+With a salt the lookup **is** provenance. A token carrying this session's salt
+was issued by this session; a caller cannot have written it; the two sets stop
+overlapping by construction. `restorable` becomes *carries our salt and has a
+mapping*, and `issued`, `written`, the per-request sets and the request-wide
+walk that fills them all have nothing left to decide.
+
+**This buys coverage as well as simplicity, which was not in the issue.** Today
+the sweep can restore only what *this request* issued, because that is the only
+set it can trust. A value masked in turn one, not mentioned in turn three, and
+echoed by the model in turn three's response is left as a placeholder — ours,
+mappable, and not restored, because turn three's `issued` does not contain it.
+Ownership by salt restores it. That case is common in a long conversation and is
+worth a test of its own.
+
 ## What is deleted **[decided]**
 
 A mechanism that exists to answer the shape question has nothing left to do, and
@@ -161,6 +181,8 @@ absent one — it reads as coverage.
 - **`key_is_unserveable`'s first arm.** `is_placeholder(key)` refuses any
   bracket-shaped key; with ownership decidable, the question it was standing in
   for can be asked directly.
+- **`Provenance` and both its sets**, per the section above, along with the
+  request-wide walk that builds `written`.
 
 Deletion is per-task and each one is mutation-proved in the direction that
 matters: put the mechanism back, and no test should fail for a *reason that
