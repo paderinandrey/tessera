@@ -58,7 +58,7 @@ from pathlib import Path
 
 from tessera_detector.pipeline import build_detector
 
-CORPUS = Path("evaluation/corpus")
+CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 SHAPES = {
     "none": "",
     "bare": "[PERSON_1]",
@@ -67,8 +67,13 @@ SHAPES = {
 
 
 def documents():
-    for path in sorted(CORPUS.glob("*.json")):
-        yield path.name, json.loads(path.read_text())["text"]
+    # One JSON object per line, the shape `evaluate.py` already reads. A glob
+    # over `*.json` finds nothing here and the gate would report "both shapes
+    # must run" rather than a measurement.
+    for line in CORPUS.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            record = json.loads(line)
+            yield record["id"], record["text"]
 
 
 def run(detector, text):
@@ -440,8 +445,8 @@ equal. Restore by inverse text substitution and re-run.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add gateway/src/mapping.rs gateway/src/proxy.rs gateway/src/stream.rs
-git commit -m "feat(gateway): issued placeholders carry a per-session salt (#32)"
+git add gateway/src/mapping.rs gateway/src/session.rs gateway/src/proxy.rs gateway/src/stream.rs
+git commit -m "feat(gateway): issued placeholders carry a per-session namespace (#32)"
 ```
 
 ---
@@ -619,29 +624,29 @@ Expected: FAIL — `owns` does not exist and `restore_in_string` still takes a `
 - In `proxy.rs`, delete the request-wide literal walk that built `written` and
   the `Provenance::new(...)` construction, and call `restore_sweep(&upstream)`.
 
-- [ ] **Step 5: Delete the mechanisms that answered ownership by shape**
+- [ ] **Step 5: Delete `Provenance`, and nothing else**
 
-- `Mapping::reserve_literals` and its call in `mask`.
-- The skip-taken-numbers loop in `placeholder_for` becomes a plain increment:
+Two review rounds landed on the deletion list and this is what survives them.
 
-```rust
-        self.next += 1;
-        let placeholder = format!("[{entity_type}_{}.{}]", self.next, self.salt);
-```
+`Provenance` goes: its two sets are what ownership replaces, and its own doc
+comment names this slice as what separates them.
 
-- `proxy::mask_all`'s reservation pass over every slot.
+**`reserve_literals` stays, and so does the request-wide reservation pass.**
+They looked like they answered the ownership question and they do not. They keep
+a caller's literal *self-mapped*, and the strict path depends on that: it does an
+unconditional `by_placeholder` lookup and raises `MappingError::Unknown` on a
+miss, so a caller's `[PERSON_1]` echoed into a described slot would go from a
+successful unchanged response to a 502. The sweep is unaffected either way — a
+self-mapped literal carries no namespace, so `owns` is false and it is left.
 
-**`key_is_unserveable`'s first arm stays**, and was on this list until review.
-It refuses *any* exact placeholder-shaped property key; the containment arm that
-would remain refuses only keys this mapping maps. Deleting it moves a client
-from a refusal to a model-chosen property name — a response that refuses today
-ceasing to refuse, which the first global constraint forbids. Leave it, and
-leave its test alone.
+**The skip-taken-numbers loop stays too.** With a namespace an issued token and
+a caller's literal are different keys and cannot collide, so the loop guards
+nothing *today* — but removing it while `reserve_literals` still writes into the
+same map is a change whose safety depends on two things at once, and this slice
+has already been wrong twice about which mechanism guards what.
 
-For each deletion, run the full suite. A test that fails **only** because it
-asserts the deleted mechanism exists is rewritten to assert the behaviour that
-replaced it. A test that fails for any other reason is a real regression: stop
-and report it.
+None of these are deleted here. They are a follow-up issue, opened when this
+ships, to be argued against real traffic rather than against a plan.
 
 - [ ] **Step 6: Run the new tests, then the suite**
 
@@ -824,11 +829,48 @@ and delete the sentence naming #32 as what would restore it. **Replace the
 claim; do not annotate it.** The rule this repository learned the hard way is
 that a reader implements the definition, not the note beneath it.
 
+- [ ] **Step 5b: Refuse the lossy fallback when it carries this namespace**
+
+`Lenient::token` is not the only way a token reaches the client. When a
+restored value needs escaping inside a serialized document the round trip
+cannot reproduce, `restore_in_string_with` calls `lossy_document`, the lenient
+rule answers `Ok`, and the **original text is returned — namespace and all**.
+That falsifies this task's promise and publishes the namespace, which a caller
+can then write on a later turn.
+
+```rust
+#[test]
+fn a_lossy_fallback_carrying_this_namespace_refuses_rather_than_publishing_it() {
+    // The other door out. The document cannot be re-serialized faithfully, so
+    // the fallback is the bytes as they came — with our token still in them.
+    let mut mapping = Mapping::with_namespace("3f7a2b91c4d5");
+    let value = "Martina \"Weber\"";
+    let token = mapping
+        .mask(value, &[span("PERSON", 0, value.chars().count())])
+        .unwrap();
+    let document = format!("{{\"mode\":\"a\",\"mode\":\"b\",\"name\":\"{token}\"}}");
+
+    let served = mapping.restore_sweep(&json!({"note": document}));
+    assert!(
+        served.is_err(),
+        "a lossy fallback published the namespace: {served:?}"
+    );
+}
+```
+
+In `restore_in_string_with`, every arm that returns `Ok(text.to_owned())` after
+`lossy_document` must first ask whether `text` still carries a token in this
+namespace, and refuse if it does. **Leaving a stranger's token there is still
+correct** — that is the caller's own text and the whole point of the slice.
+
 - [ ] **Step 6: Mutation**
 
 Remove the `minted_here` arm from the sweep. Expected:
 `a_token_this_namespace_issued_but_cannot_map_refuses_rather_than_reaching_the_client`
-FAILS. Restore by inverse substitution.
+FAILS. Restore by inverse substitution. Then remove the namespace check from the lossy
+fallback; expected:
+`a_lossy_fallback_carrying_this_namespace_refuses_rather_than_publishing_it`
+FAILS. Restore that one too.
 
 - [ ] **Step 7: Commit**
 

@@ -144,7 +144,7 @@ bound is not a guess — it is what lets the streamed buffer release an unclosed
 `[` as ordinary text without ever orphaning a real token.
 
 A twelve-character namespace and its delimiter make the worst case 76. **`MAX_HELD`
-becomes 72**, and the arithmetic in both comments is restated rather than
+becomes 80**, and the arithmetic in both comments is restated rather than
 adjusted, because the next person to add a component to the token will read
 those comments and not this document.
 
@@ -195,34 +195,39 @@ mappable, and not restored, because turn three's `issued` does not contain it.
 Ownership by salt restores it. That case is common in a long conversation and is
 worth a test of its own.
 
-## What is deleted **[decided]**
+## What is deleted **[decided, revised twice]**
 
-A mechanism that exists to answer the shape question has nothing left to do, and
-this repository's own rule is that a guard which guards nothing is worse than an
-absent one — it reads as coverage.
+**Only `Provenance`.** Its two sets are what ownership replaces, and its own doc
+comment names this slice as what separates them.
 
-- **`reserve_literals`' self-mapping** and the skip-taken-numbers loop in
-  `placeholder_for`. Both exist so an issued token cannot collide with a
-  caller's literal. With a salt, no collision is possible.
-- **`Provenance` and both its sets**, per the section above, along with the
-  request-wide walk that builds `written`.
+The first draft listed four more, on this repository's rule that a guard which
+guards nothing reads as coverage. Two review rounds found that three of them
+guard something after all, and the pattern in the mistakes is worth more than
+the list:
 
-Deletion is per-task and each one is mutation-proved in the direction that
-matters: put the mechanism back, and no test should fail for a *reason that
-still exists*. A test that fails only because it asserts the old mechanism's
-presence is a test to rewrite, not a reason to keep the code.
+- **`key_is_unserveable`'s first arm** refuses any exact placeholder-shaped
+  property key. The arm that would remain refuses only keys this mapping maps,
+  so deleting it moves a client from a refusal to a model-chosen property name.
+- **`reserve_literals`** keeps a caller's literal self-mapped, and the *strict*
+  path depends on that: it looks the token up unconditionally and raises
+  `Unknown` on a miss, so a caller's `[PERSON_1]` echoed into a described slot
+  would become a 502 where it is a successful unchanged response today. The
+  sweep is indifferent — a self-mapped literal carries no namespace, so `owns`
+  is false and it is left either way.
+- **The skip-taken-numbers loop** genuinely guards nothing once namespaces
+  exist, and stays anyway: removing it while `reserve_literals` still writes
+  into the same map makes its safety depend on two things at once, and this
+  design has now been wrong twice about which mechanism guards what.
 
-What is **not** deleted, and was on the list until review:
-**`key_is_unserveable`'s first arm.** It refuses *any* exact placeholder-shaped
-property key, and the containment arm that would remain refuses only keys this
-mapping maps. Deleting it moves a client from a refusal to a model-chosen
-property name — a response that refuses today ceasing to refuse, which this
-slice's own first constraint forbids and `AGENTS.md` asks to be stated rather
-than absorbed. It stays.
+**The rule the two rounds produced:** *"this exists to answer a question I am
+replacing" is a claim about the mechanism's history, not about its behaviour.*
+Both wrong deletions were mechanisms built for the shape question that had
+quietly acquired a second job. Deleting them is a follow-up issue, argued
+against real traffic rather than against a plan.
 
-Nor are `pieces`, `is_placeholder` and `placeholder_type`: they recognise
-tokens, which is still needed and now needed for a second reason — a stranger's
-token must be recognised precisely so it can be left.
+What is **not** deleted for a different reason: `pieces`, `is_placeholder` and
+`placeholder_type` recognise tokens, which is still needed and now needed twice
+over — a stranger's token must be recognised precisely so it can be left.
 
 ## Tasks
 
@@ -231,7 +236,7 @@ token must be recognised precisely so it can be left.
    and report on failure.
 2. **Mint salted tokens.** Per-session salt, grammar accepts both forms,
    ownership answered in one predicate.
-3. **Raise `MAX_HELD` to 72** and restate the arithmetic in both comments.
+3. **Raise `MAX_HELD` to 80** and restate the arithmetic in both comments.
 4. **Provenance becomes a lookup.** Replace the shape-based answers; delete the
    mechanisms that only served them.
 5. **Journal records the unsalted token.**
