@@ -1170,12 +1170,16 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// removing it makes evaluation safe. A client that evals model output has a
 /// larger problem than this function.
 ///
-/// **YAML is outside for the same reason as evaluation.** It has no quoted
-/// string to stay inside: a bare scalar is a value there, so `:`, `@`, `?` and
-/// `!` act on the structure directly, and every one of them is on this list —
-/// `:` is in every timestamp, `@` in every e-mail address. Covering a reader
-/// nobody in this path has would leave an allowlist that refuses the values
-/// this gateway exists to restore.
+/// **YAML is outside, and not because it lacks quoted scalars.** It has both
+/// kinds, and inside either one these characters are as inert as they are in
+/// JSON. What it also has is the *plain* scalar, unquoted, which is where the
+/// argument above loses its footing: everything here rests on the value
+/// landing inside a quoted string, and in YAML nothing guarantees it does. A
+/// value substituted into a plain scalar meets `:`, `?` and `!` acting on the
+/// structure directly, and every one of those is on this list — `:` is in
+/// every timestamp, `@` in every e-mail address. Covering a reader nobody in
+/// this path has would leave an allowlist that refuses the values this gateway
+/// exists to restore.
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
