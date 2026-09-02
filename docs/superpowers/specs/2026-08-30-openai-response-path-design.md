@@ -129,16 +129,27 @@ served today would come back malformed. This is exactly the argument used below
 for keeping Anthropic's unknown blocks refused, and OpenAI's unknown fields need
 it too.
 
-**So the rule is about the inserted value first, and the string's shape second,
-and in that order it is exact.**
+**So the rule is about the inserted value first, and the string's shape
+second.**
 
-Substituting into JSON *text* is byte-safe precisely when the inserted value
-carries no `"`, no `\` and no control character: without a quote the string
-cannot be closed, and a comma or a brace inside a JSON string is an ordinary
-character. **A value that needs no escaping is substituted in place**, whatever
-the surrounding string is, and the document's formatting is preserved exactly.
+Substituting into text is byte-safe when **every character of the inserted
+value is inert** — when none of them can end the string it lands in, start an
+escape inside it, or be a character the format forbids there raw. A comma or a
+brace inside a string is an ordinary character and cannot reach the structure
+around it, which is why both are inert; a quote of either kind, a backtick, a
+backslash, a control character and a slash are not. **A value that is wholly
+inert is substituted in place**, whatever the surrounding string is, and the
+document's formatting is preserved exactly.
 
-**A value that does need escaping, into a string that parses as JSON, forces
+This is stated as a property and tested as an allowlist, `json_string_inert`,
+because the failure directions are not symmetric: a character wrongly called
+inert is an injection, and one wrongly called dangerous is a restoration lost.
+**An earlier version of this paragraph defined the rule as the absence of `"`,
+`\` and control characters** — a blocklist — and a value of
+`x','admin':true,'pad':'y` walked past it and turned `{'name':'[PERSON_1]'}`
+into a JSON5 object carrying a member the upstream never sent.
+
+**A value that is not wholly inert, into a string that parses as JSON, forces
 structural restoration** — parsed, restored leaf by leaf, re-serialized, the
 `embedded: true` handling a described document already gets. Reformatting is the
 price of not corrupting, and it is paid only in that case.
@@ -152,9 +163,7 @@ mark, a comment, a single-quoted key or a trailing comma each produce a text
 question are recorded below; what stands is `structure_encloses_a_token`, which
 asks whether a `{` or `[` was opened before the token and nothing else.
 
-**Nor is "needs escaping" the character set this section began with.** `"`, `\`
-and the control characters were a blocklist, and a value of single quotes walked
-past it into a JSON5 document. The test is an allowlist now.
+
 
 **"Parses as JSON" means any JSON value, not only an object or an array.** An
 undescribed field may carry the serialized scalar `"[PERSON_1]"`, which is a
