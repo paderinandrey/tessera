@@ -936,13 +936,16 @@ impl Mapping {
 /// What the two restoration paths do *not* share, which is a shorter list than
 /// what they do.
 ///
-/// The escaping rule and the recursion under it are facts about JSON: a value
-/// that is not wholly inert cannot be substituted into JSON *text* and shown to
-/// be safe — `json_string_inert` is the test, and it is an allowlist, so this
-/// takes in an apostrophe, a backtick and a slash as readily as a `"` — and a
-/// string that is a serialized document has to be reopened for the value to
-/// land in a leaf. Neither fact knows anything about which tokens
-/// this gateway may claim. So they live in `restore_in_string_with` and
+/// The escaping rule and the recursion under it are about **text and the
+/// readers of it**, not about provenance. A value that is not wholly inert
+/// cannot be substituted into text and shown safe *without knowing which
+/// reader the client uses* — `json_string_inert` is the test, an allowlist, so
+/// it takes in an apostrophe, a backtick and a slash as readily as a `"`. Only
+/// the `"` is dangerous in JSON proper; the others are ordinary inside a
+/// double-quoted string there, and are held back because the string is
+/// double-quoted only to *this* reader. And a string that is a serialized
+/// document has to be reopened for the value to land in a leaf. Neither of
+/// those knows anything about which tokens this gateway may claim. So they live in `restore_in_string_with` and
 /// `restore_document_with`, once, and this trait carries the two questions whose
 /// answers genuinely differ.
 ///
@@ -1149,8 +1152,17 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
     }
 }
 
-/// Whether this character is one a value can carry into any JSON text without
-/// being able to end a string, start an escape, or break one.
+/// Whether this character is one a value can carry into text that some reader
+/// of the JSON family may parse, without being able to end a string, start an
+/// escape, or break one **in any of them**.
+///
+/// The last clause is the whole of the conservatism and was missing from this
+/// line for a while. In JSON proper an apostrophe inside a double-quoted string
+/// is an ordinary character and provably safe; it is not admitted here because
+/// the string is double-quoted only to *this* reader, and which reader the
+/// client uses is what this gateway cannot find out. So the answer is `false`
+/// for characters that are dangerous only somewhere, and the cost of that is a
+/// restoration, never an injection.
 ///
 /// **An allowlist, and the direction is the point.** This was the opposite —
 /// `"`, `\` and the control characters — and a value of
