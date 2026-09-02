@@ -296,3 +296,23 @@ def test_the_trace_names_the_discriminator_that_actually_decided() -> None:
 
     assert decision.rule == "nested-sensitivity-merge"
     assert decision.kept.entity_type == "IBAN"
+
+
+def test_a_same_type_merge_keeps_the_more_confident_reading_under_a_custom_predicate() -> None:
+    # Rule 2 promises max confidence, and it picks its winner by untouchability
+    # first — so a custom predicate can make a 0.6 catalog span win the identity
+    # over a 0.9 model span of the same type. Taking the winner's confidence
+    # there lowers a number the documented rule says is the maximum.
+    #
+    # Different-type merges are the opposite case: the confidence belongs to the
+    # reading that survived, because the other reading is gone. Same type means
+    # both readings agree, and the merge is of evidence rather than between it.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+    quiet = span(entity_type="IBAN", start=0, end=10, confidence=0.6, recognizer="catalog:a")
+    loud = span(entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="ner:gliner")
+
+    (kept,) = resolve([quiet, loud], specificity=SPEC, untouchable=catalog_backed).spans
+
+    assert kept.recognizer == "catalog:a", "the untouchable reading lost its identity"
+    assert kept.confidence == 0.9, "a same-type merge lowered the confidence"
+    assert (kept.start, kept.end) == (0, 15)

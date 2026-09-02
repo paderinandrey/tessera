@@ -86,12 +86,25 @@ types are rated equally a caller now gets the more sensitive — or, under a
 custom `untouchable`, the more confident — reading's `entity_type`, `recognizer`
 and `tier`. That is the fix, and it is a different output for the same input.
 
-**A merged span's confidence can now be lower than before.** `_union` took the
-maximum of the two; it takes the surviving reading's. Every other field already
-came from that reading, so this removes an exception rather than adding one —
-but a caller reading `confidence` off a merged span sees a different number.
-Rule 2 is unaffected, since it picks the more confident span as the winner
-first.
+**A merged span's confidence can now be lower than before, except under rule
+2.** `_union` took the maximum of the two; it takes the surviving reading's.
+Every other field already came from that reading, so this removes an exception
+rather than adding one — but a caller reading `confidence` off a merged span
+sees a different number.
+
+The first version of this paragraph said rule 2 was unaffected "since it picks
+the more confident span as the winner first". **That is only true when both
+spans answer the `untouchable` predicate the same way.** Rule 2 picks its winner
+by untouchability *before* confidence, so a caller supplying a custom predicate
+can have a 0.6 catalog reading take the identity from a 0.9 model reading of the
+same type — and the winner's confidence would then have lowered a number the
+module docstring documents as the maximum.
+
+So rule 2 passes its confidence explicitly, and the difference is the other side
+of the same argument rather than an exception to it: **a same-type merge joins
+two readings that agree**, so the number is evidence about one conclusion and
+the maximum is right. Everywhere else the losing reading is gone, and its
+confidence goes with it.
 
 **`Resolution.trace` gains three rule names** — `nested-specificity-merge`,
 `nested-confidence-merge`, `nested-sensitivity-merge` — where the branch

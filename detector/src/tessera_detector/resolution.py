@@ -73,23 +73,31 @@ def _more_sensitive(a: Span, b: Span) -> Span:
     return a
 
 
-def _union(a: Span, b: Span, take_type_from: Span) -> Span:
+def _union(a: Span, b: Span, take_type_from: Span, *, confidence: float | None = None) -> Span:
     """The two spans' extent, under the surviving reading's identity.
 
-    **Confidence comes from the reading that survived, not from whichever input
-    happened to be surer of itself.** It was `max` of the two, so a merge could
-    hand its output a number belonging to a span that is not in it — and
+    **Confidence comes from the reading that survived**, not from whichever
+    input happened to be surer of itself. It was `max` of the two, so a merge
+    could hand its output a number belonging to a span that is not in it — and
     `_outranks` then compared a later span against that borrowed number, letting
     a bridge decide the reported type by proxy after it had been dropped. Every
-    other field already comes from `take_type_from`; this one was the exception
-    and had no argument for being one. Rule 2 is unaffected: it picks the more
-    confident span as the winner first, so the winner's confidence *is* the max.
+    other field already comes from `take_type_from`; this one was the exception.
+
+    **Rule 2 passes `confidence` explicitly, and the difference is not an
+    exception to that argument but the other side of it.** A same-type merge
+    joins two readings that *agree*, so the number is evidence about one
+    conclusion and the maximum is the documented answer. Its winner is chosen by
+    untouchability before confidence, so under a custom predicate a 0.6 catalog
+    reading can take the identity from a 0.9 model reading of the same type —
+    and taking the winner's number there would lower a value rule 2 promises is
+    the maximum. Everywhere else the losing reading is *gone*, and its
+    confidence goes with it.
     """
     return Span(
         entity_type=take_type_from.entity_type,
         start=min(a.start, b.start),
         end=max(a.end, b.end),
-        confidence=take_type_from.confidence,
+        confidence=take_type_from.confidence if confidence is None else confidence,
         recognizer=take_type_from.recognizer,
         tier=take_type_from.tier,
         boosted=a.boosted or b.boosted,
@@ -132,7 +140,9 @@ def _resolve_pair(
             winner = a if untouchable(a) else b
         else:
             winner = a if a.confidence >= b.confidence else b
-        return _union(a, b, take_type_from=winner), "same-type-merge"
+        return _union(
+            a, b, take_type_from=winner, confidence=max(a.confidence, b.confidence)
+        ), "same-type-merge"
 
     for outer, inner in ((a, b), (b, a)):
         if _strictly_contains(outer, inner):
