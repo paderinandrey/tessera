@@ -74,11 +74,37 @@ Rule 1 is untouched: a checksum span still never loses to a non-checksum one,
 and the outer's extent still survives, so nothing shrinks and nothing that was
 masked stops being masked.
 
-## What it costs and what it buys
+## What breaks, and for whom **[revised in review]**
 
-**Nothing that refuses stops refusing, and no span narrows.** The union is the
-same union; only which of two checksum types names it changes, and it changes
-toward the one the catalog rates more specific.
+The first draft said only that a type changes "toward the one the catalog rates
+more specific". That was true of the first draft's condition and is too narrow
+for what shipped. `resolve` is public, and three things about its output change.
+
+**A nested checksum span can now be renamed by confidence or sensitivity, not
+only by specificity.** `_outranks` is the full ordering, so where two checksum
+types are rated equally a caller now gets the more sensitive — or, under a
+custom `untouchable`, the more confident — reading's `entity_type`, `recognizer`
+and `tier`. That is the fix, and it is a different output for the same input.
+
+**A merged span's confidence can now be lower than before.** `_union` took the
+maximum of the two; it takes the surviving reading's. Every other field already
+came from that reading, so this removes an exception rather than adding one —
+but a caller reading `confidence` off a merged span sees a different number.
+Rule 2 is unaffected, since it picks the more confident span as the winner
+first.
+
+**`Resolution.trace` gains three rule names** — `nested-specificity-merge`,
+`nested-confidence-merge`, `nested-sensitivity-merge` — where the branch
+previously reported `specific-inner-merge` regardless of what decided it. The
+trace is the decision-evidence interface, so anything matching on rule strings
+sees values it has not seen. Nothing in this repository does: `resolve`'s only
+caller is `Detector.detect`, which reads `.spans` and never `.trace`. The
+sandbox that the module docstring says surfaces these decisions lives outside
+it, and this is the notice.
+
+**What does not change:** no span narrows, nothing that was masked stops being
+masked, and rule 1 still holds — a checksum span never loses to a non-checksum
+one.
 
 Measured end to end, on the input that surfaced it: `Le client Marty (NIR
 1 71 07 10 830 660 47)` behind a 24-character placeholder returns `FR_NIR`

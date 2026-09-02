@@ -260,3 +260,39 @@ def test_confidence_settles_nested_untouchables_under_a_custom_predicate() -> No
     ).spans
 
     assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 0, 20)
+
+
+def test_a_bridge_cannot_lend_its_confidence_to_the_span_that_replaces_it() -> None:
+    # The third layer of the same defect. `_union` took `max` confidence, so a
+    # merge handed its output a number belonging to the span it dropped — and
+    # `_outranks` then compared the next span against that borrowed number.
+    # The bridge lost every rule, was in no output, and still chose the type.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+    tie = {"AAA": 80, "BBB": 80, "ORG": 10}
+    weaker = span(entity_type="AAA", start=5, end=15, confidence=0.6, recognizer="catalog:a")
+    stronger = span(entity_type="BBB", start=5, end=15, confidence=0.8, recognizer="catalog:b")
+    bridge = span(
+        entity_type="ORG", start=0, end=15, confidence=0.9, recognizer="ner:gliner", tier=3
+    )
+
+    (alone,) = resolve([weaker, stronger], specificity=tie, untouchable=catalog_backed).spans
+    assert alone.entity_type == "BBB"
+
+    (kept,) = resolve(
+        [weaker, stronger, bridge], specificity=tie, untouchable=catalog_backed
+    ).spans
+    assert (kept.entity_type, kept.start, kept.end) == ("BBB", 0, 15)
+
+
+def test_the_trace_names_the_discriminator_that_actually_decided() -> None:
+    # `Resolution.trace` is the decision-evidence interface and the sandbox
+    # reads it. A merge settled by sensitivity that reports `specific-inner-merge`
+    # is a false explanation of a correct answer.
+    tie = {"IBAN": 80, "FR_NIR": 80}
+    outer = span(entity_type="FR_NIR", start=0, end=20, recognizer="catalog:fr_nir", tier=2)
+    inner = span(entity_type="IBAN", start=5, end=15, recognizer="catalog:iban", tier=1)
+
+    (decision,) = resolve([outer, inner], specificity=tie).trace
+
+    assert decision.rule == "nested-sensitivity-merge"
+    assert decision.kept.entity_type == "IBAN"

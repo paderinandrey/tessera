@@ -74,19 +74,35 @@ def _more_sensitive(a: Span, b: Span) -> Span:
 
 
 def _union(a: Span, b: Span, take_type_from: Span) -> Span:
+    """The two spans' extent, under the surviving reading's identity.
+
+    **Confidence comes from the reading that survived, not from whichever input
+    happened to be surer of itself.** It was `max` of the two, so a merge could
+    hand its output a number belonging to a span that is not in it — and
+    `_outranks` then compared a later span against that borrowed number, letting
+    a bridge decide the reported type by proxy after it had been dropped. Every
+    other field already comes from `take_type_from`; this one was the exception
+    and had no argument for being one. Rule 2 is unaffected: it picks the more
+    confident span as the winner first, so the winner's confidence *is* the max.
+    """
     return Span(
         entity_type=take_type_from.entity_type,
         start=min(a.start, b.start),
         end=max(a.end, b.end),
-        confidence=max(a.confidence, b.confidence),
+        confidence=take_type_from.confidence,
         recognizer=take_type_from.recognizer,
         tier=take_type_from.tier,
         boosted=a.boosted or b.boosted,
     )
 
 
-def _outranks(challenger: Span, holder: Span, specificity: Mapping[str, int]) -> bool:
-    """Whether `challenger`'s reading should name the span instead of `holder`'s.
+def _outranks(challenger: Span, holder: Span, specificity: Mapping[str, int]) -> str | None:
+    """Which discriminator makes `challenger`'s reading name the span, or `None`.
+
+    The name is returned rather than a bare `True` because `Resolution.trace` is
+    the decision-evidence interface: a merge decided by sensitivity that reports
+    `specific-inner-merge` is a false explanation of a correct answer, and the
+    sandbox reads these.
 
     The ordering rule 4 applies to an unnested pair — specificity, then
     confidence, then sensitivity — asked as one question so that the nesting
@@ -98,10 +114,10 @@ def _outranks(challenger: Span, holder: Span, specificity: Mapping[str, int]) ->
     challenger_specificity = specificity.get(challenger.entity_type, 0)
     holder_specificity = specificity.get(holder.entity_type, 0)
     if challenger_specificity != holder_specificity:
-        return challenger_specificity > holder_specificity
+        return "specificity" if challenger_specificity > holder_specificity else None
     if challenger.confidence != holder.confidence:
-        return challenger.confidence > holder.confidence
-    return challenger.tier < holder.tier
+        return "confidence" if challenger.confidence > holder.confidence else None
+    return "sensitivity" if challenger.tier < holder.tier else None
 
 
 def _resolve_pair(
@@ -154,8 +170,12 @@ def _resolve_pair(
             # `FR_NIR` reading of the same digits, and without this branch the
             # eighty loses to the forty for no reason but the order the pairs
             # were folded in. See #39.
-            if untouchable(outer) and untouchable(inner) and _outranks(inner, outer, specificity):
-                return _union(outer, inner, take_type_from=inner), "specific-inner-merge"
+            if untouchable(outer) and untouchable(inner):
+                discriminator = _outranks(inner, outer, specificity)
+                if discriminator is not None:
+                    return _union(outer, inner, take_type_from=inner), (
+                        f"nested-{discriminator}-merge"
+                    )
             return outer, "nesting-outer-wins"
 
     # Rule 1 precedes rule 4: a lone checksum span never loses to a non-checksum one.
