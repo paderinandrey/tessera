@@ -120,8 +120,15 @@ boosted. The `or` was right by accident when the maximum came from the boosted
 side and wrong when it did not.
 
 **`Resolution.trace` gains three rule names** — `nested-specificity-merge`,
-`nested-confidence-merge`, `nested-sensitivity-merge` — where the branch
-previously reported `specific-inner-merge` regardless of what decided it. The
+`nested-confidence-merge`, `nested-sensitivity-merge` — and they replace
+**`nesting-outer-wins`**, which is what these inputs reported before this
+change. An earlier draft of this notice said they replace
+`specific-inner-merge`. That was true of an intermediate commit on this branch
+and false of the released behaviour a consumer actually has: `specific-inner-merge`
+requires a non-untouchable outer and is a separate branch that still fires
+unchanged, while two untouchable spans in containment fell through to
+`nesting-outer-wins`. A rule-string matcher told to migrate from the wrong prior
+value would have missed exactly the decisions that changed. The
 trace is the decision-evidence interface, so anything matching on rule strings
 sees values it has not seen. Nothing in this repository does: `resolve`'s only
 caller is `Detector.detect`, which reads `.spans` and never `.trace`. The
