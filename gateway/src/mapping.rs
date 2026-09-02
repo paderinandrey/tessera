@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::fmt;
 
-use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 /// A span as the detector reports it: offsets are in characters, not bytes.
@@ -60,6 +63,51 @@ pub enum MappingError {
              with it"
     )]
     PlaceholderKey(String),
+    /// A serialized document inside a described field that cannot be restored
+    /// without changing what the upstream sent. Carries a fixed phrase naming
+    /// which cause it is — the same `&'static str` treatment as
+    /// `MaskCountMismatch`, and for the same reason: several sites, one class,
+    /// and nothing in it that a response could have written.
+    ///
+    /// **The causes are not a list to memorize, and the phrase is why they do
+    /// not have to be.** Restoring structurally means reading a document and
+    /// writing it back, and this variant is what every way that round trip
+    /// fails to reproduce its input comes out as — a member collapsed, a key
+    /// renamed, a number rounded, or the read refused on a text a client would
+    /// have accepted. The phrase says which; the class and the answer are one.
+    ///
+    /// **Two guards raise this, and only one of them is behind the escaping
+    /// question.** The inner one, in `restore_in_string_with`, is reached once
+    /// an inserted value is not wholly inert by `json_string_inert` — which is
+    /// wider than a `"`, a `\` or a control character, and takes in `O'Brien`
+    /// and a `Steuernummer` spelled `21/815/08150`. The outer one is the
+    /// `read_document`/`write_document` pair around a described `arguments`,
+    /// and it asks nothing about the value at all: it round-trips whenever the
+    /// restoration changed the document, so a wholly inert `Weber` into a
+    /// document carrying duplicate members or an unspellable number refuses
+    /// too.
+    ///
+    /// The bound used to be written as the inner guard alone, which
+    /// undercounts this error and, worse, reads as licence to omit the outer
+    /// guard — the frame the finding that produced it was actually about. A
+    /// document still restores textually and keeps every byte it came with
+    /// when nothing is put back into it, which remains the overwhelming
+    /// majority.
+    ///
+    /// **Why this refuses where the sweep leaves it.** The sweep's fallback is
+    /// to serve the bytes it was given, which costs restoration and corrupts
+    /// nothing. That fallback is not available to a described field: the bytes
+    /// still hold the placeholder, and a placeholder reaching a client from a
+    /// field it dispatches on is what this path exists to prevent. Serving the
+    /// document restored-but-changed is the other alternative and it is worse —
+    /// a member dropped, or a key silently renamed, in `arguments` a client
+    /// executes. So it refuses, exactly as it refuses a token it cannot map.
+    #[error(
+        "a serialized document in the upstream response cannot be restored without changing \
+             what the upstream sent ({0}); the response is refused rather than served \
+             corrupted or with a placeholder in it"
+    )]
+    Unrestorable(&'static str),
 }
 
 /// The longest entity type that can be written as a placeholder.
@@ -161,6 +209,11 @@ pub struct Mapping {
     /// per request rather than per span: a detector that disagrees about types
     /// disagrees about all of them, and one line per span would be a flood.
     redacted: usize,
+    /// Tokens `placeholder_for` returned since `begin_request`. Per request,
+    /// not per session: a session's table is what provenance cannot be read
+    /// from. `absorb` does not carry it, for the same reason reserved literals
+    /// are absent from `order`.
+    issued: HashSet<String>,
 }
 
 impl Mapping {
@@ -176,6 +229,27 @@ impl Mapping {
 
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+
+    /// Starts a request's issuance record.
+    ///
+    /// The clear is a no-op today and is kept deliberately. `absorb` never
+    /// carries `issued` into the session, and `handle` masks into a clone, so
+    /// a session's copy of this field is structurally always empty and there is
+    /// nothing to clear. What this method buys is the *boundary*: the set means
+    /// "issued since the last `begin_request`", and a caller that reuses a
+    /// mapping across two requests — a future batch path, a test driving two
+    /// turns through one `Mapping` — gets the meaning the name promises rather
+    /// than a set that silently accumulates.
+    ///
+    /// Do not delete it on the grounds that it clears nothing. The one thing it
+    /// must not say is that the clone arrives dirty; it does not.
+    pub fn begin_request(&mut self) {
+        self.issued.clear();
+    }
+
+    pub fn issued(&self) -> HashSet<String> {
+        self.issued.clone()
     }
 
     /// How many spans this mapping had to mask under the generic type.
@@ -297,7 +371,9 @@ impl Mapping {
         value: String,
     ) -> Result<String, MappingError> {
         if let Some(existing) = self.by_value.get(&value) {
-            return Ok(existing.clone());
+            let existing = existing.clone();
+            self.issued.insert(existing.clone());
+            return Ok(existing);
         }
         // Syntax cannot tell a type name from a value shaped like one, and
         // `WEBER` for a span covering WEBER passes any grammar. So the name is
@@ -320,6 +396,7 @@ impl Mapping {
         self.by_value.insert(value.clone(), placeholder.clone());
         self.by_placeholder.insert(placeholder.clone(), value);
         self.order.push(placeholder.clone());
+        self.issued.insert(placeholder.clone());
         Ok(placeholder)
     }
 
@@ -342,9 +419,17 @@ impl Mapping {
     ///
     /// A caller handing this a value assembled in memory rather than parsed has
     /// neither protection and needs its own bound.
+    ///
+    /// **Its string arm is `restore_in_string_strictly`, not `restore`, and the
+    /// difference is the escaping rule.** A leaf here can be a *serialized*
+    /// document — `arguments` inside `arguments`, an error envelope quoting a
+    /// body back — and substituting a value carrying a `"` into one as text
+    /// closes the string it lands in. That is the same hazard the sweep has,
+    /// answered by the same code; what differs is the token policy, which stays
+    /// strict here. See `Restoration`.
     pub fn restore_value(&self, value: &Value) -> Result<Value, MappingError> {
         Ok(match value {
-            Value::String(text) => Value::String(self.restore(text)?),
+            Value::String(text) => Value::String(self.restore_in_string_strictly(text)?),
             Value::Array(items) => Value::Array(
                 items
                     .iter()
@@ -431,6 +516,1026 @@ impl Mapping {
             }
         }
         Ok(result)
+    }
+
+    /// Restore inside one string, leniently and without breaking a document the
+    /// string may be.
+    ///
+    /// **Lenient**: it never fails, and it fails to fail *by type* — `Lenient`
+    /// names `Infallible` as its error, so the shared code below is the same
+    /// code the strict path runs and the leniency is still unforgeable here.
+    /// A token this request did not issue, or one the caller also wrote, is
+    /// left exactly as it stands — see `Provenance`.
+    ///
+    /// **`cfg(test)`, because the sweep stopped needing a door of its own.**
+    /// `restore_document_with` is generic over the rule and calls
+    /// `restore_in_string_with` directly, so production enters the lenient path
+    /// once, at `restore_sweep`, over a whole body. What remains here is the
+    /// per-string contract those tests state — `Lenient` is private, and a test
+    /// constructing it inline would state the rule in the shared function's
+    /// vocabulary rather than the sweep's. Deleting it would take the sweep's
+    /// per-string cases with it or rewrite thirteen of them for no gain.
+    #[cfg(test)]
+    pub fn restore_in_string(&self, text: &str, provenance: &Provenance) -> String {
+        self.restore_in_string_with(text, &Lenient(provenance))
+            // There is no arm to write: `Infallible` has no variants, so this
+            // is the compiler agreeing that the sweep cannot refuse.
+            .unwrap_or_else(|error| match error {})
+    }
+
+    /// Restore inside one string, strictly: the described path's door onto the
+    /// same code, with `Strict`'s token policy instead of `Lenient`'s.
+    ///
+    /// This is what `restore_value`'s string arm calls and what the slot loop's
+    /// text slots call, and it is the whole of the fix for the described path:
+    /// before it, `arguments` was parsed once and its leaves restored as plain
+    /// text, so a leaf that was *itself* a serialized document took the value
+    /// unescaped and the client executed whatever the value's quotes made of
+    /// it.
+    ///
+    /// **What it does not take from the sweep is the leniency.** An unmappable
+    /// token still raises `MappingError::Unknown` here, at every depth. What it
+    /// takes is the escaping rule and the recursion, which are properties of
+    /// JSON and not of this gateway's provenance policy.
+    ///
+    /// **A document that cannot be re-serialized faithfully refuses here rather
+    /// than being left, whatever the cause.** On the sweep, leaving one costs coverage and
+    /// changes no bytes; the token stays, which is the lenient answer to
+    /// everything. On this path leaving one would serve a placeholder from a
+    /// described field, which is the one outcome this path exists to prevent —
+    /// and substituting anyway is the corruption it also exists to prevent. So
+    /// the third answer is the only one left, and it is the answer this path
+    /// already gives to a token it cannot map: refuse. See
+    /// `MappingError::Unrestorable`.
+    pub fn restore_in_string_strictly(&self, text: &str) -> Result<String, MappingError> {
+        self.restore_in_string_with(text, &Strict)
+    }
+
+    /// The escaping rule both paths share, and the reason it is one function.
+    ///
+    /// **The rule is about the inserted value first and the string's shape
+    /// second.** Substituting into text is byte-safe when every character of
+    /// the value is inert — when none of them can end the string it lands in,
+    /// start an escape inside it, or be forbidden there raw. A comma or a brace
+    /// inside a string is an ordinary character and always was. So a value that
+    /// is wholly inert is substituted whatever it sits in, and the document's
+    /// formatting survives byte for byte.
+    ///
+    /// **This paragraph said `"`, `\` and the control characters for most of
+    /// this branch's life, and that was a blocklist**: a value of
+    /// `x','admin':true,'pad':'y` passed it and turned `{'name':'[PERSON_1]'}`
+    /// into a JSON5 object carrying a member the upstream never sent. The test
+    /// is `json_string_inert` now and it is an allowlist, so an omission costs
+    /// a restoration instead of admitting an injection. The old sentence
+    /// survived the change by four commits, which is the argument for stating
+    /// the property rather than the character set.
+    ///
+    /// A value that is *not* inert, into a string that parses as JSON, forces
+    /// parse-and-re-serialize. Reformatting is the price of not corrupting and
+    /// is paid only there. Into a string that does not parse, the question is
+    /// no longer "then there is no structure to break" — that was the other
+    /// half of the same mistake, since a text this reader refuses may be a
+    /// document to the client's. `structure_encloses_a_token` answers it
+    /// instead, by asking whether a container was opened before the token.
+    ///
+    /// **That price was argued for the sweep and is now paid in described
+    /// fields too, which is worth stating in the terms a client sees.** A
+    /// `content` that parses as JSON and takes a value needing escaping reaches
+    /// the client re-serialized — key order is `serde_json::Map`'s, not the
+    /// model's, and insignificant whitespace is gone — where before this it was
+    /// byte-preserved. The trade is unchanged and the reasoning is the same one
+    /// as for the sweep: byte preservation is worth having and is what the
+    /// escaping test exists to keep, but it cannot be kept for the one input
+    /// where keeping it means emitting a document this gateway injected into.
+    /// It is not a widening of the price so much as a correction to who pays
+    /// it: the described path was never byte-preserving on this input either,
+    /// it was corrupting.
+    ///
+    /// **Reformatting is the price; losing anything else is not.** This is the
+    /// sentence that has been wrong twice, and both times in the same way: it
+    /// said the parse was lossy *on one input*, an object with two members of
+    /// the same name, and read as an inventory it was a claim nobody had
+    /// checked. So the claim is made the other way round now — by asking what a
+    /// JSON text is made of, which is a closed question, rather than by listing
+    /// what has been noticed.
+    ///
+    /// **A JSON text is structure, strings, numbers and literals, and the round
+    /// trip is examined at each.** Structure and literals have one spelling
+    /// each, so `to_string` reproduces them. A string comes back with whatever
+    /// escapes `serde_json` prefers — `A` for `A` — and that is a
+    /// different spelling of the same string, which the client's own parse
+    /// undoes, so nothing is lost. Objects lose a member when two share a name,
+    /// because a map cannot hold both; that is the structural loss, and
+    /// `carries_duplicate_members` is its test. Numbers are held as `i64`,
+    /// `u64` or `f64`, so a lexeme too precise for a double or an integer past
+    /// 64 bits comes back rounded; that is the lexical loss, and
+    /// `carries_an_unstable_number` is its test. Key order is not preserved and
+    /// whitespace is not preserved, and those are the reformatting above.
+    ///
+    /// **And the fourth thing is not a loss but a refusal**: this reader can
+    /// reject a text a client accepts — a document past its recursion limit, an
+    /// exponent it calls out of range — and reading that as "not a document"
+    /// substitutes into one blind. `structure_encloses_a_token` is what stands
+    /// there.
+    ///
+    /// What the two paths do about all four is the one thing they do not share,
+    /// and it is `Restoration::lossy_document`'s to answer: the sweep leaves the
+    /// string exactly as it came, restoration and all, and the described path
+    /// refuses. Each test runs *behind* the escaping test rather than in front
+    /// of it, so a document is only ever left — or refused — for a loss it was
+    /// actually about to take. A value needing no escaping still substitutes
+    /// into any of them and keeps every byte around it, because nothing is ever
+    /// re-serialized on that path.
+    ///
+    /// Testing that the result still *parses* is not enough and was tried:
+    /// restoring a token in `{"name":"[PERSON_1]"}` to `x","admin":true,...`
+    /// yields **valid** JSON carrying fields nobody sent, which a client's tool
+    /// then acts on.
+    ///
+    /// **The flat scan decides whether the parse happens, and that bounds what
+    /// this rule can see.** A token whose characters the enclosing document
+    /// escaped — `[PERSON_1]` in the bytes, `[PERSON_1]` after a parse —
+    /// is not a placeholder to `pieces`, so nothing needs escaping, no parse
+    /// follows and the string is returned as it stands. That is the behaviour
+    /// both paths had before this function existed, and it is unchanged by it:
+    /// closing it means parsing every string that might be JSON, which is the
+    /// byte-for-byte preservation above given up for every response.
+    fn restore_in_string_with<R: Restoration>(
+        &self,
+        text: &str,
+        rule: &R,
+    ) -> Result<String, R::Error> {
+        let mut out = String::with_capacity(text.len());
+        let mut needs_escaping = false;
+        for piece in pieces(text) {
+            match piece {
+                Piece::Text(run) => out.push_str(run),
+                Piece::Placeholder(candidate) => {
+                    // Asked of whatever the rule returns, including the token
+                    // `Lenient` hands back unrestored: a placeholder is bracket,
+                    // upper-case, underscore and digits by `placeholder_type`'s
+                    // grammar, so a left token can never answer `true` here and
+                    // the uniform question is the same question the two arms
+                    // used to ask separately.
+                    let value = rule.token(self, candidate)?;
+                    needs_escaping |= !value.chars().all(json_string_inert);
+                    out.push_str(value);
+                }
+            }
+        }
+        if !needs_escaping {
+            return Ok(out);
+        }
+        // The substitution inserted a character that can close a string. If the
+        // original was a document, redo it structurally so the value lands in a
+        // leaf and is escaped on the way out.
+        //
+        // **A failed parse is not a proof that the string is prose**, and
+        // reading it as one is how `out` — the very substitution this branch
+        // exists to avoid emitting — used to go out. A document nested past
+        // `serde_json`'s recursion limit, or carrying an exponent it calls out
+        // of range, is a document every JavaScript client parses and this
+        // reader refuses; emitting `out` for it injects exactly as it would
+        // have into a document that parsed.
+        //
+        // A quote-free text used to be exempted here on the argument that our
+        // value can only close a string that exists and a string in JSON is
+        // delimited by `"`. The second half of that was a claim about a
+        // reader: `{'name':'[PERSON_1]'}` holds a string, holds our token in
+        // it, and holds no `"` at all. The exemption is gone and the escaping
+        // test carries that weight instead, as an allowlist rather than a
+        // blocklist — see `json_string_inert`.
+        //
+        // So `structure_encloses_a_token` decides alone, by asking whether
+        // any container was opened before the token. Six readings before it
+        // each made some claim about what another reader accepts, and six were
+        // defeated in turn; this one makes none. Where a container was opened,
+        // nothing here can tell corruption from prose, so the rule decides.
+        let Ok(document) = serde_json::from_str::<Value>(text) else {
+            if !structure_encloses_a_token(text) {
+                return Ok(out);
+            }
+            rule.lossy_document("a string this gateway cannot parse but a client may")?;
+            return Ok(text.to_owned());
+        };
+        // The parse above loses two things, both before anything here gets to
+        // look at the document, and `round_trip_loses` below asks about both.
+        // The structural one: two members of the same name
+        // collapse into one, so re-serializing hands the client a
+        // document the upstream did not send — a string forwarded byte for
+        // byte before this sweep existed, and a parser differential the moment
+        // the client's reader keeps the first member where `serde_json` keeps
+        // the last. Nothing below can put the lost member back, so the rule
+        // decides: the sweep leaves the string exactly as it came — restoration
+        // lost for this one string, no bytes changed — and the described path
+        // refuses, because leaving it there would be leaving a placeholder in a
+        // field the client executes. Same shape as the collision arm of
+        // `restore_document_with`: what cannot be restored faithfully is not
+        // restored unfaithfully.
+        let restored = self.restore_document_with(&document, rule)?;
+        // A collision inside may have left every restorable token where it
+        // stood — see `restore_document_with`'s object arm, which only reaches
+        // that fallback under a rule that tolerates it. Nothing changed, so the
+        // caller gets back the bytes it gave rather than a re-serialized
+        // equivalent of them.
+        //
+        // **This runs before the loss check below and that ordering is
+        // load-bearing.** A document is only ever left — or refused — for a
+        // loss it was actually about to take, and a document nobody is
+        // rewriting takes none. Asking first would refuse a response over a
+        // number in a string this pass was not going to touch.
+        if restored == document {
+            // **Equality of two `Value`s says nothing about the text when the
+            // parse dropped part of it.** A token sitting in a member the parse
+            // collapsed is absent from both sides of that comparison, so
+            // "nothing changed" reads as "nothing to restore" when what
+            // happened is that the only thing to restore was hidden. Ask the
+            // bytes instead, and only where the round trip is known to lose:
+            // where it is faithful, a token still standing is one no mapping
+            // claims, and leaving it is what leniency means.
+            if carries_a_placeholder(text) {
+                if let Some(cause) = round_trip_loses(text) {
+                    rule.lossy_document(cause)?;
+                }
+            }
+            return Ok(text.to_owned());
+        }
+        // Nothing is re-serialized in *this function* until the round trip is
+        // known to reproduce what it read. `round_trip_loses` is that question
+        // and both its causes are asked here.
+        if let Some(cause) = round_trip_loses(text) {
+            rule.lossy_document(cause)?;
+            return Ok(text.to_owned());
+        }
+        // `out` is not the fallback here and cannot be: `text` parsed, so it is
+        // a document, and `out` is the unescaped substitution into it. A `Value`
+        // that came from a parse re-serializes or the two disagree about JSON,
+        // which is `carries_duplicate_members`'s case for the same treatment —
+        // the rule decides and the bytes stand.
+        match serde_json::to_string(&restored) {
+            Ok(serialized) => Ok(serialized),
+            Err(_) => {
+                rule.lossy_document("a document this gateway could not write back")?;
+                Ok(text.to_owned())
+            }
+        }
+    }
+
+    /// The recursion, which fixes escaping and **does not extend the key rule**.
+    ///
+    /// Parsing a nested serialized document promotes strings into key positions
+    /// that were plain text a moment earlier. Refusing there would reject a
+    /// response served today — `{"[PERSON_1]":"ok"}` inside a described
+    /// `arguments` is text to `restore_value` now, is substituted, and is
+    /// served. Additivity decides it: the key is restored exactly as today's
+    /// substitution restores it, and the key rule keeps the depth it has.
+    ///
+    /// **That argument is why the strict path shares this walk rather than
+    /// growing its own.** `restore_value`'s key rule — a key that is or carries
+    /// a placeholder refuses — belongs to the layer the caller parsed, where a
+    /// key is a key in the document the client dispatches on. Down here a "key"
+    /// was a run of characters inside a string one layer up, and the same
+    /// additivity that keeps the sweep from refusing on it keeps the described
+    /// path from refusing on it too: the response is served today. So the key
+    /// rule stops where it stops on both paths, and what crosses the boundary
+    /// is the escaping.
+    ///
+    /// **Unbounded recursion, and `restore_value`'s note does not transfer.**
+    /// Neither of its two protections covers this walk, because this one has a
+    /// second axis.
+    ///
+    /// That walk is bounded by a single `serde_json` parse: everything it sees
+    /// came from one `from_str`, whose depth limit — 128 today, measured, and a
+    /// dependency's promise rather than ours — caps the tree. This walk
+    /// *re-enters* the parser. The `Value::String` arm calls
+    /// `restore_in_string_with`,
+    /// which parses again whenever the string it just restored into needs
+    /// escaping, and that parse gets a fresh budget. So the bound is 128 × the
+    /// number of nested **serialized** documents, not 128. Its other protection
+    /// misses for the same reason: the request-direction refusal past
+    /// `MAX_JSON_DEPTH` counts document depth, and a serialized document inside
+    /// a string is one string to `walk` — these layers are invisible to it.
+    ///
+    /// What bounds the layer count is the input, and the growth was measured
+    /// rather than assumed: each layer escapes the one below, so its backslashes
+    /// double. Wrapping a scalar N times costs `4 * 2^N + 8` bytes — 131,080 at
+    /// fifteen layers, and the per-layer ratio is 2.000 by layer thirteen. Forty
+    /// layers is four terabytes. A body deep enough to exhaust the stack cannot
+    /// be transmitted.
+    ///
+    /// That exponential cost is the *whole* protection, and nothing here caps
+    /// body size, so a caller that finds a way to re-enter this walk without
+    /// paying the escaping cost has removed it. And as in `restore_value`: a
+    /// value assembled in memory rather than parsed has no protection at all,
+    /// which is why this stays private.
+    fn restore_document_with<R: Restoration>(
+        &self,
+        value: &Value,
+        rule: &R,
+    ) -> Result<Value, R::Error> {
+        Ok(match value {
+            Value::String(text) => Value::String(self.restore_in_string_with(text, rule)?),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.restore_document_with(item, rule))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Value::Object(fields) => {
+                let mut out = serde_json::Map::with_capacity(fields.len());
+                for (key, item) in fields {
+                    let restored = self.restore_in_string_with(key, rule)?;
+                    // A map cannot hold two identical keys, so a restored key
+                    // landing on one already present would silently drop a
+                    // field — a tool argument lost, where today's textual
+                    // substitution serves both. Substituting instead yields
+                    // duplicate property names, whose meaning is ambiguous. So
+                    // the rule decides between the two answers that remain:
+                    // the sweep hands this object back exactly as it came, and
+                    // the described path refuses, because handing it back there
+                    // hands back the placeholder in it.
+                    //
+                    // **Exactly this object, and nothing above it** — on the
+                    // path that takes the fallback. The ambiguity is a fact
+                    // about one map's key set, and the fields around it are not
+                    // implicated by it. Reporting the collision upwards instead
+                    // — which is what returning `None` from here did — made one
+                    // such object an off switch for the whole body: a `meta`
+                    // object with a colliding key left `refusal` holding the
+                    // placeholder that #31 is about. A refusal *does* travel,
+                    // and on the strict path that is correct rather than an off
+                    // switch: it costs the response, not the restoration, and a
+                    // refused response carries no placeholder either.
+                    if out.contains_key(&restored) {
+                        rule.lossy_document("a restored key colliding with one already present")?;
+                        return Ok(value.clone());
+                    }
+                    out.insert(restored, self.restore_document_with(item, rule)?);
+                }
+                Value::Object(out)
+            }
+            other => other.clone(),
+        })
+    }
+
+    /// The lenient pass over a whole response body.
+    ///
+    /// Infallible by type, which is the design's leniency written where it
+    /// cannot be forgotten: **nothing in the sweep refuses**, including a
+    /// placeholder-shaped key of either kind. Strictness lives in the slot path
+    /// that runs after this and overwrites what it addresses.
+    ///
+    /// **`value` must have come from `serde_json::from_str` or
+    /// `serde_json::from_slice`, not be assembled in memory.** This is the
+    /// public door onto `restore_document_with`'s recursion, which is unbounded on
+    /// its own terms — what bounds it is that everything it walks was
+    /// produced by one parse, whose own recursion limit (128, measured, a
+    /// dependency's promise rather than ours) caps the depth. A `Value` built
+    /// by hand — with `json!` in a test, or by a future caller assembling one
+    /// — carries none of that protection, and nothing here checks for it.
+    ///
+    /// **What the sweep restores is not everything, and the exception is one
+    /// rule rather than a list: where this gateway cannot write back what it
+    /// was given, it leaves the bytes rather than guessing at them.**
+    ///
+    /// A restored key that would collide with one already in its own map
+    /// leaves *that map* exactly as it arrived — every field present, none of
+    /// them restored, keys included. Everything outside it still restores.
+    ///
+    /// A string that *is* a serialized document leaves *that string* whole
+    /// whenever restoring it would need re-serializing and the round trip
+    /// would not reproduce it — two members of the same name, which the parse
+    /// collapses; a number too precise for the `f64` it is held as; a text this
+    /// reader rejects and a client would accept. See `restore_in_string_with`,
+    /// which argues the set from what a JSON text is made of rather than from
+    /// what has been noticed so far. The unit of the loss is the string, not the
+    /// object, because by the time an object could be identified the loss has
+    /// already happened. Everything outside that string still restores.
+    ///
+    /// So the promise is: every token this request issued and the caller did
+    /// not write is restored, except where restoring it would change something
+    /// else the upstream sent. State it with both clauses or not at all — it
+    /// was once stated without the first, while that fallback was body-wide,
+    /// and the sentence read as a guarantee the code could switch off from
+    /// anywhere. **And state the exception as the rule, not as the shapes**:
+    /// written as a closed list of two it has twice been made false by someone
+    /// finding a third, and each time in six other files at once.
+    ///
+    /// **Every exception is the sweep's, and none is the described path's.**
+    /// They are `Lenient`'s answers to `Restoration::lossy_document`; `Strict`
+    /// refuses at each, so a described field is never served from one of these
+    /// documents at all. The promise above is about what a *client receives on
+    /// a 200 from a field no slot addresses*, and that is where it should stay
+    /// stated.
+    pub fn restore_sweep(&self, value: &Value, provenance: &Provenance) -> Value {
+        self.restore_document_with(value, &Lenient(provenance))
+            .unwrap_or_else(|error| match error {})
+    }
+}
+
+/// What the two restoration paths do *not* share, which is a shorter list than
+/// what they do.
+///
+/// The escaping rule and the recursion under it are about **text and the
+/// readers of it**, not about provenance. A value that is not wholly inert
+/// cannot be substituted into text and shown safe *without knowing which
+/// reader the client uses* — `json_string_inert` is the test, an allowlist, so
+/// it takes in an apostrophe, a backtick and a slash as readily as a `"`. Only
+/// the `"` is dangerous in JSON proper; the others are ordinary inside a
+/// double-quoted string there, and are held back because the string is
+/// double-quoted only to *this* reader. And a string that is a serialized
+/// document has to be reopened for the value to land in a leaf. Neither of
+/// those knows anything about which tokens this gateway may claim. So they live in `restore_in_string_with` and
+/// `restore_document_with`, once, and this trait carries the two questions whose
+/// answers genuinely differ.
+///
+/// **The token policy.** The sweep is lenient and provenance-gated: a token this
+/// request did not issue, or one the caller also wrote, is left as it stands and
+/// nothing fails. The described path is strict: a token it cannot map raises
+/// `MappingError::Unknown` and the response is refused. That refusal is the
+/// guarantee the described path exists for, and leniency reaching it would be
+/// this gateway serving its own placeholder from a field a client dispatches on.
+///
+/// **What to do with a document that cannot be re-serialized faithfully.** A
+/// restored key colliding with one already present, two members of the same
+/// name that the parse already collapsed, a number the parse rounds, a text
+/// this reader will not accept and a client would. The sweep leaves the bytes
+/// it was given, which loses restoration and corrupts nothing. The described
+/// path cannot: leaving the bytes there leaves the placeholder in them. It
+/// refuses. **The list is deliberately not presented as closed** — it has grown
+/// twice, both times when someone checked rather than remembered, and this
+/// trait's job is that both paths keep answering whatever it grows to.
+///
+/// **The error type is where the leniency is nailed down.** `Lenient::Error` is
+/// `Infallible`, so the shared code compiles to a sweep that has no way to fail
+/// — the property `restore_sweep`'s signature used to carry alone, now carried
+/// through a trait rather than through a second copy of the walk.
+trait Restoration {
+    type Error;
+
+    /// What one placeholder-shaped token becomes. The returned text is
+    /// substituted as-is, and `restore_in_string_with` asks it whether it needs
+    /// escaping — including when it is the token itself.
+    fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, Self::Error>;
+
+    /// Called when restoring a document would change what the upstream sent,
+    /// with a fixed phrase naming the cause. Returning `Ok` means the caller
+    /// falls back to the bytes it was given; returning `Err` refuses the
+    /// response.
+    fn lossy_document(&self, cause: &'static str) -> Result<(), Self::Error>;
+}
+
+/// The sweep's policy: provenance-gated, and infallible by type.
+struct Lenient<'a>(&'a Provenance);
+
+impl Restoration for Lenient<'_> {
+    type Error = Infallible;
+
+    fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, Infallible> {
+        Ok(match mapping.by_placeholder.get(candidate) {
+            Some(value) if self.0.restorable(candidate) => value,
+            // Not ours, or ours and also the caller's. Either way the token is
+            // the answer, and `Infallible` says the sweep has no other one.
+            _ => candidate,
+        })
+    }
+
+    fn lossy_document(&self, _cause: &'static str) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+/// The described path's policy: every token maps or the response is refused.
+struct Strict;
+
+impl Restoration for Strict {
+    type Error = MappingError;
+
+    fn token<'a>(&self, mapping: &'a Mapping, candidate: &'a str) -> Result<&'a str, MappingError> {
+        mapping
+            .by_placeholder
+            .get(candidate)
+            .map(String::as_str)
+            .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))
+    }
+
+    fn lossy_document(&self, cause: &'static str) -> Result<(), MappingError> {
+        Err(MappingError::Unrestorable(cause))
+    }
+}
+
+/// Whether any object anywhere in `text` carries two members of the same name,
+/// which is exactly the condition under which a `Value` round trip loses one.
+///
+/// **`text` must already have parsed as a `Value`.** The caller has that parse
+/// in hand; this is a second pass over the same bytes, and the precondition is
+/// what makes the error case below decidable.
+///
+/// **`serde_json::from_str::<Value>` cannot answer this**: it inserts into a
+/// `Map`, and the second insert overwrites the first, so by the time there is a
+/// `Value` to inspect the evidence is gone. What answers it is a visitor that
+/// sees member names as the parser hands them over, one at a time, before any
+/// map exists to collapse them.
+///
+/// **The answer travels in the value; an error means something else entirely.**
+/// Reporting a duplicate by *failing* the deserialization would mean telling a
+/// genuine duplicate apart from a syntax error by sniffing a message — wrong
+/// the day that message changes, and wrong in the expensive direction, since a
+/// document with no duplicates left unrestored quietly shrinks the coverage
+/// this sweep exists to add. So the visitor accepts every JSON value there is
+/// and carries a `bool` out of the whole walk.
+///
+/// That leaves `Err` free to mean the only thing it can mean under the
+/// precondition: **this scan and the `Value` parse disagreed about bytes they
+/// both read** — a visitor arm missing for some JSON type, nothing a caller can
+/// send. `true` is the answer to that, so the defect costs restoration on the
+/// documents it touches and shows up as coverage falling away, rather than
+/// being read as "no duplicates" and handing the collapsing path a document it
+/// must not have. `every_json_type_survives_the_duplicate_scan` is what says
+/// the case is empty today.
+///
+/// **Exact in both directions.** A duplicate is reported precisely when two
+/// members of one object have equal names after unescaping, and that is
+/// precisely when `Map::insert` overwrites: the map is keyed by `String`, and
+/// `next_key::<String>` unescapes exactly as the map's own parse does. So
+/// `"a"` twice and `"a"` beside `"a"` are both duplicates, and both would
+/// lose a member. Nothing else is reported.
+///
+/// **Depth is bounded by the same parse.** This walk recurses through
+/// `next_element` and `next_value`, both of which re-enter
+/// `Deserializer::deserialize_any`, where `serde_json`'s recursion limit — the
+/// same 128 that bounds the `Value` parse — is enforced. It adds no reach that
+/// `restore_document`'s note does not already describe.
+fn carries_duplicate_members(text: &str) -> bool {
+    serde_json::from_str::<DuplicateScan>(text).map_or(true, |scan| scan.0)
+}
+
+/// The walk's answer: `true` if some object below carried a repeated name.
+struct DuplicateScan(bool);
+
+impl<'de> Deserialize<'de> for DuplicateScan {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(DuplicateScanVisitor)
+    }
+}
+
+struct DuplicateScanVisitor;
+
+/// Every scalar arm answers `false` identically, and the list is short because
+/// serde's own defaults do half the work: `visit_borrowed_str`, `visit_string`
+/// and `visit_char` forward to `visit_str`, `visit_i8`/`i16`/`i32` forward to
+/// `visit_i64`, `visit_u8`/`u16`/`u32` to `visit_u64`, and `visit_f32` to
+/// `visit_f64`. So the arms here are not the set the reader calls —
+/// `deserialize_any` hands a borrowed string to `visit_borrowed_str`, and this
+/// scan sees it only through that forward — they are the set every other
+/// method funnels into.
+///
+/// **What the net rests on is that no default arm returns `Ok`.** Each one
+/// either forwards into an arm implemented here or returns an "invalid type"
+/// error, and `carries_duplicate_members` reads an error as `true`. There is
+/// no third case, so a JSON type this visitor does not handle cannot be
+/// mistaken for a document with no duplicates — the property is closed by the
+/// trait, not by remembering to list an arm.
+///
+/// `visit_i128`/`visit_u128` and `visit_none`/`visit_some` are therefore left
+/// out twice over: `deserialize_any` has no path to them — an integer too wide
+/// for `i64`/`u64` arrives as `f64`, and `null` arrives as `visit_unit` — and
+/// were that to change, their defaults error rather than pass.
+macro_rules! scalar_arms {
+    ($($name:ident($type:ty)),* $(,)?) => {
+        $(
+            fn $name<E: serde::de::Error>(self, _value: $type) -> Result<Self::Value, E> {
+                Ok(DuplicateScan(false))
+            }
+        )*
+    };
+}
+
+impl<'de> Visitor<'de> for DuplicateScanVisitor {
+    type Value = DuplicateScan;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    scalar_arms!(
+        visit_bool(bool),
+        visit_i64(i64),
+        visit_u64(u64),
+        visit_f64(f64),
+        visit_str(&str),
+    );
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateScan(false))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Self::Value, A::Error> {
+        let mut duplicate = false;
+        while let Some(item) = items.next_element::<DuplicateScan>()? {
+            duplicate |= item.0;
+        }
+        Ok(DuplicateScan(duplicate))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<Self::Value, A::Error> {
+        let mut duplicate = false;
+        let mut seen = HashSet::new();
+        while let Some(key) = fields.next_key::<String>()? {
+            duplicate |= !seen.insert(key);
+            // Every value is walked even once a duplicate is known: the
+            // deserializer must be drained to stay in step with the input, and
+            // draining it is the walk.
+            duplicate |= fields.next_value::<DuplicateScan>()?.0;
+        }
+        Ok(DuplicateScan(duplicate))
+    }
+}
+
+/// Whether this character is one a value can carry into text that some reader
+/// of the JSON family may parse, without being able to end a string, start an
+/// escape, or break one **in any of them**.
+///
+/// The last clause is the whole of the conservatism and was missing from this
+/// line for a while. In JSON proper an apostrophe inside a double-quoted string
+/// is an ordinary character and provably safe; it is not admitted here because
+/// the string is double-quoted only to *this* reader, and which reader the
+/// client uses is what this gateway cannot find out. So the answer is `false`
+/// for characters that are dangerous only somewhere, and the cost of that is a
+/// restoration, never an injection.
+///
+/// **An allowlist, and the direction is the point.** This was the opposite —
+/// `"`, `\` and the control characters — and a value of
+/// `x','admin':true,'pad':'y` therefore counted as safe, went out by plain
+/// substitution, and turned `{'name':'[PERSON_1]'}` into a JSON5 object with a
+/// member the upstream never sent. A blocklist of delimiters is a claim about
+/// which characters open a string in the reader we do not have, and its
+/// omissions are injections; an allowlist's omissions are restorations lost.
+/// The same inversion `structure_encloses_a_token` went through, for the same
+/// reason.
+///
+/// **The property is about strings, not about delimiters**, and saying it the
+/// other way was wrong twice. A value lands *inside* a quoted string, so what
+/// matters is only whether a character can end that string, start an escape in
+/// it, or be one the format forbids there raw — `"`, `'`, a backtick, `\`, the
+/// control characters. `,` and `:` delimit in plain JSON and are admitted here
+/// precisely because a comma inside a string is a comma: they cannot reach the
+/// structure around them. The first draft claimed the list held no delimiter in
+/// any dialect at all; the second narrowed that to the JSON family and was
+/// still false, since JSON's own delimiters are on it. The claim to keep is the
+/// one the opening line makes.
+///
+/// `/` is out, and it is the one whose cost was
+/// measured rather than assumed: a German `Steuernummer` is spelled
+/// `21/815/08150` and e-mail local parts may carry a slash, so this was not
+/// free. It turned out to be nearly so, because a slash-bearing identifier
+/// lives in a document that *parses*, where the structural path restores it
+/// correctly, and in plain prose, which opens no container. What it loses is
+/// bracketed prose — the cost already paid by `structure_encloses_a_token`,
+/// extended to one more class of value.
+///
+/// What is left is what detected spans are actually made of: letters and
+/// digits in any script, and the punctuation that appears in names,
+/// addresses, e-mails, IBANs and phone numbers.
+///
+/// **Where the model stops, said plainly.** This covers a client that *parses*
+/// the text as data — JSON, JSON5, JSONC, a repairing parser — where a value
+/// sits inside a string and the ways out of a string are its delimiter, the
+/// escape, and a character the format forbids raw. It does not cover a client
+/// that *evaluates* the text as code, and it cannot: under evaluation `,`,
+/// `:`, `+`, `.` and a bare word are each enough, so no allowlist short of
+/// nothing at all would help. `/` came out because it was cheap, not because
+/// removing it makes evaluation safe. A client that evals model output has a
+/// larger problem than this function.
+///
+/// **YAML is outside, and not because it lacks quoted scalars.** It has both
+/// kinds, and inside either one these characters are as inert as they are in
+/// JSON. What it also has is the *plain* scalar, unquoted, which is where the
+/// argument above loses its footing: everything here rests on the value
+/// landing inside a quoted string, and in YAML nothing guarantees it does. A
+/// value substituted into a plain scalar meets `:`, `?` and `!` acting on the
+/// structure directly, and every one of those is on this list — `:` is in
+/// every timestamp, `@` in every e-mail address. Covering a reader nobody in
+/// this path has would leave an allowlist that refuses the values this gateway
+/// exists to restore.
+fn json_string_inert(character: char) -> bool {
+    character.is_alphanumeric()
+        || matches!(
+            character,
+            ' ' | '.' | ',' | '-' | '_' | '@' | '+' | ':' | ';' | '(' | ')' | '?' | '!'
+        )
+}
+
+/// Everything `parse → Value → to_string` does not carry, asked of the bytes
+/// that would go into it, and named for the journal if the answer is `Some`.
+///
+/// **One function because there is more than one caller, and the second caller
+/// is why this exists.** `restore_in_string_with` asks it of a *nested*
+/// serialized document. `proxy::handle` asks it of the outer one — a described
+/// `arguments` is read by `read_document` and written by `write_document`, and
+/// that pair is a `parse → Value → to_string` of its own, one frame above
+/// anything this module can see. The guards lived only on the inner path for a
+/// round, which read as covered and was not: `arguments` is exactly the field
+/// the finding was about.
+///
+/// The set is argued in `restore_in_string_with` from what a JSON text is made
+/// of. Adding to it here reaches both callers, which is the point.
+/// Whether these bytes carry a token shaped like one this gateway issues.
+///
+/// **Asked of the text, which is the whole reason it exists.** Every other way
+/// to ask this walks a parsed document, and a parse is exactly what can hide a
+/// token from the asker: `{"name":"[PERSON_1]","name":"fixed"}` collapses to one
+/// member before anything sees it, and the token that was in the other one is
+/// simply gone. So a caller holding a text and a `Value` cannot learn from the
+/// `Value` whether the text has something left to restore.
+///
+/// It reads the shape through `pieces` and not the mapping, so it answers
+/// `true` for a token this gateway never issued. That is the conservative
+/// direction and the ambiguity #32 exists to remove: until an issued token
+/// carries something a caller could not have written, a described field cannot
+/// tell ours from a stranger's, and the safe reading of a token in a document
+/// this reader cannot reproduce is that it is ours.
+pub(crate) fn carries_a_placeholder(text: &str) -> bool {
+    pieces(text).any(|piece| matches!(piece, Piece::Placeholder(_)))
+}
+
+pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
+    if carries_duplicate_members(text) {
+        return Some("two members of the same name");
+    }
+    if carries_an_unstable_number(text) {
+        return Some("a number the parse does not reproduce");
+    }
+    None
+}
+
+/// Whether any container was opened before one of our tokens: the one test
+/// standing between a text this reader refuses and an unescaped substitution
+/// into it.
+///
+/// **Seven versions of this guard have now been written, and this is the first
+/// that says nothing about a reader other than ours.** The six before it read
+/// the first byte; the first byte after whitespace; the first thing that is
+/// neither whitespace nor a token; whether a container had ever been opened,
+/// gated on a list of what may follow a `[`; the same with that list inverted;
+/// and finally a bracket count. Each was defeated by something its author had
+/// not met — a byte order mark, a Markdown checkbox, a comment, a JSON5 quote,
+/// `NaN`, and a `]` inside a string. **Every one of them was a claim about
+/// what some other reader accepts**, and this branch exists only for texts our
+/// own reader refuses and another accepts, so every such claim was a guess in
+/// the one place guessing cannot be afforded.
+///
+/// The danger itself is exact. Our value's `"` closes the string the token
+/// sits in, and the members it then writes have to land in something. So an
+/// opener before the token is the whole question: `{` or `[` anywhere ahead of
+/// it, and the substitution does not go out.
+///
+/// **Closers are not counted, and that is the lesson rather than an
+/// oversight.** Subtracting on `}` and `]` is only correct for closers that
+/// are structural, and telling those from the ones inside a string means
+/// knowing which delimiters open a string in the reader we do not have — `"`,
+/// `'`, a backtick in some repairing parsers. `["]","[PERSON_1]",NaN]` drove a
+/// count to zero on a `]` inside a string and let an object into an array.
+/// That list would have been the seventh of its kind.
+///
+/// **Nothing here reads a dialect.** A comment, a byte order mark, `NaN`, a
+/// single-quoted key, a trailing comma, a quoted closer and whatever is
+/// invented next all sit after an opener, so they are conservative without
+/// being recognised. This is why the sequence stops here: there is no list to
+/// be found wanting.
+///
+/// **Our own tokens are not containers.** A token's brackets are inside its
+/// `Piece::Placeholder` and never looked at; the piece is where the question
+/// is asked instead, so a container opened past the token encloses nothing of
+/// ours. `pieces` is the same reading `restore` uses, so the two cannot drift
+/// about what a token is.
+///
+/// **What it costs, stated rather than left to be found.** Markdown opens a
+/// bracket in front of ordinary text constantly — a checkbox, a link, a
+/// footnote — and closes it long before the token, and none of that is
+/// credited. The cost is bounded twice: this branch is only reached when the
+/// mapped value is **not wholly inert**, and on the lenient side the result is a
+/// restoration lost with the bytes untouched. Only a described field turns it
+/// into a refusal.
+///
+/// "Not wholly inert" is wider than the `"`, `\` and control characters this
+/// sentence named for four commits after `json_string_inert` replaced them:
+/// `O'Brien` and a `Steuernummer` spelled `21/815/08150` both reach here, and
+/// both are ordinary values. Undercounting it is how the old predicate would
+/// get put back by someone reading only this.
+fn structure_encloses_a_token(text: &str) -> bool {
+    let mut opened = false;
+    for piece in pieces(text) {
+        if let Piece::Placeholder(_) = piece {
+            // Our own token's brackets are inside this piece and never counted:
+            // a token is not a container, and `pieces` is what keeps that one
+            // reading shared with `restore`.
+            //
+            // **The question is asked here and not after the loop.** A
+            // container opened past the token encloses nothing of ours.
+            if opened {
+                return true;
+            }
+            continue;
+        }
+        let Piece::Text(run) = piece else {
+            unreachable!()
+        };
+        if run.contains(['{', '[']) {
+            opened = true;
+        }
+    }
+    false
+}
+
+/// Whether some number in this document would come back from a `Value` round
+/// trip spelled differently than it went in.
+///
+/// **Why a byte scan and not a visitor.** `DuplicateScan` can answer its
+/// question because member names survive `next_key::<String>` intact. A number
+/// does not: `deserialize_any` hands the visitor an `i64`, a `u64` or an `f64`,
+/// which is the loss itself, so a visitor is on the wrong side of it and can
+/// only ever compare a rounded value to itself. The lexeme exists in exactly
+/// one place — the bytes — so that is where it is read.
+///
+/// **The scan is only ever run on text that already parsed**, which is what
+/// makes it a scan rather than a parser. In valid JSON a `"` opens a string and
+/// the only escape that can hide the closing one is `\`, so skipping strings is
+/// exact; outside a string a `-` or a digit can begin nothing but a number, and
+/// no literal or key can supply one.
+///
+/// **The test per number is the round trip itself**, asked of that number
+/// alone: parse the lexeme, print it, compare. Nothing here knows what a
+/// double cannot hold, which is deliberate — it is the same argument
+/// `carries_duplicate_members` makes about members and not a list of the ways
+/// a number can be lost.
+///
+/// **It is exact about loss and inexact about spelling, in the safe
+/// direction.** `1e2` prints as `100.0` and denotes the same number, and this
+/// reports it. Deciding otherwise means comparing two decimal spellings for
+/// equality of value, which is a normalizer this does not have and a place to
+/// be subtly wrong; the cost of not having it is restoration lost on a document
+/// that spells a number unusually *and* carries a value needing escaping, and
+/// the cost of having it wrong is a rounded number in a tool call. Model output
+/// spells numbers canonically, so the case is nearly empty either way.
+fn carries_an_unstable_number(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            // A string. Its contents are not numbers, and a nested document
+            // inside one is this function's business at the depth that restores
+            // it, not at this one.
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    // Only `\` can hide the closing quote. A UTF-8
+                    // continuation byte is never ASCII, so indexing by byte
+                    // cannot mistake one for either.
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    index += 1;
+                }
+                if !number_survives(&text[start..index]) {
+                    return true;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// Whether one number's lexeme is what `Value` gives back for it.
+///
+/// A lexeme this reader cannot parse answers `false`, which reports a loss. It
+/// cannot arise from `carries_an_unstable_number`'s caller — the whole text
+/// parsed first — and if the scan and the parser ever disagree about where a
+/// number begins, costing restoration is the direction to be wrong in.
+fn number_survives(lexeme: &str) -> bool {
+    let Ok(number) = serde_json::from_str::<Value>(lexeme) else {
+        return false;
+    };
+    // Bound rather than compared in place, and not because of the allocation.
+    // `clippy::cmp_owned` reads `number.to_string() == lexeme` and suggests
+    // `number == lexeme`, which is a different question: `Value`'s comparison
+    // against a `str` is true only for `Value::String`, so a number would
+    // answer `false` for every input, every document would be reported lossy,
+    // and the structural path would go quiet. The printed form is the
+    // comparison this needs.
+    let printed = number.to_string();
+    normalized_number(&printed) == normalized_number(lexeme)
+}
+
+/// One number's lexeme with the spellings that carry no information removed, so
+/// that comparing two of them compares values and not typography.
+///
+/// **This exists because the number row was held to a stricter standard than
+/// every other row, and nothing justified the difference.** Key order is not
+/// preserved and that is priced as reformatting; escape spellings are not
+/// preserved and that is waved through as the same string spelled differently.
+/// Then `2.50` → `2.5` — the same number spelled differently, which the
+/// client's own parse undoes exactly as it undoes the other two — was called a
+/// loss and refused the response. In JSON-mode `content` that is money:
+/// measured, `2.50`, `10.00`, `1e308` and `-0` all reported as losses, and all
+/// four had been served correctly before the check existed.
+///
+/// **Two normalizations, and both are value-preserving by definition, which is
+/// what keeps the comparison a proof.** Trailing zeros in a *fraction* carry
+/// nothing — `2.50` is `2.5`, and a `10.00` reduced to `10` is still `10`
+/// because the zeros before the point are never touched. An exponent's `+`, its
+/// leading zeros and a zero exponent entirely carry nothing — `1e+308`,
+/// `1e0308` and `1e308` are one number, and `1e0` is `1`. Neither rewrites a
+/// digit that means anything, so two lexemes equal after this denote the same
+/// number, and the round trip that produced one from the other lost nothing.
+///
+/// **What it deliberately does not do is arithmetic.** `1e2` normalizes to
+/// `1e2` and `serde_json` prints `100.0`, so that pair still reports a loss —
+/// the same for `1E5`, `1e+5` and `1e08`, which all expand the same way.
+/// Deciding those equal means evaluating the exponent, which is the normalizer
+/// declined last round and declined again: being subtly wrong there rounds a
+/// number in a tool call, while being conservative costs restoration on a
+/// spelling model output does not produce.
+fn normalized_number(lexeme: &str) -> String {
+    let (mantissa, exponent) = match lexeme.find(['e', 'E']) {
+        Some(at) => (&lexeme[..at], Some(&lexeme[at + 1..])),
+        None => (lexeme, None),
+    };
+    let mut out = String::with_capacity(lexeme.len());
+    match mantissa.split_once('.') {
+        // Only the fraction is trimmed. `100` keeps its zeros: they are the
+        // number, and stripping them is the one way this could change a value.
+        Some((whole, fraction)) => {
+            out.push_str(whole);
+            let fraction = fraction.trim_end_matches('0');
+            if !fraction.is_empty() {
+                out.push('.');
+                out.push_str(fraction);
+            }
+        }
+        None => out.push_str(mantissa),
+    }
+    if let Some(exponent) = exponent {
+        let (sign, digits) = match exponent.strip_prefix('-') {
+            Some(digits) => ("-", digits),
+            None => ("", exponent.strip_prefix('+').unwrap_or(exponent)),
+        };
+        let digits = digits.trim_start_matches('0');
+        // All zeros: `1e0` is `1`, and dropping the exponent is how it compares
+        // equal to the `1.0` the round trip prints for it.
+        if !digits.is_empty() {
+            out.push('e');
+            out.push_str(sign);
+            out.push_str(digits);
+        }
+    }
+    out
+}
+
+/// Which tokens in a response this gateway may claim as its own.
+///
+/// A `by_placeholder` lookup is **not** provenance: a session outlives a
+/// request, so a token turn one issued is in the table when turn three's caller
+/// writes that same literal themselves. Restoring on the lookup would hand the
+/// client turn one's value in place of its own text, and refusing on it would
+/// reject a response that is served today. Both were tried; the spec records
+/// them.
+///
+/// So provenance is built from this request and nothing else.
+pub struct Provenance {
+    /// Tokens `placeholder_for` returned during this request's mask pass. A
+    /// caller's literal never reaches `placeholder_for` — `reserve_literals` is
+    /// the only thing that sees one — so this set cannot be forged from the
+    /// request body.
+    issued: HashSet<String>,
+    /// Placeholder-shaped tokens the request body carried, from **every**
+    /// string in it. Not from `reserve_literals`: that runs only inside
+    /// provider-selected slots, and dispatch strings are deliberately not
+    /// slots, so a tool name `lookup_[PERSON_1]` would be invisible to it and
+    /// the echoed name would come back as `lookup_Martina Weber` — a broken
+    /// call the client cannot diagnose.
+    written: HashSet<String>,
+}
+
+impl Provenance {
+    pub fn new(issued: HashSet<String>, written: HashSet<String>) -> Self {
+        Self { issued, written }
+    }
+
+    /// Whether the sweep may restore this token. A token in both sets is
+    /// ambiguous by construction: the two occurrences reach the response as the
+    /// same bytes, and nothing distinguishes them. Left, which loses coverage
+    /// and corrupts nothing. #32 is what separates them.
+    pub fn restorable(&self, token: &str) -> bool {
+        self.issued.contains(token) && !self.written.contains(token)
     }
 }
 
@@ -1862,6 +2967,50 @@ impl<'a> Iterator for Pieces<'a> {
     }
 }
 
+/// Every placeholder-shaped token the request body carries, from every string
+/// in it — values, keys, and fields no slot addresses.
+///
+/// It looks for a lexical shape rather than for meaning, so it needs no
+/// provider knowledge and **nothing may be exempt from it**. Exempting a field
+/// is how `lookup_[PERSON_1]` in a tool name — dispatch, and deliberately not a
+/// slot — would have been missed, and the echoed name restored to
+/// `lookup_Martina Weber`.
+pub fn placeholder_literals(value: &Value) -> HashSet<String> {
+    let mut found = HashSet::new();
+    collect_literals(value, &mut found);
+    found
+}
+
+fn collect_literals(value: &Value, found: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => {
+            for piece in pieces(text) {
+                if let Piece::Placeholder(candidate) = piece {
+                    found.insert(candidate.to_owned());
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_literals(item, found);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                // Keys as well as values: a property name is a string the
+                // caller chose, and it reaches the response the same way.
+                for piece in pieces(key) {
+                    if let Piece::Placeholder(candidate) = piece {
+                        found.insert(candidate.to_owned());
+                    }
+                }
+                collect_literals(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `[TYPE_N]`: **one** opening bracket, upper-case type, underscore, digits,
 /// **one** closing bracket.
 ///
@@ -1957,6 +3106,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(masked, "[PERSON_1] schrieb an [PERSON_1]");
+    }
+
+    #[test]
+    fn a_mapping_records_the_tokens_this_request_issued_and_forgets_the_last_ones() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let masked = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        assert_eq!(mapping.issued(), HashSet::from([masked.clone()]));
+
+        // A literal the caller wrote is not issued. `reserve_literals` sees it;
+        // `placeholder_for` never does, which is what makes the set unforgeable.
+        mapping.reserve_literals("the caller wrote [ORG_5] here");
+        assert_eq!(mapping.issued(), HashSet::from([masked.clone()]));
+
+        // A second turn re-masking the same value still issues it: the token is
+        // reused from `by_value`, and reuse is issuance for this purpose.
+        mapping.begin_request();
+        assert_eq!(mapping.issued(), HashSet::new());
+        mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        assert_eq!(mapping.issued(), HashSet::from([masked]));
     }
 
     #[test]
@@ -2207,6 +3380,10 @@ mod tests {
 
         session.absorb(&work, 10);
         assert_eq!(session.redacted_count(), 0);
+        // Same reasoning applies to `issued`: it is this request's record, and
+        // `absorb` never reads or writes it, so the session's own set is
+        // untouched by a request it never masked with directly.
+        assert_eq!(session.issued(), HashSet::new());
     }
 
     #[test]
@@ -4055,6 +5232,1070 @@ mod tests {
             result, document,
             "a number is copied through untouched — examined by the detector, \
              never rewritten by the rebuild"
+        );
+    }
+
+    #[test]
+    fn a_token_is_restorable_only_if_this_request_issued_it_and_the_caller_did_not_write_it() {
+        let issued = HashSet::from(["[PERSON_1]".to_owned(), "[IBAN_2]".to_owned()]);
+        let written = HashSet::from(["[PERSON_1]".to_owned(), "[ORG_9]".to_owned()]);
+        let provenance = Provenance::new(issued, written);
+
+        // Issued and not written: the ordinary case, and the whole point.
+        assert!(provenance.restorable("[IBAN_2]"));
+        // Issued *and* written: the two occurrences are the same bytes in the
+        // response, so neither can be told from the other. Left.
+        assert!(!provenance.restorable("[PERSON_1]"));
+        // Written only: the caller's own literal.
+        assert!(!provenance.restorable("[ORG_9]"));
+        // Neither: the model invented it.
+        assert!(!provenance.restorable("[PERSON_7]"));
+    }
+
+    #[test]
+    fn the_literal_walk_reads_every_string_including_the_ones_no_slot_addresses() {
+        let body = json!({
+            "model": "gpt",
+            // A dispatch string. `reserve_literals` never sees one, because
+            // dispatch is deliberately not a slot — this is the case that
+            // would echo back as a broken tool name.
+            "tools": [{"type": "function", "function": {"name": "lookup_[PERSON_1]"}}],
+            "messages": [
+                {"role": "user", "content": "see [ORG_2]"},
+                // Nested, and in key position.
+                {"role": "user", "content": {"[IBAN_3]": ["deep [PERSON_4]"]}}
+            ],
+            // Not placeholder-shaped: no type, no number.
+            "metadata": {"note": "[not a token]"}
+        });
+
+        assert_eq!(
+            placeholder_literals(&body),
+            HashSet::from([
+                "[PERSON_1]".to_owned(),
+                "[ORG_2]".to_owned(),
+                "[IBAN_3]".to_owned(),
+                "[PERSON_4]".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_value_needing_no_escaping_is_substituted_in_place_and_keeps_formatting() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        // A document with formatting the client may be comparing byte for byte.
+        let document = format!("{{\"name\": \"{token}\",  \"ok\": 1}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            "{\"name\": \"Martina Weber\",  \"ok\": 1}",
+            "a value with no quote, backslash or control character cannot close \
+             a string, so the substitution stands and the spacing survives"
+        );
+    }
+
+    #[test]
+    fn a_value_needing_escaping_cannot_inject_fields_into_a_document() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        // The injection: a value carrying a quote and a comma.
+        let hostile = "x\",\"admin\":true,\"unused\":\"y";
+        let token = mapping
+            .mask(hostile, &[span("PERSON", 0, hostile.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("{{\"name\":\"{token}\"}}"), &provenance);
+        let parsed: Value = serde_json::from_str(&restored).expect("still a document");
+        assert_eq!(
+            parsed,
+            json!({"name": hostile}),
+            "one field carrying the value, not three: the assertion is the \
+             injection, not the parse — a corrupted document parses"
+        );
+    }
+
+    #[test]
+    fn a_serialized_scalar_is_a_document_too() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let hostile = "Martina \"Weber\"";
+        let token = mapping
+            .mask(hostile, &[span("PERSON", 0, hostile.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("\"{token}\""), &provenance);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored).expect("still a document"),
+            json!(hostile)
+        );
+    }
+
+    #[test]
+    fn a_token_this_request_did_not_issue_is_left_where_it_stands() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        // Issued, and also written by the caller: ambiguous, so left.
+        let provenance =
+            Provenance::new(mapping.issued(), HashSet::from(["[PERSON_1]".to_owned()]));
+        assert_eq!(
+            mapping.restore_in_string("see [PERSON_1] and [ORG_9]", &provenance),
+            "see [PERSON_1] and [ORG_9]"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_key_inside_a_nested_document_is_restored_as_it_is_today() {
+        // The key rule keeps the depth it has. Refusing here would reject a
+        // response served today: this string is text to `restore_value` now,
+        // is substituted, and is served. Additivity decides it.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("{{\"{token}\":\"ok\"}}"), &provenance);
+        assert_eq!(restored, "{\"Martina Weber\":\"ok\"}");
+    }
+
+    #[test]
+    fn a_placeholder_key_is_restored_in_the_structural_path_too() {
+        // The test above never reaches `restore_document`: its value needs no
+        // escaping, so the textual path answers and the key is substituted
+        // there. This one carries a quote, so the structural path is the one
+        // taken — and the key rule has to keep its depth on that path as well,
+        // which is where an implementation would be tempted to reuse
+        // `restore_value`'s refusal.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let restored = mapping.restore_in_string(&format!("{{\"{token}\":\"ok\"}}"), &provenance);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored).expect("still a document"),
+            json!({value: "ok"}),
+            "restored, and escaped by the serializer rather than by hand"
+        );
+    }
+
+    #[test]
+    fn a_restored_key_that_would_collide_leaves_the_document_untouched() {
+        // A map cannot hold two identical keys, so structural restoration
+        // would silently drop one — a tool argument lost, where a textual
+        // substitution today serves both. Substituting instead yields
+        // duplicate property names, whose meaning is ambiguous. So the string
+        // is left exactly as it came.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        // A value needing escaping, so the structural path is the one taken.
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "neither field may be lost"
+        );
+    }
+
+    /// A mapping whose one token restores to a value carrying a quote, so
+    /// every caller of this takes the structural path rather than the textual
+    /// one. Returned with a `Provenance` that claims the token.
+    fn structural_mapping() -> (Mapping, Provenance, String) {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        (mapping, provenance, token)
+    }
+
+    #[test]
+    fn a_document_carrying_duplicate_members_is_left_exactly_as_it_came() {
+        // The parse that opens the structural path collapses two members of
+        // the same name before anything here sees them, and no later step can
+        // put the lost one back. Re-serializing would change bytes a client
+        // was forwarded unaltered before this sweep existed — and change them
+        // in a way two readers disagree about, since `serde_json` keeps the
+        // last member and a reader that keeps the first sees a different
+        // document. So this one is left, restoration and all.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "a member was collapsed on the way through"
+        );
+    }
+
+    #[test]
+    fn a_number_the_parse_would_round_costs_restoration_and_not_precision() {
+        // The round trip loses more than members. `Value` holds a number as an
+        // `i64`, a `u64` or an `f64`, so a lexeme carrying more precision than
+        // a double comes back rounded — silently, in a document beside the
+        // name this pass was restoring, and in `arguments` a client executes.
+        // The sweep's answer is the one it gives to every other thing the round
+        // trip cannot carry: leave the bytes, lose the restoration.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document =
+            format!("{{\"amount\":0.12345678901234567890123456789,\"name\":\"{token}\"}}");
+        let restored = mapping.restore_in_string(&document, &provenance);
+        assert_eq!(
+            restored, document,
+            "the unrelated number was rewritten by a pass that was restoring a name"
+        );
+        assert!(
+            restored.contains("0.12345678901234567890123456789"),
+            "the precision the upstream sent did not survive: {restored}"
+        );
+    }
+
+    #[test]
+    fn an_integer_past_what_a_double_holds_is_left_rather_than_rounded() {
+        // The same loss with no decimal point in sight, which is the shape that
+        // makes "it is only about floats" wrong: past `u64` an integer becomes
+        // an `f64` too. An id, an amount in minor units, a nonce.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"id\":123456789012345678901234567890,\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "an integer the parse could not hold was served rounded"
+        );
+    }
+
+    #[test]
+    fn a_document_this_reader_rejects_and_a_client_accepts_is_not_substituted_into() {
+        // A failed parse used to mean "not JSON", and the fallback was the
+        // unescaped substitution this whole branch exists not to emit. `1e999`
+        // is valid JSON — the grammar bounds no exponent — and every JavaScript
+        // client reads this document, as `Infinity` and the rest intact. This
+        // reader calls the number out of range and refuses the parse, so
+        // nothing here knows the shape of what it is substituting into.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let hostile = "x\",\"admin\":true,\"unused\":\"y";
+        let token = mapping
+            .mask(hostile, &[span("PERSON", 0, hostile.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"limit\":1e999,\"name\":\"{token}\"}}");
+        let restored = mapping.restore_in_string(&document, &provenance);
+        assert_eq!(
+            restored, document,
+            "the bytes were rewritten on the strength of a parse that failed"
+        );
+        assert!(
+            !restored.contains("\"admin\""),
+            "an unparseable document was injected into: {restored}"
+        );
+    }
+
+    #[test]
+    fn the_strict_string_door_refuses_both_of_the_round_trips_new_losses() {
+        // The policies stay split at each new cause, for the reason they were
+        // split at the first two: leaving the bytes is the sweep's answer and
+        // costs restoration, and the same answer in a described field leaves
+        // the placeholder in `arguments` a client dispatches on.
+        //
+        // **Read what this reaches, because its first name claimed more.** It
+        // was `the_described_path_refuses_...`, and it hands `restore_value` a
+        // `Value` whose `arguments` is a *string leaf* — which routes to
+        // `restore_in_string_strictly`, the door for a document nested one
+        // level down. Production does not route `arguments` that way:
+        // `read_document` parses that string before `restore_value` ever sees
+        // it, so what production exercises is the outer round trip in
+        // `proxy::handle`, which this test cannot reach and did not cover while
+        // reading as though it did.
+        // `an_arguments_document_the_round_trip_would_change_refuses_the_response`
+        // is that path. This one is the nested door, named for it now.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+
+        let rounded =
+            format!("{{\"amount\":0.12345678901234567890123456789,\"name\":\"{token}\"}}");
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": rounded })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described document was served with an unrelated number rounded"
+        );
+
+        let unparseable = format!("{{\"limit\":1e999,\"name\":\"{token}\"}}");
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": unparseable })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described document this reader cannot parse was substituted into anyway"
+        );
+    }
+
+    #[test]
+    fn a_document_behind_a_byte_order_mark_is_not_read_as_prose() {
+        // The hole the first-byte reading left, and the reason the reading is
+        // now a race. `char::is_whitespace` is false for U+FEFF, so `trim_start`
+        // left it, the first byte was neither `{` nor `[` nor `"`, and a
+        // document `serde_json` refuses outright was called prose. The
+        // substitution then went out unescaped.
+        //
+        // The value is the injection rather than a value that merely needs
+        // escaping: before this, the client received
+        // `{"name":"x","admin":true,"pad":""}` — a member it never sent, in a
+        // document every BOM-skipping reader parses.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",\"admin\":true,\"pad\":\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        let document = format!("\u{FEFF}{{\"name\":\"{token}\"}}");
+
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "a document behind a byte order mark was substituted into as prose"
+        );
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": document })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described document behind a byte order mark was served anyway"
+        );
+    }
+
+    #[test]
+    fn prose_whose_words_arrive_before_any_structure_still_restores() {
+        // The other half of the race, and what stops the fix above from
+        // refusing ordinary traffic. A bullet, an em dash, an emoji, a
+        // quotation later in the sentence — none of them is structure, and the
+        // word reaches the reader first in every one.
+        let (mapping, provenance, token) = structural_mapping();
+
+        for text in [
+            format!("- {token} said \"hi\""),
+            format!("\u{2014} {token} said \"hi\""),
+            format!("2024 war {token} in Bern, sagte \"X\""),
+        ] {
+            let restored = mapping.restore_in_string(&text, &provenance);
+            assert!(
+                restored.contains("Martina \"Weber\""),
+                "prose lost its restoration to the race: {text:?} -> {restored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_placeholder_a_duplicate_member_hides_is_refused_rather_than_served() {
+        // The same hole one level below the slot loop, and not the one that
+        // was reported. `restore_in_string_with` returns the original text when
+        // the restoration changed nothing — correct, unless the parse is what
+        // made it change nothing. Here the only token sits in the member the
+        // parse discards, so both sides of that comparison are placeholder-free
+        // and the strict door answered `Ok` with `[PERSON_1]` still in the
+        // string.
+        //
+        // The lenient door is right to keep the bytes: that is the duplicate
+        // rule, restoration lost and nothing changed. The strict one cannot,
+        // because bytes kept there are a placeholder served.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",\"admin\":true,\"pad\":\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        let text = format!("{{\"name\":\"{token}\",\"name\":\"fixed\"}}");
+
+        assert_eq!(
+            mapping.restore_in_string(&text, &provenance),
+            text,
+            "the lenient sweep rewrote a document it cannot reproduce"
+        );
+        assert!(
+            matches!(
+                mapping.restore_in_string_strictly(&text),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a described field served a placeholder the parse had hidden"
+        );
+    }
+
+    #[test]
+    fn a_document_a_comment_hides_the_start_of_is_still_enclosing() {
+        // The fourth finding on this guard, and the one that ended the
+        // prefix-reading approach. `/*metadata*/{"name":"[PERSON_1]"}` is a
+        // document to a comment-tolerant reader — which is what agent
+        // frameworks use on tool arguments, because models emit malformed
+        // JSON — and the reading before this met `m` inside the comment and
+        // called the whole thing prose. The client received
+        // `{"name":"x","admin":true,"pad":""}`.
+        //
+        // Recognising comments would have been the fourth patch to a question
+        // about prefixes, with single-quoted keys and trailing commas behind
+        // it. The question is now about enclosure instead, and a prefix of any
+        // composition simply stops mattering: the brace is before the token,
+        // so the token may be inside a string inside a container, so the
+        // substitution does not go out.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",\"admin\":true,\"pad\":\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [
+            format!("/*metadata*/{{\"name\":\"{token}\"}}"),
+            format!("// note\n{{\"name\":\"{token}\"}}"),
+            format!("{{\"name\":\"{token}\",}}"),
+            // A JSON5 object whose first member is single-quoted. The brace
+            // encloses the token whatever follows the brace, which is why a
+            // brace is not asked the question a bracket is asked.
+            format!("{{'a':'x',\"b\":\"{token}\"}}"),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "a document behind a prefix this reader chokes on was injected into"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected document: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_no_container_reaches_still_restores() {
+        // The other side of the enclosure question, and what it buys. A
+        // quotation opening the text, and a label before one, were both
+        // refused by every prefix reading this guard has had — and neither has
+        // any container in it at all, so our value has no string inside a
+        // structure to close. They restore now.
+        let (mapping, provenance, token) = structural_mapping();
+
+        for text in [
+            format!("\"Hallo\", sagte {token}"),
+            format!("{token}: \"hello\""),
+            // The count is read where the token is, not at the end of the
+            // text: a container opened after it encloses nothing of ours.
+            format!("{token} und dann {{\"a\":\"b\"}}"),
+        ] {
+            let restored = mapping.restore_in_string(&text, &provenance);
+            assert!(
+                restored.contains("Martina \"Weber\""),
+                "prose with no container lost its restoration: {text:?} -> {restored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_behind_a_prefix_this_reader_rejects_is_still_enclosing() {
+        // The fifth finding, and the same mistake as the first four, one frame
+        // smaller: enclosure after a `[` was a list of what *strict* JSON
+        // allows there, and this branch exists only for texts our reader
+        // refuses and another accepts. A comment and a JSON5 string both fell
+        // out of the list, and the substitution put a whole object into an
+        // array the client executes.
+        //
+        // `[true,…]` was already conservative, `t` being `true`'s letter, and
+        // it stays that way — the inversion is not a loosening.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",{\"admin\":true},\"pad";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [
+            format!("[/*metadata*/\"{token}\"]"),
+            format!("['a',\"{token}\"]"),
+            format!("[true,/*c*/\"{token}\"]"),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "an object was injected into an array behind a prefix this reader rejects"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected array: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_could_delimit_a_regex_literal_is_not_inert() {
+        // `/` was allowlisted for dates and paths, and it delimits a regex
+        // literal: `{name:/[PERSON_1]/}` with a value of `x/,admin:true,pad:/y`
+        // came back `{name:/x/,admin:true,pad:/y/}`, an object with a member
+        // the upstream never sent.
+        //
+        // That shape needs a client that *evaluates* the text — no JSON
+        // family parser reads a regex literal — and evaluation is outside what
+        // `json_string_inert` can defend, since `,` and `:` would each be
+        // enough. The slash comes out because it costs almost nothing, which
+        // was measured, not because it makes evaluation safe.
+        let value = "x/,admin:true,pad:/y";
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+        let text = format!("{{name:/{token}/}}");
+
+        assert_eq!(
+            mapping.restore_in_string(&text, &provenance),
+            text,
+            "a slash-delimited value was substituted in blind"
+        );
+    }
+
+    #[test]
+    fn a_slash_bearing_identifier_still_restores_where_it_actually_appears() {
+        // What taking the slash out costs, held to the measurement that
+        // justified it. A German `Steuernummer` carries two slashes and an
+        // e-mail local part may carry one, so this had to be checked rather
+        // than assumed: both still restore inside a document that parses,
+        // where the structural path escapes them, and in prose, which opens no
+        // container. Only bracketed prose loses them, which is the cost
+        // `structure_encloses_a_token` already carries.
+        for value in ["21/815/08150", "a/b@c.de"] {
+            let mut mapping = Mapping::default();
+            mapping.begin_request();
+            let token = mapping
+                .mask(value, &[span("PERSON", 0, value.chars().count())])
+                .unwrap();
+            let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+            assert_eq!(
+                mapping.restore_in_string(&format!("{{\"tax\":\"{token}\"}}"), &provenance),
+                format!("{{\"tax\":\"{value}\"}}"),
+                "an identifier with a slash stopped restoring inside a document"
+            );
+            assert_eq!(
+                mapping.restore_in_string(&format!("Die Nummer {token} gilt."), &provenance),
+                format!("Die Nummer {value} gilt."),
+                "an identifier with a slash stopped restoring in prose"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_could_close_another_dialects_string_is_not_substituted_blind() {
+        // The escaping test was a blocklist — `"`, `\\`, the control
+        // characters — so a value made of single quotes counted as safe and
+        // never reached any of the checks below. `{'name':'[PERSON_1]'}` came
+        // back as `{'name':'x','admin':true,'pad':'y'}`: a valid JSON5 object
+        // carrying a member the upstream never sent, and the same with
+        // backticks.
+        //
+        // A blocklist of delimiters is a claim about which characters open a
+        // string in the reader we do not have. Its omissions are injections.
+        let value = "x','admin':true,'pad':'y";
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [format!("{{'name':'{token}'}}"), format!("[`{token}`]")] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "a value carrying another dialect's delimiter was substituted in blind"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected document: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_values_a_detected_span_is_made_of_still_take_the_plain_path() {
+        // The width of the allowlist, and the reason it is not simply
+        // "alphanumeric". An allowlist errs by refusing, so it has to admit
+        // what this gateway actually masks: names, addresses, e-mails, IBANs
+        // with their spaces, phone numbers with their `+`. If one of these
+        // stopped restoring inside an ordinary document, the inversion would
+        // have bought safety with the product.
+        for value in [
+            "Martina Weber",
+            "Bahnhofstr. 12, 8001 Zurich",
+            "CH93 0076 2011 6238 5295 7",
+            "a.b@c.de",
+            "+41 79 123 45 67",
+        ] {
+            let mut mapping = Mapping::default();
+            mapping.begin_request();
+            let token = mapping
+                .mask(value, &[span("PERSON", 0, value.chars().count())])
+                .unwrap();
+            let provenance = Provenance::new(mapping.issued(), HashSet::new());
+            let text = format!("{{'name':'{token}'}}");
+
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                format!("{{'name':'{value}'}}"),
+                "a value a span is really made of lost its restoration"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_carrying_an_apostrophe_in_its_value_still_restores() {
+        // `O'Brien` is now not inert, which is correct — it could close a
+        // single-quoted string — but it must not cost the sentence that has no
+        // string to close. The enclosure test is what saves it, and this is
+        // the pairing that keeps the inversion from being a refusal machine.
+        let value = "Martina O'Brien";
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        assert_eq!(
+            mapping.restore_in_string(&format!("Der Kunde {token} hat's bestaetigt."), &provenance),
+            "Der Kunde Martina O'Brien hat's bestaetigt.",
+            "prose with an apostrophe on both sides lost its restoration"
+        );
+    }
+
+    #[test]
+    fn a_closer_inside_a_string_no_longer_reopens_the_substitution() {
+        // The seventh finding, and the one that ended the counting. A `]`
+        // inside a quoted string is not structural, so subtracting on it drove
+        // the depth to zero before the token and let the substitution out into
+        // a JSON5 array. Wider than reported: the single-quoted form and the
+        // brace form did it too, and neither was named.
+        //
+        // Knowing which closers are structural means knowing which delimiters
+        // open a string in the reader we do not have — `"`, `'`, a backtick in
+        // some repairing parsers — and that list is what six earlier rounds
+        // were made of. So closers are not counted at all: an opener before
+        // the token is enough. It costs the Markdown case below and it makes
+        // no claim about anyone's reader.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "x\",{\"admin\":true},\"pad";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        for text in [
+            format!("[\"]\",\"{token}\",NaN]"),
+            format!("['a]',\"{token}\",NaN]"),
+            format!("{{\"a\":\"}}\",\"b\":\"{token}\",\"c\":NaN}}"),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "a closer inside a string cleared the enclosure and let an object in"
+            );
+            assert!(
+                matches!(
+                    mapping.restore_in_string_strictly(&text),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a described field served an injected document: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_prose_pays_for_the_closers_not_being_counted() {
+        // The price, recorded rather than discovered later. Markdown puts a
+        // bracket in front of ordinary text constantly, and those brackets are
+        // closed long before the token — but proving a closer structural is
+        // the thing that cannot be done without a reader, so they buy nothing.
+        //
+        // What it costs is bounded twice over. It applies only when the mapped
+        // value is not wholly inert — wider than a `"`, since `O'Brien` and a
+        // `Steuernummer` spelled `21/815/08150` are both non-inert and both
+        // ordinary; and on the lenient side it is a restoration lost with the
+        // bytes untouched, not a refusal. Only a described field turns it into
+        // a 502.
+        let (mapping, provenance, token) = structural_mapping();
+
+        for text in [
+            format!("- [x] {token} sagte \"hi\""),
+            format!("[docs](https://x) nennt {token} \"y\""),
+            format!("[1] Siehe {token}, \"z\""),
+        ] {
+            assert_eq!(
+                mapping.restore_in_string(&text, &provenance),
+                text,
+                "bracketed prose was substituted into after closers stopped counting"
+            );
+        }
+    }
+
+    #[test]
+    fn a_container_still_open_at_the_token_is_enclosing() {
+        // The width of the Markdown leniency, and what actually separates it
+        // from a document: not what follows the bracket, but whether the
+        // bracket is still open when the token is reached. Here it is — the
+        // array closes after the token — so the conservative answer stands
+        // even though `serde_json` refuses the text.
+        let (mapping, _provenance, token) = structural_mapping();
+
+        for document in [
+            format!("[\"{token}\",1e999]"),
+            format!("[see {token}] sagte \"hi\""),
+        ] {
+            assert!(
+                matches!(
+                    mapping.restore_value(&json!({ "arguments": document })),
+                    Err(MappingError::Unrestorable(_))
+                ),
+                "a container open at the token was substituted into: {document:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prose_that_opens_with_a_placeholder_and_quotes_something_still_restores() {
+        // The residue the first-byte test left behind, and the likeliest shape
+        // of all: masked prose usually *begins* with its mask, so `[` is the
+        // ordinary first character of a restored `content`, not a rare one.
+        // With a quote anywhere in the sentence and a value needing escaping,
+        // that sentence took the strict door and became a 502 on a plain chat
+        // completion.
+        //
+        // `[PERSON_1] said "hello"` is an array holding a bare word. No reader
+        // accepts it, so nothing here can be corrupted by substituting into it.
+        let (mapping, provenance, token) = structural_mapping();
+        let text = format!("{token} said \"hello\"");
+
+        assert_eq!(
+            mapping.restore_in_string(&text, &provenance),
+            "Martina \"Weber\" said \"hello\"",
+            "prose opening with a placeholder lost its restoration"
+        );
+        assert_eq!(
+            mapping
+                .restore_value(&json!({ "arguments": text }))
+                .expect("prose opening with a placeholder refused the response"),
+            json!({ "arguments": "Martina \"Weber\" said \"hello\"" }),
+            "the described door disagreed with the lenient one about the same text"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_document_whose_first_value_is_a_placeholder_string_still_refuses() {
+        // The width of the exemption above. `["` is a `[` that opens an array,
+        // not one that opens a token, and `pieces` reports the difference: the
+        // first piece here is text. So a document this reader rejects and a
+        // client may accept keeps the conservative answer, and the exemption
+        // cannot be widened into it by accident.
+        let (mapping, _provenance, token) = structural_mapping();
+        let document = format!("[\"{token}\",1e999]");
+
+        assert!(
+            matches!(
+                mapping.restore_value(&json!({ "arguments": document })),
+                Err(MappingError::Unrestorable(_))
+            ),
+            "a document opening with an array was substituted into as if it were prose"
+        );
+    }
+
+    #[test]
+    fn prose_that_quotes_something_of_its_own_still_restores() {
+        // The regression the parse-failure guard shipped with, and the reason
+        // the guard asks about enclosure rather than about quotes. Testing the
+        // text for a quote *anywhere* caught every sentence that quotes a
+        // report title, a heading, a line the model is citing back — and since
+        // every `Slot::Text` takes the strict door, that was a 502 on a plain
+        // chat completion whose `content` happened to carry a quotation mark
+        // and whose restored value carried one too.
+        //
+        // This sentence opens no container at all.
+        // This begins with `D`.
+        let (mapping, provenance, token) = structural_mapping();
+
+        assert_eq!(
+            mapping.restore_in_string(&format!("Der Bericht \"Q3\" nennt {token}."), &provenance),
+            "Der Bericht \"Q3\" nennt Martina \"Weber\".",
+            "prose that quotes something stopped restoring"
+        );
+    }
+
+    #[test]
+    fn a_number_spelled_with_trailing_zeros_is_the_same_number_and_still_restores() {
+        // The number row was held to a stricter standard than every other row.
+        // Key order is not preserved and that is priced as reformatting; an
+        // escape respelled is waved through as the same string. Then `2.50` →
+        // `2.5` — a spelling the client's own parse undoes exactly as it undoes
+        // those two — was called a loss and cost the response. In JSON-mode
+        // `content` that is money.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"amount\":2.50,\"total\":10.00,\"name\":\"{token}\"}}");
+        let restored: Value =
+            serde_json::from_str(&mapping.restore_in_string(&document, &provenance))
+                .expect("a document, restored rather than left");
+        assert_eq!(
+            restored["name"], "Martina \"Weber\"",
+            "the document was left unrestored over a number that lost nothing: {restored}"
+        );
+        assert_eq!(restored["amount"], json!(2.5), "the amount changed value");
+        assert_eq!(restored["total"], json!(10.0), "the total changed value");
+    }
+
+    #[test]
+    fn prose_that_carries_no_quote_still_restores_a_value_that_does() {
+        // Additivity, and the reason the branch above tests the *text* for a
+        // quote rather than testing the parse. This is the ordinary case on
+        // this path — the quote is in the value, not in the prose around it —
+        // and it is not a document, never was, and still restores.
+        let (mapping, provenance, token) = structural_mapping();
+
+        assert_eq!(
+            mapping.restore_in_string(&format!("Hallo {token}!"), &provenance),
+            "Hallo Martina \"Weber\"!",
+            "prose stopped restoring because a document elsewhere might not parse"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_member_is_found_wherever_it_sits() {
+        // The scan is a whole-document walk, not a look at the top level: the
+        // duplicate here is under an array under an object, and the tokens
+        // around it are what an implementation that only checked the outermost
+        // map would happily have restored.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document =
+            format!("{{\"note\":\"{token}\",\"wrapper\":[{{\"a\":1,\"b\":2,\"a\":3}}]}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "a duplicate below the top level was walked past"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_that_only_two_spellings_share_is_found_too() {
+        // `\u0061` and `a` are different bytes and the same member name. The
+        // map that a parse builds is keyed by the unescaped string, so it
+        // collapses these two exactly as it collapses a literal repeat — and
+        // the scan reads keys through the same unescaping, so it sees them.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!("{{\"\\u0061\":1,\"a\":2,\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            document,
+            "two spellings of one member name collapsed into one field"
+        );
+    }
+
+    #[test]
+    fn a_repeated_name_that_is_not_a_duplicate_member_still_restores() {
+        // The false-positive case, and the expensive one: leaving documents
+        // alone that lose nothing to a round trip would quietly shrink the
+        // coverage this sweep exists to add. Every `id` here is in a different
+        // object, `id` also appears as an array element and as a value, and
+        // the nesting repeats the name at three depths. None of it is a
+        // duplicate member and all of it must restore.
+        let (mapping, provenance, token) = structural_mapping();
+
+        let document = format!(
+            "{{\"id\":\"{token}\",\"peer\":{{\"id\":\"x\",\"peer\":{{\"id\":\"y\"}}}},\
+             \"tags\":[\"id\",\"id\"],\"label\":\"id\",\"rows\":[{{\"id\":1}},{{\"id\":2}}]}}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&mapping.restore_in_string(&document, &provenance))
+                .expect("still a document"),
+            json!({
+                "id": "Martina \"Weber\"",
+                "peer": {"id": "x", "peer": {"id": "y"}},
+                "tags": ["id", "id"],
+                "label": "id",
+                "rows": [{"id": 1}, {"id": 2}]
+            }),
+            "a document that loses nothing to a round trip was left unrestored"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_member_costs_nothing_when_no_value_needs_escaping() {
+        // The scan sits behind the escaping test, where the structural path
+        // begins, so a document is only ever left for a duplicate it was about
+        // to lose. This value carries no quote, backslash or control
+        // character, the textual path answers, and both members survive
+        // because nothing was ever re-serialized — which is also the older
+        // behaviour this fix is restoring, arrived at the cheap way.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!("{{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"{token}\"}}");
+        assert_eq!(
+            mapping.restore_in_string(&document, &provenance),
+            "{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"Martina Weber\"}",
+            "restored in place, both members kept, formatting untouched"
+        );
+    }
+
+    #[test]
+    fn text_the_duplicate_scan_cannot_walk_is_reported_as_a_duplicate() {
+        // The direction the safety net runs in, pinned where the test above
+        // cannot reach it. `restore_in_string` never asks this question of
+        // bytes that failed to parse — it has the `Value` in hand before it
+        // asks — so the only way a walk fails there is a defect in the walk
+        // itself, and the answer to a defect has to be the side that costs a
+        // restoration rather than the side that hands the collapsing path a
+        // document nobody checked. Answering `false` here reads every future
+        // defect as "no duplicates" and puts this whole fix back.
+        assert!(carries_duplicate_members("{\"unterminated\": "));
+        assert!(carries_duplicate_members("not json at all"));
+    }
+
+    #[test]
+    fn every_json_type_survives_the_duplicate_scan() {
+        // `carries_duplicate_members` answers `true` when its walk disagrees
+        // with the parse the caller already made, because the alternative —
+        // reading a defect as "no duplicates" — hands the collapsing path a
+        // document it must not have. That makes a missing visitor arm safe,
+        // and this is what says the case is empty today: one document
+        // carrying every type `serde_json`'s `deserialize_any` can produce,
+        // including the integers at both ends of `i64`/`u64` and one past
+        // them that arrives as a float. A `true` here is an arm that is gone.
+        let document = "{\"null\":null,\"yes\":true,\"no\":false,\
+             \"neg\":-9223372036854775808,\"big\":18446744073709551615,\
+             \"wider\":184467440737095516150,\"float\":1.5,\"exp\":1e308,\
+             \"text\":\"plain\",\"escaped\":\"a\\\"b\\u0063\",\
+             \"empty_array\":[],\"empty_object\":{},\
+             \"mixed\":[null,true,1,-1,1.5,\"s\",[],{},{\"deep\":[{\"deeper\":null}]}]}";
+        assert!(
+            serde_json::from_str::<Value>(document).is_ok(),
+            "the fixture stopped being a document"
+        );
+        assert!(
+            !carries_duplicate_members(document),
+            "the scan could not walk a type the parse accepted, so every \
+             document carrying that type now goes unrestored"
+        );
+    }
+
+    #[test]
+    fn a_collision_costs_its_own_object_and_nothing_beside_it() {
+        // The collision used to travel: `restore_document` returned `None`
+        // from wherever it found one, and the `?`s at both propagation points
+        // carried it to the top, so one ambiguous object left the entire
+        // string as it came. `note` sits beside the colliding object, has
+        // nothing to do with its keys, and is restored.
+        //
+        // The nesting is deliberate — under an array under an object, which is
+        // where both propagation points used to be. What replaced them is a
+        // return type with nowhere to propagate to.
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let value = "Martina \"Weber\"";
+        let token = mapping
+            .mask(value, &[span("PERSON", 0, value.chars().count())])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let document = format!(
+            "{{\"note\":\"{token}\",\"wrapper\":[{{\"{token}\":1,\"Martina \\\"Weber\\\"\":2}}]}}"
+        );
+        let restored = mapping.restore_in_string(&document, &provenance);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored).expect("still a document"),
+            json!({
+                "note": value,
+                // Both fields still here, both keys as they came.
+                "wrapper": [{token.clone(): 1, value: 2}]
+            }),
+            "the collision reached past its own object: {restored}"
+        );
+    }
+
+    #[test]
+    fn the_sweep_restores_every_string_and_never_fails() {
+        let mut mapping = Mapping::default();
+        mapping.begin_request();
+        let token = mapping
+            .mask("Martina Weber", &[span("PERSON", 0, 13)])
+            .unwrap();
+        let provenance = Provenance::new(mapping.issued(), HashSet::new());
+
+        let body = json!({
+            "choices": [{"message": {
+                "content": format!("hello {token}"),
+                "refusal": format!("I cannot help with {token}"),
+                "annotations": [{"url_citation": {"title": format!("{token} page")}}],
+            }}],
+            // A key, and a token nobody issued: both untouched, and neither
+            // refuses. `restore_value` would have raised PlaceholderKey here.
+            "trace": {"[PERSON_9]": "invented [ORG_4]"}
+        });
+
+        assert_eq!(
+            mapping.restore_sweep(&body, &provenance),
+            json!({
+                "choices": [{"message": {
+                    "content": "hello Martina Weber",
+                    "refusal": "I cannot help with Martina Weber",
+                    "annotations": [{"url_citation": {"title": "Martina Weber page"}}],
+                }}],
+                "trace": {"[PERSON_9]": "invented [ORG_4]"}
+            })
         );
     }
 }

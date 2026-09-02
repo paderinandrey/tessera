@@ -234,36 +234,92 @@ shape the gateway has no rule for, including Anthropic's
 extended thinking, OpenAI's `logprobs`, whose token strings are the masked output again, and
 OpenAI's audio output, whose transcript no restoration can reconcile with the recording; an identifier field present in a form that cannot be masked; a
 span the detector reports at a position that cannot be applied — inverted, past the end of the
-text, or overlapping another; and a placeholder in the response that no
-mapping knows — each of these ends the request. Once a stream has begun there is nothing
+text, or overlapping another; and a placeholder that no mapping knows in a response field this
+gateway *describes* — each of these ends the request. Once a stream has begun there is nothing
 left to refuse, so it ends mid-flight instead; the rule it protects is the same. No text
 this gateway scans is forwarded unmasked. No error body or log line carries the submitted
 text.
 
-Restoration is narrower than that, and the difference is measured rather than assumed.
-Anthropic's response path is a closed list of block *types* — a block whose type it cannot
-read refuses the response rather than handing a placeholder over — and OpenAI's is not: it
-restores a choice's `content` and forwards every other field of the message as the provider
-sent it. Two things were measured wrong on the Anthropic half and both are now closed. The
-type check ran *second*, after a check for a `text` field, so a block carrying a `text`
-never reached the closed list at all: `{"type": "tool_use", "text": "ok", "input": {...}}`
-had its text described and its arguments forwarded unrestored, which is a placeholder
-reaching a client that *executes* it. And the list was closed on the type alone, so a field
-the block's type does not define was handed over as the provider wrote it — measured, at
-200, with `citations[].cited_text` carrying `[PERSON_1]` into what the client received.
-Anthropic's response blocks now have a closed list of *fields* as well as of types, and a
-field outside it refuses the response. **OpenAI's response path has neither**: a `refusal`,
-which any OpenAI refusal populates, and an `annotations[].url_citation.title` both reach
-the client **with this gateway's own placeholder in them**. That is the one direction the
-design is not closed in, it is filed as #31, and closing it means closing the list rather
-than naming those two fields.
+That last refusal used to be stated without the qualification, and it was true because the
+gateway looked nowhere else. It looks everywhere now — see the next section — and an unknown
+token in a field nobody describes is deliberately *served* rather than refused. Refusing on
+it would turn a response forwarded verbatim yesterday into a 502 today, which is a request
+that succeeds starting to fail; the gain in coverage is not worth paying for in traffic that
+already works.
 
-Two things it does not scan, and both are worth knowing before you rely on the sentence
-above. **Image and audio parts are forwarded untouched**, including a screenshot inside a
-tool result, which is the same exposure through a different field rather than a new one.
-Nothing here reads pixels, so a photograph of an identity document reaches the provider as
-the client sent it. And **the body and the message levels are not allowlisted at all** —
-see below, because that is the other half of the closed-allowlist claim.
+Restoration is narrower than that, and the difference is measured rather than assumed.
+Anthropic's response path is a closed list of block *types* — a block whose type it cannot read
+refuses the response rather than handing a placeholder over. Two things were measured wrong on
+that half and both are now closed. The type check ran *second*, after a check for a `text`
+field, so a block carrying a `text` never reached the closed list at all: `{"type": "tool_use",
+"text": "ok", "input": {...}}` had its text described and its arguments forwarded unrestored,
+which is a placeholder reaching a client that *executes* it. And the list was closed on the
+type alone, so a field the block's type does not define was handed over as the provider wrote
+it — measured, at 200, with `citations[].cited_text` carrying `[PERSON_1]` into what the client
+received. Anthropic's response blocks now have a closed list of *fields* as well as of types,
+and a field outside it refuses the response.
+
+OpenAI's response path had neither, and #31 is the measurement: it restored a choice's
+`content` and forwarded every other field of the message as the provider sent it, so a
+`refusal` — which any OpenAI refusal populates — and an `annotations[].url_citation.title` both
+reached the client **with this gateway's own placeholder in them**, at 200. It no longer
+describes only what it names. Before the slots are written, the whole upstream body is swept
+for the placeholders *this request* issued, and the slot loop then overwrites what it describes
+with its own strict result, so a field nobody described is restored rather than forwarded. The
+promise, in both its clauses: **a placeholder issued by this gateway does not reach the client
+from a field the gateway describes. Elsewhere everything this request issued and the caller did
+not write is restored, except where restoring it would drop something the upstream sent**,
+which is served exactly as it came. Both clauses are load-bearing and neither is decoration.
+The sweep will not claim a token the *caller* wrote itself, because a caller that puts
+`[PERSON_1]` into a later turn of a session and has the model echo it back has to get its own
+text returned rather than turn one's value; a token that is both issued and written is
+ambiguous by construction and is left alone, and #32 is what separates the two and lets the
+first sentence be stated without its qualification.
+
+The second clause is one rule and not a list of cases — what cannot be re-serialized
+faithfully is left, never guessed at. An object whose restored keys would collide —
+`{"[PERSON_1]": "a", "Weber": "b"}`, where restoring the key would drop one of the two fields —
+keeps every key and value it arrived with, which is one object rather than the body around it.
+And a string that is itself a serialized document is left whole whenever restoring it would
+need re-serializing and the gateway cannot write the document back as it came: two members of
+the same name — `{"mode":"safe","mode":"admin","name":"[PERSON_1]"}` — which the parse
+collapses before any restoring happens, a number carrying more precision than the double it is
+read into, or a text this gateway cannot rule out being a document a client's reader would
+accept. That last one is wider than it sounds, and deliberately: ruling it out would mean
+knowing which prefixes, literals and quote characters some other parser tolerates, and six
+attempts to know that were each defeated by the seventh thing. So the test is only whether a
+`{` or `[` was opened before the placeholder — which also catches ordinary prose that opens a
+bracket, `- [x] [PERSON_1] said "hi"` among it. The list is open on purpose; the rule is what
+holds. These are still places a placeholder can reach the client from.
+
+That last case is reached only when the value being restored carries a character that could
+end the string it lands in, or start an escape inside it — a quote of either kind, a backtick, a backslash, a control
+character, a slash. Names, addresses, e-mails, IBANs and phone numbers do not, and take the
+plain path untouched; `O'Brien` does, and so does a `Steuernummer` spelled `21/815/08150`.
+Neither loses anything inside a document that parses, where the restoration is structural and
+escaped, nor in ordinary prose, which opens no container — only in prose that opens one. So it
+is a narrow price for a guarantee that assumes nothing about the client's parser.
+
+That guarantee covers a client that **parses** the response as data. It does not cover one that
+**evaluates** it as code, and no rule of this kind could: under evaluation a comma or a colon is
+enough on its own.
+
+**Leaving is an answer the second clause gives, and the first clause never gives it.** The same
+shapes inside a field the gateway describes — `arguments` a client dispatches on, `content` it
+parses — refuse the response with a 502 instead, under the class `mapping_lossy_document`.
+Leaving the bytes there is not the harmless answer it is elsewhere: those bytes still hold the
+placeholder, which is the one thing the first clause promises they will not. Serving them
+re-serialized is worse again, since it hands a client a document to execute with a member
+dropped, a key renamed or a number rounded. So neither is served, and the rule the two clauses
+share is the narrower one: what cannot be re-serialized faithfully is never guessed at.
+
+Two things it does not scan, and both are worth knowing before you rely on *no text this
+gateway scans is forwarded unmasked* above — a claim about the way up, which the two paragraphs
+before this one are not. **Image and audio parts are forwarded untouched**, including a
+screenshot inside a tool result, which is the same exposure through a different field rather
+than a new one. Nothing here reads pixels, so a photograph of an identity document reaches the
+provider as the client sent it. And **the body and the message levels are not allowlisted at
+all** — see below, because that is the other half of the closed-allowlist claim.
 
 Tool traffic is masked now, so what it still refuses is worth stating on its own.
 **Streamed tool calls**, which the buffered path's masking does not reach: a document
@@ -597,8 +653,10 @@ and a 502 can mean either the provider or this gateway — so the classes that
 mean *a defect here* are worth knowing by name: `shape_pointer` (a pointer this
 gateway produced did not resolve in a body it had already walked),
 `mapping_unknown_placeholder`, `mapping_bad_span`, `mapping_mask_mismatch` and
-`mapping_placeholder_key`. `shape_response` and `upstream_failed` are the
-provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
+`mapping_placeholder_key`. `shape_response`, `upstream_failed` and
+`mapping_lossy_document` (a document the provider sent that cannot be restored
+without changing something else in it — a member dropped, a key renamed, a
+number rounded — refused rather than served changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
 `mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
 `tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
 `session_disabled` and `session_no_credential` are the caller's;

@@ -82,6 +82,15 @@ impl StreamError {
             StreamError::Mapping(MappingError::TooLarge) => "stream_too_large",
             StreamError::Mapping(MappingError::MaskCountMismatch(_)) => "stream_mask_mismatch",
             StreamError::Mapping(MappingError::PlaceholderKey(_)) => "stream_placeholder_key",
+            // Not `stream_unrestorable_document`, though the variant is
+            // `Unrestorable` and the parallel would be tidier. The short name
+            // above is already this enum's word for `MappingError::Unknown`,
+            // so a sibling one word longer would read as "the unknown-token
+            // failure, in a document" to the only reader who matters here —
+            // somebody holding a journal line and no source. What actually
+            // happened is that restoring the document would have dropped a
+            // member or renamed a key, so the class says that.
+            StreamError::Mapping(MappingError::Unrestorable(_)) => "stream_lossy_document",
             StreamError::Shape(ShapeError::Request(_)) => "stream_shape_request",
             StreamError::Shape(ShapeError::Response(_)) => "stream_shape_response",
             StreamError::Shape(ShapeError::Pointer(_)) => "stream_shape_pointer",
@@ -127,6 +136,40 @@ pub const MAX_HELD: usize = 64;
 /// matching `[TYPE_N]` contains no `[`, so only the text from the last `[` with
 /// no `]` after it can begin one; everything before that point is complete and
 /// is emitted restored.
+///
+/// **What it does not do: the escaping rule.** `push` and `finish` call
+/// `Mapping::restore`, which substitutes as text. The buffered path stopped
+/// doing that — a `content` that is a serialized document, under
+/// `response_format: json_object`, is restored structurally there so a value
+/// carrying a `"` lands in a leaf instead of closing the string it was
+/// substituted into. This buffer has no way to do the same. That protection is
+/// a parse of the whole string; what arrives here is a fragment of one, and
+/// `safe_prefix_len` holds text back only far enough not to split a
+/// placeholder, so the boundary it releases on is a `[` and has no relation to
+/// where a document begins or ends. Restoring the fragment `{"name":"` proves
+/// nothing about the document it will become at the client.
+///
+/// **So the two paths differ here, deliberately and not silently.** The
+/// `arguments` case — the one the recursion was written for — cannot reach this
+/// buffer at all: `reject_streamed_tools` refuses `stream: true` on a request
+/// carrying tool traffic. What remains open is a JSON-mode `content` on a
+/// streamed completion. Closing it means buffering a whole run before emitting
+/// any of it, which is the thing streaming exists not to do, or teaching this
+/// buffer to track JSON structure across fragments — a parser of our own beside
+/// the one `serde_json` already has, on the path where a mistake is
+/// unrecoverable because the bytes have gone out. Neither is worth it for the
+/// case; it is recorded rather than fixed. `proxy::handle`'s text-slot arm says
+/// the same from the side that is closed.
+///
+/// **`restore` here is the plain substitution and it never asks
+/// `json_string_inert`.** The buffered path asks, and answers a value that
+/// could close a string in some dialect by taking the structural route or
+/// refusing; this path has no structural route to take. So the case left open
+/// is wider than a value carrying a `"`: an apostrophe closes a string for a
+/// JSON5 reader just as well. The cheap way to close it is to refuse the
+/// request shape the way `reject_streamed_tools` refuses the other one — a
+/// change to what this gateway accepts rather than to how it restores, so it
+/// is filed as #36 rather than taken here.
 pub struct RestoreBuffer<'a> {
     mapping: &'a Mapping,
     held: String,
@@ -789,6 +832,8 @@ mod audit_class_tests {
             StreamError::Mapping(MappingError::TooLarge).audit_class(),
             StreamError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
             StreamError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+            StreamError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
             StreamError::Shape(ShapeError::Request("messages")).audit_class(),
             StreamError::Shape(ShapeError::Response("choices")).audit_class(),

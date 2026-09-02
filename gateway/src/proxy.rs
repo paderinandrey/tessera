@@ -13,7 +13,7 @@ use crate::audit::{Detected, Record};
 use crate::config::Config;
 use crate::detector::{DetectorClient, DetectorError};
 use crate::mapping;
-use crate::mapping::{Mapping, MappingError, Span};
+use crate::mapping::{Mapping, MappingError, Provenance, Span};
 use crate::provider::{
     as_response_error, read_document, read_pointer, write_document, write_pointer, Anthropic,
     OpenAi, Provider, ShapeError, Slot,
@@ -98,6 +98,15 @@ impl ProxyError {
             // be given a status here, as `audit_class` already makes it be
             // given a class: a wildcard turns a variant somebody forgot into
             // a silent 502.
+            //
+            // `Unrestorable` belongs in this arm and not in the 400 above, and
+            // the two documents it is raised for say why: a serialized document
+            // with two members of the same name, and one whose restored keys
+            // would collide. Both are *the upstream's* bytes — the caller's
+            // request is well formed, and there is nothing smaller or
+            // differently shaped for them to send that would change the
+            // answer. It is this gateway declining to serve a response it
+            // cannot serve faithfully, which is what 502 is for.
             ProxyError::Shape(ShapeError::Response(_))
             | ProxyError::Shape(ShapeError::Pointer(_))
             | ProxyError::Detector(_)
@@ -105,6 +114,7 @@ impl ProxyError {
             | ProxyError::Mapping(MappingError::BadSpan(_))
             | ProxyError::Mapping(MappingError::MaskCountMismatch(_))
             | ProxyError::Mapping(MappingError::PlaceholderKey(_))
+            | ProxyError::Mapping(MappingError::Unrestorable(_))
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -152,6 +162,15 @@ impl ProxyError {
             ProxyError::Mapping(MappingError::TooLarge) => "mapping_too_large",
             ProxyError::Mapping(MappingError::MaskCountMismatch(_)) => "mapping_mask_mismatch",
             ProxyError::Mapping(MappingError::PlaceholderKey(_)) => "mapping_placeholder_key",
+            // Named for the loss that was about to be taken rather than for
+            // the variant, because the variant's name is already spoken for
+            // one level down: `stream_unrestorable` is `MappingError::Unknown`
+            // on the streamed path, and a second class one word longer would
+            // read as its document-shaped sibling when it is a different
+            // failure entirely. `lossy_document` is what the code calls the
+            // question, so the class and the seam that raises it grep to each
+            // other.
+            ProxyError::Mapping(MappingError::Unrestorable(_)) => "mapping_lossy_document",
             ProxyError::Upstream(_) => "upstream_failed",
             ProxyError::Session(SessionError::BadId) => "session_bad_id",
             ProxyError::Session(SessionError::Disabled) => "session_disabled",
@@ -856,6 +875,9 @@ async fn handle(
                 None => Arc::clone(&claimed.session.mapping).lock_owned().await,
             };
             let mut work = guard.clone();
+            // On the clone, so the boundary is this request's. The session's
+            // own copy never carries an issuance record to clear.
+            work.begin_request();
             let (masked, found) = mask_all(
                 provider.name(),
                 &state.detector,
@@ -886,6 +908,7 @@ async fn handle(
         }
         None => {
             let mut work = Mapping::new();
+            work.begin_request();
             let (masked, found) = mask_all(
                 provider.name(),
                 &state.detector,
@@ -902,6 +925,16 @@ async fn handle(
             (masked, work)
         }
     };
+
+    // Which tokens in the response this gateway may claim as its own. Both
+    // arms above leave `mapping` holding this request's issuance, so it is
+    // read here rather than threaded out of the match.
+    //
+    // Built from the request as it arrived, before anything rewrote it:
+    // `masked` carries the placeholders this request just issued, and reading
+    // the literals off that would put every one of them in both sets and leave
+    // nothing restorable at all.
+    let provenance = Provenance::new(mapping.issued(), mapping::placeholder_literals(&body));
 
     // Only what is masked leaves the process.
     let mut request = state.upstream.post(format!(
@@ -977,9 +1010,19 @@ async fn handle(
                 Ok(parsed) => {
                     (status, returned, Json(mapping.restore_value(&parsed)?)).into_response()
                 }
+                // Reached when *this* reader will not parse the body, which is
+                // not the same as the body not being one — a document nested
+                // past the parser's limit or carrying an exponent it calls out
+                // of range arrives here and a client reads it. `restore` alone
+                // has no escaping rule and no structural retry, so a mapped
+                // value carrying a `"` closed the string it landed in, here,
+                // for the same reason it did in the arm above before this fix.
+                // The strict door asks the question this arm cannot: it
+                // substitutes as text only where it can prove nothing can be
+                // closed, and refuses rather than guessing otherwise.
                 Err(_) => {
                     let text = String::from_utf8_lossy(&raw);
-                    (status, returned, mapping.restore(&text)?).into_response()
+                    (status, returned, mapping.restore_in_string_strictly(&text)?).into_response()
                 }
             },
         ));
@@ -997,25 +1040,190 @@ async fn handle(
     // `arguments` is the live case — models do it — and without this the caller
     // would be told the request they sent was malformed and would go looking
     // for it there forever.
-    let mut restored = upstream.clone();
+    //
+    // The sweep runs on the untouched upstream body and the slots below are
+    // computed from that same body, so neither pass reads the other's output
+    // and no value is restored twice. Sweeping the *result* would corrupt a
+    // multi-turn session: strict restoration puts back a stored value carrying
+    // a literal the caller wrote in an earlier turn, and `written` describes
+    // only this request, so a second pass reads that literal as a token this
+    // request issued and overwrites the caller's own text with this turn's
+    // value. That case is
+    // `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`,
+    // which is what fails if this order is ever changed.
+    //
+    // Order matters the other way too: sweeping and stopping would make
+    // `content` lenient, so an unmappable token there would be served instead
+    // of refusing. The slot loop's strict result wins wherever the two overlap.
+    //
+    // **The sweep does not reach everywhere, and the exception is a rule
+    // rather than a list.** Where restoring would change something else the
+    // upstream sent, the bytes are left: an object whose restored keys would
+    // collide keeps the keys and values it came with, and a string that is a
+    // serialized document is left whole when the round trip that restores it
+    // would not reproduce it — see `restore_sweep`, and
+    // `restore_in_string_with` for why that set is argued from what JSON is
+    // made of rather than enumerated. A placeholder can still reach the client
+    // from inside any of them, and everything around them restores.
+    // `a_colliding_key_costs_its_own_object_and_nothing_around_it` holds the
+    // first to its size, having once been the whole body;
+    // `a_serialized_document_with_duplicate_members_reaches_the_client_intact`
+    // is the second, which exists because re-serializing that string dropped a
+    // member the upstream sent.
+    //
+    // **Every one of them stops at the slot loop below.** They are the *sweep's*
+    // answers, and the loop overwrites the sweep wherever the two address the
+    // same bytes: a slot carrying any of these shapes refuses the whole response
+    // rather than serving it, because leaving those bytes in a described field
+    // leaves the placeholder in them. So the sentences above are about a
+    // field no slot addresses, and `restore_sweep`'s doc says the same. The
+    // refusal is `MappingError::Unrestorable`, and
+    // `a_nested_document_that_cannot_be_restored_faithfully_refuses_the_response`
+    // is what holds the line between the two answers.
+    //
+    // `upstream` came out of `from_slice` above, which is the parse
+    // `restore_sweep` requires: its recursion is bounded by nothing else.
+    //
+    // **And that parse is a round trip this gateway does not guard, which is
+    // the widest statement of the problem the guards below answer.** The whole
+    // body is read into a `Value` here and written back by `Json(restored)` at
+    // the end of this function, so every number in every buffered response goes
+    // through `i64`/`u64`/`f64` — Anthropic's `input`, OpenAI's `usage`, and
+    // every field nobody describes. Measured on a body with no placeholder in
+    // it at all: `"total":123456789012345678901234567890` came back
+    // `1.2345678901234568e+29` and `"cost":0.12345678901234567890123456789`
+    // came back `0.12345678901234568`, on a 200, with nothing restored and no
+    // tool traffic involved.
+    //
+    // **It is not closed here and the reason is scope rather than difficulty.**
+    // The two guards below cover the round trips this slice *adds* — a
+    // described `arguments`, and a document nested inside a restored string —
+    // where the alternative was corrupting a document a client executes.
+    // Covering this one means either refusing any response carrying a number
+    // this reader cannot reproduce, which is a refusal on ordinary traffic that
+    // no finding asks for, or not representing a response body as a `Value` at
+    // all, which is a different slice with its own additivity argument to make.
+    // Recorded here rather than in a commit message so the next reader of these
+    // guards finds the frame above them.
+    let mut restored = mapping.restore_sweep(&upstream, &provenance);
     for slot in provider
         .response_pointers(&upstream)
         .map_err(as_response_error)?
     {
         match slot {
+            // `restore_in_string_strictly` rather than `restore`, and the
+            // reason is the same one the `Json` arm has: this loop overwrites
+            // the sweep's answer wherever the two overlap, so a text slot that
+            // takes the plain call takes back the escaping the sweep had
+            // already applied to the same string. A text slot is prose most of
+            // the time and the two calls then agree byte for byte — but
+            // `content` under `response_format: json_object` is a serialized
+            // document the client parses, and a restored value carrying a `"`
+            // substituted into it as text closes the string it lands in. Same
+            // hazard, same door, same token policy: strict either way.
+            //
+            // **The streamed twin of this line does not get this protection,
+            // and the reason is that it cannot.** A streamed `content` is
+            // restored by `RestoreBuffer`, fragment by fragment, with plain
+            // `restore` — so the `response_format: json_object` case above is
+            // closed here and open there. It is not an oversight to fix by
+            // routing that call through the strict door: the protection is a
+            // parse of the whole string, a delta is a fragment of one, and the
+            // buffer holds text back only far enough not to split a placeholder
+            // (`safe_prefix_len`, which looks for `[`), so what it releases is
+            // an arbitrary prefix with no relation to a document boundary. See
+            // `RestoreBuffer`, which says the same from the other side.
+            //
+            // **What is closed there is the `arguments` half, by a different
+            // mechanism.** `reject_streamed_tools` refuses `stream: true` on
+            // any request carrying tool traffic, so a described `arguments` —
+            // the case the whole recursion was written for — never streams at
+            // all. The residue is a JSON-mode `content` on a streamed
+            // completion, where a value that is not inert can still reach the
+            // client mid-document — and "not inert" is wider than a `"`, since
+            // an apostrophe closes a string for a JSON5 reader just as well.
+            // Two other things sit near that path and
+            // neither closes it: the hold-back buffer is about placeholders and
+            // not documents, and the slot blanking in `stream::handle` is what
+            // routes delta text *away* from the escaping-aware `restore_value`
+            // in the first place.
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(&upstream, &pointer)?;
-                write_pointer(&mut restored, &pointer, &mapping.restore(&text)?)?;
+                write_pointer(
+                    &mut restored,
+                    &pointer,
+                    &mapping.restore_in_string_strictly(&text)?,
+                )?;
             }
             // Restored whole rather than leaf by leaf: nothing here has to
             // agree with a detector about positions, so the walk that already
             // knows how to replace placeholders inside a value does the job.
+            //
+            // **`read_document` and `write_document` are themselves a
+            // `parse → Value → to_string`, and it is this pair that handles
+            // `arguments`.** That is one frame above anything `restore_value`
+            // can see: the guards inside it are asked of the strings *within*
+            // the parsed document, so a described `arguments` — the field the
+            // finding was about — had its own round trip unguarded while a
+            // document nested one level deeper inside it was covered. Measured
+            // through the pair: an `amount` of
+            // `0.12345678901234567890123456789` came back
+            // `0.12345678901234568`, an integer past 64 bits came back in
+            // exponent form, and a duplicate `mode` was collapsed — the loss
+            // the round before this one existed to close, on the path it was
+            // named for.
             Slot::Json {
                 pointer, embedded, ..
             } => {
                 let document = read_document(&upstream, &pointer, embedded, provider.name())
                     .map_err(as_response_error)?;
                 let restored_document = mapping.restore_value(&document)?;
+                // Nothing to put back means nothing to write, and the upstream's
+                // own bytes are already in `restored` from the sweep. This is
+                // the same rule `restore_in_string_with` applies one level down
+                // and it is what keeps the guard below off ordinary traffic:
+                // most `arguments` carry no placeholder at all, and refusing
+                // one over a number nobody was going to rewrite would be a
+                // refusal bought for nothing.
+                if embedded && restored_document == document {
+                    let text = read_pointer(&upstream, &pointer)?;
+                    // **The comparison above is between two `Value`s, and a
+                    // `Value` is what `read_document`'s parse already lost
+                    // something to.** A placeholder in a member that parse
+                    // collapsed — `{"name":"[PERSON_1]","name":"fixed"}` — is
+                    // on neither side of it, so the skip concluded there was
+                    // nothing to restore and served the upstream's own bytes,
+                    // token and all, in a field the client executes. The sweep
+                    // had already left that string for the same duplicate, so
+                    // nothing downstream was going to catch it.
+                    //
+                    // So the skip is taken on the text's evidence, not the
+                    // document's, and only where it is entitled to be: a
+                    // faithful round trip means the parse hid nothing, and no
+                    // placeholder means there was nothing for it to hide.
+                    // Refusing needs both, which is what keeps this off the
+                    // ordinary case the skip was added for — most `arguments`
+                    // carry no token at all, and those still go back byte for
+                    // byte however their numbers are spelled.
+                    match mapping::round_trip_loses(&text) {
+                        Some(cause) if mapping::carries_a_placeholder(&text) => {
+                            return Err(MappingError::Unrestorable(cause).into());
+                        }
+                        _ => continue,
+                    }
+                }
+                // `write_document` is about to re-serialize, so the round trip
+                // has to be known to reproduce what `read_document` read. Only
+                // `embedded` asks it: without it there is no text at this
+                // pointer, the value is part of the body, and the body's own
+                // round trip is a wider question this slot cannot answer — see
+                // the note above `restore_sweep`'s call.
+                if embedded {
+                    let text = read_pointer(&upstream, &pointer)?;
+                    if let Some(cause) = mapping::round_trip_loses(&text) {
+                        return Err(MappingError::Unrestorable(cause).into());
+                    }
+                }
                 write_document(&mut restored, &pointer, &restored_document, embedded)?;
             }
         }
@@ -2335,14 +2543,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_and_a_citation_title_reach_the_client_restored() {
+        // Issue #31's two fields, asserted on what the CLIENT received.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "I cannot help with [PERSON_1]",
+                "annotations": [{"url_citation": {"title": "[PERSON_1] page"}}]
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains("[PERSON_1]"),
+            "a placeholder reached the client: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_colliding_key_costs_its_own_object_and_nothing_around_it() {
+        // The collision fallback used to be an off switch for the whole body:
+        // `restore_document` returned `None` from wherever it found the
+        // collision and the `?`s carried it to the top, so `restore_sweep`
+        // handed back the untouched response. An object with nothing to do
+        // with `refusal` put #31's exact symptom back, on a 200.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "I cannot help with [PERSON_1]",
+                // `[PERSON_1]` restores to `Weber`, which is already a key
+                // here. Restoring it would drop one of the two fields, so this
+                // object keeps the keys it came with — and only this object.
+                "meta": {"[PERSON_1]": "a", "Weber": "b"}
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        let message = &served["choices"][0]["message"];
+        assert_eq!(
+            message["refusal"], "I cannot help with Weber",
+            "one object's collision turned the sweep off for the whole body: {body}"
+        );
+        assert_eq!(
+            message["meta"],
+            json!({"[PERSON_1]": "a", "Weber": "b"}),
+            "the colliding object lost a field or was restored anyway: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_serialized_document_with_duplicate_members_reaches_the_client_intact() {
+        // The structural path parses the string it is restoring into, and a
+        // parse collapses two members of the same name before anything this
+        // gateway wrote gets to look at them. Re-serializing then hands the
+        // client a document with one `mode` where the upstream sent two — a
+        // payload forwarded byte for byte before the sweep existed, and a
+        // parser differential for any client whose reader keeps the *first*
+        // member rather than the last.
+        //
+        // `Martina "Weber"` carries a quote, so the restored value needs
+        // escaping and the structural path is the one taken. With a value
+        // needing none the textual path answers and the bytes survive anyway.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false}
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"[PERSON_1]\"}"
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Martina \"Weber\""}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["refusal"],
+            json!("{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"[PERSON_1]\"}"),
+            "the duplicate member was collapsed on the way through: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_nobody_issued_in_an_undescribed_field_is_served_not_refused() {
+        // Additivity, tested rather than asserted. "The suite stayed green"
+        // only covers what the suite already tests.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "ok",
+                "refusal": "invented [PERSON_9]"
+            }}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["refusal"],
+            "invented [PERSON_9]"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_providers_treat_an_undescribed_response_field_the_same_way() {
+        // The asymmetry is what made this bug: one provider was given a
+        // treatment the other was not, and nothing compared them. Every other
+        // test here names a field and a provider, so each catches its own
+        // instance; this one catches the class.
+        //
+        // One body, read twice. It carries both envelopes — OpenAI reads
+        // `choices` and Anthropic reads the top-level `content`, and neither
+        // looks at the other's — so the route is the only variable between the
+        // two calls, and a difference in what the client receives can only be
+        // a difference in how the provider was treated.
+        //
+        // `diagnostics` is described by neither. That is the whole shape of the
+        // hazard: not a field somebody forgot, but the field a provider adds
+        // tomorrow, which is how #31 arrived.
+        let detector = detector_returning(person_span()).await;
+        let upstream = MockServer::start().await;
+        let response = json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "content": [{"type": "text", "text": "ok", "citations": null}],
+            "diagnostics": {"note": "drafted for [PERSON_1]"}
+        });
+        for route in ["/v1/chat/completions", "/v1/messages"] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+                .mount(&upstream)
+                .await;
+        }
+        let state = state(&detector, &upstream);
+
+        let (openai_status, openai_body) = call(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+        let (anthropic_status, anthropic_body) = call(
+            Arc::clone(&state),
+            "/v1/messages",
+            json!({"model": "claude", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(openai_status, StatusCode::OK, "{openai_body}");
+        assert_eq!(anthropic_status, StatusCode::OK, "{anthropic_body}");
+        let openai: Value = serde_json::from_str(&openai_body).expect("a JSON body");
+        let anthropic: Value = serde_json::from_str(&anthropic_body).expect("a JSON body");
+        assert_eq!(
+            openai["diagnostics"], anthropic["diagnostics"],
+            "one provider was given a treatment the other was not: \
+             {openai_body} against {anthropic_body}"
+        );
+        // Asserted as well as compared: two providers agreeing that a
+        // placeholder goes to the client is the bug, not the fix.
+        assert_eq!(
+            openai["diagnostics"]["note"],
+            format!("drafted for {SECRET}"),
+            "the undescribed field was not restored for either provider: {openai_body}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_streamed_block_restores_the_fields_no_slot_addresses() {
-        // The streamed path does **not** have the gap the buffered one had, and
-        // this pins the reason rather than the absence. `proxy::serve` starts
-        // from the upstream body and writes only the slots, so an undescribed
-        // field travels verbatim; `stream::handle` restores the whole event and
-        // *then* rewrites the slots, so an undescribed field is restored like
-        // any other string. Same shape, opposite outcome: the `cited_text` that
+        // The streamed path never had the gap the buffered one had, and this
+        // pins the reason rather than the absence. `stream::handle` restores
+        // the whole event and *then* rewrites the slots, so an undescribed
+        // field is restored like any other string: the `cited_text` that
         // reaches the client here is `Weber`, not `[PERSON_1]`.
+        //
+        // `proxy::handle` used to start from the upstream body and write only
+        // the slots, which is why the same shape reached a buffered client
+        // verbatim. It now sweeps first, so the two paths agree on this case.
+        // They are not the same rule: the buffered sweep restores only what
+        // this request issued and the caller did not write, *except where
+        // restoring it would change something else the upstream sent* — an
+        // object whose restored keys would collide, or a serialized document
+        // the round trip that restores it would not reproduce — which is
+        // narrower than what a streamed event gets on every count. The clause
+        // belongs here like it belongs everywhere else the promise is written —
+        // a stream restores its event whole and has no exception, so stating
+        // the buffered rule
+        // without it understates the distance between the two paths this
+        // comment exists to draw.
+        //
+        // **The reason has changed and the conclusion has not, which is why it
+        // is restated rather than left.** This used to read "since neither
+        // `restore_document` nor `restore_in_string` is on its path", and both
+        // halves are now false: the escaping rule and the recursion moved into
+        // `restore_in_string_with`, which a streamed event *does* enter, via
+        // the `restore_value` that restores everything in it the slots do not
+        // address. What keeps the exceptions off this path is the token
+        // policy rather than the absence of the walk — `restore_value` is
+        // strict, so a document it cannot re-serialize faithfully raises
+        // `MappingError::Unrestorable` and the stream ends, exactly as an
+        // unmappable token already ends it. No exception, for a different
+        // reason than before — and the same answer however many causes the
+        // round trip turns out to have, which is the point of routing them all
+        // through one rule.
         //
         // So there is nothing to refuse here, which is just as well: a stream
         // cannot refuse after its first bytes have gone out — the position
@@ -2675,6 +3120,378 @@ mod tests {
             returned["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             r#"{"path":"/home/Weber"}"#,
             "the client executes this, so it has to be the real value"
+        );
+    }
+
+    /// A detector that finds the whole of `text` wherever it appears, so a test
+    /// can choose a value whose characters matter — one carrying a `"`, which
+    /// is what makes restoration into JSON *text* unsafe.
+    ///
+    /// Such a value is not exotic: the detector reads third-party content, and
+    /// a name, an address or a quoted line in it can carry a quote. The caller
+    /// never has to have written it.
+    async fn detector_finding_all_of(text: &str) -> MockServer {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        let end = text.chars().count();
+        // The body carries `text` JSON-escaped, so the mock matches on a
+        // fragment that survives escaping rather than on the value itself.
+        let fragment: String = text.chars().take_while(|c| *c != '"').collect();
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(body_string_contains(fragment))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "spans": [{"entity_type": "PERSON", "start": 0, "end": end,
+                           "confidence": 1.0, "recognizer": "ner:fake",
+                           "tier": 2, "boosted": false}],
+                "layers_run": ["ner"]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["ner"]})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_serialized_document_inside_arguments_is_restored_without_injecting_into_it() {
+        // The described path's half of the escaping rule. `arguments` is a
+        // string holding a document, so the slot loop parses it and restores
+        // its leaves — and a leaf that is *itself* a serialized document was
+        // restored as plain text, straight into JSON the client then parses
+        // and executes. A value carrying a quote closes the string it lands
+        // in, and everything after the quote becomes structure.
+        //
+        // The sweep already got this right and the slot loop overwrote its
+        // answer, which is why the bug survived the sweep landing.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": r#"{"nested":"{\"name\":\"[PERSON_1]\"}"}"#}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let returned: Value = serde_json::from_str(&body).expect("a JSON body");
+        let arguments = returned["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments reach the client as a string");
+        let arguments: Value =
+            serde_json::from_str(arguments).expect("the arguments the client executes still parse");
+        let nested = arguments["nested"]
+            .as_str()
+            .expect("the nested document is still a string");
+        let nested: Value = serde_json::from_str(nested)
+            .expect("the nested document the client parses is still JSON");
+        assert_eq!(
+            nested["name"], payload,
+            "the value belongs in the leaf it was substituted into: {nested}"
+        );
+        assert!(
+            nested.get("admin").is_none(),
+            "restoration wrote a field the upstream never sent: {nested}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_serialized_document_in_content_is_restored_without_injecting_into_it() {
+        // The same overwrite, one slot kind over. `content` is a text slot, so
+        // the loop used to restore it with plain `restore` — and under
+        // `response_format: json_object` a text slot is a document the client
+        // parses. The sweep had already restored it structurally; the loop
+        // overwrote that with the textual answer, exactly as it did for
+        // `arguments`.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant",
+                 "content": r#"{"name":"[PERSON_1]"}"#}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let returned: Value = serde_json::from_str(&body).expect("a JSON body");
+        let content = returned["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content reaches the client as a string");
+        let content: Value =
+            serde_json::from_str(content).expect("the document the client parses is still JSON");
+        assert_eq!(
+            content["name"], payload,
+            "the value belongs in the leaf it was substituted into: {content}"
+        );
+        assert!(
+            content.get("admin").is_none(),
+            "restoration wrote a field the upstream never sent: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_document_that_cannot_be_restored_faithfully_refuses_the_response() {
+        // The other half of the described path's answer, and the only place
+        // this fix can make something fail that used to succeed.
+        //
+        // The nested document carries two members of the same name, so the
+        // parse the escaping rule needs has already lost one before this
+        // gateway sees it. On the sweep that costs restoration and no bytes:
+        // `a_serialized_document_with_duplicate_members_reaches_the_client_intact`
+        // is that case, on `refusal`, and it still passes. Here the same
+        // document sits inside `arguments`, where leaving the bytes leaves the
+        // placeholder in a field the client dispatches on, and substituting
+        // anyway drops a member from a document it executes. So the response is
+        // refused, which is what this path already does with a token it cannot
+        // map.
+        //
+        // `Martina "Weber"` carries the quote that makes the restored value
+        // need escaping. Without it the textual path answers, the bytes survive
+        // and nothing refuses — which is why this is unreachable on the
+        // overwhelming majority of traffic.
+        let detector = detector_returning(json!([
+            {"entity_type": "PERSON", "start": 0, "end": 15, "confidence": 1.0,
+             "recognizer": "ner:fake", "tier": 2, "boosted": false}
+        ]))
+        .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f",
+             "arguments":
+                 r#"{"nested":"{\"mode\":\"safe\",\"mode\":\"admin\",\"name\":\"[PERSON_1]\"}"}"#
+            }}]}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Martina \"Weber\""}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !body.contains("[PERSON_1]"),
+            "the refusal handed back the placeholder it refused over: {body}"
+        );
+        assert!(
+            !body.contains("Weber"),
+            "the refusal named the value it was protecting: {body}"
+        );
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 2, "the request was masked, then refused");
+        assert_eq!(lines[1]["result"], "refused");
+        assert_eq!(
+            lines[1]["error"], "mapping_lossy_document",
+            "the journal has to name this failure as its own class: {:?}",
+            lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_the_round_trip_would_change_refuses_the_response() {
+        // The path the finding was actually about, which the guards missed for
+        // a round. `arguments` is read by `read_document` and written by
+        // `write_document`, and that pair is a `parse -> Value -> to_string` of
+        // its own, one frame above the strings `restore_value` walks. So the
+        // document *nested inside* `arguments` was covered and `arguments`
+        // itself was not.
+        //
+        // **The restored value here carries no quote, and that is the point.**
+        // The nested guard only runs once something needs escaping; this round
+        // trip happens whenever there is anything to restore at all, so the
+        // case is wider than the one it was hiding behind.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f",
+             "arguments":
+                 r#"{"amount":0.12345678901234567890123456789,"name":"[PERSON_1]"}"#
+            }}]}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !body.contains("0.12345678901234568"),
+            "the amount was rounded on the way to the client: {body}"
+        );
+        let lines = journal(&path);
+        assert_eq!(lines[1]["error"], "mapping_lossy_document");
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_hiding_its_placeholder_in_a_duplicate_refuses() {
+        // The skip above compares two `Value`s, and the parse that produced
+        // them keeps the last of two members with the same name. So the only
+        // placeholder in this document was on neither side of that comparison:
+        // the skip read "nothing to restore", served the upstream's own bytes,
+        // and `[PERSON_1]` went to a client that executes them. Measured at
+        // 200 OK before the fix, with the token in the served `arguments`.
+        //
+        // The sweep had already left the same string alone for the same
+        // duplicate, so nothing downstream was going to catch it.
+        let payload = r#"x","admin":true,"pad":""#;
+        let arguments = r#"{"name":"[PERSON_1]","name":"fixed"}"#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": arguments}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+
+        assert!(
+            !body.contains("PERSON_1"),
+            "a placeholder reached the client from a described field: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a document whose placeholder the parse hid was served anyway: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_with_duplicates_and_no_placeholder_keeps_its_own_bytes() {
+        // The other half, and the reason the refusal above asks two questions
+        // rather than one. Duplicate members are a loss this reader cannot
+        // undo, but a document with nothing of ours in it has nothing to
+        // restore and nothing to refuse over — it is forwarded exactly as the
+        // upstream wrote it, both members intact, as it was before any of this
+        // existed.
+        let arguments = r#"{"mode":"safe","mode":"admin"}"#;
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": arguments}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json!(arguments),
+            "a document nobody was restoring was refused or rewritten: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arguments_document_with_nothing_to_restore_keeps_its_own_bytes() {
+        // Additivity for the guard above, and a repair to what the pair did
+        // before it. `read_document` and `write_document` re-serialized
+        // `arguments` on every response that carried one, whether or not there
+        // was anything to put back — so a number too precise for a double was
+        // rounded on the way through with no placeholder in sight, and adding a
+        // guard without this would have turned that silent rounding into a 502
+        // bought for nothing.
+        //
+        // Nothing to restore means nothing to write, and the upstream's own
+        // bytes are already in the body from the sweep.
+        let arguments =
+            r#"{"amount":0.12345678901234567890123456789,"id":123456789012345678901234567890}"#;
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f",
+                 "arguments": arguments}}]}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let served: Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(
+            served["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            json!(arguments),
+            "a document nobody was restoring came back rewritten: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_this_reader_rejects_is_not_injected_into() {
+        // P1-B at the fourth fallback. An error envelope that this reader will
+        // not parse — `1e999` is valid JSON and every client reads it — took
+        // the text arm, where `restore` substitutes with no escaping rule and
+        // no structural retry. A mapped value carrying a `"` closed the string
+        // it landed in, in a body the client parses for its retry semantics.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(
+                r#"{"limit":1e999,"error":"[PERSON_1]"}"#.as_bytes().to_vec(),
+                "application/json",
+            ))
+            .mount(&upstream)
+            .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+
+        assert!(
+            !body.contains("\"admin\""),
+            "an error body was injected into: {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "the upstream's status is worth keeping, but not at the price of \
+             serving a body this gateway corrupted: {body}"
         );
     }
 
@@ -4541,6 +5358,145 @@ mod tests {
         assert!(
             second.contains("[PERSON_1]"),
             "the second turn renamed the same person: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number() {
+        // Why the sweep runs on the upstream body and not on the slot loop's
+        // result. Turn one's caller writes `[PERSON_3]` themselves inside a
+        // message the detector spans whole, so the session stores a *value*
+        // carrying that literal. `reserve_literals` maps it to itself for that
+        // one request and `absorb` does not carry the self-map, while `next`
+        // only ever climbs — so by turn three `[PERSON_3]` is free, and turn
+        // three issues it for `Braun`.
+        //
+        // Restoring `content` strictly puts turn one's stored value back,
+        // literal and all. A sweep over *that* would read the literal as a
+        // token this request issued and hand the client `Braun Weber`.
+        // Sweeping the untouched upstream body cannot: what the response
+        // carries is `[PERSON_1]`, which this request did not issue.
+        use wiremock::matchers::body_string_contains;
+        let detector = MockServer::start().await;
+        let span = |end: usize| {
+            json!({"spans": [{"entity_type": "PERSON", "start": 0, "end": end,
+                              "confidence": 1.0, "recognizer": "ner:fake",
+                              "tier": 2, "boosted": false}],
+                   "layers_run": ["deterministic"]})
+        };
+        for (text, end) in [("[PERSON_3] Weber", 16), ("Meier", 5), ("Braun", 5)] {
+            Mock::given(method("POST"))
+                .and(path("/detect"))
+                .and(body_string_contains(text))
+                .respond_with(ResponseTemplate::new(200).set_body_json(span(end)))
+                .mount(&detector)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "[PERSON_1]"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        let mut served = String::new();
+        for text in ["[PERSON_3] Weber", "Meier", "Braun"] {
+            let (status, body) = call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": [{"role": "user", "content": text}]}),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            served = body;
+        }
+
+        assert!(
+            served.contains("[PERSON_3] Weber"),
+            "the caller's own literal was overwritten: {served}"
+        );
+        assert!(
+            !served.contains("Braun"),
+            "a value this turn issued was restored into an earlier turn's text: {served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_writing_a_session_owned_literal_gets_its_own_text_back() {
+        // Turn one issues `[PERSON_1]` for `Weber` and the session keeps it.
+        // Turn two's caller writes that literal itself and the provider echoes
+        // it into two fields: `content`, which the slot loop describes, and
+        // `refusal`, which it does not.
+        //
+        // The two answers differ, and the difference is the point. `refusal` is
+        // reached only by the sweep, which asks `Provenance::restorable` —
+        // turn two issued nothing, so the token is not this request's to claim
+        // and the caller gets back the bytes it sent. `content` is reached by
+        // the slot loop, which restores strictly out of the session table and
+        // does not consult provenance at all, so it hands back turn one's
+        // value. #32 is what makes the two agree; until then this is the
+        // behaviour, asserted here rather than left to be discovered.
+        //
+        // **This is not the ordering pin**, though an earlier draft of the plan
+        // said it was: measured, it passes with the sweep on either side of the
+        // slot loop. A token inside a value masked from *this* request is
+        // necessarily also in this request's `written` set, so `restorable`
+        // excludes it whichever order runs. The hazard needs a value that
+        // entered the table in an earlier turn, and
+        // `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`
+        // above is the test that fails when the sweep moves.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "[PERSON_1]",
+                "refusal": "I cannot help with [PERSON_1]"
+            }}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        // Turn two names the placeholder itself and says nothing the detector
+        // finds, so this request issues nothing at all.
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "[PERSON_1] wer?"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+
+        let served: Value = serde_json::from_str(&second).expect("a JSON body");
+        let message = &served["choices"][0]["message"];
+        assert_eq!(
+            message["refusal"], "I cannot help with [PERSON_1]",
+            "the sweep claimed a token this request never issued: {second}"
+        );
+        assert_eq!(
+            message["content"], SECRET,
+            "the described field stopped restoring strictly out of the table: {second}"
         );
     }
 
@@ -6854,6 +7810,8 @@ mod tests {
             ProxyError::Mapping(MappingError::TooLarge).audit_class(),
             ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
             ProxyError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
+                .audit_class(),
+            ProxyError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
             ProxyError::Upstream("reset".to_owned()).audit_class(),
             ProxyError::Session(SessionError::BadId).audit_class(),
