@@ -18,6 +18,7 @@
 
 - **Spec:** `docs/superpowers/specs/2026-08-30-openai-response-path-design.md`. Read it before Task 1; every task below implements part of it.
 - **Additivity is the invariant of the whole plan.** Nothing that refuses today may stop refusing, and nothing that succeeds today may start failing. Any task that cannot hold this has found a design problem — report it rather than trading it away.
+  > **This half did not survive, and the plan was right to demand a report rather than a trade.** The loss handling that came out of review does make described fields refuse where plain substitution used to serve — those being the responses that were silently corrupted. The surviving half is "nothing that refuses today stops refusing". See the design document, which states the change and its price; this line is kept as what was asked for.
 - **The sweep never refuses.** Its restoration type is infallible. Strictness lives only in the existing slot path.
 - **Mutation standard:** break the invariant, run the **named** test, check *why* it failed, restore by inverse text substitution, record the output verbatim. Never `git checkout <file>` to restore a mutation — this repo lost a fix that way.
 - **Verification before any commit:** `cd gateway && cargo test --quiet && cargo fmt --check && touch src/*.rs && cargo clippy --all-targets -- -D warnings`

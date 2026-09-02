@@ -46,9 +46,20 @@ instance while leaving the policy that produced it.
 **Sweep the original body leniently. Then overwrite each described field with its
 strict slot restoration, computed from the same original.**
 
-The change is **purely additive**. Nothing that refuses today stops refusing;
-nothing that succeeds today starts failing. Coverage grows and nothing else
-moves.
+**The change was designed to be purely additive, and it is not.** That was the
+goal — coverage grows, nothing else moves — and it held for the sweep, which
+never refuses. It stopped holding for described fields once the loss handling
+below arrived: a `content` or an `arguments` whose round trip cannot reproduce
+what the upstream sent now raises `MappingError::Unrestorable` and returns 502,
+under the class `mapping_lossy_document`, where plain substitution used to serve
+it. Serving it was never correct — those are the responses that were being
+corrupted silently — but it is a behaviour change and calling it additive would
+license a reader to require the old outcome.
+
+What survives of the goal is narrower and worth keeping: **nothing that refuses
+today stops refusing**, and every new refusal is a response that was previously
+served altered. The costs are enumerated with the loss handling and priced
+again in `README.md`.
 
 ### Why that order, and why the obvious order is wrong twice
 
@@ -91,10 +102,17 @@ different route.
 
 One case additionally *cannot* be served by the sweep at all, and is why slots
 would be needed even if leniency were not a concern: **a string holding a
-document**, `tool_calls[].function.arguments`. `restore_value` on a string does a
-plain substitution, so a restored value containing a quote, a backslash or a
-newline breaks the JSON *text* it is substituted into. `embedded: true` parses,
+document**, `tool_calls[].function.arguments`. `embedded: true` parses,
 restores per leaf and re-serializes, and `write_document` escapes correctly.
+
+**This paragraph used to say `restore_value` on a string "does a plain
+substitution", and that was true of the design and false of the code by the time
+the recursion fix landed.** Its string arm is `restore_in_string_strictly`, which
+carries the whole escaping rule — inert values substituted, non-inert ones
+restored structurally or refused. Implementing the old sentence would put the
+quote and single-quote injections straight back, which is why it is replaced
+here rather than footnoted: a reader implements the definition, not the note
+under it.
 
 The error-body path and the streamed path are unchanged. Both already restore
 whole and neither gains nor loses anything here.
