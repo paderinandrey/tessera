@@ -179,3 +179,43 @@ def test_checksum_outer_keeps_its_identity_over_a_more_specific_inner() -> None:
     (kept,) = resolution.spans
     assert kept.entity_type == "IBAN"
     assert kept.recognizer == "catalog:iban"
+
+
+def test_a_third_span_that_loses_every_rule_does_not_change_which_checksum_wins() -> None:
+    # #39. `resolve` folds over conflicting pairs, so a merge can synthesise an
+    # outer that then wins by nesting — and the containment branch never asks
+    # about specificity when both sides carry a checksum.
+    #
+    # `ORG` loses to both on specificity and appears in neither output. Sorted,
+    # it comes first, so it merges with `CREDIT_CARD` and the union swallows the
+    # more specific `FR_NIR`. Eighty lost to forty because forty was merged
+    # first, and a French social security number was recorded as a payment card.
+    #
+    # The extent is asserted as well as the type: the union widening to cover
+    # the NER span is deliberate, and a test that checked only the type could
+    # not tell that apart from a replacement.
+    card = span(entity_type="CREDIT_CARD", start=45, end=66, recognizer="catalog:credit_card")
+    nir = span(entity_type="FR_NIR", start=45, end=66, recognizer="catalog:fr_nir")
+    org = span(
+        entity_type="ORG", start=41, end=66, confidence=0.9, recognizer="ner:gliner", tier=2
+    )
+
+    (alone,) = resolve([card, nir], specificity=SPEC).spans
+    assert (alone.entity_type, alone.start, alone.end) == ("FR_NIR", 45, 66)
+
+    (kept,) = resolve([card, nir, org], specificity=SPEC).spans
+    assert (kept.entity_type, kept.start, kept.end) == ("FR_NIR", 41, 66)
+
+
+def test_a_checksum_outer_keeps_its_type_over_a_less_specific_checksum_inner() -> None:
+    # The other side of the branch above, and it was missing: dropping the
+    # specificity comparison entirely left every test in this file passing, so
+    # nothing held that the new merge fires only when the inner *outranks* the
+    # outer. Without that, the more specific of two checksum readings would
+    # lose whenever it happened to be the outer one.
+    outer = span(entity_type="IBAN", start=0, end=27, recognizer="catalog:iban")
+    inner = span(entity_type="CREDIT_CARD", start=10, end=20, recognizer="catalog:credit_card")
+
+    (kept,) = resolve([outer, inner], specificity=SPEC).spans
+
+    assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 0, 27)

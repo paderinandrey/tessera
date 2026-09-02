@@ -8,9 +8,12 @@ Rules, in precedence order:
 3. Different types, strict containment: outer wins, with two exceptions. Per rule 1,
    an untouchable inner nested in a non-untouchable outer merges to the union bounds
    and keeps the more sensitive type, so the identifier keeps its identity in audit.
-   And a strictly more specific inner type does the same, unless the outer is itself
-   untouchable: an ORG reading of "la CGT" must not erase the trade-union reading of
-   "CGT", because the narrower type is what marks the span sensitive.
+   And a strictly more specific inner type does the same: an ORG reading of "la CGT"
+   must not erase the trade-union reading of "CGT", because the narrower type is what
+   marks the span sensitive. That holds whether or not the outer is untouchable — a
+   checksum outer is protected from a *less* specific inner, which says nothing about
+   one that outranks it, and an outer can be a span nobody found, since a merge
+   synthesises them (#39).
 4. Different types, partial overlap or equal range: higher specificity wins, then
    higher confidence; on a full tie the spans merge with the more sensitive type
    (lower tier).
@@ -109,6 +112,30 @@ def _resolve_pair(
             # whatever specificity a catalog assigns the inner type.
             if not untouchable(outer) and specificity.get(inner.entity_type, 0) > specificity.get(
                 outer.entity_type, 0
+            ):
+                return _union(outer, inner, take_type_from=inner), "specific-inner-merge"
+            # **Both** untouchable, and the inner is the more specific of the
+            # two. Rule 1 is why the inner's own checksum is required and not
+            # merely its specificity: a catalog IBAN is not replaced by a
+            # model's guess however high a catalog rates that guess's type.
+            # `test_checksum_outer_keeps_its_identity_over_a_more_specific_inner`
+            # holds that, and caught this branch written without the condition.
+            #
+            # The guard above excludes both cases to protect a checksum outer
+            # from a *less* specific inner, which is right and says nothing
+            # about an inner that outranks it.
+            #
+            # It matters because the outer here is often not a span anyone
+            # found: a merge can synthesise one. `ORG` overlapping a
+            # `CREDIT_CARD` produces a card-typed union that then contains an
+            # `FR_NIR` reading of the same digits, and without this branch the
+            # eighty loses to the forty for no reason but the order the pairs
+            # were folded in. See #39.
+            if (
+                untouchable(outer)
+                and untouchable(inner)
+                and specificity.get(inner.entity_type, 0)
+                > specificity.get(outer.entity_type, 0)
             ):
                 return _union(outer, inner, take_type_from=inner), "specific-inner-merge"
             return outer, "nesting-outer-wins"

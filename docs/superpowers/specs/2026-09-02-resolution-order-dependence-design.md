@@ -1,0 +1,124 @@
+# A checksum span with higher specificity must not lose to one it contains — design
+
+Closes #39.
+
+> One branch of one function, so the design and its test plan are one document
+> rather than two. Decisions were taken without the user in the room, on a
+> standing instruction; the one worth their attention is **how far this claims
+> to go**, in the last section.
+
+## The defect
+
+`resolve` folds over conflicting pairs: it finds the first overlapping pair by
+index, replaces the two with one, re-sorts, and repeats. A fold is
+order-dependent unless its operation is associative, and this one is not — so a
+span that appears in no output can still decide which of two others survives.
+
+Reproduced with three spans, no model and no text:
+
+```python
+cc  = Span("CREDIT_CARD", 45, 66, 1.0, "catalog:credit_card", tier=1)
+nir = Span("FR_NIR",      45, 66, 1.0, "catalog:fr_nir",      tier=1)
+org = Span("ORG",         41, 66, 0.9, "ner:gliner",          tier=2)
+
+resolve([cc, nir])        # -> FR_NIR[45:66]      rule: specificity
+resolve([cc, nir, org])   # -> CREDIT_CARD[41:66] rules: untouchable-inner-merge, nesting-outer-wins
+```
+
+Specificity is `FR_NIR` 80, `CREDIT_CARD` 40, `ORG` 10. The `ORG` span loses to
+both and appears in neither output, yet it changes which of the other two wins.
+
+**Why.** Sorted, `ORG` comes first, so the first conflicting pair is
+`(ORG, CREDIT_CARD)`. Rule 3's `untouchable-inner-merge` fires — the inner
+carries a checksum, the outer does not — and produces `CREDIT_CARD[41:66]`. That
+synthesised span now **strictly contains** `FR_NIR[45:66]`, and in the
+containment branch both are untouchable, so neither exception applies and
+`nesting-outer-wins` returns the outer. **Specificity is never consulted again.**
+Eighty loses to forty because forty was merged first.
+
+## The hole, stated exactly
+
+Rule 3 has two exceptions to *outer wins*, and both are guarded by
+`not untouchable(outer)`:
+
+- an untouchable inner inside a non-untouchable outer merges and keeps the
+  sensitive type;
+- a more specific inner inside a non-untouchable outer keeps its identity.
+
+So when the outer is **itself** untouchable, the inner's specificity is never
+asked. That is deliberate for the case the comment names — a checksum outer must
+not be replaced by a less specific inner — but it says nothing about an inner
+that is **more** specific and equally untouchable, which is this defect.
+
+## The change
+
+One branch. When both spans carry checksums and the inner's type is more
+specific, take the union and the inner's type — the same shape as the
+`specific-inner-merge` beside it, with the guard that excluded it removed for
+the case where the inner outranks the outer.
+
+Rule 1 is untouched: a checksum span still never loses to a non-checksum one,
+and the outer's extent still survives, so nothing shrinks and nothing that was
+masked stops being masked.
+
+## What it costs and what it buys
+
+**Nothing that refuses stops refusing, and no span narrows.** The union is the
+same union; only which of two checksum types names it changes, and it changes
+toward the one the catalog rates more specific.
+
+Measured end to end, on the input that surfaced it: `Le client Marty (NIR
+1 71 07 10 830 660 47)` behind a 24-character placeholder returns `FR_NIR`
+rather than `CREDIT_CARD`. A French social security number stops being recorded
+as a payment card.
+
+**Nothing was exposed before this and nothing is now.** Both types are Tier 1
+and both are masked; the defect is an evidence-layer error, not a leak. That is
+why it is a fix and not an incident.
+
+Across the 130-document public corpus the aggregate detection numbers do not
+move at all, because the corpus's other losses are NER instability to leading
+context and have nothing to do with this rule.
+
+## How far this claims to go **[decided]**
+
+**Not to confluence.** `resolve` remains a fold and remains order-dependent in
+general. Legitimately so, in part: a span can bridge two others, and removing it
+un-merges them, which is correct rather than a defect. A randomised search over
+twenty thousand small span sets, run against the fix, found three shapes where
+an absent span still changes the output — and reading them showed all three are
+bridges, not this bug.
+
+So the invariant "a span absent from the output cannot influence it" is **false
+by design** and must not be written as a test. What this fix closes is one named
+gap, with one named consequence. A confluent resolver is a larger question about
+five interacting rules, and if it is wanted it deserves its own slice rather
+than being smuggled in behind a one-branch fix.
+
+## Testing
+
+The regression test is the three synthetic spans above, asserting the type and
+the extent, because the extent is what tells a widening apart from a
+replacement. It needs no model and no corpus, which is what makes it a
+regression test rather than a corpus expectation.
+
+Three mutations, and the third found a missing test rather than confirming one.
+
+- **Remove the new branch** → the regression test fails with `CREDIT_CARD`.
+- **Drop the `untouchable(inner)` requirement** →
+  `test_checksum_outer_keeps_its_identity_over_a_more_specific_inner` fails. That
+  one is not hypothetical: this branch was written without the condition first,
+  and the existing suite caught it before any review did. Rule 1 is why the
+  inner's own checksum is required and not merely its specificity — a catalog
+  IBAN is not replaced by a model's guess however high a catalog rates the
+  guess's type.
+- **Drop the specificity comparison**, so the branch fires whenever both are
+  untouchable → **every test passed.** This design predicted the existing suite
+  would catch it and the prediction was wrong: nothing held that the merge fires
+  only when the inner *outranks* the outer, so the more specific of two checksum
+  readings would have lost whenever it happened to be the outer one. A test was
+  added and the mutation now kills it.
+
+The third is the one worth keeping in mind: a mutation that survives is not a
+weak mutation, it is a missing test, and this design asserted coverage it had
+not checked.
