@@ -219,3 +219,44 @@ def test_a_checksum_outer_keeps_its_type_over_a_less_specific_checksum_inner() -
     (kept,) = resolve([outer, inner], specificity=SPEC).spans
 
     assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 0, 27)
+
+
+def test_a_bridge_cannot_flip_the_type_when_two_checksums_tie_on_specificity() -> None:
+    # The same defect one level down, and the reason the fix is a comparison
+    # rather than a condition. A catalog may rate two checksum types equally;
+    # rule 4 then settles the pair by sensitivity, so the tier-1 IBAN wins.
+    #
+    # Nested, the containment branch used a strict specificity `>` and never
+    # reached that tie-break, so a broader ORG that sorts first could
+    # synthesise an FR_NIR outer and the answer flipped — a span in neither
+    # output deciding the reported type, exactly what this fix is for.
+    tie = {"IBAN": 80, "FR_NIR": 80, "ORG": 10}
+    iban = span(entity_type="IBAN", start=45, end=66, recognizer="catalog:iban", tier=1)
+    nir = span(entity_type="FR_NIR", start=45, end=66, recognizer="catalog:fr_nir", tier=2)
+    org = span(
+        entity_type="ORG", start=41, end=66, confidence=0.9, recognizer="ner:gliner", tier=3
+    )
+
+    (alone,) = resolve([iban, nir], specificity=tie).spans
+    assert alone.entity_type == "IBAN"
+
+    (kept,) = resolve([iban, nir, org], specificity=tie).spans
+    assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 41, 66)
+
+
+def test_confidence_settles_nested_untouchables_under_a_custom_predicate() -> None:
+    # The default predicate calls a span untouchable only at confidence 1.0, so
+    # two of them never differ and this step of the ordering is unreachable —
+    # which is why removing it left every test passing. `resolve` takes the
+    # predicate as a parameter, and a caller that admits lower confidences
+    # needs the same answer nested as unnested.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+    tie = {"IBAN": 80, "FR_NIR": 80}
+    outer = span(entity_type="FR_NIR", start=0, end=20, confidence=0.6, recognizer="catalog:a")
+    inner = span(entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="catalog:b")
+
+    (kept,) = resolve(
+        [outer, inner], specificity=tie, untouchable=catalog_backed
+    ).spans
+
+    assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 0, 20)

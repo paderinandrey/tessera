@@ -85,6 +85,25 @@ def _union(a: Span, b: Span, take_type_from: Span) -> Span:
     )
 
 
+def _outranks(challenger: Span, holder: Span, specificity: Mapping[str, int]) -> bool:
+    """Whether `challenger`'s reading should name the span instead of `holder`'s.
+
+    The ordering rule 4 applies to an unnested pair — specificity, then
+    confidence, then sensitivity — asked as one question so that the nesting
+    branch can reach the same verdict. It was a bespoke `>` on specificity
+    there, which meant two checksum types a catalog rates equally were settled
+    by sensitivity when they sat side by side and by *which one a merge
+    happened to widen* when one contained the other.
+    """
+    challenger_specificity = specificity.get(challenger.entity_type, 0)
+    holder_specificity = specificity.get(holder.entity_type, 0)
+    if challenger_specificity != holder_specificity:
+        return challenger_specificity > holder_specificity
+    if challenger.confidence != holder.confidence:
+        return challenger.confidence > holder.confidence
+    return challenger.tier < holder.tier
+
+
 def _resolve_pair(
     a: Span,
     b: Span,
@@ -122,8 +141,12 @@ def _resolve_pair(
             # holds that, and caught this branch written without the condition.
             #
             # The guard above excludes both cases to protect a checksum outer
-            # from a *less* specific inner, which is right and says nothing
-            # about an inner that outranks it.
+            # from an inner that does *not* outrank it, which is right and says
+            # nothing about one that does. `_outranks` is the same ordering
+            # rule 4 uses on an unnested pair, so nesting no longer changes the
+            # verdict — a bespoke `>` on specificity alone left two equally
+            # rated checksum types being settled by which one a merge happened
+            # to widen.
             #
             # It matters because the outer here is often not a span anyone
             # found: a merge can synthesise one. `ORG` overlapping a
@@ -131,12 +154,7 @@ def _resolve_pair(
             # `FR_NIR` reading of the same digits, and without this branch the
             # eighty loses to the forty for no reason but the order the pairs
             # were folded in. See #39.
-            if (
-                untouchable(outer)
-                and untouchable(inner)
-                and specificity.get(inner.entity_type, 0)
-                > specificity.get(outer.entity_type, 0)
-            ):
+            if untouchable(outer) and untouchable(inner) and _outranks(inner, outer, specificity):
                 return _union(outer, inner, take_type_from=inner), "specific-inner-merge"
             return outer, "nesting-outer-wins"
 

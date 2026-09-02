@@ -52,10 +52,23 @@ that is **more** specific and equally untouchable, which is this defect.
 
 ## The change
 
-One branch. When both spans carry checksums and the inner's type is more
-specific, take the union and the inner's type — the same shape as the
-`specific-inner-merge` beside it, with the guard that excluded it removed for
-the case where the inner outranks the outer.
+One branch, and the condition in it is a **comparison rather than a test**.
+
+The first draft asked whether the inner's specificity was strictly greater. That
+closes the reported case and leaves the same defect one level down: a catalog may
+rate two checksum types equally, and rule 4 then settles them by sensitivity — so
+side by side a tier-1 `IBAN` beats a tier-2 `FR_NIR`, while nested the strict `>`
+was false and the outer won, whichever one a merge happened to widen. A bridge
+span still flipped the answer.
+
+So the branch defers to `_outranks`, which is the ordering rule 4 already applies
+to an unnested pair: specificity, then confidence, then sensitivity. **Nesting
+should not change the verdict**, and stating it that way is what makes the fix
+about the principle rather than about the case.
+
+Both spans must carry checksums. Rule 1 is untouched: a checksum span still never
+loses to a non-checksum one, and the outer's extent still survives, so nothing
+shrinks and nothing that was masked stops being masked.
 
 Rule 1 is untouched: a checksum span still never loses to a non-checksum one,
 and the outer's extent still survives, so nothing shrinks and nothing that was
@@ -119,6 +132,20 @@ Three mutations, and the third found a missing test rather than confirming one.
   readings would have lost whenever it happened to be the outer one. A test was
   added and the mutation now kills it.
 
-The third is the one worth keeping in mind: a mutation that survives is not a
-weak mutation, it is a missing test, and this design asserted coverage it had
-not checked.
+Two more after review found the same thing twice.
+
+- **Drop the tier step from `_outranks`** →
+  `test_a_bridge_cannot_flip_the_type_when_two_checksums_tie_on_specificity`
+  fails. That test is the review finding, reproduced before the fix.
+- **Drop the confidence step** → **every test passed again.** The reason is
+  worth recording: the default predicate calls a span untouchable only at
+  confidence 1.0, so two untouchable spans never differ on it and the step is
+  unreachable through `build_detector`. It exists for a caller supplying its own
+  `untouchable`, which `resolve` takes as a parameter — so the test that pins it
+  supplies one, and the mutation now kills it.
+
+**A mutation that survives is a missing test, not a weak mutation.** It happened
+three times in this fix: once where the design predicted coverage that did not
+exist, once where a review found the gap first, and once where a step was
+reachable only through a parameter nothing exercised. Each time the answer was a
+test, never a smaller claim.
