@@ -8,9 +8,12 @@ Rules, in precedence order:
 3. Different types, strict containment: outer wins, with two exceptions. Per rule 1,
    an untouchable inner nested in a non-untouchable outer merges to the union bounds
    and keeps the more sensitive type, so the identifier keeps its identity in audit.
-   And a strictly more specific inner type does the same, unless the outer is itself
-   untouchable: an ORG reading of "la CGT" must not erase the trade-union reading of
-   "CGT", because the narrower type is what marks the span sensitive.
+   And a strictly more specific inner type does the same: an ORG reading of "la CGT"
+   must not erase the trade-union reading of "CGT", because the narrower type is what
+   marks the span sensitive. That holds whether or not the outer is untouchable — a
+   checksum outer is protected from a *less* specific inner, which says nothing about
+   one that outranks it, and an outer can be a span nobody found, since a merge
+   synthesises them (#39).
 4. Different types, partial overlap or equal range: higher specificity wins, then
    higher confidence; on a full tie the spans merge with the more sensitive type
    (lower tier).
@@ -70,16 +73,72 @@ def _more_sensitive(a: Span, b: Span) -> Span:
     return a
 
 
-def _union(a: Span, b: Span, take_type_from: Span) -> Span:
+def _union(
+    a: Span,
+    b: Span,
+    take_type_from: Span,
+    *,
+    confidence: float | None = None,
+    boosted: bool | None = None,
+) -> Span:
+    """The two spans' extent, under the surviving reading's identity.
+
+    **Confidence comes from the reading that survived**, not from whichever
+    input happened to be surer of itself. It was `max` of the two, so a merge
+    could hand its output a number belonging to a span that is not in it — and
+    `_outranks` then compared a later span against that borrowed number, letting
+    a bridge decide the reported type by proxy after it had been dropped. Every
+    other field already comes from `take_type_from`; this one was the exception.
+
+    `boosted` travels with it, for the same reason and one field over: it says
+    *this* confidence was raised by surrounding context, so inheriting it from a
+    dropped reading produces a record the deterministic layer cannot emit —
+    a boost never applies at 1.0, and a merge could report `confidence=1.0,
+    boosted=True`.
+
+    **Rule 2 passes both explicitly, and the difference is not an
+    exception to that argument but the other side of it.** A same-type merge
+    joins two readings that *agree*, so the number is evidence about one
+    conclusion and the maximum is the documented answer. Its winner is chosen by
+    untouchability before confidence, so under a custom predicate a 0.6 catalog
+    reading can take the identity from a 0.9 model reading of the same type —
+    and taking the winner's number there would lower a value rule 2 promises is
+    the maximum. Everywhere else the losing reading is *gone*, and its
+    confidence goes with it.
+    """
     return Span(
         entity_type=take_type_from.entity_type,
         start=min(a.start, b.start),
         end=max(a.end, b.end),
-        confidence=max(a.confidence, b.confidence),
+        confidence=take_type_from.confidence if confidence is None else confidence,
         recognizer=take_type_from.recognizer,
         tier=take_type_from.tier,
-        boosted=a.boosted or b.boosted,
+        boosted=take_type_from.boosted if boosted is None else boosted,
     )
+
+
+def _outranks(challenger: Span, holder: Span, specificity: Mapping[str, int]) -> str | None:
+    """Which discriminator makes `challenger`'s reading name the span, or `None`.
+
+    The name is returned rather than a bare `True` because `Resolution.trace` is
+    the decision-evidence interface: a merge decided by sensitivity that reports
+    `specific-inner-merge` is a false explanation of a correct answer, and the
+    sandbox reads these.
+
+    The ordering rule 4 applies to an unnested pair — specificity, then
+    confidence, then sensitivity — asked as one question so that the nesting
+    branch can reach the same verdict. It was a bespoke `>` on specificity
+    there, which meant two checksum types a catalog rates equally were settled
+    by sensitivity when they sat side by side and by *which one a merge
+    happened to widen* when one contained the other.
+    """
+    challenger_specificity = specificity.get(challenger.entity_type, 0)
+    holder_specificity = specificity.get(holder.entity_type, 0)
+    if challenger_specificity != holder_specificity:
+        return "specificity" if challenger_specificity > holder_specificity else None
+    if challenger.confidence != holder.confidence:
+        return "confidence" if challenger.confidence > holder.confidence else None
+    return "sensitivity" if challenger.tier < holder.tier else None
 
 
 def _resolve_pair(
@@ -94,7 +153,20 @@ def _resolve_pair(
             winner = a if untouchable(a) else b
         else:
             winner = a if a.confidence >= b.confidence else b
-        return _union(a, b, take_type_from=winner), "same-type-merge"
+        # The maximum confidence and the boost that produced it travel
+        # together: `boosted` says *this* number was raised by context, so
+        # taking it from anywhere but the reading that supplied the number
+        # makes the record disagree with itself. An `or` across both was right
+        # by accident when the maximum came from the boosted side and wrong
+        # when it did not.
+        surest = a if a.confidence >= b.confidence else b
+        return _union(
+            a,
+            b,
+            take_type_from=winner,
+            confidence=surest.confidence,
+            boosted=surest.boosted,
+        ), "same-type-merge"
 
     for outer, inner in ((a, b), (b, a)):
         if _strictly_contains(outer, inner):
@@ -111,6 +183,33 @@ def _resolve_pair(
                 outer.entity_type, 0
             ):
                 return _union(outer, inner, take_type_from=inner), "specific-inner-merge"
+            # **Both** untouchable, and the inner is the more specific of the
+            # two. Rule 1 is why the inner's own checksum is required and not
+            # merely its specificity: a catalog IBAN is not replaced by a
+            # model's guess however high a catalog rates that guess's type.
+            # `test_checksum_outer_keeps_its_identity_over_a_more_specific_inner`
+            # holds that, and caught this branch written without the condition.
+            #
+            # The guard above excludes both cases to protect a checksum outer
+            # from an inner that does *not* outrank it, which is right and says
+            # nothing about one that does. `_outranks` is the same ordering
+            # rule 4 uses on an unnested pair, so nesting no longer changes the
+            # verdict — a bespoke `>` on specificity alone left two equally
+            # rated checksum types being settled by which one a merge happened
+            # to widen.
+            #
+            # It matters because the outer here is often not a span anyone
+            # found: a merge can synthesise one. `ORG` overlapping a
+            # `CREDIT_CARD` produces a card-typed union that then contains an
+            # `FR_NIR` reading of the same digits, and without this branch the
+            # eighty loses to the forty for no reason but the order the pairs
+            # were folded in. See #39.
+            if untouchable(outer) and untouchable(inner):
+                discriminator = _outranks(inner, outer, specificity)
+                if discriminator is not None:
+                    return _union(outer, inner, take_type_from=inner), (
+                        f"nested-{discriminator}-merge"
+                    )
             return outer, "nesting-outer-wins"
 
     # Rule 1 precedes rule 4: a lone checksum span never loses to a non-checksum one.

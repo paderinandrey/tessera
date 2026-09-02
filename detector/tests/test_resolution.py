@@ -179,3 +179,190 @@ def test_checksum_outer_keeps_its_identity_over_a_more_specific_inner() -> None:
     (kept,) = resolution.spans
     assert kept.entity_type == "IBAN"
     assert kept.recognizer == "catalog:iban"
+
+
+def test_a_third_span_that_loses_every_rule_does_not_change_which_checksum_wins() -> None:
+    # #39. `resolve` folds over conflicting pairs, so a merge can synthesise an
+    # outer that then wins by nesting — and the containment branch never asks
+    # about specificity when both sides carry a checksum.
+    #
+    # `ORG` loses to both on specificity and appears in neither output. Sorted,
+    # it comes first, so it merges with `CREDIT_CARD` and the union swallows the
+    # more specific `FR_NIR`. Eighty lost to forty because forty was merged
+    # first, and a French social security number was recorded as a payment card.
+    #
+    # The extent is asserted as well as the type: the union widening to cover
+    # the NER span is deliberate, and a test that checked only the type could
+    # not tell that apart from a replacement.
+    card = span(entity_type="CREDIT_CARD", start=45, end=66, recognizer="catalog:credit_card")
+    nir = span(entity_type="FR_NIR", start=45, end=66, recognizer="catalog:fr_nir")
+    org = span(
+        entity_type="ORG", start=41, end=66, confidence=0.9, recognizer="ner:gliner", tier=2
+    )
+
+    (alone,) = resolve([card, nir], specificity=SPEC).spans
+    assert (alone.entity_type, alone.start, alone.end) == ("FR_NIR", 45, 66)
+
+    (kept,) = resolve([card, nir, org], specificity=SPEC).spans
+    assert (kept.entity_type, kept.start, kept.end) == ("FR_NIR", 41, 66)
+
+
+def test_a_checksum_outer_keeps_its_type_over_a_less_specific_checksum_inner() -> None:
+    # The other side of the branch above, and it was missing: dropping the
+    # specificity comparison entirely left every test in this file passing, so
+    # nothing held that the new merge fires only when the inner *outranks* the
+    # outer. Without that, the more specific of two checksum readings would
+    # lose whenever it happened to be the outer one.
+    outer = span(entity_type="IBAN", start=0, end=27, recognizer="catalog:iban")
+    inner = span(entity_type="CREDIT_CARD", start=10, end=20, recognizer="catalog:credit_card")
+
+    (kept,) = resolve([outer, inner], specificity=SPEC).spans
+
+    assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 0, 27)
+
+
+def test_a_bridge_cannot_flip_the_type_when_two_checksums_tie_on_specificity() -> None:
+    # The same defect one level down, and the reason the fix is a comparison
+    # rather than a condition. A catalog may rate two checksum types equally;
+    # rule 4 then settles the pair by sensitivity, so the tier-1 IBAN wins.
+    #
+    # Nested, the containment branch used a strict specificity `>` and never
+    # reached that tie-break, so a broader ORG that sorts first could
+    # synthesise an FR_NIR outer and the answer flipped — a span in neither
+    # output deciding the reported type, exactly what this fix is for.
+    tie = {"IBAN": 80, "FR_NIR": 80, "ORG": 10}
+    iban = span(entity_type="IBAN", start=45, end=66, recognizer="catalog:iban", tier=1)
+    nir = span(entity_type="FR_NIR", start=45, end=66, recognizer="catalog:fr_nir", tier=2)
+    org = span(
+        entity_type="ORG", start=41, end=66, confidence=0.9, recognizer="ner:gliner", tier=3
+    )
+
+    (alone,) = resolve([iban, nir], specificity=tie).spans
+    assert alone.entity_type == "IBAN"
+
+    (kept,) = resolve([iban, nir, org], specificity=tie).spans
+    assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 41, 66)
+
+
+def test_confidence_settles_nested_untouchables_under_a_custom_predicate() -> None:
+    # The default predicate calls a span untouchable only at confidence 1.0, so
+    # two of them never differ and this step of the ordering is unreachable —
+    # which is why removing it left every test passing. `resolve` takes the
+    # predicate as a parameter, and a caller that admits lower confidences
+    # needs the same answer nested as unnested.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+    tie = {"IBAN": 80, "FR_NIR": 80}
+    outer = span(entity_type="FR_NIR", start=0, end=20, confidence=0.6, recognizer="catalog:a")
+    inner = span(entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="catalog:b")
+
+    (kept,) = resolve(
+        [outer, inner], specificity=tie, untouchable=catalog_backed
+    ).spans
+
+    assert (kept.entity_type, kept.start, kept.end) == ("IBAN", 0, 20)
+
+
+def test_a_bridge_cannot_lend_its_confidence_to_the_span_that_replaces_it() -> None:
+    # The third layer of the same defect. `_union` took `max` confidence, so a
+    # merge handed its output a number belonging to the span it dropped — and
+    # `_outranks` then compared the next span against that borrowed number.
+    # The bridge lost every rule, was in no output, and still chose the type.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+    tie = {"AAA": 80, "BBB": 80, "ORG": 10}
+    weaker = span(entity_type="AAA", start=5, end=15, confidence=0.6, recognizer="catalog:a")
+    stronger = span(entity_type="BBB", start=5, end=15, confidence=0.8, recognizer="catalog:b")
+    bridge = span(
+        entity_type="ORG", start=0, end=15, confidence=0.9, recognizer="ner:gliner", tier=3
+    )
+
+    (alone,) = resolve([weaker, stronger], specificity=tie, untouchable=catalog_backed).spans
+    assert alone.entity_type == "BBB"
+
+    (kept,) = resolve(
+        [weaker, stronger, bridge], specificity=tie, untouchable=catalog_backed
+    ).spans
+    assert (kept.entity_type, kept.start, kept.end) == ("BBB", 0, 15)
+
+
+def test_the_trace_names_the_discriminator_that_actually_decided() -> None:
+    # `Resolution.trace` is the decision-evidence interface and the sandbox
+    # reads it. A merge settled by sensitivity that reports `specific-inner-merge`
+    # is a false explanation of a correct answer.
+    tie = {"IBAN": 80, "FR_NIR": 80}
+    outer = span(entity_type="FR_NIR", start=0, end=20, recognizer="catalog:fr_nir", tier=2)
+    inner = span(entity_type="IBAN", start=5, end=15, recognizer="catalog:iban", tier=1)
+
+    (decision,) = resolve([outer, inner], specificity=tie).trace
+
+    assert decision.rule == "nested-sensitivity-merge"
+    assert decision.kept.entity_type == "IBAN"
+
+
+def test_a_same_type_merge_keeps_the_more_confident_reading_under_a_custom_predicate() -> None:
+    # Rule 2 promises max confidence, and it picks its winner by untouchability
+    # first — so a custom predicate can make a 0.6 catalog span win the identity
+    # over a 0.9 model span of the same type. Taking the winner's confidence
+    # there lowers a number the documented rule says is the maximum.
+    #
+    # Different-type merges are the opposite case: the confidence belongs to the
+    # reading that survived, because the other reading is gone. Same type means
+    # both readings agree, and the merge is of evidence rather than between it.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+    quiet = span(entity_type="IBAN", start=0, end=10, confidence=0.6, recognizer="catalog:a")
+    loud = span(entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="ner:gliner")
+
+    (kept,) = resolve([quiet, loud], specificity=SPEC, untouchable=catalog_backed).spans
+
+    assert kept.recognizer == "catalog:a", "the untouchable reading lost its identity"
+    assert kept.confidence == 0.9, "a same-type merge lowered the confidence"
+    assert (kept.start, kept.end) == (0, 15)
+
+
+def test_a_merge_does_not_inherit_a_boost_from_the_reading_it_dropped() -> None:
+    # The same shape as the borrowed confidence, one field over, and it was left
+    # behind when that one was fixed: `boosted` is still an `or` across both
+    # inputs, so a merged span can report that its confidence was raised by
+    # context when the boost belonged to the reading that lost.
+    #
+    # It produces a record the deterministic layer cannot: a boost never applies
+    # at confidence 1.0 — "a boost must never fabricate checksum status" — so
+    # `confidence=1.0, boosted=True` is a combination no catalog rule emits.
+    boosted_outer = span(
+        entity_type="ORG", start=0, end=20, confidence=0.85, recognizer="catalog:org", boosted=True
+    )
+    checksum_inner = span(
+        entity_type="IBAN", start=5, end=15, confidence=1.0, recognizer="catalog:iban", tier=1
+    )
+
+    (kept,) = resolve([boosted_outer, checksum_inner], specificity=SPEC).spans
+
+    assert (kept.entity_type, kept.confidence) == ("IBAN", 1.0)
+    assert not kept.boosted, "a merged span claimed a boost belonging to the reading it dropped"
+
+
+def test_a_same_type_merge_reports_the_boost_belonging_to_the_confidence_it_took() -> None:
+    # Rule 2 takes the maximum confidence, so the boost flag has to be the one
+    # attached to *that* number. `or` across both inputs was right by accident
+    # in one direction and wrong in the other: a merge whose maximum came from
+    # an unboosted reading would still have claimed a boost.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+
+    # The winner takes the identity by untouchability, and the maximum comes
+    # from the reading it beat — which was boosted, so the record must say so.
+    quiet = span(entity_type="IBAN", start=0, end=10, confidence=0.6, recognizer="catalog:a")
+    loud = span(
+        entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="ner:g", boosted=True
+    )
+    (kept,) = resolve([quiet, loud], specificity=SPEC, untouchable=catalog_backed).spans
+    assert (kept.confidence, kept.boosted) == (0.9, True)
+
+    # The other direction, which `or` got wrong: the winner is boosted at 0.85
+    # and the maximum comes from an unboosted 0.9.
+    boosted_winner = span(
+        entity_type="IBAN", start=0, end=10, confidence=0.85, recognizer="catalog:a", boosted=True
+    )
+    plain = span(entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="ner:g")
+    (kept,) = resolve(
+        [boosted_winner, plain], specificity=SPEC, untouchable=catalog_backed
+    ).spans
+    assert (kept.confidence, kept.boosted) == (0.9, False)
