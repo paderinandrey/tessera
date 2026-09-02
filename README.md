@@ -293,7 +293,7 @@ bracket, `- [x] [PERSON_1] said "hi"` among it. The list is open on purpose; the
 holds. These are still places a placeholder can reach the client from.
 
 That last case is reached only when the value being restored carries a character that could
-delimit something in a JSON-family dialect — a quote of either kind, a backtick, a backslash, a control
+end the string it lands in, or start an escape inside it — a quote of either kind, a backtick, a backslash, a control
 character, a slash. Names, addresses, e-mails, IBANs and phone numbers do not, and take the
 plain path untouched; `O'Brien` does, and so does a `Steuernummer` spelled `21/815/08150`.
 Neither loses anything inside a document that parses, where the restoration is structural and

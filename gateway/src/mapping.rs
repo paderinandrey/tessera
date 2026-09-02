@@ -1136,10 +1136,18 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// The same inversion `structure_encloses_a_token` went through, for the same
 /// reason.
 ///
-/// So nothing is admitted that could be a delimiter in any dialect **of the
-/// JSON family** — `'` and a backtick are out along with `"` — and nothing
-/// whose meaning depends on a parser. `/` is out too, and it is the one whose
-/// cost was
+/// **The property is about strings, not about delimiters**, and saying it the
+/// other way was wrong twice. A value lands *inside* a quoted string, so what
+/// matters is only whether a character can end that string, start an escape in
+/// it, or be one the format forbids there raw — `"`, `'`, a backtick, `\`, the
+/// control characters. `,` and `:` delimit in plain JSON and are admitted here
+/// precisely because a comma inside a string is a comma: they cannot reach the
+/// structure around them. The first draft claimed the list held no delimiter in
+/// any dialect at all; the second narrowed that to the JSON family and was
+/// still false, since JSON's own delimiters are on it. The claim to keep is the
+/// one the opening line makes.
+///
+/// `/` is out, and it is the one whose cost was
 /// measured rather than assumed: a German `Steuernummer` is spelled
 /// `21/815/08150` and e-mail local parts may carry a slash, so this was not
 /// free. It turned out to be nearly so, because a slash-bearing identifier
@@ -1162,15 +1170,12 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// removing it makes evaluation safe. A client that evals model output has a
 /// larger problem than this function.
 ///
-/// **The same boundary excludes YAML, and saying so is the honest form of the
-/// claim.** `:`, `@`, `?` and `!` are all indicators there, and every one of
-/// them is on this list — `:` is in every timestamp, `@` in every e-mail
-/// address. Taking them off to cover a reader nobody in this path has would
-/// leave an allowlist that refuses the values this gateway exists to restore,
-/// which is the trade the measurement below the slash exists to prevent.
-/// **"A delimiter in any dialect at all" was the first draft of this sentence,
-/// and it was not true when written** — a claim about every format there is
-/// cannot be kept, and the family this gateway actually speaks can.
+/// **YAML is outside for the same reason as evaluation.** It has no quoted
+/// string to stay inside: a bare scalar is a value there, so `:`, `@`, `?` and
+/// `!` act on the structure directly, and every one of them is on this list —
+/// `:` is in every timestamp, `@` in every e-mail address. Covering a reader
+/// nobody in this path has would leave an allowlist that refuses the values
+/// this gateway exists to restore.
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
