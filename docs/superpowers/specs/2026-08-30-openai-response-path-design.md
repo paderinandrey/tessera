@@ -141,8 +141,20 @@ the surrounding string is, and the document's formatting is preserved exactly.
 **A value that does need escaping, into a string that parses as JSON, forces
 structural restoration** — parsed, restored leaf by leaf, re-serialized, the
 `embedded: true` handling a described document already gets. Reformatting is the
-price of not corrupting, and it is paid only in that case. Into a string that is
-*not* JSON there is no structure to break, so the substitution stands.
+price of not corrupting, and it is paid only in that case.
+
+**"Into a string that is not JSON there is no structure to break" was the next
+sentence here, and it is the mistake this design was most wrong about.** Not
+JSON *to this reader* is not the same as not JSON, and the branch where those
+two differ is exactly where an unescaped substitution is dangerous: a byte order
+mark, a comment, a single-quoted key or a trailing comma each produce a text
+`serde_json` refuses and a client's parser accepts. Nine readings of that
+question are recorded below; what stands is `structure_encloses_a_token`, which
+asks whether a `{` or `[` was opened before the token and nothing else.
+
+**Nor is "needs escaping" the character set this section began with.** `"`, `\`
+and the control characters were a blocklist, and a value of single quotes walked
+past it into a JSON5 document. The test is an allowlist now.
 
 **"Parses as JSON" means any JSON value, not only an object or an array.** An
 undescribed field may carry the serialized scalar `"[PERSON_1]"`, which is a

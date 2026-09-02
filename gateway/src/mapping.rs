@@ -562,17 +562,29 @@ impl Mapping {
     /// The escaping rule both paths share, and the reason it is one function.
     ///
     /// **The rule is about the inserted value first and the string's shape
-    /// second, and in that order it is exact.** Substituting into JSON *text*
-    /// is byte-safe precisely when the value carries no `"`, no `\` and no
-    /// control character: without a quote the string cannot be closed, and a
-    /// comma or a brace inside a JSON string is an ordinary character. So a
-    /// value needing no escaping is substituted whatever it sits in, and the
-    /// document's formatting survives byte for byte.
+    /// second.** Substituting into text is byte-safe when every character of
+    /// the value is inert — when none of them can end the string it lands in,
+    /// start an escape inside it, or be forbidden there raw. A comma or a brace
+    /// inside a string is an ordinary character and always was. So a value that
+    /// is wholly inert is substituted whatever it sits in, and the document's
+    /// formatting survives byte for byte.
     ///
-    /// A value that *does* need escaping, into a string that parses as JSON,
-    /// forces parse-and-re-serialize. Reformatting is the price of not
-    /// corrupting and is paid only there. Into a string that is not JSON there
-    /// is no structure to break.
+    /// **This paragraph said `"`, `\` and the control characters for most of
+    /// this branch's life, and that was a blocklist**: a value of
+    /// `x','admin':true,'pad':'y` passed it and turned `{'name':'[PERSON_1]'}`
+    /// into a JSON5 object carrying a member the upstream never sent. The test
+    /// is `json_string_inert` now and it is an allowlist, so an omission costs
+    /// a restoration instead of admitting an injection. The old sentence
+    /// survived the change by four commits, which is the argument for stating
+    /// the property rather than the character set.
+    ///
+    /// A value that is *not* inert, into a string that parses as JSON, forces
+    /// parse-and-re-serialize. Reformatting is the price of not corrupting and
+    /// is paid only there. Into a string that does not parse, the question is
+    /// no longer "then there is no structure to break" — that was the other
+    /// half of the same mistake, since a text this reader refuses may be a
+    /// document to the client's. `structure_encloses_a_token` answers it
+    /// instead, by asking whether a container was opened before the token.
     ///
     /// **That price was argued for the sweep and is now paid in described
     /// fields too, which is worth stating in the terms a client sees.** A
