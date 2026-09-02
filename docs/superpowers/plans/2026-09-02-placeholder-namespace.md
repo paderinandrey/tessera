@@ -82,6 +82,13 @@ def run(detector, text):
 
 def main():
     detector = build_detector()
+    # Without weights `build_detector` returns a deterministic-only detector,
+    # and this measurement would report "not worse" without ever exercising
+    # the layer most likely to react to a changed token shape. A gate that
+    # cannot fail is not a gate.
+    if not getattr(detector, "ner_available", False):
+        print("NER is not provisioned; this measurement cannot gate", file=sys.stderr)
+        return 2
     rows = []
     for name, text in documents():
         base = run(detector, text)
@@ -138,12 +145,22 @@ Run: `uv run --project detector python evaluation/placeholder_shape.py`
 
 Record the printed JSON verbatim in the task report. Then run the existing gate to confirm nothing else moved:
 
-Run: `uv run --project detector python evaluation/evaluate.py`
+Run: `uv run --project detector python evaluation/evaluate.py --require-ner`
 Expected: PASS, same as on `main`.
+
+**`--require-ner` is not optional here.** Without it `evaluate.py` skips its NER
+gates and still exits zero, so the follow-up check would agree with a
+measurement that never ran. Both commands need the `ner` dependency group
+synced and the pinned weights present: `make model`, then
+`uv sync --project detector --group ner --group serve`.
 
 - [ ] **Step 3: Decide, and say which way**
 
-If `salted worse than bare` is `false`, continue to Task 2 and quote the numbers.
+If the script exits 2, **stop**: the environment cannot answer the question, and
+proceeding would ship a shape nobody measured against the layer that matters.
+
+If `salted worse than bare` is `false`, continue to Task 2 and quote the numbers,
+and say in the report that NER was provisioned.
 
 If it is `true`, **stop**. Write the numbers into the task report, state which of the three counters moved, and hand back. Do not shorten the salt, change the delimiter, or reshape the token to make this pass — that is fitting the design to the measurement after seeing it, and the spec forbids it by name.
 
@@ -829,48 +846,92 @@ and delete the sentence naming #32 as what would restore it. **Replace the
 claim; do not annotate it.** The rule this repository learned the hard way is
 that a reader implements the definition, not the note beneath it.
 
-- [ ] **Step 5b: Refuse the lossy fallback when it carries this namespace**
+- [ ] **Step 5b: No served response may carry this namespace**
 
-`Lenient::token` is not the only way a token reaches the client. When a
-restored value needs escaping inside a serialized document the round trip
-cannot reproduce, `restore_in_string_with` calls `lossy_document`, the lenient
-rule answers `Ok`, and the **original text is returned — namespace and all**.
-That falsifies this task's promise and publishes the namespace, which a caller
-can then write on a later turn.
+`Lenient::token` is not the only way a token reaches the client, and chasing the
+others one at a time is how this step was written twice and was incomplete both
+times. The ones found so far: `lossy_document`'s successful fallback returns the
+original text; `restore_document_with`'s object-collision arm returns the
+original object; and a token whose brackets are spelled `\u005b`/`\u005d` is not
+recognised by the flat scan at all, so an early return hands it over intact.
+
+**The namespace is its own detector, and that closes the class instead of the
+cases.** Twelve hex characters that could have come from nowhere but this
+gateway, and restoration *removes* them — a token is replaced by its value, so
+after a successful restoration the namespace does not appear in the body at all.
+Its presence in what is about to be served is therefore evidence that something
+of ours survived, whatever path left it there and however its brackets are
+spelled.
+
+So the check is one post-condition on the served body rather than a guard per
+site:
+
+```rust
+    /// Whether these bytes still carry this mapping's namespace anywhere.
+    ///
+    /// **Asked of the finished body, which is what makes it a post-condition
+    /// rather than a sixth guard.** A successful restoration removes the token
+    /// and leaves the value, so the namespace surviving means something of ours
+    /// did — through a lossy fallback, through a collision fallback, or spelled
+    /// in escapes the scan does not read as a token. Three separate holes were
+    /// found one at a time before this replaced them, which is the argument for
+    /// asking once at the end instead of at every exit.
+    ///
+    /// A stranger's namespace is not this one and does not match, so a caller's
+    /// own text is unaffected — which is the whole point of the slice.
+    pub fn published_namespace(&self, served: &str) -> bool {
+        served.contains(&self.namespace)
+    }
+```
+
+In `proxy::handle`, after the sweep and the slot loop and before the response is
+built, ask it of the serialized body and refuse with
+`MappingError::Unrestorable("a response still carrying this session's namespace")`
+when it answers true.
 
 ```rust
 #[test]
-fn a_lossy_fallback_carrying_this_namespace_refuses_rather_than_publishing_it() {
-    // The other door out. The document cannot be re-serialized faithfully, so
-    // the fallback is the bytes as they came — with our token still in them.
+fn no_path_serves_a_body_still_carrying_this_namespace() {
+    // Three doors, one check. Each of these reached the client with a token in
+    // it before the post-condition existed, and each was found separately.
     let mut mapping = Mapping::with_namespace("3f7a2b91c4d5");
     let value = "Martina \"Weber\"";
     let token = mapping
         .mask(value, &[span("PERSON", 0, value.chars().count())])
         .unwrap();
-    let document = format!("{{\"mode\":\"a\",\"mode\":\"b\",\"name\":\"{token}\"}}");
 
-    let served = mapping.restore_sweep(&json!({"note": document}));
-    assert!(
-        served.is_err(),
-        "a lossy fallback published the namespace: {served:?}"
-    );
+    for body in [
+        // a document the round trip cannot reproduce, so the fallback is the
+        // bytes as they came
+        format!("{{\"mode\":\"a\",\"mode\":\"b\",\"name\":\"{token}\"}}"),
+        // brackets spelled as escapes, which the flat scan does not read
+        token.replace('[', "\\u005b").replace(']', "\\u005d"),
+    ] {
+        assert!(
+            mapping.published_namespace(&body),
+            "a body carrying the namespace was not caught: {body}"
+        );
+    }
+
+    // A stranger's namespace is not ours and must pass.
+    assert!(!mapping.published_namespace("[PERSON_1.0a1b7c33e2f1]"));
+    // And a successful restoration leaves nothing to catch.
+    assert!(!mapping.published_namespace(&mapping.restore_in_string(&token)));
 }
 ```
 
-In `restore_in_string_with`, every arm that returns `Ok(text.to_owned())` after
-`lossy_document` must first ask whether `text` still carries a token in this
-namespace, and refuse if it does. **Leaving a stranger's token there is still
-correct** — that is the caller's own text and the whole point of the slice.
+The object-collision arm and the lossy fallback keep their current behaviour;
+the post-condition is what makes the promise true, and it is one place to read
+rather than four to keep in step.
 
 - [ ] **Step 6: Mutation**
 
 Remove the `minted_here` arm from the sweep. Expected:
 `a_token_this_namespace_issued_but_cannot_map_refuses_rather_than_reaching_the_client`
-FAILS. Restore by inverse substitution. Then remove the namespace check from the lossy
-fallback; expected:
-`a_lossy_fallback_carrying_this_namespace_refuses_rather_than_publishing_it`
-FAILS. Restore that one too.
+FAILS. Restore by inverse substitution. Then remove the post-condition's call site in
+`proxy::handle`; expected: the router-level test added beside
+`no_path_serves_a_body_still_carrying_this_namespace` FAILS. Restore that one
+too.
 
 - [ ] **Step 7: Commit**
 

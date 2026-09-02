@@ -195,6 +195,27 @@ mappable, and not restored, because turn three's `issued` does not contain it.
 Ownership by salt restores it. That case is common in a long conversation and is
 worth a test of its own.
 
+## The namespace is its own detector **[decided in review]**
+
+Three separate paths were found, one per review round, that hand a token to the
+client after ownership was supposed to have closed the question: the lossy
+fallback returns the original text; the object-collision arm returns the
+original object; and a token spelled `\u005bPERSON_1.…\u005d` is not read as a
+token at all, so an early return passes it through.
+
+They are the same hole three times, and guarding them one at a time is what
+produced three rounds of findings.
+
+**Restoration removes the namespace.** A token is replaced by its value, so a
+body that still contains twelve hex characters no caller could have written is a
+body where something of ours survived — whatever path left it there and however
+its brackets are spelled. That is a post-condition, asked once of the finished
+response, not a sixth guard at a fifth exit.
+
+A stranger's namespace is a different string and does not match, so a caller's
+own text is untouched. That is the whole point of the slice, and it is why this
+check can be as blunt as `contains`.
+
 ## What is deleted **[decided, revised twice]**
 
 **Only `Provenance`.** Its two sets are what ownership replaces, and its own doc
