@@ -114,8 +114,15 @@ quote and single-quote injections straight back, which is why it is replaced
 here rather than footnoted: a reader implements the definition, not the note
 under it.
 
-The error-body path and the streamed path are unchanged. Both already restore
-whole and neither gains nor loses anything here.
+The streamed path is unchanged. **The error-body path is not, and saying it was
+hid a real compatibility change.** It restores whole and always did, but the arm
+it restores *with* moved underneath it: `restore_value`'s string leaves take
+`restore_in_string_strictly` now, and the non-JSON error body takes it too. So a
+provider error carrying a document-shaped string can be re-serialized, or
+refused with a 502 in place of the provider's own status, where it used to be
+substituted into. That path needs acceptance coverage of its own, and has it —
+`an_error_body_this_reader_rejects_is_not_injected_into` is the case that found
+it.
 
 **But be exact about what the sweep is, because the tempting sentence is false.**
 Those two paths restore whole **strictly**: `restore` raises `Unknown` on a token
@@ -141,9 +148,10 @@ is not restored at all, and after this it is restored leniently.
 
 **"Naive" is not the same as "correct", and one case proves it.** An undescribed
 field may itself be a *string holding serialized JSON* — the same shape as
-`arguments`, which is why that one has a slot. Substituting a value containing a
-quote, a backslash or a newline into such a string corrupts it, so a response
-served today would come back malformed. This is exactly the argument used below
+`arguments`, which is why that one has a slot. Substituting a value that is not
+wholly inert into such a string corrupts it — a quote of either kind, a
+backtick, a backslash, a control character or a slash — so a response served
+today would come back malformed. This is exactly the argument used below
 for keeping Anthropic's unknown blocks refused, and OpenAI's unknown fields need
 it too.
 
@@ -406,9 +414,18 @@ hold the placeholder and a placeholder reaching a client from a field it
 dispatches on is what the strict path exists to prevent — and substituting
 anyway is the corruption it also exists to prevent. So it refuses, with
 `MappingError::Unrestorable`, a 502, and the journal class
-`mapping_lossy_document`. This is reachable only once a value needing escaping is
-already going in, which is why it does not narrow what succeeds today in any
-case the suite or the promise describes.
+`mapping_lossy_document`.
+
+**This was written as reachable only once a value needing escaping is already
+going in, and that is no longer the bound.** It holds for the guard inside
+`restore_in_string_with`, which only runs when something is not inert. It does
+not hold one frame up: the `read_document`/`write_document` pair round-trips a
+described `arguments` whenever the restoration changed the document at all, so a
+wholly inert value into a document carrying duplicate members or an unspellable
+number refuses too. The test for it uses a value with no quote in it deliberately
+— `an_arguments_document_the_round_trip_would_change_refuses_the_response`. An
+implementation that reads the old bound omits the outer guard, which is the frame
+the original finding was actually about.
 
 A weaker remedy was tried first and is recorded because it looks sufficient and
 is not: *substitute, and keep the original if the string parsed as JSON before

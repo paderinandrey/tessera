@@ -1288,9 +1288,15 @@ pub(crate) fn round_trip_loses(text: &str) -> Option<&'static str> {
 /// bracket in front of ordinary text constantly — a checkbox, a link, a
 /// footnote — and closes it long before the token, and none of that is
 /// credited. The cost is bounded twice: this branch is only reached when the
-/// mapped value carries a `"`, `\` or control character, which a detected span
-/// rarely does, and on the lenient side the result is a restoration lost with
-/// the bytes untouched. Only a described field turns it into a refusal.
+/// mapped value is **not wholly inert**, and on the lenient side the result is a
+/// restoration lost with the bytes untouched. Only a described field turns it
+/// into a refusal.
+///
+/// "Not wholly inert" is wider than the `"`, `\` and control characters this
+/// sentence named for four commits after `json_string_inert` replaced them:
+/// `O'Brien` and a `Steuernummer` spelled `21/815/08150` both reach here, and
+/// both are ordinary values. Undercounting it is how the old predicate would
+/// get put back by someone reading only this.
 fn structure_encloses_a_token(text: &str) -> bool {
     let mut opened = false;
     for piece in pieces(text) {
