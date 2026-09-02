@@ -106,6 +106,19 @@ two readings that agree**, so the number is evidence about one conclusion and
 the maximum is right. Everywhere else the losing reading is gone, and its
 confidence goes with it.
 
+**A merged span's `boosted` can now be false where it was true, and true where
+it was false.** It was `a.boosted or b.boosted`, the same shape the confidence
+had, and it was left standing when the confidence was fixed — so a merge could
+report that its number was raised by surrounding context when the boost belonged
+to the reading it dropped. That produces a record the deterministic layer cannot
+emit: a boost never applies at confidence 1.0, and the merge could return
+`confidence=1.0, boosted=True`.
+
+It follows the surviving reading now, except under rule 2, where it follows the
+*confidence*: that rule takes the maximum, and the flag says **this** number was
+boosted. The `or` was right by accident when the maximum came from the boosted
+side and wrong when it did not.
+
 **`Resolution.trace` gains three rule names** — `nested-specificity-merge`,
 `nested-confidence-merge`, `nested-sensitivity-merge` — where the branch
 previously reported `specific-inner-merge` regardless of what decided it. The
@@ -183,8 +196,22 @@ Two more after review found the same thing twice.
   `untouchable`, which `resolve` takes as a parameter — so the test that pins it
   supplies one, and the mutation now kills it.
 
-**A mutation that survives is a missing test, not a weak mutation.** It happened
-three times in this fix: once where the design predicted coverage that did not
-exist, once where a review found the gap first, and once where a step was
-reachable only through a parameter nothing exercised. Each time the answer was a
-test, never a smaller claim.
+**A mutation that survives is a missing test — or a better rule.** It happened
+five times in this fix. Three were missing tests: the design predicted coverage
+that did not exist, a review found a gap first, and a step was reachable only
+through a parameter nothing exercised.
+
+The fifth was neither. Dropping rule 2's explicit `boosted` changed nothing that
+any test could see, and asking why produced a **better rule than the one being
+mutated**: rule 2 takes the maximum confidence, so the flag has to be the one
+attached to that number, not the disjunction of both and not the winner's. The
+`or` was right by accident in one direction. A surviving mutation is a question
+about the rule, and sometimes the answer is that the rule was wrong rather than
+untested.
+
+**The lesson the whole branch produced.** A merged span is a claim about which
+evidence survived, and every field on it needs that question asked separately.
+Four came from the winner, `confidence` did not, and `boosted` was overlooked
+even while `confidence` was being fixed for exactly this. The extent is the one
+field that is still deliberately both — it is the only one where taking the
+union is the point.

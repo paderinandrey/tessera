@@ -73,7 +73,14 @@ def _more_sensitive(a: Span, b: Span) -> Span:
     return a
 
 
-def _union(a: Span, b: Span, take_type_from: Span, *, confidence: float | None = None) -> Span:
+def _union(
+    a: Span,
+    b: Span,
+    take_type_from: Span,
+    *,
+    confidence: float | None = None,
+    boosted: bool | None = None,
+) -> Span:
     """The two spans' extent, under the surviving reading's identity.
 
     **Confidence comes from the reading that survived**, not from whichever
@@ -83,7 +90,13 @@ def _union(a: Span, b: Span, take_type_from: Span, *, confidence: float | None =
     a bridge decide the reported type by proxy after it had been dropped. Every
     other field already comes from `take_type_from`; this one was the exception.
 
-    **Rule 2 passes `confidence` explicitly, and the difference is not an
+    `boosted` travels with it, for the same reason and one field over: it says
+    *this* confidence was raised by surrounding context, so inheriting it from a
+    dropped reading produces a record the deterministic layer cannot emit —
+    a boost never applies at 1.0, and a merge could report `confidence=1.0,
+    boosted=True`.
+
+    **Rule 2 passes both explicitly, and the difference is not an
     exception to that argument but the other side of it.** A same-type merge
     joins two readings that *agree*, so the number is evidence about one
     conclusion and the maximum is the documented answer. Its winner is chosen by
@@ -100,7 +113,7 @@ def _union(a: Span, b: Span, take_type_from: Span, *, confidence: float | None =
         confidence=take_type_from.confidence if confidence is None else confidence,
         recognizer=take_type_from.recognizer,
         tier=take_type_from.tier,
-        boosted=a.boosted or b.boosted,
+        boosted=take_type_from.boosted if boosted is None else boosted,
     )
 
 
@@ -140,8 +153,19 @@ def _resolve_pair(
             winner = a if untouchable(a) else b
         else:
             winner = a if a.confidence >= b.confidence else b
+        # The maximum confidence and the boost that produced it travel
+        # together: `boosted` says *this* number was raised by context, so
+        # taking it from anywhere but the reading that supplied the number
+        # makes the record disagree with itself. An `or` across both was right
+        # by accident when the maximum came from the boosted side and wrong
+        # when it did not.
+        surest = a if a.confidence >= b.confidence else b
         return _union(
-            a, b, take_type_from=winner, confidence=max(a.confidence, b.confidence)
+            a,
+            b,
+            take_type_from=winner,
+            confidence=surest.confidence,
+            boosted=surest.boosted,
         ), "same-type-merge"
 
     for outer, inner in ((a, b), (b, a)):

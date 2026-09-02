@@ -316,3 +316,53 @@ def test_a_same_type_merge_keeps_the_more_confident_reading_under_a_custom_predi
     assert kept.recognizer == "catalog:a", "the untouchable reading lost its identity"
     assert kept.confidence == 0.9, "a same-type merge lowered the confidence"
     assert (kept.start, kept.end) == (0, 15)
+
+
+def test_a_merge_does_not_inherit_a_boost_from_the_reading_it_dropped() -> None:
+    # The same shape as the borrowed confidence, one field over, and it was left
+    # behind when that one was fixed: `boosted` is still an `or` across both
+    # inputs, so a merged span can report that its confidence was raised by
+    # context when the boost belonged to the reading that lost.
+    #
+    # It produces a record the deterministic layer cannot: a boost never applies
+    # at confidence 1.0 — "a boost must never fabricate checksum status" — so
+    # `confidence=1.0, boosted=True` is a combination no catalog rule emits.
+    boosted_outer = span(
+        entity_type="ORG", start=0, end=20, confidence=0.85, recognizer="catalog:org", boosted=True
+    )
+    checksum_inner = span(
+        entity_type="IBAN", start=5, end=15, confidence=1.0, recognizer="catalog:iban", tier=1
+    )
+
+    (kept,) = resolve([boosted_outer, checksum_inner], specificity=SPEC).spans
+
+    assert (kept.entity_type, kept.confidence) == ("IBAN", 1.0)
+    assert not kept.boosted, "a merged span claimed a boost belonging to the reading it dropped"
+
+
+def test_a_same_type_merge_reports_the_boost_belonging_to_the_confidence_it_took() -> None:
+    # Rule 2 takes the maximum confidence, so the boost flag has to be the one
+    # attached to *that* number. `or` across both inputs was right by accident
+    # in one direction and wrong in the other: a merge whose maximum came from
+    # an unboosted reading would still have claimed a boost.
+    catalog_backed = lambda candidate: candidate.recognizer.startswith("catalog:")  # noqa: E731
+
+    # The winner takes the identity by untouchability, and the maximum comes
+    # from the reading it beat — which was boosted, so the record must say so.
+    quiet = span(entity_type="IBAN", start=0, end=10, confidence=0.6, recognizer="catalog:a")
+    loud = span(
+        entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="ner:g", boosted=True
+    )
+    (kept,) = resolve([quiet, loud], specificity=SPEC, untouchable=catalog_backed).spans
+    assert (kept.confidence, kept.boosted) == (0.9, True)
+
+    # The other direction, which `or` got wrong: the winner is boosted at 0.85
+    # and the maximum comes from an unboosted 0.9.
+    boosted_winner = span(
+        entity_type="IBAN", start=0, end=10, confidence=0.85, recognizer="catalog:a", boosted=True
+    )
+    plain = span(entity_type="IBAN", start=5, end=15, confidence=0.9, recognizer="ner:g")
+    (kept,) = resolve(
+        [boosted_winner, plain], specificity=SPEC, untouchable=catalog_backed
+    ).spans
+    assert (kept.confidence, kept.boosted) == (0.9, False)
