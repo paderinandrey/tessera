@@ -13,7 +13,7 @@
 - **Nothing that refuses today may stop refusing.** New refusals are allowed and are the point; silently serving something previously refused is not.
 - **Every invariant is proved by mutation**: break it, run the *named* test, check *why* it failed, restore by **inverse text substitution** — never `git checkout`.
 - **Salt: four lowercase hex characters, two bytes of entropy.** Copied verbatim from the spec; do not choose a different length.
-- **The journal records the unsalted token.** `[PERSON_1]`, never `[PERSON_1.7f3a]`.
+- **No salt may reach a journal line.** The journal writes no token at all today, so this is a property to keep rather than a change to make — see Task 5.
 - **`stream::MAX_HELD` becomes 72.** Worst case is `[` + 40 + `_` + 20 digits + `.` + 4 + `]` = 68.
 - Local gate for every task: `cargo test --manifest-path gateway/Cargo.toml`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`.
 
