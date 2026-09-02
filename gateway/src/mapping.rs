@@ -76,11 +76,23 @@ pub enum MappingError {
     /// renamed, a number rounded, or the read refused on a text a client would
     /// have accepted. The phrase says which; the class and the answer are one.
     ///
-    /// **Only reachable once a value needing escaping is already going in.** A
-    /// document restores textually and keeps every byte it came with when no
-    /// inserted value carries a `"`, a `\` or a control character, and that is
-    /// the overwhelming majority; the parse that loses something happens only
-    /// when the alternative is corrupting the document instead.
+    /// **Two guards raise this, and only one of them is behind the escaping
+    /// question.** The inner one, in `restore_in_string_with`, is reached once
+    /// an inserted value is not wholly inert by `json_string_inert` — which is
+    /// wider than a `"`, a `\` or a control character, and takes in `O'Brien`
+    /// and a `Steuernummer` spelled `21/815/08150`. The outer one is the
+    /// `read_document`/`write_document` pair around a described `arguments`,
+    /// and it asks nothing about the value at all: it round-trips whenever the
+    /// restoration changed the document, so a wholly inert `Weber` into a
+    /// document carrying duplicate members or an unspellable number refuses
+    /// too.
+    ///
+    /// The bound used to be written as the inner guard alone, which
+    /// undercounts this error and, worse, reads as licence to omit the outer
+    /// guard — the frame the finding that produced it was actually about. A
+    /// document still restores textually and keeps every byte it came with
+    /// when nothing is put back into it, which remains the overwhelming
+    /// majority.
     ///
     /// **Why this refuses where the sweep leaves it.** The sweep's fallback is
     /// to serve the bytes it was given, which costs restoration and corrupts
@@ -925,9 +937,11 @@ impl Mapping {
 /// what they do.
 ///
 /// The escaping rule and the recursion under it are facts about JSON: a value
-/// carrying a `"`, a `\` or a control character cannot be substituted into JSON
-/// *text*, and a string that is a serialized document has to be reopened for
-/// the value to land in a leaf. Neither fact knows anything about which tokens
+/// that is not wholly inert cannot be substituted into JSON *text* and shown to
+/// be safe — `json_string_inert` is the test, and it is an allowlist, so this
+/// takes in an apostrophe, a backtick and a slash as readily as a `"` — and a
+/// string that is a serialized document has to be reopened for the value to
+/// land in a leaf. Neither fact knows anything about which tokens
 /// this gateway may claim. So they live in `restore_in_string_with` and
 /// `restore_document_with`, once, and this trait carries the two questions whose
 /// answers genuinely differ.
@@ -5933,10 +5947,11 @@ mod tests {
         // the thing that cannot be done without a reader, so they buy nothing.
         //
         // What it costs is bounded twice over. It applies only when the mapped
-        // value carries a `"`, `\` or control character, which a detected span
-        // rarely does; and on the lenient side it is a restoration lost with
-        // the bytes untouched, not a refusal. Only a described field turns it
-        // into a 502.
+        // value is not wholly inert — wider than a `"`, since `O'Brien` and a
+        // `Steuernummer` spelled `21/815/08150` are both non-inert and both
+        // ordinary; and on the lenient side it is a restoration lost with the
+        // bytes untouched, not a refusal. Only a described field turns it into
+        // a 502.
         let (mapping, provenance, token) = structural_mapping();
 
         for text in [

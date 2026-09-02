@@ -149,9 +149,14 @@ is not restored at all, and after this it is restored leniently.
 **"Naive" is not the same as "correct", and one case proves it.** An undescribed
 field may itself be a *string holding serialized JSON* — the same shape as
 `arguments`, which is why that one has a slot. Substituting a value that is not
-wholly inert into such a string corrupts it — a quote of either kind, a
-backtick, a backslash, a control character or a slash — so a response served
-today would come back malformed. This is exactly the argument used below
+wholly inert into such a string **cannot be shown to leave it intact**, which is
+a weaker statement than corrupting it and is the accurate one. A `"` really does
+close the string it lands in, and the response comes back malformed. `O'Brien`,
+a backtick and a `21/815/08150` do not: inside a double-quoted JSON string each
+is an ordinary character, and the document stays valid and exact. They take the
+careful path because the string they land in is only double-quoted *to this
+reader*, and which reader the client uses is the one thing this gateway cannot
+find out. This is exactly the argument used below
 for keeping Anthropic's unknown blocks refused, and OpenAI's unknown fields need
 it too.
 
