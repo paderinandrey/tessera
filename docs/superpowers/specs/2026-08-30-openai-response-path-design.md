@@ -314,6 +314,27 @@ round trip was silently rounding numbers before any of this, and a guard without
 that skip would have turned the silent rounding into a refusal bought for
 nothing.
 
+**"Nothing to put back" is asked of the wrong thing if it is asked of the
+parsed document, and that cost a P1.** The skip compared the restored `Value`
+against the read one — and a `Value` is what the parse has already lost
+something to. In `{"name":"[PERSON_1]","name":"fixed"}` the parse keeps the last
+member, so the only placeholder is absent from *both* sides of that comparison,
+the skip concluded there was nothing to restore, and the upstream's own bytes
+went to the client with the token still in them. The sweep had left the same
+string alone for the same duplicate, so nothing downstream was going to catch
+it.
+
+So the skip is taken on the **text's** evidence and needs two conditions to be
+declined: a round trip that loses something *and* a placeholder-shaped token in
+the bytes. Either alone is not enough — a lossy document with nothing of ours in
+it still goes back byte for byte, which is the ordinary case the skip exists
+for. The same early return one frame down, in `restore_in_string_with`, had the
+identical hole and is fixed the same way; only the described door refuses, the
+lenient one keeps the bytes as the duplicate rule says it should.
+
+The general form is the one this design keeps running into: **a loss cannot be
+detected with the tool that caused it.**
+
 **The frame above *that* is the whole response body, and it stays open.**
 `proxy::handle` reads the body with `from_slice::<Value>` and writes it back
 with `Json(restored)`, so every number in every buffered response round-trips —
