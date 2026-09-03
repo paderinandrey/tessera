@@ -33,6 +33,14 @@ class NerType:
     threshold: float
     tier: int
     specificity: int
+    # Words this type's spans may not begin with, lowercase and without a
+    # trailing dot. Empty for every type but `PERSON`, which is the only one
+    # the corpus shows over-capturing.
+    trim_leading: frozenset[str] = frozenset()
+    # Words trimmed only when another trimmable word follows. Articles: `Le` is
+    # a family name in Vietnamese and `Das` in Bengali, so one on its own is not
+    # evidence of anything.
+    trim_leading_articles: frozenset[str] = frozenset()
 
 
 def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
@@ -78,6 +86,20 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 f"ner type {entity_type!r} declares specificity {specificity!r} "
                 "outside the non-negative integer range"
             )
+        trim_leading = _word_list(entity_type, entry, "trim_leading")
+        trim_leading_articles = _word_list(entity_type, entry, "trim_leading_articles")
+        # An entry in both lists would be subtracted out of the article
+        # safeguard and trimmed unconditionally — `le` in both makes
+        # `Le Thi Mai` lose its family name, which is the disclosure the split
+        # exists to prevent. A duplicate is a catalog mistake that disables a
+        # safety rule, so it stops the service rather than the name.
+        shared = trim_leading & trim_leading_articles
+        if shared:
+            raise ValueError(
+                f"ner type {entity_type!r} lists {sorted(shared)!r} as both a trim_leading word "
+                "and an article: an article is only trimmed ahead of another trimmable word, and "
+                "listing it in both would trim it unconditionally."
+            )
         types.append(
             NerType(
                 entity_type=entity_type,
@@ -85,6 +107,8 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 threshold=float(threshold),
                 tier=tier,
                 specificity=specificity,
+                trim_leading=trim_leading,
+                trim_leading_articles=trim_leading_articles,
             )
         )
     return tuple(types)
@@ -93,6 +117,113 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
 # Boundaries to prefer when cutting, best first: a chunk that ends mid-entity
 # costs a detection, so cuts land on paragraph, line or word breaks.
 _BOUNDARIES = ("\n\n", "\n", " ")
+
+
+def _word_list(entity_type: str, entry: dict[str, object], field: str) -> frozenset[str]:
+    """A catalog list of single words, normalized, or an empty set.
+
+    **One token each, refused at load time.** The rule walks a span a word at a
+    time, so `Der Kunde` written as one entry could never match and would sit in
+    the catalog looking as though it did — worse than an absent entry, because
+    it reads as coverage.
+    """
+    words = entry.get(field, [])
+    if not isinstance(words, list) or any(
+        not isinstance(word, str) or not word.strip() for word in words
+    ):
+        raise ValueError(f"ner type {entity_type!r} declares {field} that is not a list of words")
+    for word in words:
+        if len(word.split()) != 1:
+            raise ValueError(
+                f"ner type {entity_type!r} declares the {field} entry {word!r}, which is more "
+                "than one word: the rule matches a token at a time, so a phrase never matches. "
+                "List its words separately."
+            )
+    return frozenset(_normalized(word) for word in words)
+
+
+def _normalized(word: str) -> str:
+    """A leading word as the list holds it: lowercase, without a trailing dot.
+
+    So `Dr.`, `Dr` and `dr` are one entry rather than three, and a catalog that
+    spells one of them is not quietly missing the others.
+    """
+    return word.strip().rstrip(".").casefold()
+
+
+def _carries_a_word(token: str) -> bool:
+    """Whether a token holds anything but punctuation."""
+    return any(character.isalnum() for character in token)
+
+
+def trim_leading_words(
+    text: str,
+    start: int,
+    end: int,
+    words: frozenset[str],
+    articles: frozenset[str] = frozenset(),
+    *,
+    piece_starts_a_word: bool = False,
+) -> tuple[int, int]:
+    """`(start, end)` with listed words dropped from the front of the span.
+
+    The model reads `Der Kunde Karz` as one person, so the same person behind a
+    different role noun or title is a different *value* to a session that keys
+    on equality — two placeholders for one person, which is the failure the
+    README's stability argument is built against.
+
+    **An article is trimmed only in front of another trimmable word.** `Le` is a
+    Vietnamese family name and `Das` a Bengali one, so trimming a leading
+    article on its own sends a real name component to the provider in clear:
+    `Le Thi Mai` would arrive as `Le [PERSON_1]`. `Le salarié Gallet` still
+    loses both words, because the article is followed by one that goes anyway.
+
+    **Never trimmed to nothing.** A span made only of listed words is left as it
+    came: a rule that can empty a span is a rule that can unmask a name, and a
+    person really called `Herr` would be exactly that.
+
+    **Never trimmed at all unless the span starts on a word boundary.** A token
+    window can begin inside a word, and `der` at the end of `Alexander` is not
+    an article — trimming there would expose the rest of a name the span was at
+    least partly covering.
+
+    Only the front: the corpus shows no trailing over-capture at all, and a rule
+    trimming both ends would be twice the risk for none of the evidence.
+    """
+    if not words and not articles:
+        return start, end
+    at_document_boundary = text[start - 1].isspace() if start > 0 else piece_starts_a_word
+    if not at_document_boundary:
+        return start, end
+
+    tokens: list[tuple[int, str]] = []
+    at = start
+    while at < end:
+        while at < end and text[at].isspace():
+            at += 1
+        if at >= end:
+            break
+        token_start = at
+        while at < end and not text[at].isspace():
+            at += 1
+        tokens.append((token_start, text[token_start:at]))
+
+    trimmable = 0
+    while trimmable < len(tokens) and _normalized(tokens[trimmable][1]) in (words | articles):
+        trimmable += 1
+    # An article at the end of the run is followed by the name, not by another
+    # word that goes anyway, so it stays — and so does everything after it.
+    while trimmable and _normalized(tokens[trimmable - 1][1]) in articles - words:
+        trimmable -= 1
+    # **What is left has to be a word, not merely a token.** The model puts
+    # trailing punctuation inside a span often enough that `Herr !` reaches
+    # here, and counting the `!` as remaining content let the trim keep the
+    # punctuation and send `Herr` in clear. A span whose only survivors carry no
+    # letter or digit is left as it came, which is the never-empty clause asked
+    # about content rather than about count.
+    if not trimmable or not any(_carries_a_word(token) for _, token in tokens[trimmable:]):
+        return start, end
+    return tokens[trimmable][0], end
 
 
 def chunks(text: str, *, size: int, overlap: int) -> list[tuple[int, str]]:
@@ -223,7 +354,9 @@ class GlinerRecognizer:
             for start, end in self._windows(chunk):
                 yield offset + start, chunk[start:end]
 
-    def _spans_from(self, base: int, piece: str, inference: InferencePass) -> Iterator[Span]:
+    def _spans_from(
+        self, base: int, piece: str, inference: InferencePass, *, at_boundary: bool = False
+    ) -> Iterator[Span]:
         for entity in self._model.predict_entities(
             piece, list(inference.labels), threshold=inference.threshold
         ):
@@ -231,10 +364,23 @@ class GlinerRecognizer:
             score = float(entity["score"])
             if ner_type is None or score < ner_type.threshold:
                 continue
+            # A window can begin inside a source word, and this function is
+            # handed the window rather than the document — so a span at offset
+            # zero looks like a word boundary when it is the tail of
+            # `Alexander`. `detect` knows better and says so; anything that
+            # does not know says nothing and no trimming happens.
+            start, end = trim_leading_words(
+                piece,
+                int(entity["start"]),
+                int(entity["end"]),
+                ner_type.trim_leading,
+                ner_type.trim_leading_articles,
+                piece_starts_a_word=at_boundary,
+            )
             yield Span(
                 entity_type=ner_type.entity_type,
-                start=base + int(entity["start"]),
-                end=base + int(entity["end"]),
+                start=base + start,
+                end=base + end,
                 confidence=min(score, 0.99),
                 recognizer="ner:gliner",
                 tier=ner_type.tier,
@@ -251,8 +397,9 @@ class GlinerRecognizer:
             return []
         spans: list[Span] = []
         for base, piece in self.windows(text):
+            at_boundary = base == 0 or text[base - 1].isspace()
             for inference in self.passes:
-                spans.extend(self._spans_from(base, piece, inference))
+                spans.extend(self._spans_from(base, piece, inference, at_boundary=at_boundary))
         return spans
 
 

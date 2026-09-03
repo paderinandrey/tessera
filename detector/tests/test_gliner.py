@@ -118,3 +118,42 @@ def test_an_article_9_mention_is_never_missed_by_the_whole_group(
     ):
         found = {s.entity_type for s in recognizer.detect(text)} & article_9
         assert found, f"no Article 9 span at all in: {text}"
+
+
+def test_a_person_span_drops_the_role_noun_and_title_in_front_of_the_name(
+    recognizer: GlinerRecognizer,
+) -> None:
+    # #20. A session keys on exact value equality, so `Dr. Martina Weber` in one
+    # turn and `Frau Martina Weber` in the next are two values, two
+    # placeholders, and one person presented to the model as two — the failure
+    # the README's stability argument exists to prevent.
+    #
+    # Both must reduce to the same string. That is the whole fix: the mapping
+    # cannot know two strings are one person, so the spans have to agree.
+    first = "hier ist Dr. Martina Weber aus Zürich"
+    second = "Frau Martina Weber hat die Unterlagen nachgereicht"
+
+    def person(text: str) -> list[str]:
+        return [text[s.start : s.end] for s in recognizer.detect(text) if s.entity_type == "PERSON"]
+
+    assert person(first) == ["Martina Weber"]
+    assert person(second) == ["Martina Weber"]
+
+
+def test_a_person_span_drops_an_article_with_its_role_noun(
+    recognizer: GlinerRecognizer,
+) -> None:
+    # Fifteen of the corpus's nineteen over-captures are role nouns rather than
+    # titles, usually behind an article, which is why a list of honorifics alone
+    # would have reached four of them.
+    #
+    # One sentence each, because a longer one costs the second name entirely:
+    # the model's confidence for a name falls as the text around it grows and
+    # `PERSON`'s threshold is a fixed 0.7 (#44). That is not what this test is
+    # about, and folding both names into one sentence would have made it fail
+    # for a reason it does not hold.
+    def person(text: str) -> list[str]:
+        return [text[s.start : s.end] for s in recognizer.detect(text) if s.entity_type == "PERSON"]
+
+    assert person("Der Mandant Kuhl hat unterschrieben.") == ["Kuhl"]
+    assert person("Sehr geehrter Herr Börner, anbei die Unterlagen.") == ["Börner"]

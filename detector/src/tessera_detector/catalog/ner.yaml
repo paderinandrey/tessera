@@ -19,6 +19,52 @@ entities:
     threshold: 0.7
     tier: 2
     specificity: 30
+    # Words a person span may not begin with. The model reads `Der Kunde Karz`
+    # and `Frau Martina Weber` as whole spans, so the same person arrives as two
+    # different values across two turns and gets two placeholders — which is the
+    # one thing the placeholder-stability argument exists to prevent.
+    #
+    # Measured over the public corpus: 19 of 76 annotated PERSON entities are
+    # over-captured, all at the front, and 15 of those 19 are role nouns rather
+    # than titles. A list of honorifics alone would have reached four.
+    #
+    # Matched case-insensitively with a trailing `.` stripped, so `Dr.` and `dr`
+    # are one entry. PERSON alone carries this: LOCATION over-captures 0 of 8
+    # and ORG 0 of 4.
+    # **Articles are listed separately and are never trimmed on their own.**
+    # `Le` is a Vietnamese family name and `Das` an Indian one, so trimming a
+    # leading article by itself sends a real name component to the provider in
+    # clear — `Le Thi Mai` would arrive as `Le [PERSON_1]`. An article only goes
+    # when the word after it is itself trimmable, which is the only shape the
+    # corpus ever shows: `Der Kunde`, `Le salarié`.
+    trim_leading_articles:
+      - der
+      - die
+      - das
+      - le
+      - la
+    trim_leading:
+      # role nouns, the larger half of the problem and the part that will need
+      # adding to — `Patient`, `Versicherte`, `Bénéficiaire`, one per domain
+      - kunde
+      - kundin
+      - mandant
+      - mandantin
+      - client
+      - cliente
+      - salarié
+      - salariée
+      # honorifics and salutations
+      - herr
+      - herrn
+      - frau
+      - madame
+      - monsieur
+      - dr
+      - prof
+      - sehr
+      - geehrter
+      - geehrte
 
   - entity_type: LOCATION
     label: location

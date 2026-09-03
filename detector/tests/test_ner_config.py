@@ -147,3 +147,46 @@ def test_article_9_outranks_quasi_identifiers_but_not_identifiers() -> None:
     assert max(by_type[t].specificity for t in ("PERSON", "LOCATION", "ORG")) < 35
     # 40 is the lowest specificity in the identifier catalog.
     assert 35 < 40
+
+
+def test_a_multi_word_trim_entry_is_refused() -> None:
+    # The rule walks a span one token at a time, so `Der Kunde` written as one
+    # entry never matches — and sits in the catalog looking as though it does.
+    # A list entry that cannot fire is worse than an absent one: it reads as
+    # coverage.
+    config = """
+entities:
+  - entity_type: PERSON
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: 30
+    trim_leading:
+      - Der Kunde
+"""
+
+    with pytest.raises(ValueError, match="more than one word"):
+        load_ner_types(config)
+
+
+def test_a_word_listed_as_both_a_trim_word_and_an_article_is_refused() -> None:
+    # An entry in both lists is subtracted out of the article safeguard and
+    # trimmed unconditionally — `le` in both makes `Le Thi Mai` lose its family
+    # name, which is the disclosure the split exists to prevent. A catalog
+    # mistake that disables a safety rule stops the service rather than the
+    # name.
+    config = """
+entities:
+  - entity_type: PERSON
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: 30
+    trim_leading:
+      - le
+    trim_leading_articles:
+      - Le
+"""
+
+    with pytest.raises(ValueError, match="both a trim_leading word"):
+        load_ner_types(config)
