@@ -88,6 +88,18 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
             )
         trim_leading = _word_list(entity_type, entry, "trim_leading")
         trim_leading_articles = _word_list(entity_type, entry, "trim_leading_articles")
+        # An entry in both lists would be subtracted out of the article
+        # safeguard and trimmed unconditionally — `le` in both makes
+        # `Le Thi Mai` lose its family name, which is the disclosure the split
+        # exists to prevent. A duplicate is a catalog mistake that disables a
+        # safety rule, so it stops the service rather than the name.
+        shared = trim_leading & trim_leading_articles
+        if shared:
+            raise ValueError(
+                f"ner type {entity_type!r} lists {sorted(shared)!r} as both a trim_leading word "
+                "and an article: an article is only trimmed ahead of another trimmable word, and "
+                "listing it in both would trim it unconditionally."
+            )
         types.append(
             NerType(
                 entity_type=entity_type,
@@ -139,12 +151,19 @@ def _normalized(word: str) -> str:
     return word.strip().rstrip(".").casefold()
 
 
+def _carries_a_word(token: str) -> bool:
+    """Whether a token holds anything but punctuation."""
+    return any(character.isalnum() for character in token)
+
+
 def trim_leading_words(
     text: str,
     start: int,
     end: int,
     words: frozenset[str],
     articles: frozenset[str] = frozenset(),
+    *,
+    piece_starts_a_word: bool = False,
 ) -> tuple[int, int]:
     """`(start, end)` with listed words dropped from the front of the span.
 
@@ -173,7 +192,8 @@ def trim_leading_words(
     """
     if not words and not articles:
         return start, end
-    if start > 0 and not text[start - 1].isspace():
+    at_document_boundary = text[start - 1].isspace() if start > 0 else piece_starts_a_word
+    if not at_document_boundary:
         return start, end
 
     tokens: list[tuple[int, str]] = []
@@ -195,7 +215,13 @@ def trim_leading_words(
     # word that goes anyway, so it stays — and so does everything after it.
     while trimmable and _normalized(tokens[trimmable - 1][1]) in articles - words:
         trimmable -= 1
-    if not trimmable or trimmable >= len(tokens):
+    # **What is left has to be a word, not merely a token.** The model puts
+    # trailing punctuation inside a span often enough that `Herr !` reaches
+    # here, and counting the `!` as remaining content let the trim keep the
+    # punctuation and send `Herr` in clear. A span whose only survivors carry no
+    # letter or digit is left as it came, which is the never-empty clause asked
+    # about content rather than about count.
+    if not trimmable or not any(_carries_a_word(token) for _, token in tokens[trimmable:]):
         return start, end
     return tokens[trimmable][0], end
 
@@ -328,7 +354,9 @@ class GlinerRecognizer:
             for start, end in self._windows(chunk):
                 yield offset + start, chunk[start:end]
 
-    def _spans_from(self, base: int, piece: str, inference: InferencePass) -> Iterator[Span]:
+    def _spans_from(
+        self, base: int, piece: str, inference: InferencePass, *, at_boundary: bool = False
+    ) -> Iterator[Span]:
         for entity in self._model.predict_entities(
             piece, list(inference.labels), threshold=inference.threshold
         ):
@@ -336,12 +364,18 @@ class GlinerRecognizer:
             score = float(entity["score"])
             if ner_type is None or score < ner_type.threshold:
                 continue
+            # A window can begin inside a source word, and this function is
+            # handed the window rather than the document — so a span at offset
+            # zero looks like a word boundary when it is the tail of
+            # `Alexander`. `detect` knows better and says so; anything that
+            # does not know says nothing and no trimming happens.
             start, end = trim_leading_words(
                 piece,
                 int(entity["start"]),
                 int(entity["end"]),
                 ner_type.trim_leading,
                 ner_type.trim_leading_articles,
+                piece_starts_a_word=at_boundary,
             )
             yield Span(
                 entity_type=ner_type.entity_type,
@@ -363,8 +397,9 @@ class GlinerRecognizer:
             return []
         spans: list[Span] = []
         for base, piece in self.windows(text):
+            at_boundary = base == 0 or text[base - 1].isspace()
             for inference in self.passes:
-                spans.extend(self._spans_from(base, piece, inference))
+                spans.extend(self._spans_from(base, piece, inference, at_boundary=at_boundary))
         return spans
 
 

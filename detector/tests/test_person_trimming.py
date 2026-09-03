@@ -10,7 +10,17 @@ ARTICLES = frozenset({"der", "die", "das", "le", "la"})
 
 
 def trim(text: str, start: int = 0, end: int | None = None) -> str:
-    at, to = trim_leading_words(text, start, len(text) if end is None else end, WORDS, ARTICLES)
+    # `piece_starts_a_word` is what the caller knows and the function cannot:
+    # whether offset zero of this text is also a word boundary in the document
+    # it was cut from. These texts are whole documents, so it is.
+    at, to = trim_leading_words(
+        text,
+        start,
+        len(text) if end is None else end,
+        WORDS,
+        ARTICLES,
+        piece_starts_a_word=True,
+    )
     return text[at:to]
 
 
@@ -26,6 +36,30 @@ def test_an_article_alone_is_never_trimmed() -> None:
     assert trim("Das Gupta") == "Das Gupta"
     assert trim("Le salarié Gallet") == "Gallet"
     assert trim("Der Kunde Karz") == "Karz"
+
+
+def test_a_span_left_holding_only_punctuation_is_not_trimmed() -> None:
+    # The model puts trailing punctuation inside a span often enough that
+    # `Herr !` reaches the rule. Counting the `!` as remaining content let the
+    # trim keep the punctuation and send `Herr` to the provider in clear — the
+    # never-empty clause asked about token count when it had to ask about
+    # content.
+    assert trim("Herr !") == "Herr !"
+    assert trim("Der Kunde :") == "Der Kunde :"
+    assert trim("Der Kunde Karz !") == "Karz !"
+
+
+def test_a_window_that_begins_inside_a_word_is_not_a_boundary() -> None:
+    # A chunk can start mid-word, and this function is handed the window rather
+    # than the document, so offset zero looks like a boundary when it is the
+    # tail of `Alexander`. The caller says which it is; a caller that does not
+    # know says nothing and nothing is trimmed.
+    piece = "der Kunde Karz"
+
+    assert trim_leading_words(piece, 0, len(piece), WORDS, ARTICLES) == (0, len(piece))
+    assert trim_leading_words(
+        piece, 0, len(piece), WORDS, ARTICLES, piece_starts_a_word=True
+    ) == (10, len(piece))
 
 
 def test_trimming_needs_a_word_boundary_at_the_start() -> None:
@@ -63,13 +97,19 @@ def test_trimming_matches_case_insensitively_and_ignores_a_trailing_dot() -> Non
     # spells one of them is not quietly missing the others.
     words = frozenset({"dr", "frau"})
 
-    assert trim_leading_words("Dr. Martina Weber", 0, 17, words) == (4, 17)
-    assert trim_leading_words("FRAU Martina Weber", 0, 18, words) == (5, 18)
+    assert trim_leading_words(
+        "Dr. Martina Weber", 0, 17, words, piece_starts_a_word=True
+    ) == (4, 17)
+    assert trim_leading_words(
+        "FRAU Martina Weber", 0, 18, words, piece_starts_a_word=True
+    ) == (5, 18)
 
 
 def test_trimming_leaves_a_span_with_no_listed_word_alone() -> None:
     assert trim("Martina Weber") == "Martina Weber"
-    assert trim_leading_words("Martina Weber", 0, 13, frozenset(), frozenset()) == (0, 13)
+    assert trim_leading_words(
+        "Martina Weber", 0, 13, frozenset(), frozenset(), piece_starts_a_word=True
+    ) == (0, 13)
 
 
 def test_trimming_only_reads_inside_the_span() -> None:

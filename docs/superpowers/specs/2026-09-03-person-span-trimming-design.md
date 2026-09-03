@@ -83,10 +83,19 @@ exists to narrow. An article goes only in front of a word that goes anyway,
 which is the only shape the corpus ever shows. Found in review, and it was a
 defect this design introduced rather than one it inherited.
 
+**And a span is never trimmed down to punctuation.** The model puts trailing
+punctuation inside a span often enough that `Herr !` reaches the rule, and the
+never-empty clause counted *tokens* — so the `!` looked like remaining content,
+the trim kept it, and `Herr` went to the provider in clear. The clause asks
+about content now: what survives must carry a letter or a digit.
+
 Two more edges, both from the same review and both real:
 
-- **the span must start on a word boundary.** A token window can begin inside a
-  word, and `der` at the end of `Alexander` is not an article;
+- **the span must start on a word boundary**, and *the caller* says whether it
+  does. A token window can begin inside a word, and this function is handed the
+  window rather than the document — so offset zero looks like a boundary when it
+  is the tail of `Alexander`. A caller that does not know says nothing and
+  nothing is trimmed;
 - **whitespace is a run of any Unicode space.** Scanning for a single `" "` made
   a second space produce an empty token, which is on no list, so the walk
   stopped there — and an all-listed `Der  Kunde` slipped past the never-empty
@@ -103,6 +112,12 @@ Three kinds of word, all present in the measurements:
 
 Matched case-insensitively and after stripping a trailing `.`, so `Dr.` and
 `dr` are one entry.
+
+**A word may not appear in both lists.** An entry in both is subtracted out of
+the article safeguard and trimmed unconditionally — `le` in both makes
+`Le Thi Mai` lose its family name, which is the disclosure the split exists to
+prevent. A catalog mistake that disables a safety rule stops the service rather
+than the name.
 
 **One word per entry, enforced by the loader.** The rule walks a span a token at
 a time, so `Der Kunde` written as a single entry would never match anything and
