@@ -105,19 +105,23 @@ as it came: a rule that can empty a span is a rule that can unmask a name.
 **The list will lag.** Role nouns are open-ended in a way titles are not —
 `Patient`, `Mandantin`, `Versicherte`, `Bénéficiaire`, one per domain a client
 works in. A missing entry leaves today's behaviour, which is an over-wide mask
-rather than an exposure, so it **fails safe**; but it fails, and pretending a
-list of nine words is a solution to an open class would be the wrong claim to
-put in a design document.
+rather than an exposure, so it **fails safe**; but it fails, and calling
+twenty-three words a solution to an open class would be the wrong claim to put
+in a design document.
 
 ## Testing
 
-- the two turns from the issue produce **one** placeholder, end to end through
-  the mapping, which is the defect and the only test that proves it fixed;
+- the two turns from the issue reduce to **one string**, which is the defect:
+  the mapping keys on exact value equality, so equal strings are one placeholder
+  and nothing further needs proving at the gateway;
 - each shape in the measurement table above trims to the annotated name;
 - a span made entirely of listed words survives untrimmed;
 - a name that *is* a listed word — a person called `Herr` — is not trimmed away,
   which is the same rule as the one above and worth its own case;
 - the corpus's `PERSON` exact-bound count rises and its missed count does not.
 
-Mutations: remove the trim and the two-turn test fails with two placeholders;
-allow trimming to empty and the all-listed-words case fails.
+Mutations: remove the trim and the two-turn test fails with the honorifics still
+attached; let the walk stop at the last space rather than testing the last token
+and `Der Kunde` trims to `Kunde`, which the never-empty case catches; drop the
+single-word check on catalog entries and the loader accepts `Der Kunde` as one
+entry that can never fire.
