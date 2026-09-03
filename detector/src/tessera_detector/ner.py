@@ -33,6 +33,10 @@ class NerType:
     threshold: float
     tier: int
     specificity: int
+    # Words this type's spans may not begin with, lowercase and without a
+    # trailing dot. Empty for every type but `PERSON`, which is the only one
+    # the corpus shows over-capturing.
+    trim_leading: frozenset[str] = frozenset()
 
 
 def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
@@ -78,6 +82,13 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 f"ner type {entity_type!r} declares specificity {specificity!r} "
                 "outside the non-negative integer range"
             )
+        trim_leading = entry.get("trim_leading", [])
+        if not isinstance(trim_leading, list) or any(
+            not isinstance(word, str) or not word.strip() for word in trim_leading
+        ):
+            raise ValueError(
+                f"ner type {entity_type!r} declares trim_leading that is not a list of words"
+            )
         types.append(
             NerType(
                 entity_type=entity_type,
@@ -85,6 +96,7 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 threshold=float(threshold),
                 tier=tier,
                 specificity=specificity,
+                trim_leading=frozenset(_normalized(word) for word in trim_leading),
             )
         )
     return tuple(types)
@@ -93,6 +105,48 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
 # Boundaries to prefer when cutting, best first: a chunk that ends mid-entity
 # costs a detection, so cuts land on paragraph, line or word breaks.
 _BOUNDARIES = ("\n\n", "\n", " ")
+
+
+def _normalized(word: str) -> str:
+    """A leading word as the list holds it: lowercase, without a trailing dot.
+
+    So `Dr.`, `Dr` and `dr` are one entry rather than three, and a catalog that
+    spells one of them is not quietly missing the others.
+    """
+    return word.strip().rstrip(".").casefold()
+
+
+def trim_leading_words(text: str, start: int, end: int, words: frozenset[str]) -> tuple[int, int]:
+    """`(start, end)` with listed words dropped from the front of the span.
+
+    The model reads `Der Kunde Karz` as one person, so the same person behind a
+    different role noun or title is a different *value* to a session that keys
+    on equality — two placeholders for one person, which is the failure the
+    README's stability argument is built against.
+
+    **Never trimmed to nothing.** A span made only of listed words is left as it
+    came: a rule that can empty a span is a rule that can unmask a name, and a
+    person really called `Herr` would be exactly that. The same clause covers a
+    surname that happens to be on the list.
+
+    Only the front. The corpus shows no trailing over-capture at all, and a rule
+    that trimmed both ends would be twice the risk for none of the evidence.
+    """
+    if not words:
+        return start, end
+    at = start
+    while at < end:
+        space = text.find(" ", at)
+        token_end = end if space == -1 or space >= end else space
+        if _normalized(text[at:token_end]) not in words:
+            # The first token that is not on the list: the name starts here.
+            return at, end
+        at = token_end + 1
+    # Every token was on the list. Keep the span whole rather than empty it:
+    # this is the `Herr` clause, and the loop reaching here is the only way to
+    # know it — a scan that stops at the last space never tests the last token,
+    # which trimmed `Der Kunde` to `Kunde`.
+    return start, end
 
 
 def chunks(text: str, *, size: int, overlap: int) -> list[tuple[int, str]]:
@@ -231,10 +285,13 @@ class GlinerRecognizer:
             score = float(entity["score"])
             if ner_type is None or score < ner_type.threshold:
                 continue
+            start, end = trim_leading_words(
+                piece, int(entity["start"]), int(entity["end"]), ner_type.trim_leading
+            )
             yield Span(
                 entity_type=ner_type.entity_type,
-                start=base + int(entity["start"]),
-                end=base + int(entity["end"]),
+                start=base + start,
+                end=base + end,
                 confidence=min(score, 0.99),
                 recognizer="ner:gliner",
                 tier=ner_type.tier,
