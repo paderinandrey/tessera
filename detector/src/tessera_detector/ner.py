@@ -37,6 +37,10 @@ class NerType:
     # trailing dot. Empty for every type but `PERSON`, which is the only one
     # the corpus shows over-capturing.
     trim_leading: frozenset[str] = frozenset()
+    # Words trimmed only when another trimmable word follows. Articles: `Le` is
+    # a family name in Vietnamese and `Das` in Bengali, so one on its own is not
+    # evidence of anything.
+    trim_leading_articles: frozenset[str] = frozenset()
 
 
 def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
@@ -82,25 +86,8 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 f"ner type {entity_type!r} declares specificity {specificity!r} "
                 "outside the non-negative integer range"
             )
-        trim_leading = entry.get("trim_leading", [])
-        if not isinstance(trim_leading, list) or any(
-            not isinstance(word, str) or not word.strip() for word in trim_leading
-        ):
-            raise ValueError(
-                f"ner type {entity_type!r} declares trim_leading that is not a list of words"
-            )
-        # One token each. The rule walks the span a word at a time, so a phrase
-        # like `Der Kunde` written as a single entry would never match anything
-        # and would sit in the catalog looking as though it did — the failure
-        # that is worse than an absent entry, because it reads as coverage.
-        # Write the words separately; the walk trims them in sequence.
-        for word in trim_leading:
-            if len(word.split()) != 1:
-                raise ValueError(
-                    f"ner type {entity_type!r} declares the trim_leading entry {word!r}, "
-                    "which is more than one word: the rule matches a token at a time, "
-                    "so a phrase never matches. List its words separately."
-                )
+        trim_leading = _word_list(entity_type, entry, "trim_leading")
+        trim_leading_articles = _word_list(entity_type, entry, "trim_leading_articles")
         types.append(
             NerType(
                 entity_type=entity_type,
@@ -108,7 +95,8 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 threshold=float(threshold),
                 tier=tier,
                 specificity=specificity,
-                trim_leading=frozenset(_normalized(word) for word in trim_leading),
+                trim_leading=trim_leading,
+                trim_leading_articles=trim_leading_articles,
             )
         )
     return tuple(types)
@@ -117,6 +105,29 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
 # Boundaries to prefer when cutting, best first: a chunk that ends mid-entity
 # costs a detection, so cuts land on paragraph, line or word breaks.
 _BOUNDARIES = ("\n\n", "\n", " ")
+
+
+def _word_list(entity_type: str, entry: dict[str, object], field: str) -> frozenset[str]:
+    """A catalog list of single words, normalized, or an empty set.
+
+    **One token each, refused at load time.** The rule walks a span a word at a
+    time, so `Der Kunde` written as one entry could never match and would sit in
+    the catalog looking as though it did — worse than an absent entry, because
+    it reads as coverage.
+    """
+    words = entry.get(field, [])
+    if not isinstance(words, list) or any(
+        not isinstance(word, str) or not word.strip() for word in words
+    ):
+        raise ValueError(f"ner type {entity_type!r} declares {field} that is not a list of words")
+    for word in words:
+        if len(word.split()) != 1:
+            raise ValueError(
+                f"ner type {entity_type!r} declares the {field} entry {word!r}, which is more "
+                "than one word: the rule matches a token at a time, so a phrase never matches. "
+                "List its words separately."
+            )
+    return frozenset(_normalized(word) for word in words)
 
 
 def _normalized(word: str) -> str:
@@ -128,7 +139,13 @@ def _normalized(word: str) -> str:
     return word.strip().rstrip(".").casefold()
 
 
-def trim_leading_words(text: str, start: int, end: int, words: frozenset[str]) -> tuple[int, int]:
+def trim_leading_words(
+    text: str,
+    start: int,
+    end: int,
+    words: frozenset[str],
+    articles: frozenset[str] = frozenset(),
+) -> tuple[int, int]:
     """`(start, end)` with listed words dropped from the front of the span.
 
     The model reads `Der Kunde Karz` as one person, so the same person behind a
@@ -136,29 +153,51 @@ def trim_leading_words(text: str, start: int, end: int, words: frozenset[str]) -
     on equality — two placeholders for one person, which is the failure the
     README's stability argument is built against.
 
+    **An article is trimmed only in front of another trimmable word.** `Le` is a
+    Vietnamese family name and `Das` a Bengali one, so trimming a leading
+    article on its own sends a real name component to the provider in clear:
+    `Le Thi Mai` would arrive as `Le [PERSON_1]`. `Le salarié Gallet` still
+    loses both words, because the article is followed by one that goes anyway.
+
     **Never trimmed to nothing.** A span made only of listed words is left as it
     came: a rule that can empty a span is a rule that can unmask a name, and a
-    person really called `Herr` would be exactly that. The same clause covers a
-    surname that happens to be on the list.
+    person really called `Herr` would be exactly that.
 
-    Only the front. The corpus shows no trailing over-capture at all, and a rule
-    that trimmed both ends would be twice the risk for none of the evidence.
+    **Never trimmed at all unless the span starts on a word boundary.** A token
+    window can begin inside a word, and `der` at the end of `Alexander` is not
+    an article — trimming there would expose the rest of a name the span was at
+    least partly covering.
+
+    Only the front: the corpus shows no trailing over-capture at all, and a rule
+    trimming both ends would be twice the risk for none of the evidence.
     """
-    if not words:
+    if not words and not articles:
         return start, end
+    if start > 0 and not text[start - 1].isspace():
+        return start, end
+
+    tokens: list[tuple[int, str]] = []
     at = start
     while at < end:
-        space = text.find(" ", at)
-        token_end = end if space == -1 or space >= end else space
-        if _normalized(text[at:token_end]) not in words:
-            # The first token that is not on the list: the name starts here.
-            return at, end
-        at = token_end + 1
-    # Every token was on the list. Keep the span whole rather than empty it:
-    # this is the `Herr` clause, and the loop reaching here is the only way to
-    # know it — a scan that stops at the last space never tests the last token,
-    # which trimmed `Der Kunde` to `Kunde`.
-    return start, end
+        while at < end and text[at].isspace():
+            at += 1
+        if at >= end:
+            break
+        token_start = at
+        while at < end and not text[at].isspace():
+            at += 1
+        tokens.append((token_start, text[token_start:at]))
+
+    trimmable = 0
+    while trimmable < len(tokens) and _normalized(tokens[trimmable][1]) in (words | articles):
+        trimmable += 1
+    # An article at the end of the run is followed by the name, not by another
+    # word that goes anyway, so it stays — and so does everything after it.
+    while trimmable and _normalized(tokens[trimmable - 1][1]) in articles - words:
+        trimmable -= 1
+    if not trimmable or trimmable >= len(tokens):
+        return start, end
+    return tokens[trimmable][0], end
 
 
 def chunks(text: str, *, size: int, overlap: int) -> list[tuple[int, str]]:
@@ -298,7 +337,11 @@ class GlinerRecognizer:
             if ner_type is None or score < ner_type.threshold:
                 continue
             start, end = trim_leading_words(
-                piece, int(entity["start"]), int(entity["end"]), ner_type.trim_leading
+                piece,
+                int(entity["start"]),
+                int(entity["end"]),
+                ner_type.trim_leading,
+                ner_type.trim_leading_articles,
             )
             yield Span(
                 entity_type=ner_type.entity_type,

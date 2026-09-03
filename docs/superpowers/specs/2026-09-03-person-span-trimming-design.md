@@ -75,9 +75,27 @@ Data, not code, because the repository already treats catalogs that way and
 because this list is the part that will need adding to. It lives on the
 `PERSON` entry in `ner.yaml`, since no other type needs one.
 
+**Articles are a separate list and are never trimmed alone.** `Le` is a
+Vietnamese family name and `Das` a Bengali one, so trimming a leading article by
+itself sends a real name component to the provider in clear — `Le Thi Mai`
+arriving as `Le [PERSON_1]`, which is worse than the over-wide span the rule
+exists to narrow. An article goes only in front of a word that goes anyway,
+which is the only shape the corpus ever shows. Found in review, and it was a
+defect this design introduced rather than one it inherited.
+
+Two more edges, both from the same review and both real:
+
+- **the span must start on a word boundary.** A token window can begin inside a
+  word, and `der` at the end of `Alexander` is not an article;
+- **whitespace is a run of any Unicode space.** Scanning for a single `" "` made
+  a second space produce an empty token, which is on no list, so the walk
+  stopped there — and an all-listed `Der  Kunde` slipped past the never-empty
+  guard and exposed `Der`.
+
 Three kinds of word, all present in the measurements:
 
-- **articles** — `der`, `die`, `le`, `la`, so `Der Kunde Karz` loses both words;
+- **articles** — `der`, `die`, `le`, `la`, trimmed only ahead of one of the
+  others, so `Der Kunde Karz` loses both words and `Le Thi Mai` loses none;
 - **role nouns** — `kunde`, `mandant`, `salarié`, `client`, and their feminine
   and plural forms;
 - **honorifics and salutations** — `herr`, `frau`, `madame`, `monsieur`, `dr`,
