@@ -126,6 +126,31 @@ entry, because it reads as coverage — the same rule this repository applies to
 guard that guards nothing. The words go in separately and the walk trims them in
 sequence.
 
+## The article list is the risky half, and dropping it is a catalog edit
+
+Every review finding on this change has circled the article safeguard: an
+article trimmed alone, a word listed in both lists, a span left holding
+punctuation, a window starting mid-word. The rule for role nouns and titles has
+not been challenged once.
+
+So the fallback is worth measuring rather than describing, and it is cheap:
+
+```
+articles kept      PERSON exact 73   wider 0   unmasked 3
+articles dropped   PERSON exact 66   wider 7   unmasked 3
+```
+
+**Dropping them costs seven spans and no exposure.** Twelve of the nineteen
+over-captures still resolve — including both turns of the case in the issue,
+which carry no article — and the entire class of risk goes with the list:
+`Le` cannot be trimmed off a Vietnamese name if `le` is not there to be trimmed.
+
+**It is a catalog edit, not a code change.** Deleting the `trim_leading_articles`
+block leaves a rule that behaves correctly with an empty set, which the unit
+tests cover. Whoever operates this can take the safer half without a release,
+and that reversibility is the reason the list ships enabled: the guards around
+it are tested and mutation-proved, and the way back is one block of YAML.
+
 ## What it cannot do, said plainly
 
 **Trimming makes the mask narrower**, so a trimmed word reaches the provider.

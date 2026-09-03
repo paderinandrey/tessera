@@ -120,3 +120,23 @@ def test_trimming_only_reads_inside_the_span() -> None:
 
     assert trim(text, 0, 18) == "Martina Weber"
     assert trim(text, 5) == "Martina Weber Herr"
+
+
+def test_the_rule_works_with_no_articles_at_all() -> None:
+    # The documented fallback: deleting `trim_leading_articles` from the
+    # catalog leaves a rule that still fixes the case in the issue and takes
+    # the whole class of article-versus-name collisions with it. Measured at
+    # seven spans of the nineteen, and no change in what goes unmasked.
+    #
+    # It is a catalog edit rather than a code change, so it has to work with an
+    # empty set and that is what this holds.
+    def trimmed(text: str) -> str:
+        at, to = trim_leading_words(
+            text, 0, len(text), WORDS, frozenset(), piece_starts_a_word=True
+        )
+        return text[at:to]
+
+    assert trimmed("Herr Börner") == "Börner"
+    assert trimmed("Le Thi Mai") == "Le Thi Mai"
+    # The price: an article in front of a role noun keeps both.
+    assert trimmed("Der Kunde Karz") == "Der Kunde Karz"
