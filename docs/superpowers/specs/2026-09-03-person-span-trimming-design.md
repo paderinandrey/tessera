@@ -86,6 +86,13 @@ Three kinds of word, all present in the measurements:
 Matched case-insensitively and after stripping a trailing `.`, so `Dr.` and
 `dr` are one entry.
 
+**One word per entry, enforced by the loader.** The rule walks a span a token at
+a time, so `Der Kunde` written as a single entry would never match anything and
+would sit in the catalog looking as though it did. That is worse than an absent
+entry, because it reads as coverage — the same rule this repository applies to a
+guard that guards nothing. The words go in separately and the walk trims them in
+sequence.
+
 ## What it cannot do, said plainly
 
 **Trimming makes the mask narrower**, so a trimmed word reaches the provider.

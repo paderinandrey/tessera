@@ -89,6 +89,18 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
             raise ValueError(
                 f"ner type {entity_type!r} declares trim_leading that is not a list of words"
             )
+        # One token each. The rule walks the span a word at a time, so a phrase
+        # like `Der Kunde` written as a single entry would never match anything
+        # and would sit in the catalog looking as though it did — the failure
+        # that is worse than an absent entry, because it reads as coverage.
+        # Write the words separately; the walk trims them in sequence.
+        for word in trim_leading:
+            if len(word.split()) != 1:
+                raise ValueError(
+                    f"ner type {entity_type!r} declares the trim_leading entry {word!r}, "
+                    "which is more than one word: the rule matches a token at a time, "
+                    "so a phrase never matches. List its words separately."
+                )
         types.append(
             NerType(
                 entity_type=entity_type,

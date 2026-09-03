@@ -147,3 +147,23 @@ def test_article_9_outranks_quasi_identifiers_but_not_identifiers() -> None:
     assert max(by_type[t].specificity for t in ("PERSON", "LOCATION", "ORG")) < 35
     # 40 is the lowest specificity in the identifier catalog.
     assert 35 < 40
+
+
+def test_a_multi_word_trim_entry_is_refused() -> None:
+    # The rule walks a span one token at a time, so `Der Kunde` written as one
+    # entry never matches — and sits in the catalog looking as though it does.
+    # A list entry that cannot fire is worse than an absent one: it reads as
+    # coverage.
+    config = """
+entities:
+  - entity_type: PERSON
+    label: person
+    threshold: 0.7
+    tier: 2
+    specificity: 30
+    trim_leading:
+      - Der Kunde
+"""
+
+    with pytest.raises(ValueError, match="more than one word"):
+        load_ner_types(config)
