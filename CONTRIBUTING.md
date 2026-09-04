@@ -15,6 +15,21 @@ which adds a `Signed-off-by: Your Name <your@email>` trailer. By signing off you
 that you have the right to submit the contribution under the project's license
 (Apache-2.0).
 
+CI checks every commit in a pull request and requires the trailer to name the commit's
+own author — the certification is about who wrote it. To add it to commits already made:
+
+```
+git rebase --signoff origin/main
+```
+
+The check runs on the pull request's commits rather than on `main`, because that is where
+the contribution is. Squash-merge composes its message from them, so the trailer reaches
+`main` as well.
+
+> Commits merged before this check existed do not carry the trailer, and the history is
+> deliberately not rewritten to add one: a sign-off is an attestation by a person, and
+> backfilling it would be asserting something on their behalf after the fact.
+
 ## Ground rules
 
 - **Never commit real personal data.** Test fixtures use synthetic values only
