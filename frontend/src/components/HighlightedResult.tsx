@@ -12,8 +12,12 @@ type HighlightedResultProps = {
 
 function layerLabel(layer: DetectionLayer): string {
   switch (layer) {
-    case 'deterministic':
+    case 'checksum':
       return 'Checksum verified'
+    case 'pattern':
+      // A catalog rule with no checksum to verify: an e-mail has none, and the
+      // Steuernummer's validator is structural. Both say so in the catalog.
+      return 'Deterministic pattern'
     case 'ner':
       return 'Model detected'
     case 'other':

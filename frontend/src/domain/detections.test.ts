@@ -22,15 +22,25 @@ function span(overrides: Partial<DetectorSpan> = {}): DetectorSpan {
 
 describe('classifyRecognizer', () => {
   it('classifies catalog recognizers as deterministic', () => {
-    expect(classifyRecognizer('catalog:credit_card')).toBe('deterministic')
+    expect(classifyRecognizer('catalog:credit_card', 1)).toBe('checksum')
+  })
+
+  it('calls a catalog rule below full confidence a pattern, not a checksum', () => {
+    // An e-mail has no checksum to verify and the Steuernummer's validator is
+    // structural; both stay below 1.0 on purpose, and `resolution.py` separates
+    // them from the checksum-backed rules with exactly this predicate. Calling
+    // them "checksum verified" told the user something the detector never
+    // claimed.
+    expect(classifyRecognizer('catalog:email', 0.95)).toBe('pattern')
+    expect(classifyRecognizer('catalog:de_steuernummer', 0.8)).toBe('pattern')
   })
 
   it('classifies ner recognizers as ner', () => {
-    expect(classifyRecognizer('ner:gliner')).toBe('ner')
+    expect(classifyRecognizer('ner:gliner', 0.9)).toBe('ner')
   })
 
   it('classifies unknown recognizer prefixes as other', () => {
-    expect(classifyRecognizer('custom:recognizer')).toBe('other')
+    expect(classifyRecognizer('custom:recognizer', 1)).toBe('other')
   })
 })
 

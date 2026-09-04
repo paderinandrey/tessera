@@ -220,9 +220,17 @@ textarea:focus-visible {
   font-weight: 700;
 }
 
-.highlighted-result mark[data-layer='deterministic'] {
+.highlighted-result mark[data-layer='checksum'] {
   border-color: #86efac;
   background: #dcfce7;
+}
+
+/* A catalog rule that carries no checksum: the same family as the one above,
+   dimmer, because the evidence is weaker and the colour should not say
+   otherwise. */
+.highlighted-result mark[data-layer='pattern'] {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
 }
 
 .highlighted-result mark[data-layer='ner'] {
@@ -403,9 +411,15 @@ textarea:focus-visible {
     color: #e5e7eb;
   }
 
-  .highlighted-result mark[data-layer='deterministic'] {
+  .highlighted-result mark[data-layer='checksum'] {
     border-color: #166534;
     background: #14532d;
+    color: #dcfce7;
+  }
+
+  .highlighted-result mark[data-layer='pattern'] {
+    border-color: #14532d;
+    background: #052e16;
     color: #dcfce7;
   }
 

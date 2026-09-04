@@ -1,6 +1,6 @@
 import type { DetectorSpan } from '../api/detector'
 
-export type DetectionLayer = 'deterministic' | 'ner' | 'other'
+export type DetectionLayer = 'checksum' | 'pattern' | 'ner' | 'other'
 
 export type HighlightedSegment =
   | { kind: 'text'; text: string }
@@ -13,9 +13,24 @@ export class InvalidDetectionResponseError extends Error {
   }
 }
 
-export function classifyRecognizer(recognizer: string): DetectionLayer {
+/**
+ * Which kind of evidence a span carries.
+ *
+ * **Two catalog rules carry no checksum**, and calling every `catalog:` match
+ * "checksum verified" told the user something the detector never claimed: an
+ * e-mail has no checksum to verify, and the German Steuernummer's validator is
+ * structural. Both say so in `identifiers.yaml` beside the rules themselves.
+ *
+ * The distinction is already in the response rather than in knowledge this
+ * client would have to keep in step with a catalog it does not ship: a rule
+ * without a checksum stays below 1.0 on purpose, and `resolution.py` separates
+ * them with exactly this predicate — `catalog:` and a confidence of 1.0. Asking
+ * the same question the detector asks is how the answer stays true when the
+ * catalog grows.
+ */
+export function classifyRecognizer(recognizer: string, confidence: number): DetectionLayer {
   if (recognizer.startsWith('catalog:')) {
-    return 'deterministic'
+    return confidence >= 1 ? 'checksum' : 'pattern'
   }
   if (recognizer.startsWith('ner:')) {
     return 'ner'
@@ -51,7 +66,7 @@ export function buildHighlightedSegments(
       kind: 'detection',
       text: codePoints.slice(span.start, span.end).join(''),
       span,
-      layer: classifyRecognizer(span.recognizer),
+      layer: classifyRecognizer(span.recognizer, span.confidence),
     })
     cursor = span.end
   }
