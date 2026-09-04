@@ -74,16 +74,50 @@ input**, where before it was exactly one of them. Three consequences:
 - the placeholder substituted for that span covers more of the caller's text, so
   a request that had a word between two entities in the clear may not any more.
   That is more masking, never less;
-- `Resolution.trace` is unchanged: the three rule names are the same and fire on
-  the same inputs. Only the `kept` span's bounds differ.
+- **`Decision.dropped` gains the winning reading.** The first version of this
+  section said the trace was unchanged because the rule names and the inputs
+  that trigger them are the same. That missed a field. `resolve` builds the
+  entry as `tuple(s for s in (a, b) if s != kept)`, so while rule 4 returned one
+  of its inputs it reported one dropped span — the loser. A union is equal to
+  neither input, so both are now reported, and a consumer reading the trace as
+  decision evidence sees the reading that *won* listed among those superseded.
+  Found in review, and it is the second time on this branch that a claim about
+  what does not change was made by looking at the fields I had edited.
+
+  The new semantics is the right one and was already the semantics everywhere
+  else: `same-type-merge`, `untouchable-inner-merge`, the nested merges and
+  `tie-merge-sensitive` all synthesise a span and all report both inputs. Rule 4
+  was the exception because it was the branch that did not merge. Pairs whose
+  extents already agree still report one dropped span, and
+  `test_a_widened_rule_4_span_reports_both_inputs_as_dropped` pins both halves.
 
 **Nothing that was masked stops being masked, in either direction.** That is the
 invariant the change installs, and the test below states it as one.
 
-**Nothing was exposed in practice.** The corpus never reaches the branch, and no
-release has shipped a configuration that does — but that is a fact about the
-inputs measured so far, not a property of the code, which is the distinction
-worth writing down.
+## What the corpus evidence does and does not establish **[revised in review]**
+
+The first version of this design said "nothing was exposed in practice", on the
+grounds that the corpus never reaches the branch and "no release has shipped a
+configuration that does". The second clause does not follow from the first.
+**Reachability depends on the text, not on the configuration:** the detector
+accepts arbitrary input, and whether two different types overlap partially is a
+property of what the model returns for a given document. A byte-identical result
+on 130 synthetic documents says nothing about what some other text would have
+produced.
+
+So the claim is scoped to what was measured:
+
+- **verified** — on the public corpus, at thresholds 0.7 and 0.5, rule 4 fires
+  23 times and drops zero characters, because every conflict it sees is an equal
+  range;
+- **unknown** — whether any other input has ever reached the branch. Nothing in
+  the repository records it, `Resolution.trace` is not persisted, and the audit
+  journal records types and counts rather than span geometry.
+
+The reason this is not an incident is a fact about deployment rather than about
+the evidence: **the service is not running anywhere**, so there is no traffic
+whose spans could have been narrowed. That is the honest sentence, and it is a
+much narrower one than the draft made.
 
 ## Testing
 
@@ -110,7 +144,10 @@ than it claims fails rather than passes.
   shape they did not build;
 - `test_the_winner_still_names_a_widened_span` pins the other half: taking the
   union *and* the loser's identity would close the exposure and corrupt the
-  audit record.
+  audit record;
+- `test_a_widened_rule_4_span_reports_both_inputs_as_dropped` pins the trace
+  contract this change alters, in both directions — a widened pair reports two
+  dropped readings, an equal-range pair still reports one.
 
 Mutations, one branch at a time, restored by inverse substitution:
 

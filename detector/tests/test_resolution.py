@@ -452,3 +452,40 @@ def test_the_winner_still_names_a_widened_span() -> None:
     assert (kept.entity_type, kept.recognizer, kept.tier) == ("PERSON", "ner:g", 2)
     assert (kept.confidence, kept.boosted) == (0.55, True)
     assert (kept.start, kept.end) == (10, 45)
+
+
+def test_a_widened_rule_4_span_reports_both_inputs_as_dropped() -> None:
+    """`Decision.dropped` gained the winner, and that is a public contract change.
+
+    `resolve` builds it as `tuple(s for s in (a, b) if s != kept)`. While rule 4
+    returned one of its inputs unchanged, that was one span — the loser. Taking
+    the union makes `kept` a *new* span equal to neither input, so both are
+    reported dropped, and a caller reading the trace as decision evidence sees
+    the reading that won listed among the ones that did not survive.
+
+    The new semantics is the right one and was already the semantics everywhere
+    else: `same-type-merge`, `untouchable-inner-merge`, the nested merges and
+    `tie-merge-sensitive` all synthesise a span and all report both inputs. Rule
+    4 was the exception because it was the rule that did not merge. Pinned here
+    because the pull request for this change asserted the trace was unchanged,
+    which was wrong, and an untested contract is how it stayed wrong.
+    """
+    location = span(entity_type="LOCATION", start=10, end=40, confidence=0.8,
+                    recognizer="ner:g", tier=2)
+    person = span(entity_type="PERSON", start=30, end=45, confidence=0.8,
+                  recognizer="ner:g", tier=2)
+    (decision,) = resolve([location, person], specificity={"PERSON": 30, "LOCATION": 20}).trace
+
+    assert decision.rule == "specificity"
+    assert (decision.kept.start, decision.kept.end) == (10, 45)
+    assert set(decision.dropped) == {location, person}, (
+        "the trace must report both readings as superseded when the kept span is neither"
+    )
+
+    # Where the extents already agree, rule 4 still returns an input untouched
+    # and the trace still names one dropped span. The change is confined to the
+    # pairs whose union is wider than either.
+    equal = span(entity_type="LOCATION", start=30, end=45, confidence=0.8,
+                 recognizer="ner:g", tier=2)
+    (decision,) = resolve([equal, person], specificity={"PERSON": 30, "LOCATION": 20}).trace
+    assert decision.dropped == (equal,)
