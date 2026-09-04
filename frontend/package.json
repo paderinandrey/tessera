@@ -1,0 +1,44 @@
+{
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "generate:api": "node scripts/openapi.mjs write",
+    "check:api": "node scripts/openapi.mjs check",
+    "typecheck": "tsc -b --pretty false",
+    "lint": "eslint .",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:e2e": "playwright test",
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.102.8",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.62.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.6",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "eslint": "^10.9.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.5",
+    "globals": "^17.11.0",
+    "jsdom": "^30.0.1",
+    "msw": "^2.15.0",
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  }
+}

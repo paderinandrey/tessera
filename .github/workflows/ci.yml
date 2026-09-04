@@ -114,6 +114,33 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # `ci` rather than `install`: it fails on a lockfile that disagrees with
+      # the manifest instead of quietly resolving something else, which is the
+      # difference between a build and a build of what was reviewed.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test:run
+      # The client's types are generated from `docs/api/openapi.json`, which
+      # this repository also generates and diffs in the `detector` job. Two
+      # generated artifacts from one source drift in opposite directions
+      # unless both are checked: `detector` holds the spec to the server, and
+      # this holds the client to the spec.
+      - run: npm run check:api
+      - run: npm run build
+
   compose:
     # Only on main: building a ~1 GB detector image on every pull request
     # costs more than this catches at that frequency, and the three jobs
