@@ -16,7 +16,33 @@
 entities:
   - entity_type: PERSON
     label: person
-    threshold: 0.7
+    # **0.5, and the number is measured rather than chosen.** A threshold is a
+    # constant and the score it judges is not: the same name scores lower with
+    # more text around it and lower again when other labels share the inference
+    # call, so a bar set against isolated single-label text drops names in
+    # every other shape. The gateway joins a document's leaves into one text
+    # and asks three tier-2 labels at once, which is both shifts at once.
+    #
+    # Measured over the 130-document public corpus, entities counted as found
+    # when any span covers them:
+    #
+    #   threshold   joined found   joined over-masked   separate found   over
+    #        0.7        174               19                 183          33
+    #        0.6        178               19                 184          33
+    #        0.5        182               19                 185          34
+    #        0.4        182               19                 185          36
+    #
+    # 0.5 recovers eight of the twelve detections joining costs, adds nothing
+    # to over-masking on the joined path and one span on the separate one.
+    # 0.4 buys nothing more and costs more, so this is an optimum rather than
+    # the end of a range.
+    #
+    # The price, named because it is real: one span in sixty-eight becomes a
+    # role phrase with no name in it — `Der Kunde`, which the trimming rule
+    # keeps whole because emptying a span could unmask a name. It masks a
+    # phrase nobody needed masked and does not save the name beside it. At 0.4
+    # there are two; at 0.6 none, which is the other defensible answer.
+    threshold: 0.5
     tier: 2
     specificity: 30
     # Words a person span may not begin with. The model reads `Der Kunde Karz`

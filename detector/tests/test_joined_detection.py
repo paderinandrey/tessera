@@ -207,9 +207,16 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 
 
 # What joining currently costs in recall, measured. **This is a defect being
-# tracked, not a target** — see #44. The gate stops it
-# widening while the decision is pending; it does not bless it.
-RECALL_GAP = 9
+# tracked, not a target** — see #44. The gate stops it widening; it does not
+# bless it.
+#
+# It was nine, and lowering `PERSON`'s threshold from 0.7 to 0.5 took it to
+# three: eight of the twelve detections joining lost were names scoring between
+# those two numbers, which is what a threshold calibrated on isolated
+# single-label text does to a joined three-label call. The remaining three are
+# not that, and tightening the bound with the fix is what stops them being
+# forgotten behind a number that used to have slack in it.
+RECALL_GAP = 3
 
 
 def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector) -> None:
