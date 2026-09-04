@@ -71,11 +71,30 @@ def test_untouchable_inner_survives_inside_non_checksum_outer() -> None:
 
 
 def test_partial_overlap_higher_specificity_wins() -> None:
+    # This test was named for a partial overlap and built an equal range, so
+    # the branch it claimed to cover — the one where the extents differ — was
+    # reached by nothing in the suite. Both shapes are asserted now, and the
+    # bounds are asserted with the type, because the type alone is what let
+    # rule 4 drop the loser's characters unnoticed.
     nir = span(entity_type="FR_NIR", start=0, end=15, recognizer="catalog:fr_nir")
     card = span(entity_type="CREDIT_CARD", start=0, end=15, recognizer="catalog:credit_card")
     result = resolve([card, nir], specificity=SPEC)
     (kept,) = result.spans
     assert kept.entity_type == "FR_NIR"
+    assert (kept.start, kept.end) == (0, 15)
+
+    # Neither span contains the other, which is what makes this rule 4 rather
+    # than the containment branch above — a first draft of this case wrote
+    # `0:15` inside `0:25` and was answered by rule 3, passing for a reason it
+    # did not claim.
+    overhanging_card = span(
+        entity_type="CREDIT_CARD", start=10, end=25, recognizer="catalog:credit_card"
+    )
+    result = resolve([overhanging_card, nir], specificity=SPEC)
+    (kept,) = result.spans
+    assert [decision.rule for decision in result.trace] == ["specificity"]
+    assert kept.entity_type == "FR_NIR"
+    assert (kept.start, kept.end) == (0, 25), "the card's last ten characters lost their mask"
 
 
 def test_specificity_tie_higher_confidence_wins() -> None:
@@ -84,6 +103,10 @@ def test_specificity_tie_higher_confidence_wins() -> None:
     result = resolve([a, b], specificity={"A": 50, "B": 50})
     (kept,) = result.spans
     assert kept.entity_type == "A"
+    # The surer reading names the span; it does not decide how much of the
+    # text stays masked. Asserting the type alone let 10..15 fall out.
+    assert (kept.start, kept.end) == (0, 15)
+    assert kept.confidence == 0.9
 
 
 def test_full_tie_merges_with_more_sensitive_type() -> None:
@@ -126,6 +149,17 @@ def test_untouchable_beats_higher_specificity_on_partial_overlap() -> None:
     result = resolve([model, nir], specificity={"VERY_SPECIFIC": 95, "FR_NIR": 80})
     (kept,) = result.spans
     assert kept.entity_type == "FR_NIR"
+
+    # And the shape the name promises: the model's reading runs past the
+    # checksum's. Rule 1 keeps the identifier's identity; it must not throw
+    # away the ten characters only the model marked.
+    overhanging = span(
+        entity_type="VERY_SPECIFIC", start=5, end=25, confidence=0.99, recognizer="ner:x", tier=2
+    )
+    result = resolve([overhanging, nir], specificity={"VERY_SPECIFIC": 95, "FR_NIR": 80})
+    (kept,) = result.spans
+    assert kept.entity_type == "FR_NIR"
+    assert (kept.start, kept.end) == (0, 25)
 
 
 def test_resolution_is_order_independent() -> None:
@@ -366,3 +400,55 @@ def test_a_same_type_merge_reports_the_boost_belonging_to_the_confidence_it_took
         [boosted_winner, plain], specificity=SPEC, untouchable=catalog_backed
     ).spans
     assert (kept.confidence, kept.boosted) == (0.9, False)
+
+
+def test_a_new_span_can_never_unmask_what_another_span_marked() -> None:
+    """Rule 4's invariant, stated over the whole function rather than a branch.
+
+    The defect this pins is not a wrong type but a *shorter mask*: rule 4 used
+    to return the winning span whole, so a span arriving beside another and
+    beating it on specificity, confidence or rule 1 took the text with it and
+    left the loser's remainder in the clear. Adding a detection removed
+    masking, which inverts what the layer is for.
+
+    Checked as a property over every rule-4 shape instead of one example,
+    because the three branches failed the same way and a test per example is
+    how two of them came to be named for a shape they did not build.
+    """
+    location = span(entity_type="LOCATION", start=10, end=40, confidence=0.8,
+                    recognizer="ner:g", tier=2)
+    cases = [
+        # (challenger, which branch it takes)
+        (span(entity_type="PERSON", start=30, end=45, confidence=0.8,
+              recognizer="ner:g", tier=2), "specificity"),
+        (span(entity_type="OTHER", start=30, end=45, confidence=0.9,
+              recognizer="ner:g", tier=2), "confidence"),
+        (span(entity_type="IBAN", start=30, end=45, confidence=1.0,
+              recognizer="catalog:iban", tier=1), "untouchable-wins"),
+    ]
+    specificity = {"PERSON": 30, "LOCATION": 20, "OTHER": 20, "IBAN": 20}
+    for challenger, expected_rule in cases:
+        alone = resolve([location], specificity=specificity).spans
+        together = resolve([location, challenger], specificity=specificity)
+        (kept,) = together.spans
+        assert [decision.rule for decision in together.trace] == [expected_rule]
+        for before in alone:
+            assert kept.start <= before.start and kept.end >= before.end, (
+                f"{expected_rule} unmasked characters that {before.entity_type} had marked: "
+                f"[{before.start}:{before.end}] survives only as [{kept.start}:{kept.end}]"
+            )
+        assert kept.end >= challenger.end and kept.start <= location.start
+
+
+def test_the_winner_still_names_a_widened_span() -> None:
+    # Widening is about extent only. A rule 4 that took the union *and* the
+    # loser's identity would fix the exposure and break the audit record, so
+    # the two halves are pinned apart.
+    location = span(entity_type="LOCATION", start=10, end=40, confidence=0.8,
+                    recognizer="ner:g", tier=2)
+    person = span(entity_type="PERSON", start=30, end=45, confidence=0.55,
+                  recognizer="ner:g", tier=2, boosted=True)
+    (kept,) = resolve([location, person], specificity={"PERSON": 30, "LOCATION": 20}).spans
+    assert (kept.entity_type, kept.recognizer, kept.tier) == ("PERSON", "ner:g", 2)
+    assert (kept.confidence, kept.boosted) == (0.55, True)
+    assert (kept.start, kept.end) == (10, 45)
