@@ -1,6 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
 
-const inspectedText = '🙂 Martina in Bern • 4111'
+// The e-mail is here for the layer that carries no checksum: appended, so the
+// offsets of everything before it are untouched. `catalog:email` at 0.95 is
+// what the detector really sends for an address — there is no checksum to
+// verify, and the evidence label and colour have to say so.
+const inspectedText = '🙂 Martina in Bern • 4111 a@b.de'
 const browserErrors = new WeakMap<Page, string[]>()
 
 test.beforeEach(async ({ page }) => {
@@ -38,6 +42,10 @@ async function mockDetector(page: Page) {
           {
             entity_type: 'CREDIT_CARD', start: 20, end: 24, confidence: 1,
             recognizer: 'catalog:credit_card', tier: 1, boosted: false,
+          },
+          {
+            entity_type: 'EMAIL', start: 25, end: 31, confidence: 0.95,
+            recognizer: 'catalog:email', tier: 2, boosted: false,
           },
         ],
         layers_run: ['deterministic', 'ner'],
@@ -118,6 +126,12 @@ test('uses approved accessible evidence foreground and background pairs in dark 
   const card = page.locator('mark[aria-label="4111 — Checksum verified"]')
   await expect(card).toHaveCSS('background-color', 'rgb(20, 83, 45)')
   await expect(card).toHaveCSS('color', 'rgb(220, 252, 231)')
+
+  // The catalog layer that carries no checksum. Its colours were added without
+  // this assertion and were the only evidence pair in the page nothing checked.
+  const email = page.locator('mark[aria-label="a@b.de — Deterministic pattern"]')
+  await expect(email).toHaveCSS('background-color', 'rgb(5, 46, 22)')
+  await expect(email).toHaveCSS('color', 'rgb(220, 252, 231)')
 })
 
 test('preserves submitted whitespace and wraps an unbroken value at a narrow width', async ({ page }) => {

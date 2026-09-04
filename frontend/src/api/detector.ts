@@ -47,7 +47,13 @@ export function isDetectorSpan(value: unknown): value is DetectorSpan {
   return isInteger(value.start)
     && value.start >= 0
     && isInteger(value.end)
-    && value.end >= value.start
+    // Exclusive, and the schema gives it a minimum of 1: a span covering no
+    // characters is not a detection. `end >= start` alone admitted `0, 0`,
+    // which the guard then called a valid span and the renderer rejected
+    // later — two places disagreeing about the contract, with the one that
+    // says "this is a `DetectorSpan`" being the wrong one to be lenient.
+    && value.end >= 1
+    && value.end > value.start
     && typeof value.entity_type === 'string'
     && typeof value.recognizer === 'string'
     && typeof value.confidence === 'number'

@@ -140,6 +140,15 @@ jobs:
       # this holds the client to the spec.
       - run: npm run check:api
       - run: npm run build
+      # The unit tests above run in jsdom. The Playwright suite is the only
+      # thing that exercises a real browser, and it covers what jsdom cannot
+      # answer: whether an astral character lands the highlight where the
+      # detector said, whether the page keeps analysed text out of storage,
+      # and whether the evidence colours survive dark mode. It was added with
+      # the playground and nothing ran it, which is the same defect as having
+      # no job at all, one script down.
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
 
   compose:
     # Only on main: building a ~1 GB detector image on every pull request
