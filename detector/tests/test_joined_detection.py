@@ -142,7 +142,7 @@ def _score(detector: Detector) -> dict[str, int]:
     redacted_types = _redacted_types(detector)
     totals = dict.fromkeys(
         ("truth", "separate_found", "joined_found", "separate_masked", "joined_masked",
-         "separate_overmasked", "joined_overmasked", "crossing"),
+         "separate_overmasked", "joined_overmasked", "crossing", "lost_to_joining"),
         0,
     )
     for group in _documents():
@@ -156,6 +156,14 @@ def _score(detector: Detector) -> dict[str, int]:
         totals["crossing"] += sum(1 for span in joined if not _inside_one_leaf(span, ranges))
 
         totals["truth"] += len(truth)
+        # **Directional, not net.** `separate_found - joined_found` lets a
+        # truth that only joining finds cancel a different truth that only
+        # joining loses, so the gate can hold while names go unmasked in
+        # `Slot::Json` leaves. These are the entities reading leaves apart
+        # covers and joining does not — the ones a caller loses.
+        totals["lost_to_joining"] += sum(
+            1 for entity in truth if _covered(entity, separate) and not _covered(entity, joined)
+        )
         entities = [
             EvalEntity(entity_type=span.entity_type, start=span.start, end=span.end)
             for span in truth
@@ -211,33 +219,41 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 # bless it.
 #
 # It was nine, and lowering `PERSON`'s threshold from 0.7 to 0.5 took it to
-# three: eight of the twelve detections joining lost were names scoring between
+# four: eight of the twelve detections joining lost were names scoring between
 # those two numbers, which is what a threshold calibrated on isolated
-# single-label text does to a joined three-label call. The remaining three are
+# single-label text does to a joined three-label call. The remaining four are
 # not that, and tightening the bound with the fix is what stops them being
 # forgotten behind a number that used to have slack in it.
-RECALL_GAP = 3
+#
+# **Four, and directional.** This gated `separate_found - joined_found` and read
+# three, because one truth that only *joining* finds cancelled one of the four
+# that only joining loses. A net figure lets the gate hold at a constant while
+# names go unmasked, as long as unrelated ones turn up elsewhere — and the
+# caller whose tool-call JSON lost a name is not compensated by a different
+# document gaining one. Raised by review on #48, and the arithmetic was right.
+LOST_TO_JOINING = 4
 
 
 def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector) -> None:
-    # Joining a document's leaves finds fewer of the entities the corpus
-    # annotates than reading them apart: twelve fewer, all `PERSON`, against
-    # three it finds and separate reading does not. Counted by position, so a
+    # The entities reading leaves apart covers and joining does not, counted as
+    # a set rather than as a difference of two totals. Counted by position, so a
     # relabelling is not a loss — these are characters left unmasked that
     # per-leaf detection would have hidden, in `Slot::Json` leaves, which is
     # where a tool call keeps its names.
     #
-    # An earlier version of this test asserted the opposite and passed, because
-    # it required the covering span to carry the *gold type*. Under that rule
-    # both strategies found 164 and the gap was invisible. Position is the
-    # question a masking gateway asks — the placeholder's name is not what
-    # protects anyone — and under it the two strategies are not equal.
+    # Two earlier versions of this test were wrong the same way, by aggregating
+    # over something that is not the caller's loss:
+    #
+    # - it required the covering span to carry the *gold type*, under which both
+    #   strategies found 164 and the gap was invisible. Position is the question
+    #   a masking gateway asks; the placeholder's name protects nobody;
+    # - it then gated `separate_found - joined_found`, a net figure that a truth
+    #   found only by joining can pay for. It read 3 against a real 4.
     totals = _score(detector)
-    gap = totals["separate_found"] - totals["joined_found"]
 
-    assert gap <= RECALL_GAP, (
-        "joining lost more annotated entities than the gap being tracked: "
-        f"{gap} against {RECALL_GAP}, of {totals['truth']}"
+    assert totals["lost_to_joining"] <= LOST_TO_JOINING, (
+        "joining left more annotated entities unmasked than the gap being tracked: "
+        f"{totals['lost_to_joining']} against {LOST_TO_JOINING}, of {totals['truth']}"
     )
 
 

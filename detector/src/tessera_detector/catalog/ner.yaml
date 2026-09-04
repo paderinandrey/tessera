@@ -26,22 +26,47 @@ entities:
     # Measured over the 130-document public corpus, entities counted as found
     # when any span covers them:
     #
-    #   threshold   joined found   joined over-masked   separate found   over
-    #        0.7        174               19                 183          33
-    #        0.6        178               19                 184          33
-    #        0.5        182               19                 185          34
-    #        0.4        182               19                 185          36
+    #   threshold   joined found   lost to joining   joined over   separate over
+    #        0.7        174                 12               19             33
+    #        0.6        178                  8               19             33
+    #        0.5        182                  4               19             34
+    #        0.4        182                  4               19             36
     #
-    # 0.5 recovers eight of the twelve detections joining costs, adds nothing
-    # to over-masking on the joined path and one span on the separate one.
-    # 0.4 buys nothing more and costs more, so this is an optimum rather than
-    # the end of a range.
+    # 0.5 recovers eight of the twelve entities joining costs, adds nothing to
+    # over-masking on the joined path and one span on the separate one. 0.4
+    # recovers nothing further and costs two more there, so 0.5 is the top of a
+    # plateau rather than a point on a slope.
+    #
+    # **Checked against the sweep that produced it**, because a best-of-four on
+    # 130 documents is a procedure that can find noise, and the reported result
+    # and the CI gate come from the same rows. A paired bootstrap over documents
+    # — 2000 resamples, `evaluation/threshold_bootstrap.py`, predeclared at 95%:
+    #
+    #   0.5 vs 0.6   more found in 98.2% of resamples, never fewer; 95% CI of
+    #                the difference [1, 8], excluding zero
+    #   0.5 vs 0.7   99.9%; CI [2, 15]
+    #   0.5 vs 0.4   identical on every resample; CI [0, 0]
+    #
+    # So the 0.5→0.6 cliff survives resampling and the 0.4→0.5 flat is flat in
+    # every sample rather than on average. Taking the **higher** end of that
+    # plateau is the conservative reading: same recall, one fewer over-masked
+    # span, and more room before the cliff.
+    #
+    # This is resampling, not held-out validation — it bounds how much of the
+    # gap is sampling variation in *this* corpus and cannot tell whether the
+    # corpus resembles a client's text. The private corpus is the measure that
+    # answers that, and it is reported separately.
     #
     # The price, named because it is real: one span in sixty-eight becomes a
-    # role phrase with no name in it — `Der Kunde`, which the trimming rule
-    # keeps whole because emptying a span could unmask a name. It masks a
-    # phrase nobody needed masked and does not save the name beside it. At 0.4
-    # there are two; at 0.6 none, which is the other defensible answer.
+    # role phrase with no name in it — `Der Kunde` in `mixed-0008`, which the
+    # trimming rule keeps whole because emptying a span could unmask a name.
+    # **It is over-masking and not a miss**: the name beside it, `Hoareau`,
+    # has its own span at 0.842, well clear of any of these bars. An earlier
+    # version of this note said the role phrase "does not save the name beside
+    # it", which was wrong and wrong in the alarming direction.
+    # `test_the_lower_threshold_prices_a_role_phrase_and_still_masks_the_name`
+    # holds both halves. At 0.4 there are two such spans; at 0.6 none, which is
+    # the other defensible answer.
     threshold: 0.5
     tier: 2
     specificity: 30

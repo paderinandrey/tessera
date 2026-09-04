@@ -149,7 +149,7 @@ def test_a_person_span_drops_an_article_with_its_role_noun(
     #
     # One sentence each, because a longer one costs the second name entirely:
     # the model's confidence for a name falls as the text around it grows and
-    # `PERSON`'s threshold is a fixed 0.7 (#44). That is not what this test is
+    # `PERSON`'s threshold is a fixed 0.5 (#44). That is not what this test is
     # about, and folding both names into one sentence would have made it fail
     # for a reason it does not hold.
     def person(text: str) -> list[str]:
@@ -157,3 +157,48 @@ def test_a_person_span_drops_an_article_with_its_role_noun(
 
     assert person("Der Mandant Kuhl hat unterschrieben.") == ["Kuhl"]
     assert person("Sehr geehrter Herr Börner, anbei die Unterlagen.") == ["Börner"]
+
+
+def test_the_lower_threshold_prices_a_role_phrase_and_still_masks_the_name(
+    recognizer: GlinerRecognizer,
+) -> None:
+    """What `PERSON`'s 0.5 buys and what it costs, on the sentence that shows both.
+
+    `mixed-0008` in the public corpus, verbatim. The model returns two `PERSON`
+    spans here: `Hoareau` at 0.842, which the gold annotates, and `Der Kunde` at
+    0.552, which it does not. The second exists only because the threshold is
+    0.5; at 0.7 it is dropped.
+
+    **The cost is over-masking and not a miss.** An earlier version of this
+    claim — written in #48's review request — said the role phrase masks a
+    phrase nobody needed masked *and leaves the name beside it*. That is wrong:
+    the name has its own span, well clear of the bar, and both assertions are
+    here so the distinction cannot quietly stop holding.
+
+    This replaces a test that asserted `trim("Der Kunde") == "Der Kunde"`. That
+    one called the trimming helper, read no catalog and asked the model nothing,
+    so it passed at 0.5, 0.6 and 0.7 alike and duplicated
+    `test_trimming_never_empties_a_span` one file over. It claimed to make the
+    threshold's cost a fixture and could not have noticed the cost changing.
+
+    Deliberately sensitive to the threshold: raising it back to 0.7 fails this
+    test. A recorded price should have to be re-recorded when the thing being
+    priced moves.
+    """
+    text = (
+        "Der Kunde Hoareau de la société Texier S.A.R.L. demande un remboursement "
+        "— IBAN FR76 3000 6000 0100 3853 4344 797."
+    )
+    people = sorted(
+        (span.start, span.end)
+        for span in recognizer.detect(text)
+        if span.entity_type == "PERSON"
+    )
+
+    assert (10, 17) in people, "the name the gold annotates is not masked"
+    assert text[10:17] == "Hoareau"
+    assert (0, 9) in people, (
+        "the role phrase the 0.5 threshold admits is gone — if the threshold moved, "
+        "the price recorded in `ner.yaml` moved with it and needs re-measuring"
+    )
+    assert text[0:9] == "Der Kunde"

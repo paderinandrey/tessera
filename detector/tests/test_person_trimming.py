@@ -141,15 +141,3 @@ def test_the_rule_works_with_no_articles_at_all() -> None:
     # The price: an article in front of a role noun keeps both.
     assert trimmed("Der Kunde Karz") == "Der Kunde Karz"
 
-
-def test_a_span_of_role_words_alone_is_the_priced_cost_of_the_threshold() -> None:
-    # `PERSON`'s threshold is 0.5, and one span in sixty-eight on the corpus is
-    # a role phrase with no name in it. This is that span, and it is here so the
-    # cost is a fixture rather than a surprise: the trimming rule keeps it whole
-    # because emptying a span could unmask a name, so it masks a phrase nobody
-    # needed masked and does not save the name beside it.
-    #
-    # Raising the threshold to 0.6 removes it and gives back four of the eight
-    # detections the lower bar recovers. That trade is recorded in `ner.yaml`
-    # beside the number.
-    assert trim("Der Kunde") == "Der Kunde"
