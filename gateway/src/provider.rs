@@ -358,6 +358,52 @@ fn reject_streamed_tools(
     Ok(())
 }
 
+/// A streamed response the caller has declared will be a JSON document.
+///
+/// `RestoreBuffer` substitutes with `Mapping::restore`, the plain textual
+/// substitution, because a delta is a fragment and the structural route the
+/// buffered path takes is a parse of the whole string. So a restored value
+/// carrying a character that can close a string — a `"`, an apostrophe, a
+/// backslash — lands in the client's document unescaped and mid-flight, and
+/// the bytes are gone before anything can reconsider. #36.
+///
+/// **The condition is the caller's declaration, not the value.** Refusing on
+/// "the mapping holds a value that is not inert" looks tighter and is wrong:
+/// `json_string_inert` is an allowlist that excludes the apostrophe, so
+/// `O'Brien` fails it — and a streamed *prose* reply carrying that name is
+/// neither a document nor a hazard. The buffered path can tell those apart
+/// because it parses; this one cannot, so refusing on the value would refuse
+/// most streamed prose about anyone Irish. `response_format` is the one signal
+/// that separates them, and it separates them because the **caller** supplied
+/// it: they are telling us the reply is a document they will parse.
+///
+/// **`json_schema` as well as `json_object`.** Structured Outputs declares a
+/// document exactly as JSON mode does; naming only the older one would have
+/// left the newer and more popular half open, which is the shape of gap this
+/// function exists to close.
+///
+/// **What it does not close, stated because the guard is on a declaration.** A
+/// streamed reply whose content happens to be JSON while the request set no
+/// `response_format` is still restored as text. The caller has not declared a
+/// document contract there, and the alternative is a parser of ours on the path
+/// where a mistake cannot be taken back — the option #36 rejected and this does
+/// not revisit. The residual is recorded in the spec rather than left to be
+/// rediscovered.
+fn reject_streamed_json_mode(body: &Value, provider: &'static str) -> Result<(), ShapeError> {
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let declared = body
+        .pointer("/response_format/type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "json_object" | "json_schema"));
+    if streaming && declared {
+        return Err(ShapeError::Unsupported(
+            provider,
+            "a streamed response declared as a JSON document",
+        ));
+    }
+    Ok(())
+}
+
 /// Why one key is safe to admit — the question every allowlist entry below has
 /// to answer, asked by the type rather than by a comment.
 ///
@@ -1597,6 +1643,10 @@ impl Provider for OpenAi {
         // continuation carrying only history is covered without asking for a
         // top-level `tools` that a continuation need not repeat.
         reject_streamed_tools(body, &pointers, "openai")?;
+        // Reads the request rather than the slots: `response_format` describes
+        // the *response*, which has no slots yet, and it is the caller's
+        // declaration rather than anything masking found.
+        reject_streamed_json_mode(body, "openai")?;
         Ok(pointers)
     }
 
@@ -1829,6 +1879,12 @@ impl Provider for Anthropic {
         // for a top-level `tools` did, and a location added later is covered
         // the day it is described.
         reject_streamed_tools(body, &pointers, "anthropic")?;
+        // Called for both providers though only one has the field today. The
+        // Messages API asks for structured output through tools, which
+        // `reject_streamed_tools` already refuses — so this is inert here, and
+        // it is the day Anthropic grows a `response_format` that the omission
+        // would cost, silently, in the half nobody was looking at.
+        reject_streamed_json_mode(body, "anthropic")?;
         Ok(pointers)
     }
 
@@ -4381,6 +4437,96 @@ mod tests {
                 "{provider} forwarded a tool_choice on a message: {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_streamed_response_declared_as_a_document_is_refused() {
+        // #36. `RestoreBuffer` substitutes as text, so a value carrying a
+        // character that can close a string lands in the client's document
+        // mid-flight and the bytes are gone. The buffered path takes a
+        // structural route; a delta is a fragment and has none.
+        for kind in ["json_object", "json_schema"] {
+            let declared = json!({
+                "model": "gpt", "stream": true,
+                "response_format": {"type": kind},
+                "messages": [{"role": "user", "content": "hallo"}]
+            });
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&declared),
+                    Err(ShapeError::Unsupported(
+                        "openai",
+                        "a streamed response declared as a JSON document"
+                    ))
+                ),
+                "{kind} was admitted on a streamed request"
+            );
+        }
+
+        // Both halves are needed. Declaring a document without streaming is the
+        // case the buffered path restores structurally, and streaming without
+        // declaring one is an ordinary completion — refusing either would cost
+        // requests this gateway handles correctly today.
+        let buffered = json!({
+            "model": "gpt",
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(OpenAi.request_pointers(&buffered).is_ok());
+        let streamed_prose = json!({"model": "gpt", "stream": true,
+                                    "messages": [{"role": "user", "content": "hallo"}]});
+        assert!(OpenAi.request_pointers(&streamed_prose).is_ok());
+
+        // `{"type": "text"}` is the default written out, and it declares the
+        // opposite of a document.
+        let text_mode = json!({
+            "model": "gpt", "stream": true,
+            "response_format": {"type": "text"},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(OpenAi.request_pointers(&text_mode).is_ok());
+    }
+
+    #[test]
+    fn the_streamed_document_refusal_reads_a_declaration_and_not_a_value() {
+        // The guard this replaced in an earlier draft: refuse when the mapping
+        // holds a value that is not `json_string_inert`. It is tighter on
+        // paper and wrong in practice, because the allowlist excludes the
+        // apostrophe — so a streamed prose reply mentioning `O'Brien` would
+        // have been refused, and prose is what streaming is mostly for.
+        //
+        // Pinned as a test rather than a comment because the tighter guard is
+        // the one a reader reaches for: it is the same predicate the buffered
+        // path uses, and the reason it does not transfer is that the buffered
+        // path also *parses*, which is what tells its prose from its documents.
+        let prose = json!({
+            "model": "gpt", "stream": true,
+            "messages": [{"role": "user", "content": "schreib etwas über O'Brien"}]
+        });
+        assert!(
+            OpenAi.request_pointers(&prose).is_ok(),
+            "a streamed prose request was refused for carrying a non-inert character"
+        );
+    }
+
+    #[test]
+    fn anthropic_is_asked_the_same_question_though_it_has_no_field_today() {
+        // Inert on the Messages API, which asks for structured output through
+        // tools — already refused by `reject_streamed_tools`. It is here so the
+        // day Anthropic grows the field is not the day the half nobody watched
+        // silently admits it.
+        let declared = json!({
+            "model": "claude", "stream": true, "max_tokens": 16,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&declared),
+            Err(ShapeError::Unsupported(
+                "anthropic",
+                "a streamed response declared as a JSON document"
+            ))
+        ));
     }
 
     #[test]

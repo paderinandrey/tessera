@@ -149,27 +149,36 @@ pub const MAX_HELD: usize = 64;
 /// where a document begins or ends. Restoring the fragment `{"name":"` proves
 /// nothing about the document it will become at the client.
 ///
-/// **So the two paths differ here, deliberately and not silently.** The
-/// `arguments` case — the one the recursion was written for — cannot reach this
-/// buffer at all: `reject_streamed_tools` refuses `stream: true` on a request
-/// carrying tool traffic. What remains open is a JSON-mode `content` on a
-/// streamed completion. Closing it means buffering a whole run before emitting
-/// any of it, which is the thing streaming exists not to do, or teaching this
-/// buffer to track JSON structure across fragments — a parser of our own beside
-/// the one `serde_json` already has, on the path where a mistake is
-/// unrecoverable because the bytes have gone out. Neither is worth it for the
-/// case; it is recorded rather than fixed. `proxy::handle`'s text-slot arm says
-/// the same from the side that is closed.
+/// **So the two paths differ here, and neither one of them decides it.** Both
+/// halves are answered before the upstream call, by refusing a request shape:
+///
+/// - the `arguments` case — the one the recursion was written for — cannot
+///   reach this buffer at all, because `reject_streamed_tools` refuses
+///   `stream: true` on a request carrying tool traffic;
+/// - a `content` the caller has declared will be a document cannot either,
+///   because `reject_streamed_json_mode` refuses `stream: true` beside a
+///   `response_format` of `json_object` or `json_schema` (#36).
+///
+/// Buffering a whole run before emitting any of it is the thing streaming
+/// exists not to do, and teaching this buffer to track JSON structure across
+/// fragments is a parser of our own beside the one `serde_json` already has, on
+/// the path where a mistake is unrecoverable because the bytes have gone out.
+/// Refusing the shape costs neither.
 ///
 /// **`restore` here is the plain substitution and it never asks
 /// `json_string_inert`.** The buffered path asks, and answers a value that
 /// could close a string in some dialect by taking the structural route or
-/// refusing; this path has no structural route to take. So the case left open
-/// is wider than a value carrying a `"`: an apostrophe closes a string for a
-/// JSON5 reader just as well. The cheap way to close it is to refuse the
-/// request shape the way `reject_streamed_tools` refuses the other one — a
-/// change to what this gateway accepts rather than to how it restores, so it
-/// is filed as #36 rather than taken here.
+/// refusing; this path has no structural route to take. That is why the
+/// question is settled at admission rather than here, and why it is settled on
+/// the caller's *declaration* rather than on the value: an apostrophe fails
+/// `json_string_inert`, so refusing on the value would refuse a streamed prose
+/// reply about anyone called `O'Brien` — prose being most of what streams.
+///
+/// **What is still restored as text: a streamed reply whose content happens to
+/// be JSON while the request declared no `response_format`.** The caller has
+/// not claimed a document contract there and this buffer cannot find one
+/// without the parser above. Recorded in #36's design rather than left here to
+/// be rediscovered as a surprise.
 pub struct RestoreBuffer<'a> {
     mapping: &'a Mapping,
     held: String,
