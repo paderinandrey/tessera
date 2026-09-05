@@ -165,23 +165,33 @@ pub const MAX_HELD: usize = 64;
 /// the path where a mistake is unrecoverable because the bytes have gone out.
 /// Refusing the shape costs neither.
 ///
-/// **`restore` here is the plain substitution and it never asks
-/// `json_string_inert`.** The buffered path asks, and answers a value that
-/// could close a string in some dialect by taking the structural route or
-/// refusing; this path has no structural route to take. That is why the
-/// question is settled at admission rather than here, and why it is settled on
-/// the caller's *declaration* rather than on the value: an apostrophe fails
-/// `json_string_inert`, so refusing on the value would refuse a streamed prose
-/// reply about anyone called `O'Brien` — prose being most of what streams.
+/// **And what this buffer now decides for itself.** It restores through
+/// `Mapping::restore_in_stream`, which asks `json_string_inert` of every value
+/// it substitutes and refuses one that could close a string *when a container
+/// has been opened before the token* — `opened` below, the same question
+/// `structure_encloses_a_token` asks of a whole string, carried across
+/// fragments in a bool.
 ///
-/// **What is still restored as text: a streamed reply whose content happens to
-/// be JSON while the request declared no `response_format`.** The caller has
-/// not claimed a document contract there and this buffer cannot find one
-/// without the parser above. Recorded in #36's design rather than left here to
-/// be rediscovered as a surprise.
+/// That was the thing thought impossible here, and the mistake was in the
+/// inference: a delta cannot be **parsed**, which was read as "cannot decide".
+/// "Was a bracket seen before this token" needs no parse, no lookahead and no
+/// second copy of `serde_json` — only a fact about text already gone past,
+/// which is exactly what a stream has.
+///
+/// It leaves prose alone, which is what a rule on the *value* alone could not
+/// do: an apostrophe fails `json_string_inert`, so refusing on that would
+/// refuse a streamed reply about anyone called `O'Brien`, and prose is most of
+/// what streams. See #55, and `restore_in_stream` for the row-by-row
+/// comparison with the buffered path — one row differs, and it is the one where
+/// a parse would have let the buffered path succeed rather than refuse.
 pub struct RestoreBuffer<'a> {
     mapping: &'a Mapping,
     held: String,
+    /// Whether a `{` or `[` has gone past in this run's text, which is the one
+    /// thing a stream can know about the document it may be in without parsing
+    /// one. Carried across fragments, never reset, and scoped to this run
+    /// because a buffer is — see `Mapping::restore_in_stream`.
+    opened: bool,
 }
 
 impl<'a> RestoreBuffer<'a> {
@@ -189,6 +199,7 @@ impl<'a> RestoreBuffer<'a> {
         Self {
             mapping,
             held: String::new(),
+            opened: false,
         }
     }
 
@@ -203,7 +214,7 @@ impl<'a> RestoreBuffer<'a> {
             }
             let rest = self.held.split_off(split);
             let ready = std::mem::replace(&mut self.held, rest);
-            emitted.push_str(&self.mapping.restore(&ready)?);
+            emitted.push_str(&self.mapping.restore_in_stream(&ready, &mut self.opened)?);
             // Releasing a bracket that ran past the cap can expose a further
             // complete region behind it.
             if self.held.len() <= MAX_HELD {
@@ -216,7 +227,7 @@ impl<'a> RestoreBuffer<'a> {
     /// Emit whatever is still held: the text run has ended.
     pub fn finish(&mut self) -> Result<String, MappingError> {
         let ready = std::mem::take(&mut self.held);
-        self.mapping.restore(&ready)
+        self.mapping.restore_in_stream(&ready, &mut self.opened)
     }
 
     /// Byte length of the prefix that cannot be part of a pending placeholder.
@@ -1597,6 +1608,185 @@ mod buffer_tests {
             )
             .unwrap();
         mapping
+    }
+
+    /// A mapping whose one value carries a character that can close a string.
+    /// `O'Brien` rather than `x","admin":true` on purpose: the apostrophe is
+    /// what makes this an ordinary name and not a crafted payload, and it fails
+    /// `json_string_inert` exactly as a quote does because a permissive reader
+    /// honours it exactly as well.
+    fn mapped_to_a_non_inert_value() -> Mapping {
+        let mut mapping = Mapping::new();
+        mapping
+            .mask(
+                "O'Brien",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 7,
+                }],
+            )
+            .unwrap();
+        mapping
+    }
+
+    #[test]
+    fn a_value_that_could_close_a_string_is_refused_inside_a_streamed_structure() {
+        // #55. The streamed path substituted as text unconditionally, so this
+        // wrote `{"name":"O'Brien"}` into the client's document with the
+        // apostrophe closing the string it landed in — and the bytes were gone
+        // before anything could reconsider. A delta cannot be parsed, which was
+        // read as "cannot decide", but "was a container opened before this
+        // token" needs no parse.
+        let mapping = mapped_to_a_non_inert_value();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let error = buffer
+            .push(r#"{"name":"[PERSON_1]"}"#)
+            .expect_err("a non-inert value inside an opened structure must not be substituted");
+        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+    }
+
+    #[test]
+    fn the_structure_and_the_token_may_arrive_in_different_fragments() {
+        // The whole reason this is a flag and not a scan: the `{` and the token
+        // land in separate deltas, so a rule that looked only at the fragment
+        // in hand would see `[PERSON_1]"}` with nothing opened and substitute.
+        let mapping = mapped_to_a_non_inert_value();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert_eq!(buffer.push(r#"{"name":"#).unwrap(), r#"{"name":"#);
+        let error = buffer
+            .push(r#""[PERSON_1]"}"#)
+            .expect_err("the container opened two fragments ago still encloses this token");
+        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+    }
+
+    #[test]
+    fn the_same_value_in_prose_is_substituted() {
+        // The row that keeps this from being "refuse every apostrophe". No
+        // container was opened, so there is no string for the value to close,
+        // and prose is most of what streams.
+        let mapping = mapped_to_a_non_inert_value();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = buffer.push("Guten Tag [PERSON_1], ").unwrap();
+        out.push_str(&buffer.push("wie geht es Ihnen?").unwrap());
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "Guten Tag O'Brien, wie geht es Ihnen?");
+    }
+
+    #[test]
+    fn an_inert_value_inside_a_structure_is_substituted() {
+        // The other row that keeps the rule narrow: a container is not the
+        // problem, a value that can escape its string is. `Weber` cannot.
+        let mapping = mapped();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = buffer.push(r#"{"name":"[PERSON_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"name":"Weber"}"#);
+    }
+
+    #[test]
+    fn a_container_opened_after_the_token_does_not_enclose_it() {
+        // `structure_encloses_a_token` asks at the token and not after the
+        // loop, and this carries that reading across fragments: a `{` that
+        // arrives later says nothing about a value already emitted.
+        //
+        // **Both fragments in one push**, deliberately. Split across two, this
+        // passes under a rule that pre-scans each fragment for brackets before
+        // restoring it — a mutation that survived when the test was written
+        // that way, because the two pieces never shared a run. One push is what
+        // makes the *position within the run* the thing being asserted.
+        let mapping = mapped_to_a_non_inert_value();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = buffer.push(r#"[PERSON_1] wrote {"a":1} and "#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"O'Brien wrote {"a":1} and "#);
+
+        // And once it has been opened it stays opened, in the same run: a
+        // second token after the brace is refused.
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let error = buffer
+            .push(r#"a {"b":1} then [PERSON_1]"#)
+            .expect_err("a container opened earlier in the same run still encloses this token");
+        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_value_the_buffered_allowlist_calls_dangerous_still_streams() {
+        // **The test that separates the two predicates**, and the measurement
+        // that made it necessary. A first version of this rule reused
+        // `json_string_inert`, the buffered path's allowlist. On the public
+        // corpus that rejects 3.1% of annotated values — and the offending
+        // characters are `/` and `&`: every German tax number, whose canonical
+        // form is `419/130/29933`, and company names like
+        // `Boerner AG & Co. KGaA`.
+        //
+        // Neither can close a string in any reader. The allowlist excludes them
+        // because on the buffered path being wrong costs a parse, which that
+        // path was happy to do — its own comment prices `/` that way, "it came
+        // out because it was cheap". Here being wrong costs a killed stream, so
+        // the question is the narrower one: `can_leave_a_string`.
+        //
+        // Under the allowlist this test fails on both values.
+        for value in ["419/130/29933", "Boerner AG & Co. KGaA"] {
+            let mut mapping = Mapping::new();
+            mapping
+                .mask(
+                    value,
+                    &[Span {
+                        entity_type: "ORG".into(),
+                        start: 0,
+                        end: value.chars().count(),
+                    }],
+                )
+                .unwrap();
+            let mut buffer = RestoreBuffer::new(&mapping);
+            let mut out = buffer.push(r#"{"x":"[ORG_1]"}"#).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(
+                out,
+                format!(r#"{{"x":"{value}"}}"#),
+                "a value that cannot close a string ended the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_out_of_a_string_is_refused() {
+        // The other side: the enumeration this rule is built from — a
+        // delimiter, the escape, a character the format forbids raw — asserted
+        // member by member, so a narrowing that drops one is a failing test
+        // rather than a silent injection.
+        for value in ["a\"b", "a'b", "a`b", "a\\b", "a\nb", "a\u{1}b"] {
+            let mut mapping = Mapping::new();
+            mapping
+                .mask(
+                    value,
+                    &[Span {
+                        entity_type: "ORG".into(),
+                        start: 0,
+                        end: value.chars().count(),
+                    }],
+                )
+                .unwrap();
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(r#"{"x":"[ORG_1]"}"#).is_err(),
+                "a value carrying {value:?} was substituted into a streamed structure"
+            );
+        }
+    }
+
+    #[test]
+    fn one_run_s_structure_does_not_bind_another() {
+        // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
+        // text run — the granularity at which the buffered path restores a
+        // slot. A `{` in one choice's content must not refuse a token in
+        // another's.
+        let mapping = mapped_to_a_non_inert_value();
+        let mut first = RestoreBuffer::new(&mapping);
+        assert!(first.push(r#"{"name":"[PERSON_1]"}"#).is_err());
+        let mut second = RestoreBuffer::new(&mapping);
+        assert_eq!(second.push("hallo [PERSON_1]").unwrap(), "hallo O'Brien");
     }
 
     #[test]

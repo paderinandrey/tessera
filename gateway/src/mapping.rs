@@ -501,6 +501,22 @@ impl Mapping {
         })
     }
 
+    /// The plain textual substitution, **with no production caller left**.
+    ///
+    /// That is the shape of the change `restore_in_stream` made rather than a
+    /// tidying note. This was the streamed path's restoration, and it was the
+    /// last place in the gateway that substituted a value into a caller's text
+    /// without first asking whether the text was a document. Every path asks
+    /// now — the sweep through `Lenient`, the described slots through `Strict`,
+    /// the stream through the running `opened` flag — so the unconditional
+    /// answer has nobody to give it to.
+    ///
+    /// Kept for the tests that state the substitution contract on its own,
+    /// where the document question would be noise: what a token grammar admits,
+    /// what an unknown placeholder costs, that `[see [PERSON_1]]` finds the
+    /// inner token. Deleting it would rewrite those in a vocabulary about
+    /// documents that they are not about.
+    #[cfg(test)]
     pub fn restore(&self, text: &str) -> Result<String, MappingError> {
         let mut result = String::with_capacity(text.len());
         for piece in pieces(text) {
@@ -516,6 +532,80 @@ impl Mapping {
             }
         }
         Ok(result)
+    }
+
+    /// Restore a fragment of a stream, refusing a substitution the buffered path
+    /// would not have made textually.
+    ///
+    /// **The same question `structure_encloses_a_token` asks, carried across
+    /// fragments in a bool.** A stream cannot parse — a delta is a piece of a
+    /// document — and that was taken as meaning it could not decide anything,
+    /// so it substituted as text unconditionally and a value carrying a `"` or
+    /// an apostrophe closed the string it landed in. But "was a container
+    /// opened before this token" needs no parse and no lookahead: it is a
+    /// running fact about the text already seen, and `opened` is that fact.
+    ///
+    /// So the two paths ask the same thing and diverge only where the streamed
+    /// one has less to work with:
+    ///
+    /// | | buffered | streamed |
+    /// |---|---|---|
+    /// | value wholly inert | substitute | substitute |
+    /// | non-inert, no container opened | substitute (prose) | substitute (prose) |
+    /// | non-inert, container opened, parses | restore structurally | **refuse** |
+    /// | non-inert, container opened, will not parse | refuse | refuse |
+    ///
+    /// **One row differs and it is the price of the missing parse.** Where the
+    /// buffered path can put the value in a leaf and escape it on the way out,
+    /// this one has no document to put it in, so it refuses rather than
+    /// corrupt. A stream is therefore strictly more likely to end than a
+    /// buffered response is to fail, and the trade is a truncated answer the
+    /// client can see against a silently altered document their agent may act
+    /// on.
+    ///
+    /// `opened` is never reset, exactly as it is never reset in
+    /// `structure_encloses_a_token`: a container opened *after* a token
+    /// encloses nothing of ours, and one opened before it is not un-opened by a
+    /// closing brace this function does not track. It is scoped to one text run
+    /// because `RestoreBuffer` is — `stream::handle` keys a buffer per run, the
+    /// same granularity at which the buffered path restores a slot.
+    ///
+    /// **The false positive this accepts, named rather than discovered.** Prose
+    /// carrying a bracket before a name whose value is not inert — a markdown
+    /// list, a fenced example — ends the stream. That is not new behaviour
+    /// invented here: the buffered path already refuses exactly that text, in
+    /// its fourth row above, and six earlier readings that tried to be cleverer
+    /// about which reader accepts what were each defeated in turn. Sharing the
+    /// rule is worth more than being right about brackets.
+    pub fn restore_in_stream(&self, text: &str, opened: &mut bool) -> Result<String, MappingError> {
+        let mut out = String::with_capacity(text.len());
+        for piece in pieces(text) {
+            match piece {
+                Piece::Text(run) => {
+                    // Our own token's brackets never reach here: `pieces` yields
+                    // a placeholder as its own piece, so the one reading of what
+                    // is a token stays shared with `restore`.
+                    if run.contains(['{', '[']) {
+                        *opened = true;
+                    }
+                    out.push_str(run);
+                }
+                Piece::Placeholder(candidate) => {
+                    let value = self
+                        .by_placeholder
+                        .get(candidate)
+                        .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
+
+                    if *opened && value.chars().any(can_leave_a_string) {
+                        return Err(MappingError::Unrestorable(
+                            "a value that could close a string, inside a streamed structure",
+                        ));
+                    }
+                    out.push_str(value);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Restore inside one string, leniently and without breaking a document the
@@ -1218,6 +1308,53 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// every timestamp, `@` in every e-mail address. Covering a reader nobody in
 /// this path has would leave an allowlist that refuses the values this gateway
 /// exists to restore.
+/// Whether this character is one of the ways *out* of a string, for the
+/// streamed path, which cannot repair and can only refuse.
+///
+/// **A different question from `json_string_inert`, and the difference is
+/// cost.** That function decides whether to attempt a structural restore, so
+/// its conservatism is free: a character wrongly called dangerous costs a parse
+/// the buffered path was happy to do, and the value is restored correctly
+/// either way. Its own documentation prices it that way — "`/` came out
+/// because it was cheap".
+///
+/// On a stream there is no structural route, so the same conservatism costs a
+/// **killed stream**. Measured on the public corpus before this existed:
+/// `json_string_inert` rejects 3.1% of annotated values, and the offending
+/// characters are `/` and `&` — every German tax number, whose canonical form
+/// is `419/130/29933`, and company names like `Boerner AG & Co. KGaA`. Neither
+/// can close a string in any reader. Lifting a predicate priced for a free
+/// route into a place where it refuses is half a rule, which is the mistake
+/// #54 was written to avoid making in the other direction.
+///
+/// So this asks the narrower question, from the closed enumeration
+/// `json_string_inert`'s own comment already makes: the ways out of a string
+/// are its delimiter, the escape, and a character the format forbids raw.
+///
+/// - **delimiters** — the double quote in JSON, the apostrophe in JSON5 and
+///   JS, the backtick in a template literal. Formats with longer delimiters
+///   build them from those two;
+/// - **the escape** — the backslash, which can consume the delimiter after it;
+/// - **forbidden raw** — the C0 controls, which JSON requires escaped inside a
+///   string and which a lenient reader may treat as a terminator.
+///
+/// **It is a blocklist, and that is the deliberate part.** The repository's
+/// rule is that a predicate whose omissions cause injections must become one
+/// whose omissions cost restorations — and on the buffered path an omission
+/// from `json_string_inert` costs exactly that, a restoration taken
+/// structurally. Here the polarity of the *cost* is reversed: an omission from
+/// an allowlist costs a refused stream, which is the expensive failure, so the
+/// enumeration has to be of the hazard rather than of the safe set. It is a
+/// closed structural enumeration rather than a list of characters that looked
+/// alarming, which is what makes that defensible.
+///
+/// **The residual:** a delimited-string format whose delimiter is none of the
+/// three above would be missed. I know of none, and say so rather than implying
+/// the set is proven.
+fn can_leave_a_string(character: char) -> bool {
+    matches!(character, '"' | '\'' | '`' | '\\') || character.is_control()
+}
+
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
