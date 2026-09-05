@@ -2011,6 +2011,28 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_bracket_inside_a_quoted_value_is_not_a_structural_opener() {
+        // **A delimiter inside a substituted value is only structural where it
+        // lands.** `Acme [Europe]` restored into a quoted position carries a
+        // bracket, and counting it as an opener would arm the bare-position rule
+        // for the rest of the run — so the ordinary name two words later would
+        // end the stream for a bracket that was inside a string.
+        //
+        // The lexer gets this for nothing, because it folds the value in at the
+        // place the value lands: inside `Place::Text` a bracket falls through
+        // like any other character. The flag-based version it replaced did not,
+        // and this test is that finding kept as a property rather than as
+        // history — raised in review of the commit before the lexer.
+        let mapping = mapped_to(&[("Acme [Europe]", "ORG"), ("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = buffer
+            .push(r#"She called "[ORG_1]" and [PERSON_2] replied"#)
+            .expect("a bracket inside a quoted value is literal, not an opener");
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"She called "Acme [Europe]" and O'Brien replied"#);
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a
