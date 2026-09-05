@@ -41,11 +41,27 @@ jobs:
       - name: Fetch the pull request's commits as data
         env:
           NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # `refs/pull/N/head` exists on the base repository for forks too, so
           # this needs no credentials for the contributor's remote.
           git fetch --no-tags origin "refs/pull/$NUMBER/head:refs/dco/head"
+
+          # **That ref moves; the event's head SHA does not.** A force-push
+          # between the event being created and this step running leaves the
+          # ref pointing at the new head, so the run would report a verdict
+          # about commits other than the ones that triggered it — and a run
+          # triggered by an unsigned head could pass because the ref had since
+          # moved to a signed replacement, leaving a green check attached to
+          # the earlier event.
+          actual="$(git rev-parse refs/dco/head)"
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::the pull request moved under this run: expected $EXPECTED, "\
+                 "found $actual. The push that moved it starts its own run; this one "\
+                 "cannot speak for either head."
+            exit 1
+          fi
       - name: Every commit carries a sign-off matching its author
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
