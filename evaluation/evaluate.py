@@ -217,7 +217,15 @@ def main(argv: list[str] | None = None) -> int:
     # identity rather than counted: a count lets a fixed leak pay for a new one.
     # A known entry that stops appearing is an improvement and passes silently;
     # anything else fails and says what it is.
-    print(f"\nAnnotated entities with words reaching the provider: {len(unmasked)}")
+    # Occurrences and distinct entities both, because the two numbers answer
+    # different questions and quoting one where the other is meant is how a
+    # README and a gate come to disagree: `eine Hepatitis-B-Infektion` appears
+    # twice in the corpus and is one entry in the table.
+    distinct = {(entity_type, value) for entity_type, value, _ in unmasked}
+    print(
+        f"\nAnnotated entities with words reaching the provider: {len(unmasked)} "
+        f"occurrences of {len(distinct)} entities"
+    )
     surprises = []
     for entity_type, value, words in sorted(unmasked):
         known = KNOWN_UNMASKED.get((entity_type, value))
