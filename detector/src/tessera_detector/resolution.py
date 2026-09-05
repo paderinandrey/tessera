@@ -14,9 +14,14 @@ Rules, in precedence order:
    checksum outer is protected from a *less* specific inner, which says nothing about
    one that outranks it, and an outer can be a span nobody found, since a merge
    synthesises them (#39).
-4. Different types, partial overlap or equal range: higher specificity wins, then
-   higher confidence; on a full tie the spans merge with the more sensitive type
-   (lower tier).
+4. Different types, partial overlap or equal range: higher specificity names the
+   span, then higher confidence; on a full tie the more sensitive type (lower
+   tier) names it. **The extent is always the union**, whichever reading wins.
+   Returning the winner whole let a span that arrives beside another and beats it
+   take the text with it, leaving the loser's remainder unmasked — so adding a
+   detection could subtract masking. No rule here may shrink what the layers
+   below marked; widening is over-masking, which REQ-38 counts as irritation,
+   and the alternative is exposure.
 
 Every applied rule is recorded in the trace — the sandbox surfaces these decisions.
 """
@@ -212,16 +217,36 @@ def _resolve_pair(
                     )
             return outer, "nesting-outer-wins"
 
-    # Rule 1 precedes rule 4: a lone checksum span never loses to a non-checksum one.
+    # Rule 4. **Every branch returns the union of the two extents**, and the
+    # winner supplies only the identity. Three of them used to return the
+    # winning span whole, which drops the loser's characters wherever the two
+    # overlap partially rather than exactly — so adding a span could *unmask*
+    # text: a `PERSON[30:45]` arriving beside a `LOCATION[10:40]` won on
+    # specificity and left 10..30 in the clear. The layer above cannot repair
+    # that, because by then the dropped reading is gone.
+    #
+    # Taking the union widens instead, which costs over-masking (REQ-38's
+    # irritation metric) and never exposure — the trade rules 2 and 3 already
+    # make everywhere else. Rule 4 was the one place the fold could shrink
+    # what the layers below had marked.
+    #
+    # Ranges that are exactly equal are the only shape the public corpus feeds
+    # this branch, and on those the union is the same span, which is why this
+    # correction moves no measured number. That is the argument for making it
+    # now rather than when something reaches it.
     if untouchable(a) != untouchable(b):
-        return (a if untouchable(a) else b), "untouchable-wins"
+        # Rule 1 precedes rule 4: a lone checksum span never loses its identity
+        # to a non-checksum one. Its *extent* still grows to cover both.
+        return _union(a, b, take_type_from=(a if untouchable(a) else b)), "untouchable-wins"
 
     spec_a = specificity.get(a.entity_type, 0)
     spec_b = specificity.get(b.entity_type, 0)
     if spec_a != spec_b:
-        return (a if spec_a > spec_b else b), "specificity"
+        return _union(a, b, take_type_from=(a if spec_a > spec_b else b)), "specificity"
     if a.confidence != b.confidence:
-        return (a if a.confidence > b.confidence else b), "confidence"
+        return _union(
+            a, b, take_type_from=(a if a.confidence > b.confidence else b)
+        ), "confidence"
     return _union(a, b, _more_sensitive(a, b)), "tie-merge-sensitive"
 
 

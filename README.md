@@ -732,7 +732,7 @@ Current results on the public corpus, with the NER weights installed:
 | IBAN | 1.000 | 1.000 | 1.000 |
 | LOCATION | 0.667 | 1.000 | 0.800 |
 | ORG | 0.154 | 0.333 | 0.211 |
-| PERSON | 0.785 | 0.671 | 0.723 |
+| PERSON | 1.000 | 0.855 | 0.922 |
 
 Article 9 special categories, detected by the same layer at a lower threshold:
 
@@ -777,7 +777,17 @@ orientation — each clause gets its own label.
 > enumerate is scored as wrong. So `make evaluate` enforces the Tier 1 recall gate
 > (≥ 0.99), the Article 9 coverage gate (≥ 0.95) and the LOCATION over-masking gate
 > (≥ 0.8), while the strict per-type precisions are reported and warned about rather than
-> enforced. PERSON precision is the honest weak spot and is not gated.
+> enforced.
+>
+> **PERSON's weak spot is recall, not precision.** The table above read 0.785 /
+> 0.671 until the span-trimming rule landed (#20): the model returns
+> `Der Kunde Karz` where the gold annotates `Karz`, and every such span counted
+> as a false positive while masking the name correctly. Trimming the role noun
+> and the honorific off the front moved precision to 1.000 — 65 predictions, 0
+> that land outside a gold span — and left eleven names the model does not find
+> at all. That is the number to push on, and it is not gated either: a recall
+> gate on a synthetic corpus in fixed template slots would measure the
+> generator.
 >
 > REQ-38's 0.8 precision target is an irritation metric — below it, clients say the service
 > ruins their text — so the binding gate measures **over-masking**: predictions that land on
