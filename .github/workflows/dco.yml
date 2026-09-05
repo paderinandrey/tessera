@@ -16,7 +16,14 @@ name: DCO
 # the branch. The token is read-only.
 
 on:
+  # `edited` is here for a retarget. Changing a pull request's base emits that
+  # action without changing the head SHA, so the default set — `opened`,
+  # `synchronize`, `reopened` — never fires, and the green check from the old
+  # base stays attached to a commit range that is no longer the one being
+  # merged. A commit that belonged to the previous base and is unsigned then
+  # enters the range unchecked.
   pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
 
 permissions:
   contents: read
@@ -94,9 +101,12 @@ jobs:
             echo "    git commit -s               # the next commit"
             echo "    git rebase --signoff $BASE  # commits already made"
             echo
-            echo "'git rebase --signoff' signs as the committer, so it only helps where"
-            echo "you are also the author. A commit authored by someone else has to be"
-            echo "signed off by them."
+            echo "Two cases where that is the wrong tool:"
+            echo "  - it signs as the committer, so it only helps where you are also the"
+            echo "    author. A commit written by someone else has to be signed off by them."
+            echo "  - it flattens merges, and a merge carrying a conflict resolution holds"
+            echo "    content that exists nowhere else. Use --rebase-merges --signoff, or"
+            echo "    amend the merge in place with 'git commit --amend -s'."
             exit 1
           fi
           echo "all commits signed off"

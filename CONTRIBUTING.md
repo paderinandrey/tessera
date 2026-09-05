@@ -23,9 +23,16 @@ sign-off by somebody else is not it. To add one to commits you have already made
 git rebase --signoff origin/main
 ```
 
-`git rebase --signoff` signs as the **committer**, so it only helps where you are also
-the author. A commit written by someone else has to be signed off by them; rebasing it
-adds *your* trailer, leaves their authorship, and the check will still reject it.
+Two cases where that command is the wrong tool:
+
+- **it signs as the committer**, so it only helps where you are also the author. A commit
+  written by someone else has to be signed off by them; rebasing it adds *your* trailer,
+  leaves their authorship, and the check still rejects it;
+- **it flattens merge commits.** An ordinary rebase drops them, and a merge carrying a
+  conflict resolution or a staged edit exists nowhere else — so running this to add a
+  sign-off would delete the very content that made the merge worth checking. Use
+  `git rebase --rebase-merges --signoff origin/main`, or amend the merge in place with
+  `git commit --amend -s` while it is checked out.
 
 The check runs on the pull request's commits rather than on `main`, because that is where
 the contribution is. Squash-merge promotes the trailers into the merge commit's own
