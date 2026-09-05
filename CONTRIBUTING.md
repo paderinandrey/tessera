@@ -28,11 +28,30 @@ Two cases where that command is the wrong tool:
 - **it signs as the committer**, so it only helps where you are also the author. A commit
   written by someone else has to be signed off by them; rebasing it adds *your* trailer,
   leaves their authorship, and the check still rejects it;
-- **it flattens merge commits.** An ordinary rebase drops them, and a merge carrying a
-  conflict resolution or a staged edit exists nowhere else — so running this to add a
-  sign-off would delete the very content that made the merge worth checking. Use
-  `git rebase --rebase-merges --signoff origin/main`, or amend the merge in place with
-  `git commit --amend -s` while it is checked out.
+- **it does not sign merge commits, and without `--rebase-merges` it deletes them.** An
+  ordinary rebase drops merges, and one carrying a conflict resolution holds content that
+  exists nowhere else — so running this to add a sign-off would delete the very thing that
+  made the merge worth checking.
+
+Make merges signed when you make them:
+
+```
+git merge --signoff <branch>
+```
+
+For a merge already made, `--rebase-merges --signoff` is **not** the answer either: it
+preserves the merge and signs only the ordinary commits, because `--signoff` applies to
+`pick`/`edit`/`reword` steps and not to `merge` ones. Verified on git 2.55. If the merge
+is the branch tip, `git commit --amend -s --no-edit` is enough. Otherwise:
+
+```
+git rebase --rebase-merges -i origin/main
+# in the todo list, after the `merge …` line, add:
+#     exec git commit --amend -s --no-edit
+```
+
+Then check the merge still holds its resolution — `git show <merge>:<file>` — because
+`--rebase-merges` re-performs the merge rather than copying it.
 
 The check runs on the pull request's commits rather than on `main`, because that is where
 the contribution is. Squash-merge promotes the trailers into the merge commit's own

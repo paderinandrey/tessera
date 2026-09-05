@@ -104,9 +104,11 @@ jobs:
             echo "Two cases where that is the wrong tool:"
             echo "  - it signs as the committer, so it only helps where you are also the"
             echo "    author. A commit written by someone else has to be signed off by them."
-            echo "  - it flattens merges, and a merge carrying a conflict resolution holds"
-            echo "    content that exists nowhere else. Use --rebase-merges --signoff, or"
-            echo "    amend the merge in place with 'git commit --amend -s'."
+            echo "  - it neither signs merges nor keeps them. '--signoff' applies to"
+            echo "    pick/edit/reword steps and not to merge ones, and without"
+            echo "    '--rebase-merges' the merge is dropped along with any resolution"
+            echo "    it carries. Make merges with 'git merge --signoff'; for one already"
+            echo "    made see CONTRIBUTING.md."
             exit 1
           fi
           echo "all commits signed off"
