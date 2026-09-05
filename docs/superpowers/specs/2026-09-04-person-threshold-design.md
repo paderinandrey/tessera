@@ -71,9 +71,9 @@ and the CI gate come from the same rows — so the number was training-set
 performance, and the design said nothing about it. Raised in review.
 
 Nothing measured on one corpus can fix that. What it can do is bound it, so
-`evaluation/threshold_bootstrap.py` runs a **paired bootstrap over documents**:
-2000 resamples of the 33 document groups, each threshold compared against 0.5 on
-the same resample, the procedure and its 95% bar written down before running.
+`evaluation/threshold_bootstrap.py` resamples the 33 document groups 2000 times
+and **re-runs the selection inside each resample**, with the procedure and its
+95% bar written down before running.
 
 ```
 threshold   joined found   lost to joining   joined over   separate over
@@ -81,28 +81,44 @@ threshold   joined found   lost to joining   joined over   separate over
      0.6        178               8              19             33
      0.5        182               4              19             34
      0.4        182               4              19             36
-
-0.5 vs 0.6   more found in 98.2% of resamples, never fewer; 95% CI [1, 8]
-0.5 vs 0.7   99.9%;                                         95% CI [2, 15]
-0.5 vs 0.4   identical on every single resample;            95% CI [0, 0]
 ```
 
-Two things it says that the sweep alone did not. The **0.5→0.6 cliff survives
-resampling** — the interval excludes zero, so the gap is a shape in these
-documents rather than four documents' luck. And **0.4 is not worse, it is the
-same**: tied on every resample, not merely on the total. The plateau is flat
-rather than sloping.
+**The first version of this script did not re-run the selection.** It fixed 0.5
+and bootstrapped the pairwise margins around it, which asks "given that 0.5 won,
+how large is its margin" and cannot answer "would 0.5 win again". Conditioning
+on the observed winner hides exactly the bias a best-of-four invites: some
+candidate wins by chance, and the margin around whichever one did looks
+reassuring either way. Raised in review, correctly, and it changed the answer.
 
-That changes the argument for 0.5 rather than the choice. It is not the peak of
-a curve; it is the **top of a plateau**, which is the conservative end — the same
-recall as 0.4 with two fewer over-masked spans on the separate path, and the most
-distance from the cliff.
+**The predeclared test fails.**
 
-**What this still is not: held-out validation.** Resampling bounds how much of
-the gap is sampling variation *within* this corpus. It cannot say whether the
-corpus resembles a client's text, and the corpus is synthetic with names in
-fixed template slots. The private annotated corpus is the measure that answers
-that question, and it is reported separately.
+```
+the selection rule, re-run on each resample, picks:
+  0.4  11.9%    0.5  86.9%    0.6  1.2%    0.7  0.0%
+```
+
+86.9% is below the 95% bar. **0.5 is not calibrated as an exact value**, the
+earlier claim that "the number is measured rather than chosen" was wrong, and
+`ner.yaml` now says so where the number is.
+
+**What survives is the plateau.** 98.8% of resamples select 0.4 or 0.5 — two
+thresholds tied on recall in *every single* resample, separated by two
+over-masked spans on the separate path. Nothing near 0.7 is ever selected. So
+the decision this change makes, lowering the bar from 0.7, is stable under
+resampling; the decision between 0.5 and 0.4 is a coin toss and either is
+defensible. 0.5 is taken for the two fewer over-masked spans, which is what a
+tie-break is worth and no more.
+
+**That second criterion was written after the first one failed**, which is a
+thing to declare rather than quietly substitute. It is defensible only because
+it is the decision the change actually makes and not the one the strict test
+asks about — and both numbers are printed by the script, with the failure first.
+
+**What this still is not: held-out validation.** Resampling bounds sampling
+variation *within* this corpus. It cannot say whether the corpus resembles a
+client's text, and the corpus is synthetic with names in fixed template slots.
+The private annotated corpus is the measure that answers that question, and it
+is reported separately.
 
 ## What it does not fix
 
