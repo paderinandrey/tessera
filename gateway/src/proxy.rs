@@ -1193,15 +1193,21 @@ async fn handle(
             // `json_schema`, so a `content` the caller has declared will be a
             // document does not stream either (#36).
             //
-            // The residue is a streamed `content` that happens to be JSON while
-            // the request declared nothing, where a value that is not inert can
-            // still reach the client mid-document — and "not inert" is wider
-            // than a `"`, since an apostrophe closes a string for a JSON5
-            // reader just as well. That residue is deliberate: the guard is on
-            // the caller's declaration because nothing on the streamed path can
-            // tell a document from prose, and refusing on the *value* instead
-            // would refuse most streamed prose. Two other things sit near that
-            // path and neither closes it: the hold-back buffer is about
+            // **And the undeclared case is answered by the stream itself.**
+            // `RestoreBuffer` restores through `Mapping::restore_in_stream`,
+            // which refuses a value that could close a string when a container
+            // was opened before the token — `structure_encloses_a_token`'s
+            // question, carried across fragments in a bool rather than asked of
+            // a whole string. So a streamed `content` that happens to be JSON
+            // while the request declared nothing ends the stream instead of
+            // being corrupted (#55).
+            //
+            // The two mechanisms are not redundant. This one refuses before the
+            // upstream call and costs the caller nothing, which is only
+            // possible because the caller *said* the reply would be a document;
+            // that one refuses mid-stream, after tokens are spent, which is the
+            // best available answer when nobody said. Two other things sit near
+            // that path and neither closes it: the hold-back buffer is about
             // placeholders and not documents, and the slot blanking in
             // `stream::handle` is what routes delta text *away* from the
             // escaping-aware `restore_value` in the first place.

@@ -501,6 +501,22 @@ impl Mapping {
         })
     }
 
+    /// The plain textual substitution, **with no production caller left**.
+    ///
+    /// That is the shape of the change `restore_in_stream` made rather than a
+    /// tidying note. This was the streamed path's restoration, and it was the
+    /// last place in the gateway that substituted a value into a caller's text
+    /// without first asking whether the text was a document. Every path asks
+    /// now — the sweep through `Lenient`, the described slots through `Strict`,
+    /// the stream through the running `opened` flag — so the unconditional
+    /// answer has nobody to give it to.
+    ///
+    /// Kept for the tests that state the substitution contract on its own,
+    /// where the document question would be noise: what a token grammar admits,
+    /// what an unknown placeholder costs, that `[see [PERSON_1]]` finds the
+    /// inner token. Deleting it would rewrite those in a vocabulary about
+    /// documents that they are not about.
+    #[cfg(test)]
     pub fn restore(&self, text: &str) -> Result<String, MappingError> {
         let mut result = String::with_capacity(text.len());
         for piece in pieces(text) {
@@ -516,6 +532,80 @@ impl Mapping {
             }
         }
         Ok(result)
+    }
+
+    /// Restore a fragment of a stream, refusing a substitution the buffered path
+    /// would not have made textually.
+    ///
+    /// **The same question `structure_encloses_a_token` asks, carried across
+    /// fragments in a bool.** A stream cannot parse — a delta is a piece of a
+    /// document — and that was taken as meaning it could not decide anything,
+    /// so it substituted as text unconditionally and a value carrying a `"` or
+    /// an apostrophe closed the string it landed in. But "was a container
+    /// opened before this token" needs no parse and no lookahead: it is a
+    /// running fact about the text already seen, and `opened` is that fact.
+    ///
+    /// So the two paths ask the same thing and diverge only where the streamed
+    /// one has less to work with:
+    ///
+    /// | | buffered | streamed |
+    /// |---|---|---|
+    /// | value wholly inert | substitute | substitute |
+    /// | non-inert, no container opened | substitute (prose) | substitute (prose) |
+    /// | non-inert, container opened, parses | restore structurally | **refuse** |
+    /// | non-inert, container opened, will not parse | refuse | refuse |
+    ///
+    /// **One row differs and it is the price of the missing parse.** Where the
+    /// buffered path can put the value in a leaf and escape it on the way out,
+    /// this one has no document to put it in, so it refuses rather than
+    /// corrupt. A stream is therefore strictly more likely to end than a
+    /// buffered response is to fail, and the trade is a truncated answer the
+    /// client can see against a silently altered document their agent may act
+    /// on.
+    ///
+    /// `opened` is never reset, exactly as it is never reset in
+    /// `structure_encloses_a_token`: a container opened *after* a token
+    /// encloses nothing of ours, and one opened before it is not un-opened by a
+    /// closing brace this function does not track. It is scoped to one text run
+    /// because `RestoreBuffer` is — `stream::handle` keys a buffer per run, the
+    /// same granularity at which the buffered path restores a slot.
+    ///
+    /// **The false positive this accepts, named rather than discovered.** Prose
+    /// carrying a bracket before a name whose value is not inert — a markdown
+    /// list, a fenced example — ends the stream. That is not new behaviour
+    /// invented here: the buffered path already refuses exactly that text, in
+    /// its fourth row above, and six earlier readings that tried to be cleverer
+    /// about which reader accepts what were each defeated in turn. Sharing the
+    /// rule is worth more than being right about brackets.
+    pub fn restore_in_stream(&self, text: &str, opened: &mut bool) -> Result<String, MappingError> {
+        let mut out = String::with_capacity(text.len());
+        for piece in pieces(text) {
+            match piece {
+                Piece::Text(run) => {
+                    // Our own token's brackets never reach here: `pieces` yields
+                    // a placeholder as its own piece, so the one reading of what
+                    // is a token stays shared with `restore`.
+                    if run.contains(['{', '[']) {
+                        *opened = true;
+                    }
+                    out.push_str(run);
+                }
+                Piece::Placeholder(candidate) => {
+                    let value = self
+                        .by_placeholder
+                        .get(candidate)
+                        .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
+
+                    if *opened && !value.chars().all(json_string_inert) {
+                        return Err(MappingError::Unrestorable(
+                            "a value that could close a string, inside a streamed structure",
+                        ));
+                    }
+                    out.push_str(value);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Restore inside one string, leniently and without breaking a document the

@@ -578,11 +578,22 @@ unescaped, mid-flight, with the bytes gone before anything could reconsider.
 The guard reads the caller's **declaration** rather than the values the detector found.
 Refusing whenever a masked value could close a string sounds tighter and is worse: a name
 like `O'Brien` qualifies, and a streamed prose reply mentioning one is neither a document
-nor a hazard. So a streamed reply whose content happens to be JSON while the request
-declared no `response_format` is still restored as text — the caller has not claimed a
-document contract there, and the alternative is a second JSON parser on the one path where a
-mistake cannot be taken back. Clients needing structured output can have it buffered, which
-restores it correctly, or streamed as undeclared text at their own risk.
+nor a hazard.
+
+**A stream that was never declared a document decides for itself, mid-flight.** It cannot
+parse — a delta is a fragment of a document — but it can carry one fact about the text
+already gone past: whether a `{` or a `[` was seen before the token being substituted. Where
+one was, and the value could close a string, the stream ends with an `error` event rather
+than writing it. That is the same question the buffered path asks of a whole string; the two
+answer alike except in one case, where the buffered path can parse the document, put the
+value in a leaf and escape it on the way out. A stream has no document to put it in, so it
+refuses where the buffered path would have succeeded, and a truncated answer the client can
+see is the better half of that trade against a silently altered one their agent may act on.
+
+Prose is untouched: no container opened means no string for the value to close. The cost is
+a stream that ends when a bracket and an apostrophe-bearing name meet in one reply — a
+markdown list beside a name like `O'Brien` — which is behaviour the buffered path already
+had for the same text.
 
 Whatever was already restored is served before the error event, whether the stream ends
 because the connection broke or because a token could not be restored. It was safe to send a
