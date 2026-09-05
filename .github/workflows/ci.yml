@@ -9,61 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  # `CONTRIBUTING.md` requires every commit to carry a DCO sign-off and nothing
-  # checked, so no commit ever did — zero of the twenty before this one. A rule
-  # enforced by nobody reads as coverage without being any, which is the thing
-  # this repository keeps flagging in its own code. See #51.
-  #
-  # Runs on the pull request's own commits rather than on `main`: squash-merge
-  # composes its message from them, so a trailer here reaches `main` too, and
-  # the attestation belongs to the contribution rather than to the merge.
-  dco:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # The whole range, not a shallow clone: a PR's commits are only
-          # enumerable when their common ancestor with the base is present.
-          fetch-depth: 0
-      - name: Every commit carries a sign-off matching its author
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          failed=0
-          # Merge commits are excluded: their authorship is the merger's, not a
-          # contributor's, and the DCO certifies the contribution.
-          for commit in $(git rev-list --no-merges "$BASE..$HEAD"); do
-            author="$(git show -s --format='%ae' "$commit")"
-            signed="$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")"
-            subject="$(git show -s --format='%s' "$commit")"
-            if [ -z "$signed" ]; then
-              echo "::error::${commit:0:12} has no Signed-off-by trailer — $subject"
-              failed=1
-              continue
-            fi
-            # The sign-off certifies that *this author* has the right to submit
-            # it, so a trailer naming someone else is not the attestation the
-            # DCO asks for. Compared on the address, which is what identifies a
-            # person here; display names vary between commits by one human.
-            if ! printf '%s\n' "$signed" | grep -qiF "<$author>"; then
-              echo "::error::${commit:0:12} is signed off by someone other than its author"
-              echo "  author:   $author"
-              echo "  trailers: $(printf '%s' "$signed" | tr '\n' ';')"
-              failed=1
-            fi
-          done
-          if [ "$failed" -ne 0 ]; then
-            echo
-            echo "Every commit must be signed off (CONTRIBUTING.md):"
-            echo "    git commit -s          # on the next commit"
-            echo "    git rebase --signoff \$BASE   # to add it to commits already made"
-            exit 1
-          fi
-          echo "all commits signed off"
-
   detector:
     runs-on: ubuntu-latest
     defaults:

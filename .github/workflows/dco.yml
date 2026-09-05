@@ -1,0 +1,102 @@
+name: DCO
+
+# **A separate workflow, on `pull_request_target`, and that is the point.**
+# `CONTRIBUTING.md` requires every commit to carry a DCO sign-off and nothing
+# checked, so no commit ever did. Enforcing it from a `pull_request` job would
+# have left the same hole one level up: that event runs the workflow definition
+# *from the pull request*, so a contributor can keep a green check named `dco`
+# while replacing its body with `true`. A required status a pull request can
+# redefine is not a required status. See #51.
+#
+# `pull_request_target` runs the base branch's definition instead, which a pull
+# request cannot edit. Its usual danger — a privileged token plus untrusted code
+# — does not apply here because **nothing from the pull request is executed**:
+# the job fetches the commits as data and runs `git rev-list` and `git show`
+# over their metadata. No checkout of the head tree, no build, no script from
+# the branch. The token is read-only.
+
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The base branch, deliberately: the pull request's tree is never
+          # checked out, only its commits are fetched below. Full history
+          # because a range is only walkable when the common ancestor is here.
+          fetch-depth: 0
+      - name: Fetch the pull request's commits as data
+        env:
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # `refs/pull/N/head` exists on the base repository for forks too, so
+          # this needs no credentials for the contributor's remote.
+          git fetch --no-tags origin "refs/pull/$NUMBER/head:refs/dco/head"
+      - name: Every commit carries a sign-off matching its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: refs/dco/head
+        run: |
+          set -euo pipefail
+          failed=0
+          # **Merge commits included.** They were skipped on the grounds that
+          # their authorship is the merger's — true of a clean merge and false
+          # of one carrying a conflict resolution or a staged edit, which is
+          # content introduced by exactly one commit and by no other. Skipping
+          # them left the only commit adding those changes unchecked, under
+          # documentation promising every commit is checked.
+          for commit in $(git rev-list "$BASE..$HEAD"); do
+            author="$(git show -s --format='%ae' "$commit" | tr '[:upper:]' '[:lower:]')"
+            subject="$(git show -s --format='%s' "$commit")"
+
+            # An empty author address would make the comparison below a test
+            # against the empty string, which `Signed-off-by: Mallory <>`
+            # satisfies. Git accepts `author Alice <>`, so this is reachable.
+            if [ -z "$author" ]; then
+              echo "::error::${commit:0:12} has no author address — $subject"
+              failed=1
+              continue
+            fi
+
+            trailers="$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")"
+            if [ -z "$trailers" ]; then
+              echo "::error::${commit:0:12} has no Signed-off-by trailer — $subject"
+              failed=1
+              continue
+            fi
+
+            # **The address is the last bracketed field on the line**, and the
+            # comparison is whole-line rather than substring. A trailer reading
+            # `Mallory <mallory@e.com> (copied from <alice@e.com>)` contains
+            # Alice's address while identifying Mallory, and a substring test
+            # accepts it. Several sign-offs are fine — co-developed commits
+            # carry them — as long as one of them names the author.
+            addresses="$(printf '%s\n' "$trailers" \
+              | sed -n 's/.*<\([^<>]*\)>[[:space:]]*$/\1/p' \
+              | tr '[:upper:]' '[:lower:]')"
+            if ! printf '%s\n' "$addresses" | grep -qxF -- "$author"; then
+              echo "::error::${commit:0:12} has no sign-off naming its author — $subject"
+              echo "  author:    $author"
+              echo "  signed by: $(printf '%s' "$addresses" | tr '\n' ' ')"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo
+            echo "Every commit must be signed off by its own author (CONTRIBUTING.md)."
+            echo "    git commit -s               # the next commit"
+            echo "    git rebase --signoff $BASE  # commits already made"
+            echo
+            echo "'git rebase --signoff' signs as the committer, so it only helps where"
+            echo "you are also the author. A commit authored by someone else has to be"
+            echo "signed off by them."
+            exit 1
+          fi
+          echo "all commits signed off"
