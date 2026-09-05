@@ -105,28 +105,45 @@ def _rebased(detector: Detector, group: list[dict]) -> tuple[list[Span], list[Sp
     return truth, separate, joined
 
 
-def _covered(text: str, truth: Span, predictions: list[Span]) -> bool:
-    """Whether every word of the entity that carries data is masked.
+def _lost(text: str, truth: Span, separate: list[Span], joined: list[Span]) -> bool:
+    """Whether joining leaves words of this entity that reading leaves apart does not.
 
-    **Position, not label; and words, not characters.** These gates are about
-    what reaches a provider, which is decided by which characters are replaced —
-    a prediction that marks a person's name and calls it a location hides
-    exactly the same bytes.
+    **A comparison of two sets, not two verdicts.** Every earlier version asked
+    each strategy a yes/no question and compared the answers, and every one was
+    wrong because the two strategies fail the same question for reasons that
+    have nothing to do with joining:
 
-    Three versions of this predicate have been wrong, each by aggregating over
-    something that is not the caller's loss:
-
-    - **type-matched.** Both strategies found 164 and the gap was invisible.
-      The placeholder's name protects nobody;
+    - **type-matched.** Both found 164; the gap was invisible. A placeholder's
+      name protects nobody;
+    - **a net difference.** One truth only joining finds cancelled one of the
+      losses, so it read 3 against a real 4;
     - **full containment.** The corpus annotates `eine Hepatitis-B-Infektion`
       and the detector returns `Hepatitis-B-Infektion`, so *neither* strategy
-      contained it — and a HEALTH entity that joining genuinely loses was hidden
-      because the article shortfall failed the separate path on the same test.
-      Two errors cancelling, in the gate written to catch exactly that;
-    - and the count over it was a **net difference** before it was a set.
+      contained it — and a HEALTH entity joining genuinely loses was hidden,
+      because the shortfall failed the separate path on the same test and the
+      two errors cancelled inside the gate written to catch it. 4 against 5;
+    - **words, minus a list of articles.** That saw the fifth, and bought it
+      with an exemption that fired in any position under any type, so a `PERSON`
+      annotated `Le Thi Mai` with only `Thi Mai` predicted would have read as
+      masked — `Le` being a Vietnamese family name that `ner.py` protects by
+      name. Found in review, and it is the trimming rule's own defect
+      reintroduced in the code that measures it.
 
-    `unmasked_words` is the question now, shared with `evaluate.py`'s own
-    unmasked-entity gate rather than copied.
+    Comparing the sets needs no list. A word both strategies leave — a gold
+    article neither predicts — is in both sets and cancels itself. A word only
+    joining leaves is the loss, and nothing has to decide what a word means.
+    """
+    apart = set(unmasked_words(text, truth.start, truth.end, separate))
+    together = set(unmasked_words(text, truth.start, truth.end, joined))
+    return bool(together - apart)
+
+
+def _covered(text: str, truth: Span, predictions: list[Span]) -> bool:
+    """Whether every word of the entity is completely masked.
+
+    Reported rather than gated — `separate_found` and `joined_found` are context
+    for the number below, and both carry the corpus's article shortfalls, which
+    is why the gate is `_lost` and not a difference of these two.
     """
     return not unmasked_words(text, truth.start, truth.end, predictions)
 
@@ -173,9 +190,7 @@ def _score(detector: Detector) -> dict[str, int]:
         # `Slot::Json` leaves. These are the entities reading leaves apart
         # covers and joining does not — the ones a caller loses.
         totals["lost_to_joining"] += sum(
-            1
-            for entity in truth
-            if _covered(text, entity, separate) and not _covered(text, entity, joined)
+            1 for entity in truth if _lost(text, entity, separate, joined)
         )
         entities = [
             EvalEntity(entity_type=span.entity_type, start=span.start, end=span.end)

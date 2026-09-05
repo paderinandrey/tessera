@@ -13,21 +13,6 @@ from dataclasses import dataclass
 from .spans import Span
 
 IOU_THRESHOLD = 0.5
-# Words that are not personal data even inside an annotated span, so a
-# prediction that leaves one outside has still masked the entity.
-#
-# Kept small and closed: this exists to stop an annotation convention being
-# reported as a leak, not to excuse a missing word. The corpus annotates
-# `un diabète de type 2` and the detector returns `diabète de type 2`; `un` is
-# not personal data, which is the same argument the `PERSON` trimming rule makes
-# for `Der Kunde`.
-LEADING_ARTICLES = frozenset(
-    {
-        "un", "une", "des", "du", "de", "le", "la", "les",
-        "ein", "eine", "einen", "einem", "einer",
-        "der", "die", "das", "den", "dem",
-    }
-)
 _WORD = re.compile(r"\w+", re.UNICODE)
 # How much of a prediction must cover real data before it stops counting as
 # over-masking. Half: a span that is mostly padding is padding.
@@ -231,32 +216,44 @@ __all__ = [
 
 
 def unmasked_words(text: str, start: int, end: int, predictions: list[Span]) -> list[str]:
-    """Words of `text[start:end]` that no prediction covers and that carry data.
+    """Words of `text[start:end]` that no prediction covers **completely**.
 
     **Words, not characters, and not spans** — the three questions differ and
-    only one of them is what a masking gateway is for:
+    only one is what a masking gateway is for. A *span* test reports a type
+    disagreement as a leak; a *character* test reports an annotation convention
+    as one; this asks whether anything a reader could use went out.
 
-    - a *span* test asks whether some prediction has these exact bounds, so it
-      reports a type disagreement or a boundary one character short as a leak;
-    - a *character* test asks whether every character is covered, so it reports
-      an annotation that includes the leading article as a leak;
-    - this asks whether anything a reader could use went out.
+    **Completely, and that is not a detail.** A first version asked whether
+    *any* character of the word was covered, which reports `Texier` as masked
+    when a prediction covers only the `T` and `exier` goes to the provider — a
+    gate blind to exactly the truncated and shifted boundaries it exists to
+    catch. Found in review.
 
-    Every gate in this repository that has been wrong was wrong by aggregating
-    over one of the first two. `test_joined_detection`'s recall gate has now
-    been three: type-matched (the gap read 164 against 164 and was invisible),
-    net (3 against a real 4), and full containment (4 against a real 5, hiding
-    an Article 9 loss because the article shortfall made the *separate* path
-    fail the same test and the two errors cancelled).
+    **No word is exempt here, and that is a change of place rather than of
+    policy.** A first version dropped a leading article, on the grounds that the
+    corpus annotates `un diabète de type 2` where the detector returns
+    `diabète de type 2` and `un` is not personal data. That reasoning is sound
+    and the implementation was not: it exempted the token in any position, under
+    any type, so a `PERSON` annotated `Le Thi Mai` with only `Thi Mai` predicted
+    reported as fully masked — and `ner.py` already documents `Le` as a
+    Vietnamese family name and `Das` as an Indian one, protected by name in the
+    trimming rule. The same defect, reintroduced one layer up, in the code that
+    measures whether the first one worked.
+
+    So this function has no list. A caller that needs to forgive an annotation
+    convention names the entity it is forgiving — see `evaluate.py`'s
+    `KNOWN_UNMASKED` — and a caller comparing two strategies compares their
+    unmasked sets, where a shortfall both share cancels itself without anyone
+    having to decide what a word means.
     """
     covered: set[int] = set()
     for span in predictions:
         covered |= set(range(span.start, span.end))
-    out = []
-    for match in _WORD.finditer(text[start:end]):
-        at = start + match.start()
-        if any(index in covered for index in range(at, start + match.end())):
-            continue
-        if match.group().lower() not in LEADING_ARTICLES:
-            out.append(match.group())
-    return out
+    return [
+        match.group()
+        for match in _WORD.finditer(text[start:end])
+        if not all(
+            index in covered
+            for index in range(start + match.start(), start + match.end())
+        )
+    ]

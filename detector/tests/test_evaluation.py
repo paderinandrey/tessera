@@ -1,6 +1,12 @@
 import pytest
 
-from tessera_detector.evaluation import EvalEntity, Metrics, evaluate_document, summarize
+from tessera_detector.evaluation import (
+    EvalEntity,
+    Metrics,
+    evaluate_document,
+    summarize,
+    unmasked_words,
+)
 from tessera_detector.spans import Span
 
 
@@ -201,3 +207,46 @@ def test_overmasking_ignores_a_grazing_overlap() -> None:
     assert overmasking_counts(gold, [pred_span("LOCATION", 7, 47)], types={"LOCATION"}) == {
         "LOCATION": (0, 1)
     }
+
+
+def test_a_partly_covered_word_is_not_masked() -> None:
+    # The finding this predicate was written wrong for. It asked whether *any*
+    # character of the word was covered, so a prediction reaching the `T` of
+    # `Texier` reported the whole name masked while `exier` went to the
+    # provider — a gate blind to exactly the truncated and shifted boundaries it
+    # exists to catch.
+    assert unmasked_words("Texier", 0, 6, [pred_span("PERSON", 0, 1)]) == ["Texier"]
+    assert unmasked_words("Texier", 0, 6, [pred_span("PERSON", 1, 6)]) == ["Texier"]
+    assert unmasked_words("Texier", 0, 6, [pred_span("PERSON", 0, 6)]) == []
+
+
+def test_no_word_is_exempt_by_spelling() -> None:
+    """`Le Thi Mai` with only `Thi Mai` predicted leaks a family name.
+
+    An earlier version dropped a leading article from the count, on the sound
+    argument that the corpus annotates `un diabète de type 2` where the detector
+    returns `diabète de type 2`. The implementation was not sound: it matched
+    the token in **any** position under **any** type, and `ner.py` already
+    documents `Le` as a Vietnamese family name and `Das` as an Indian one,
+    protected by name in the trimming rule. The same defect, one layer up, in
+    the code that measures whether the first one worked.
+
+    Forgiving an annotation convention is a caller's job and it names the entity
+    it forgives — `evaluate.py`'s `KNOWN_UNMASKED` — so this function has no
+    list to be wrong about.
+    """
+    text = "Le Thi Mai"
+    assert unmasked_words(text, 0, 10, [pred_span("PERSON", 3, 10)]) == ["Le"]
+    assert unmasked_words(text, 0, 10, [pred_span("PERSON", 0, 10)]) == []
+
+    article = "un diabète de type 2"
+    assert unmasked_words(article, 0, len(article), [pred_span("HEALTH", 3, 20)]) == ["un"]
+
+
+def test_a_word_covered_by_two_spans_between_them_is_masked() -> None:
+    # Coverage is a union, not a search for one span that contains the word:
+    # restoration replaces characters, and two adjacent placeholders replace
+    # them just as thoroughly as one.
+    assert unmasked_words(
+        "Martina", 0, 7, [pred_span("PERSON", 0, 4), pred_span("PERSON", 4, 7)]
+    ) == []
