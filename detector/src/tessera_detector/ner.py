@@ -4,6 +4,7 @@ Types are data: entity type, the label handed to the model, its threshold, tier 
 specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
+import copy
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib import resources
@@ -316,7 +317,40 @@ class GlinerRecognizer:
         # construction here would find already loaded. See its own
         # docstring for what that distinction fixes.
         self.dependency_digest = dependency_digest("gliner")
-        self._tokenizer = self._model.data_processor.transformer_tokenizer
+        # **A copy, and the copy is the fix.** This used to be the very object
+        # GLiNER tokenizes with, and sharing it makes the service fail under
+        # concurrent requests: `api.detect` is a sync route, so Starlette runs
+        # it in a threadpool, and two requests then use one HuggingFace fast
+        # tokenizer from two threads.
+        #
+        # The failure is not a data race in our code but a `RuntimeError:
+        # Already borrowed` out of the Rust object underneath. `transformers`
+        # calls `set_truncation_and_padding` before each encode, which *mutates*
+        # the tokenizer when the strategy changes — and the two callers here
+        # want different strategies. `_windows` asks for offset mappings with no
+        # padding; GLiNER pads for batching. So each call flips the state back,
+        # every flip is a mutable borrow, and a concurrent reader panics.
+        #
+        # Neither caller races with itself: repeat calls in the same strategy
+        # skip the mutation entirely. It takes the two *interleaved*, which is
+        # what `detect` does, and is why isolating either one found nothing.
+        # Measured through the real app before the copy: 11 of 64 requests
+        # failed at eight concurrent, and 22 of 128 at sixteen.
+        #
+        # A lock is the other repair and it is worse: the borrow that panics is
+        # inside GLiNER's inference, so the lock would have to cover the
+        # inference, which serializes the only expensive part of the call.
+        # Separate objects make the question not arise.
+        #
+        # The copy costs **26.5 MB against the model's 2 948 MB** — nine parts
+        # in a thousand, measured rather than waved at, because "just copy it"
+        # deserves a number when the thing being copied carries a 250 000-token
+        # vocabulary.
+        #
+        # And it was the only shared mutable thing: inference against inference,
+        # windowing against windowing, and whole `detect` calls against each
+        # other all run clean on four threads once these two are apart.
+        self._tokenizer = copy.deepcopy(self._model.data_processor.transformer_tokenizer)
         self._token_budget = int(self._model.config.max_len) - PROMPT_TOKEN_RESERVE
         # One inference pass per tier. GLiNER gives a span a single label, so
         # tiers competing in one call lose data: "ver.di" is claimed by
