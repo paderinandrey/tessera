@@ -47,18 +47,20 @@ entities:
     # not the margin around the winner, which conditions on the winner and
     # cannot answer whether it would win again. Predeclared at 95%:
     #
-    #   selection returns   0.4  11.9%   0.5  86.9%   0.6  1.2%   0.7  0.0%
+    #   selection returns   0.4  0.0%   0.5  86.4%   0.6  1.1%   0.7  0.0%
+    #                       undecided (a tie the rule cannot break)  12.4%
     #
     # **0.5 fails that bar, and is not calibrated as an exact value.** It must
     # not be described as one. The number below is a choice on a plateau, not a
-    # measured optimum.
+    # measured optimum. The script exits non-zero on that verdict.
     #
-    # What does survive resampling is the plateau: **98.8% of resamples select
-    # 0.4 or 0.5**, which are tied on recall in every single resample and
-    # separated only by two over-masked spans on the separate path. Nothing near
-    # 0.7 is selected at all. So the decision this change makes — lower the bar
-    # from 0.7 — is stable; the decision between 0.5 and 0.4 is a coin toss and
-    # either is defensible.
+    # What does survive is the plateau: **98.2% of resamples select 0.5 or
+    # cannot separate it from 0.4** — the two are tied on joined recall in every
+    # cached group, and so in every possible resample, separated only by two
+    # over-masked spans on the separate path. Nothing near 0.7 is selected at
+    # all. So the decision this change makes — lower the bar from 0.7 — is
+    # stable; the decision between 0.5 and 0.4 is a coin toss and either is
+    # defensible.
     #
     # 0.5 is taken over 0.4 for the two fewer over-masked spans, which is the
     # tie-break the sweep applied and is worth exactly what a tie-break is

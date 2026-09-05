@@ -94,25 +94,48 @@ reassuring either way. Raised in review, correctly, and it changed the answer.
 
 ```
 the selection rule, re-run on each resample, picks:
-  0.4  11.9%    0.5  86.9%    0.6  1.2%    0.7  0.0%
+  0.4   0.0%    0.5  86.4%    0.6  1.1%    0.7  0.0%
+  undecided (a tie the rule cannot break)  12.4%
 ```
 
-86.9% is below the 95% bar. **0.5 is not calibrated as an exact value**, the
+86.4% is below the 95% bar. **0.5 is not calibrated as an exact value**, the
 earlier claim that "the number is measured rather than chosen" was wrong, and
-`ner.yaml` now says so where the number is.
+`ner.yaml` now says so where the number is. **The script exits non-zero on this
+verdict**, because one that printed a failure and returned success would be
+presenting the criterion below as validation.
 
-**What survives is the plateau.** 98.8% of resamples select 0.4 or 0.5 — two
-thresholds tied on recall in *every single* resample, separated by two
-over-masked spans on the separate path. Nothing near 0.7 is ever selected. So
-the decision this change makes, lowering the bar from 0.7, is stable under
-resampling; the decision between 0.5 and 0.4 is a coin toss and either is
-defensible. 0.5 is taken for the two fewer over-masked spans, which is what a
-tie-break is worth and no more.
+**What survives is the plateau.** 98.2% of resamples select 0.5 or cannot
+separate it from 0.4 — two thresholds tied on joined recall in every cached
+group, and therefore in every possible resample. Nothing near 0.7 is ever
+selected. So the decision this change makes, lowering the bar from 0.7, is
+stable under resampling; the decision between 0.5 and 0.4 is a coin toss and
+either is defensible. 0.5 is taken for the two fewer over-masked spans, which is
+what a tie-break is worth and no more.
 
 **That second criterion was written after the first one failed**, which is a
 thing to declare rather than quietly substitute. It is defensible only because
 it is the decision the change actually makes and not the one the strict test
-asks about — and both numbers are printed by the script, with the failure first.
+asks about — and it is reported without changing the exit status, so nothing
+downstream can read it as the predeclared test passing.
+
+Three corrections to the procedure itself came out of the same review, and each
+changed a number:
+
+- **the selection key asked the wrong question.** It minimised
+  `lost_to_joining`, and a threshold that makes *both* paths miss an entity
+  lowers that while joined recall gets worse — so it could win a resample for
+  losing detections everywhere. The sweep argued from joined recall, and the key
+  does now;
+- **ties were broken by list order.** `min` awarded a shared minimum to whatever
+  came first in `THRESHOLDS`, which is 0.4 — the exact neighbour the calibration
+  question is about. An undecided resample is data; a tie broken by tuple
+  position is a list's order reported as a result. 0.4's 11.9% was that, and it
+  is 0.0% with 12.4% undecided now;
+- **the plateau was computed from corpus totals**, then described as a per-
+  resample property. Equal totals can hide opposite per-group differences that
+  resampling pulls apart. Membership requires equality in every cached group
+  now, which is what makes "tied in every possible resample" true rather than
+  asserted.
 
 **What this still is not: held-out validation.** Resampling bounds sampling
 variation *within* this corpus. It cannot say whether the corpus resembles a

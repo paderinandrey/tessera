@@ -91,12 +91,18 @@ TUNED_TYPE = "PERSON"
 THRESHOLDS = (0.4, 0.5, 0.6, 0.7)
 CHOSEN = 0.5
 RESAMPLES = 2000
-# The rule the sweep applied, as a sort key: fewest entities lost to joining,
-# then fewest over-masked spans on the separate path. Written as code because a
-# selection rule that lives only in prose cannot be re-run, and re-running it is
-# the whole point.
+# The rule the sweep applied, as a sort key: **most entities covered on the
+# joined path**, then fewest over-masked spans on the separate path. Written as
+# code because a rule that lives only in prose cannot be re-run, and re-running
+# it is the whole point.
+#
+# An earlier version minimised `lost_to_joining` instead. Those are not the same
+# objective: a threshold that makes *both* paths miss an entity lowers
+# `lost_to_joining` while joined recall gets worse, so it could win a resample
+# for losing detections everywhere. The sweep argued from joined recall and this
+# now asks the same question. Raised in review on #48.
 def selection_key(totals: dict[str, int]) -> tuple[int, int]:
-    return (totals["lost_to_joining"], totals["separate_overmasked"])
+    return (-totals["joined_found"], totals["separate_overmasked"])
 
 SEED = 20260905
 # Predeclared: below this the difference is not distinguishable from resampling
@@ -200,6 +206,18 @@ def main() -> int:
     # pairwise margins below are the follow-up.
     rng = random.Random(SEED)
     selected = dict.fromkeys(THRESHOLDS, 0)
+    # A resample whose minimum is shared by several thresholds selects none of
+    # them. `min` would award it to whichever comes first in `THRESHOLDS`, so
+    # the reported rates would encode a list's order as a result — and 0.4 sits
+    # first, which is exactly the neighbour the calibration question is about.
+    # An undecided resample is data; a tie broken by tuple position is not.
+    unresolved = 0
+    # Resamples whose winner set lies entirely on the plateau, decided or not.
+    # Counting only outright wins would drop exactly the ties between 0.4 and
+    # 0.5 — which are plateau selections, and the most plateau-ish ones there
+    # are — and understate the very quantity this line exists to report.
+    plateau_selections = 0
+    rounds: list[list[float]] = []
     for _ in range(RESAMPLES):
         sample = [rng.randrange(groups) for _ in range(groups)]
         totals = {
@@ -209,25 +227,36 @@ def main() -> int:
             }
             for threshold in THRESHOLDS
         }
-        winner = min(THRESHOLDS, key=lambda t: selection_key(totals[t]))
-        selected[winner] += 1
+        best = min(selection_key(totals[t]) for t in THRESHOLDS)
+        winners = [t for t in THRESHOLDS if selection_key(totals[t]) == best]
+        if len(winners) == 1:
+            selected[winners[0]] += 1
+        else:
+            unresolved += 1
+        rounds.append(winners)
     print("\n  the selection rule re-run on each resample picks:")
     for threshold in THRESHOLDS:
         print(f"    {threshold}: {selected[threshold] / RESAMPLES:6.1%}")
+    print(f"    undecided (the rule cannot separate two or more): {unresolved / RESAMPLES:6.1%}")
     stability = selected[CHOSEN] / RESAMPLES
-    # The plateau: every threshold tied with the chosen one on recall across
-    # every resample. Computed rather than listed, so it cannot drift from what
-    # the pairwise section reports.
+
+    # The plateau: thresholds tied with the chosen one on joined recall in
+    # **every cached group**, which is what makes them tied in every possible
+    # resample rather than on the total. An earlier version compared corpus
+    # totals once and claimed the stronger property; equal totals can hide
+    # opposite per-group differences that resampling then pulls apart. Raised in
+    # review on #48, and the `for _ in (0,)` it was written with inspected
+    # nothing at all.
     plateau = {
         threshold
         for threshold in THRESHOLDS
         if all(
-            sum(measured[threshold][i]["lost_to_joining"] for i in range(groups))
-            == sum(measured[CHOSEN][i]["lost_to_joining"] for i in range(groups))
-            for _ in (0,)
+            measured[threshold][i]["joined_found"] == measured[CHOSEN][i]["joined_found"]
+            for i in range(groups)
         )
     }
-    on_plateau = sum(selected[threshold] for threshold in plateau) / RESAMPLES
+    plateau_selections = sum(1 for winners in rounds if set(winners) <= plateau)
+    on_plateau = plateau_selections / RESAMPLES
 
     print("\n  pairwise margins, conditioned on the observed winner:")
     verdicts = []
@@ -248,30 +277,31 @@ def main() -> int:
         if tied > DECISION:
             print(f"  {CHOSEN} and {rival} are indistinguishable on {key} — a plateau, not a peak")
 
-    print()
-    if stability < DECISION:
-        print(
-            f"  the predeclared test FAILS: re-running the selection picks {CHOSEN} on "
-            f"{stability:.1%} of resamples, below {DECISION:.0%}."
-        )
-        print(f"  {CHOSEN} is NOT calibrated as an exact value and must not be called one.")
-    else:
-        print(f"  {CHOSEN} is selected on {stability:.1%} of resamples, clearing {DECISION:.0%}")
-
     # The decision the change actually makes is to lower the bar from 0.7, not
-    # to prefer 0.5 over its neighbour on the same plateau. Stated separately
-    # and second, because it was written after the strict test failed.
+    # to prefer 0.5 over its neighbour on the same plateau. Reported second, and
+    # it does not change the exit status: this criterion was written after the
+    # predeclared one failed, and a script that exits 0 on a failed predeclared
+    # test is presenting a post-hoc criterion as validation. Disclosure is not a
+    # substitute for the verdict. Raised in review on #48.
     plateau_text = "/".join(str(t) for t in sorted(plateau))
     print(
         f"\n  the selection lands on the plateau ({plateau_text}) on {on_plateau:.1%} of "
-        f"resamples — the thresholds tied with {CHOSEN} on recall in every resample"
+        f"resamples — the thresholds tied with {CHOSEN} on joined recall in every group, "
+        f"and so in every possible resample"
     )
     if on_plateau < DECISION:
+        print(f"  even the plateau is below {DECISION:.0%}: the sweep found noise.")
+
+    print()
+    if stability < DECISION:
         print(
-            f"  FAIL: even the plateau is not stable at {DECISION:.0%}. The sweep found noise."
+            f"  FAIL (predeclared): re-running the selection picks {CHOSEN} on "
+            f"{stability:.1%} of resamples, below {DECISION:.0%}."
         )
+        print(f"  {CHOSEN} is NOT calibrated as an exact value and must not be called one.")
+        print("  The plateau result above stands on its own and does not rescue this verdict.")
         return 1
-    print(f"  lowering the bar to the plateau clears {DECISION:.0%}; which end of it is a tie.")
+    print(f"  {CHOSEN} is selected on {stability:.1%} of resamples, clearing {DECISION:.0%}")
     return 0
 
 
