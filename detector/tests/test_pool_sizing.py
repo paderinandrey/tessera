@@ -25,54 +25,89 @@ import pytest
 import tessera_detector.ner as ner
 
 
-def test_a_cgroup_v2_quota_is_read_as_cpus(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    quota = tmp_path / "cpu.max"
-    monkeypatch.setattr(ner, "_CGROUP_V2_QUOTA", quota)
-    monkeypatch.setattr(ner, "_CGROUP_V1_QUOTA", tmp_path / "absent")
-
-    quota.write_text("200000 100000\n")
-    assert ner._cgroup_cpu_quota() == 2.0
-    quota.write_text("50000 100000\n")
-    assert ner._cgroup_cpu_quota() == 0.5, "half a CPU is a real limit and rounds later"
+def test_a_cgroup_v2_quota_is_read_as_cpus(tmp_path) -> None:
+    (tmp_path / "cpu.max").write_text("200000 100000\n")
+    assert ner._quota_at(tmp_path) == 2.0
+    (tmp_path / "cpu.max").write_text("50000 100000\n")
+    assert ner._quota_at(tmp_path) == 0.5, "half a CPU is a real limit and rounds later"
     # "max" is how cgroup v2 spells no limit, and reading it as a number is how
     # a limitless container would get a pool sized from a parse error.
-    quota.write_text("max 100000\n")
-    assert ner._cgroup_cpu_quota() is None
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    assert ner._quota_at(tmp_path) is None
 
 
-def test_a_cgroup_v1_quota_is_read_when_v2_is_absent(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_cgroup_v1_quota_is_read_when_v2_is_absent(tmp_path) -> None:
     # A deployment does not choose which cgroup version its kernel exposes.
-    monkeypatch.setattr(ner, "_CGROUP_V2_QUOTA", tmp_path / "absent")
-    v1_quota, v1_period = tmp_path / "quota", tmp_path / "period"
-    monkeypatch.setattr(ner, "_CGROUP_V1_QUOTA", v1_quota)
-    monkeypatch.setattr(ner, "_CGROUP_V1_PERIOD", v1_period)
-
-    v1_quota.write_text("300000\n")
-    v1_period.write_text("100000\n")
-    assert ner._cgroup_cpu_quota() == 3.0
+    (tmp_path / "cpu.cfs_quota_us").write_text("300000\n")
+    (tmp_path / "cpu.cfs_period_us").write_text("100000\n")
+    assert ner._quota_at(tmp_path) == 3.0
     # -1 is how cgroup v1 spells no limit.
-    v1_quota.write_text("-1\n")
-    assert ner._cgroup_cpu_quota() is None
+    (tmp_path / "cpu.cfs_quota_us").write_text("-1\n")
+    assert ner._quota_at(tmp_path) is None
 
 
-def test_an_unreadable_cgroup_costs_the_default_and_not_an_exception(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_unreadable_cgroup_costs_the_default_and_not_an_exception(tmp_path) -> None:
     # This runs at import. A kernel that spells its files differently must cost
     # the default sizing, never a service that will not start.
-    for name in ("_CGROUP_V2_QUOTA", "_CGROUP_V1_QUOTA", "_CGROUP_V1_PERIOD"):
-        monkeypatch.setattr(ner, name, tmp_path / "absent")
-    assert ner._cgroup_cpu_quota() is None
-
-    garbage = tmp_path / "cpu.max"
-    monkeypatch.setattr(ner, "_CGROUP_V2_QUOTA", garbage)
+    assert ner._quota_at(tmp_path / "absent") is None
     for content in ("", "nonsense", "200000", "abc def", "200000 0\n"):
-        garbage.write_text(content)
-        assert ner._cgroup_cpu_quota() is None, f"{content!r} produced a number"
+        (tmp_path / "cpu.max").write_text(content)
+        assert ner._quota_at(tmp_path) is None, f"{content!r} produced a number"
+
+
+def test_the_quota_is_read_from_the_process_s_own_cgroup(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A container or a systemd unit is not at the hierarchy root.
+
+    The first version read `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` — the root,
+    which is unlimited — while the process lived at `/system.slice/x.service`
+    or `/docker/9f2c...`. So the quota came back `None` and the pool was sized
+    from the affinity count again, one round after the quota itself was the
+    finding.
+    """
+    root = tmp_path / "sys"
+    (root / "cpu").mkdir(parents=True)
+    proc = tmp_path / "cgroup"
+    proc.write_text("12:cpu,cpuacct:/docker/abc123\n")
+    monkeypatch.setattr(ner, "_CGROUP_ROOT", root)
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", proc)
+
+    leaf = root / "cpu" / "docker" / "abc123"
+    leaf.mkdir(parents=True)
+    (leaf / "cpu.cfs_quota_us").write_text("200000\n")
+    (leaf / "cpu.cfs_period_us").write_text("100000\n")
+    assert ner._cgroup_cpu_quota() == 2.0, "the root is unlimited; the leaf is not"
+
+
+def test_a_limit_on_an_ancestor_binds_too(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A service under a slice capped at two CPUs is capped at two whatever its
+    # own directory says, so the narrowest of every level wins.
+    root = tmp_path / "sys"
+    root.mkdir()
+    proc = tmp_path / "cgroup"
+    proc.write_text("0::/system.slice/tessera.service\n")
+    monkeypatch.setattr(ner, "_CGROUP_ROOT", root)
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", proc)
+
+    slice_dir = root / "system.slice"
+    unit = slice_dir / "tessera.service"
+    unit.mkdir(parents=True)
+    (slice_dir / "cpu.max").write_text("200000 100000\n")
+    (unit / "cpu.max").write_text("max 100000\n")
+    assert ner._cgroup_cpu_quota() == 2.0, "the unit is unlimited; its slice is not"
+
+    (unit / "cpu.max").write_text("100000 100000\n")
+    assert ner._cgroup_cpu_quota() == 1.0, "and the tighter of the two wins"
+
+
+def test_an_unreadable_proc_file_is_not_an_exception(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Not every kernel has one, and this runs at import.
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", tmp_path / "absent")
+    monkeypatch.setattr(ner, "_CGROUP_ROOT", tmp_path / "also-absent")
+    assert ner._cgroup_cpu_quota() is None
 
 
 def test_the_quota_wins_when_it_is_narrower(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,6 +145,12 @@ def test_the_deployment_may_say_so_itself(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv(ner._WORKERS_ENV, "0")
     assert ner._pool_size() == 1, "a pool of zero is an executor that runs nothing"
 
+    # Above the detected count, which is the whole point of an override: none of
+    # the automatic answers can know this process has the machine to itself.
+    monkeypatch.setattr(ner.os, "process_cpu_count", lambda: 4)
+    monkeypatch.setenv(ner._WORKERS_ENV, "8")
+    assert ner._pool_size() == 8
+
 
 def test_a_malformed_override_is_named_rather_than_obeyed(
     monkeypatch: pytest.MonkeyPatch,
@@ -118,7 +159,15 @@ def test_a_malformed_override_is_named_rather_than_obeyed(
     monkeypatch.setattr(ner.os, "process_cpu_count", lambda: 4)
     monkeypatch.setattr(ner, "_cgroup_cpu_quota", lambda: None)
     monkeypatch.setenv(ner._WORKERS_ENV, "two")
-    with pytest.warns(RuntimeWarning, match="not an integer"):
+    with pytest.warns(RuntimeWarning, match="not usable"):
+        assert ner._pool_size() == 4
+
+    # **Present and empty is malformed, not absent.** A Compose or Kubernetes
+    # variable that expands to nothing is a deployment that tried to set a cap
+    # and produced none — the case where falling back to a much larger automatic
+    # pool in silence is worst. Found in review of #63.
+    monkeypatch.setenv(ner._WORKERS_ENV, "")
+    with pytest.warns(RuntimeWarning, match="not usable"):
         assert ner._pool_size() == 4
 
 

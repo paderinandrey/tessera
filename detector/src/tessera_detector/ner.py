@@ -295,12 +295,76 @@ TOKEN_OVERLAP = 32
 #
 # Every earlier measurement of this used requests of one size and could not see
 # any of it.
-# Where a cgroup writes the CPU limit a container was actually given.
-_CGROUP_V2_QUOTA = Path("/sys/fs/cgroup/cpu.max")
-_CGROUP_V1_QUOTA = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
-_CGROUP_V1_PERIOD = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+# Where the cgroup filesystem is mounted, and where the process records which
+# cgroup it is in.
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
 # The override, for a deployment that knows better than any of the guesses below.
 _WORKERS_ENV = "TESSERA_DETECT_WORKERS"
+
+
+def _cgroup_paths() -> list[Path]:
+    """Every directory that could carry a CPU limit for this process, tightest last.
+
+    **The process is usually not at the hierarchy root, and the first version
+    read the root.** A cgroup-v1 container sharing the host's namespace, or any
+    systemd-managed service, lives at a path recorded in `/proc/self/cgroup` —
+    `/system.slice/tessera.service`, `/docker/9f2c…`. Reading
+    `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` inspects the *root*, which is
+    unlimited, so the quota came back `None` and the pool was sized from the
+    affinity count again. Found in review of #63, one round after the quota
+    itself was.
+
+    **Ancestors are included, because a limit on a parent slice binds too.** A
+    service under a `.slice` capped at two CPUs is capped at two whatever its
+    own directory says, so every level from the root down is a candidate and
+    `_cgroup_cpu_quota` takes the narrowest.
+    """
+    try:
+        lines = _PROC_SELF_CGROUP.read_text().splitlines()
+    except OSError:
+        return [_CGROUP_ROOT]
+    relative: list[str] = []
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy, controllers, path = fields
+        # v2 is the line with an empty controller list and hierarchy `0`; v1
+        # gives one line per controller and only the `cpu` one matters here.
+        if (hierarchy == "0" and not controllers) or "cpu" in controllers.split(","):
+            relative.append(path)
+    bases = [_CGROUP_ROOT, _CGROUP_ROOT / "cpu"]
+    candidates = [base for base in bases if base.is_dir()] or [_CGROUP_ROOT]
+    paths: list[Path] = list(candidates)
+    for base in candidates:
+        for path in relative:
+            here = base
+            for part in path.strip("/").split("/"):
+                if not part:
+                    continue
+                here = here / part
+                paths.append(here)
+    return paths
+
+
+def _quota_at(directory: Path) -> float | None:
+    """The CPU limit written in one cgroup directory, in CPUs, or `None`."""
+    try:
+        quota, period = (directory / "cpu.max").read_text().split()[:2]
+        if quota != "max" and float(period) > 0:
+            return float(quota) / float(period)
+        return None
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        v1_quota = float((directory / "cpu.cfs_quota_us").read_text().strip())
+        v1_period = float((directory / "cpu.cfs_period_us").read_text().strip())
+        if v1_quota > 0 and v1_period > 0:
+            return v1_quota / v1_period
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _cgroup_cpu_quota() -> float | None:
@@ -310,29 +374,16 @@ def _cgroup_cpu_quota() -> float | None:
     `os.process_cpu_count()` reports `sched_getaffinity`, which a `cpuset`
     changes and `docker --cpus` / a Kubernetes CPU *limit* do not — those write
     a quota. So a container given two CPUs on a large host still sees the host's
-    count here, builds a pool for it, and lets one document enqueue far more
+    count there, builds a pool for it, and lets one document enqueue far more
     concurrent inferences than it can run. Confirmed in review, in an
     environment with a two-CPU quota where `process_cpu_count()` returned three.
 
-    Both cgroup versions, because a deployment does not choose which one its
-    kernel exposes. Anything unreadable or unparseable is `None` — a wrong guess
+    Both cgroup versions, every ancestor of the process's own path, narrowest
+    wins. Anything unreadable or unparseable contributes nothing — a wrong guess
     here should cost the *default* sizing, never an exception at import.
     """
-    try:
-        quota, period = _CGROUP_V2_QUOTA.read_text().split()[:2]
-        if quota != "max" and float(period) > 0:
-            return float(quota) / float(period)
-        return None
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        v1_quota = float(_CGROUP_V1_QUOTA.read_text().strip())
-        v1_period = float(_CGROUP_V1_PERIOD.read_text().strip())
-        if v1_quota > 0 and v1_period > 0:
-            return v1_quota / v1_period
-    except (OSError, ValueError):
-        pass
-    return None
+    quotas = [quota for path in _cgroup_paths() if (quota := _quota_at(path)) is not None]
+    return min(quotas) if quotas else None
 
 
 def _pool_size() -> int:
@@ -355,15 +406,20 @@ def _pool_size() -> int:
     answer describes something other than what the process may do.
     """
     override = os.environ.get(_WORKERS_ENV)
-    if override:
+    if override is not None:
+        # **Present-and-empty is malformed, not absent.** A Compose or Kubernetes
+        # variable that expands to nothing is a deployment that tried to set a
+        # cap and produced no cap, which is exactly the case where falling back
+        # to a much larger automatic pool in silence is worst. Found in review
+        # of #63, against a `if override:` that read "" as "unset".
         try:
             return max(1, int(override))
         except ValueError:
             # A malformed override is a deployment mistake, and guessing past it
             # silently is how it stays one. Named, then ignored.
             warnings.warn(
-                f"{_WORKERS_ENV}={override!r} is not an integer; sizing from the "
-                "process's own CPUs instead",
+                f"{_WORKERS_ENV}={override!r} is not usable as a worker count; "
+                "sizing from this process's own CPUs instead",
                 RuntimeWarning,
                 stacklevel=2,
             )

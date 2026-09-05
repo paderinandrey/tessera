@@ -341,7 +341,10 @@ def test_one_text_never_submits_more_than_the_bound(
         f"{ner_module._IN_FLIGHT}; the batch was measured after a whole window's "
         "passes were appended rather than while they were"
     )
-    assert ner_module._IN_FLIGHT >= 2, "a bound of one is a `for` loop with extra steps"
+    # No lower bound asserted here. `_in_flight` deliberately returns 1 on a
+    # single-CPU deployment, and a `>= 2` left behind from an earlier round
+    # would fail the whole NER suite in exactly the environment the sizing was
+    # taught to support. Found in review of #63.
 
 
 def test_the_pool_is_sized_by_what_this_process_may_use() -> None:
@@ -352,7 +355,12 @@ def test_the_pool_is_sized_by_what_this_process_may_use() -> None:
     #
     # What is left here is the relationship, asserted so it says something true
     # on this laptop and on a two-CPU container alike.
-    allowed = os.process_cpu_count() or 1
-    assert max(1, allowed) >= ner_module._POOL_SIZE
+    # **Unless a deployment said otherwise**, which beats every detected limit
+    # by design — so asserting the pool is no larger than this host's CPUs makes
+    # the suite fail on a four-CPU runner with `TESSERA_DETECT_WORKERS=8`,
+    # against a rule the same change documents. Found in review of #63.
+    if os.environ.get(ner_module._WORKERS_ENV) is None:
+        allowed = os.process_cpu_count() or 1
+        assert max(1, allowed) >= ner_module._POOL_SIZE
     assert max(1, ner_module._POOL_SIZE // 2) >= ner_module._IN_FLIGHT
     assert ner_module._IN_FLIGHT >= 1
