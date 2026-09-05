@@ -16,20 +16,24 @@ question and the private corpus is what answers it.
 Predeclared, before running:
 
   statistic   entities the joined path covers, and entities lost to joining
-  selection   fewest entities lost to joining, ties broken by fewer over-masked
-              spans on the separate path — the rule that picked 0.5 from the
-              sweep, written out so it can be re-run rather than assumed
+  selection   **most entities covered on the joined path**, ties broken by fewer
+              over-masked spans on the separate path — the rule that picked 0.5
+              from the sweep, written out so it can be re-run rather than
+              assumed. A resample whose best is shared by several thresholds
+              selects none of them and is reported undecided
   resamples   2000 groups sampled with replacement, seeded
   decision    the threshold is calibrated if the selection rule returns it on
               >= 95% of resamples
 
 **The predeclared test fails, and the failure is the useful part.** Re-running
-the selection returns 0.5 on 86.9% of resamples — below the bar — with 0.4
-taking 11.9%, 0.6 taking 1.2% and 0.7 none. So the sweep's *exact value* is not
-recoverable from resampled data and must not be described as calibrated.
+the selection returns 0.5 on 86.4% of resamples — below the bar — with 0.6
+taking 1.1%, 0.7 and 0.4 none outright, and 12.4% undecided between 0.4 and 0.5.
+So the sweep's *exact value* is not recoverable from resampled data and must not
+be described as calibrated. The script exits non-zero on that verdict.
 
-What is recoverable is the **plateau**: 98.8% of resamples select 0.4 or 0.5,
-two thresholds tied on recall in every single resample and separated only by two
+What is recoverable is the **plateau**: 98.2% of resamples select 0.5 or cannot
+separate it from 0.4 — two thresholds tied on joined recall in every cached
+group, and therefore in every possible resample, separated only by two
 over-masked spans on the separate path. The instability is entirely a tie-break
 between them; nothing near 0.7 survives.
 
@@ -57,7 +61,11 @@ resampling adds no model time.
 
 Run from the repository root:
 
-    uv run --project detector python evaluation/threshold_bootstrap.py
+    uv run --project detector --group ner python evaluation/threshold_bootstrap.py
+
+`--group ner` is not optional: `gliner` is declared only in that dependency
+group, so without it the run reaches `GlinerRecognizer` and fails on the import
+even where `TESSERA_NER_MODEL` supplies the weights.
 """
 
 import copy
