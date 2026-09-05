@@ -294,7 +294,14 @@ TOKEN_OVERLAP = 32
 #
 # Every earlier measurement of this used requests of one size and could not see
 # any of it.
-_POOL_SIZE = max(2, os.cpu_count() or 2)
+# **`process_cpu_count`, not `cpu_count`.** The first version asked the machine
+# how many CPUs exist; what matters is how many this process may use. A
+# container pinned to two CPUs on a 64-core host reports 64 to `cpu_count`, so
+# it would build 64 workers and let one document enqueue 32 inferences on two
+# CPUs — the fairness bound not merely loosened but inverted, in exactly the
+# deployment this service ships as. `requires-python = ">=3.14"`, so the
+# affinity-aware answer is simply available. Found in review of #62.
+_POOL_SIZE = max(2, os.process_cpu_count() or 2)
 _IN_FLIGHT = max(2, _POOL_SIZE // 2)
 # Created once for the process and shared by every recognizer in it, which is
 # what keeps the bound a bound: a pool per request is how oversubscription gets
@@ -491,8 +498,15 @@ class GlinerRecognizer:
             at_boundary = base == 0 or text[base - 1].isspace()
             for inference in self.passes:
                 batch.append((base, piece, inference, at_boundary))
-            if len(batch) >= _IN_FLIGHT:
-                drain()
+                # **Inside the pass loop, not after it.** Draining only between
+                # windows lets the batch reach `_IN_FLIGHT + passes - 1` before
+                # anyone looks, so the cap this exists to enforce was advertised
+                # and not applied: at two passes and a limit of three, one
+                # document submitted four. On a small process that is the whole
+                # pool, which is the case the bound is for. Found in review
+                # of #62.
+                if len(batch) >= _IN_FLIGHT:
+                    drain()
         if batch:
             drain()
         return spans
