@@ -316,6 +316,38 @@ fn count_occurrences(text: &str, spans: &[Span], found: &mut HashMap<(String, St
 /// traffic wrote two different evidence lines because of it. The mapping is
 /// still consulted, but only ever with a value from this request in hand, and
 /// only to ask what the provider received for it.
+/// The leaves of a document and the single text the detector will be shown for
+/// them, or `None` where there are none to show.
+///
+/// **One function because `handle` prices what `mask_all` will ask.** The
+/// bounds charge a text only when the cache will not answer it, which means
+/// hashing the exact string `detect` will be handed — and a second copy of this
+/// join would let the two drift into charging for one text and detecting
+/// another. That drift has no symptom: the bound would simply stop meaning what
+/// it says, in whichever direction the copies diverged.
+///
+/// The document is still parsed twice, once per pass, which the counting loop's
+/// own comment already accepts as the price of refusing before any detector
+/// call. Joining twice is the same trade one step further and costs no I/O.
+fn document_detection(
+    document: &Value,
+    shape: mapping::Shape,
+) -> Result<(Vec<mapping::Leaf>, Option<mapping::Joined>), mapping::MappingError> {
+    let leaves = mapping::json_leaves(document, shape)?;
+    let rendered: Vec<&str> = leaves
+        .iter()
+        .map(|leaf| match leaf {
+            mapping::Leaf::Text(text) => text.as_str(),
+            mapping::Leaf::Number(number) => number.as_str(),
+        })
+        .collect();
+    // A document with no leaves at all asks the detector nothing: `{}`, or one
+    // whose every field is a boolean or a null, both of which `json_leaves`
+    // skips.
+    let joined = (!rendered.is_empty()).then(|| mapping::Joined::of(&rendered));
+    Ok((leaves, joined))
+}
+
 async fn mask_all(
     provider: &'static str,
     detector: &DetectorClient,
@@ -434,8 +466,9 @@ async fn mask_all(
             } => {
                 let document = read_document(body, pointer, *embedded, provider)?;
                 // Already counted against `max_tool_calls` in `handle`, before
-                // this round-trip was made.
-                let leaves = mapping::json_leaves(&document, *shape)?;
+                // this round-trip was made — and priced there against the same
+                // join this returns, which is why it is a shared function.
+                let (leaves, joined) = document_detection(&document, *shape)?;
                 // **One call for the whole document.** Per string it was not
                 // merely slow — 77 calls against a real tool payload measured
                 // 54.9 s, of which 30 s was per-call overhead — it was blind:
@@ -466,20 +499,7 @@ async fn mask_all(
                 // boundary, refused as `BadSpan("across a joined boundary")` —
                 // the same mechanism as between two strings, and no new
                 // variant.
-                let rendered: Vec<&str> = leaves
-                    .iter()
-                    .map(|leaf| match leaf {
-                        mapping::Leaf::Text(text) => text.as_str(),
-                        mapping::Leaf::Number(number) => number.as_str(),
-                    })
-                    .collect();
-                let per_leaf = if rendered.is_empty() {
-                    // A document with no leaves at all asks the detector
-                    // nothing: `{}`, or one whose every field is a boolean or a
-                    // null, both of which `json_leaves` skips.
-                    Vec::new()
-                } else {
-                    let joined = mapping::Joined::of(&rendered);
+                let per_leaf = if let Some(joined) = joined {
                     let spans = detector.detect(joined.text(), credential).await?;
                     documents += 1;
                     total += spans.len();
@@ -494,6 +514,8 @@ async fn mask_all(
                     // inside the wrong leaf.
                     mapping::check_spans(joined.text(), &spans)?;
                     joined.split(&spans)?
+                } else {
+                    Vec::new()
                 };
                 // `split` returns one entry per leaf of either kind, so this
                 // and the loop below line up with `leaves` position for
@@ -799,6 +821,31 @@ async fn handle(
     // the detector reads, and it occupies a place in the join that costs a
     // separator. A document of numbers and nothing else is therefore one call
     // rather than none.
+    //
+    // **Only what the cache will not answer is charged.** Both bounds are about
+    // what the caller *waits* for — `max_tool_chars`' own documentation says it
+    // is not a timeout budget but a cap on how long a caller waits for the whole
+    // request — and a text the detection cache answers costs no wait. Charging
+    // it anyway spent the budget on work that never happens: measured on the ten
+    // pinned Claude Code tool definitions, 9 193 of 20 000 characters and 20 of
+    // 40 calls, on **every** turn rather than the first, because the definitions
+    // are byte-identical afterwards and the cache serves them. That left about
+    // 10 800 characters for a new tool result for the life of the session, and
+    // it is the real mechanism behind "the bounds admit roughly twenty tools" —
+    // not a low ceiling, but most of it spent on text that costs nothing.
+    //
+    // **What this changes about what the bound means**, said plainly because it
+    // is a change and not a tuning. The bound was on the caller's text; it is on
+    // the caller's text *this gateway has not seen*. So the same request can be
+    // admitted after a turn that warmed the cache and refused after an eviction,
+    // where before it was refused either way. The failure direction is the safe
+    // one — a refusal is what the request already got, so nothing that worked
+    // stops working at the shipped defaults — but a client that comes to rely on
+    // the wider budget will meet the narrow one eventually, and the guarantee
+    // they have is the narrow one.
+    //
+    // The lookup is a digest and a map read, no I/O, and it deliberately does
+    // not refresh the entry's LRU position: see `DetectionCache::contains`.
     let mut tool_calls = 0usize;
     let mut tool_chars = 0usize;
     for slot in &slots {
@@ -808,8 +855,11 @@ async fn handle(
                 pointer,
                 tool: true,
             } => {
-                tool_calls += 1;
-                tool_chars += read_pointer(&body, pointer)?.chars().count();
+                let text = read_pointer(&body, pointer)?;
+                if !state.detector.would_be_cached(&text, credential) {
+                    tool_calls += 1;
+                    tool_chars += text.chars().count();
+                }
             }
             Slot::Json {
                 pointer,
@@ -817,29 +867,29 @@ async fn handle(
                 shape,
             } => {
                 let document = read_document(&body, pointer, *embedded, provider.name())?;
-                let mut leaves = 0usize;
-                for leaf in mapping::json_leaves(&document, *shape)? {
-                    leaves += 1;
-                    tool_chars += match leaf {
-                        mapping::Leaf::Text(text) => text.chars().count(),
-                        mapping::Leaf::Number(rendered) => rendered.chars().count(),
-                    };
+                // The same join `mask_all` will hand the detector, built by the
+                // same function, so this prices the text that will actually be
+                // asked about rather than a reconstruction of it.
+                //
+                // A document with no leaves asks nothing and is charged
+                // nothing — `{}`, or one whose every field is a boolean or a
+                // null, which the walk skips. One call for the document however
+                // many leaves are in it: this is the whole of what batching
+                // changed about the bounds, the count moving from strings to
+                // round-trips.
+                //
+                // The separators are inside `joined.text()` and so are charged
+                // with it, because the detector reads them and this bound is
+                // denominated in characters sent. That also keeps the join
+                // itself bounded: a million empty leaves are no characters of
+                // the caller's and two million of ours.
+                let (_, joined) = document_detection(&document, *shape)?;
+                if let Some(joined) = joined {
+                    if !state.detector.would_be_cached(joined.text(), credential) {
+                        tool_calls += 1;
+                        tool_chars += joined.text().chars().count();
+                    }
                 }
-                // One call for the document however many leaves are in it, and
-                // none at all for a document holding none — `{}`, or one whose
-                // every field is a boolean or a null, which the walk skips.
-                // This is the whole of what batching changed about the bounds:
-                // the count moved from strings to round-trips, and the strings
-                // stopped being what costs.
-                if leaves > 0 {
-                    tool_calls += 1;
-                }
-                // The separators are charged because the detector reads them,
-                // and this bound is denominated in characters sent. Leaving
-                // them out would also leave the join itself unbounded: a
-                // million empty leaves are no characters of the caller's and
-                // two million of ours.
-                tool_chars += mapping::Joined::separator_chars(leaves);
             }
         }
     }
@@ -1490,6 +1540,32 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+        });
+        (state, dir, path)
+    }
+
+    /// A state with the tool bounds set by the caller, and **one detector
+    /// client across every request made through it**, because the detection
+    /// cache lives in that client: a test about what the bounds charge on a
+    /// second turn needs the first turn's entry to still be there.
+    fn state_with_tool_bounds(
+        detector: &MockServer,
+        upstream: &MockServer,
+        max_tool_chars: usize,
+        max_tool_calls: usize,
+    ) -> (Arc<AppState>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
+        let state = Arc::new(AppState {
+            detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
+            upstream: reqwest::Client::new(),
+            openai_base: upstream.uri(),
+            anthropic_base: upstream.uri(),
+            sessions: SessionStore::new(test_limits()),
+            audit,
+            max_tool_chars,
+            max_tool_calls,
         });
         (state, dir, path)
     }
@@ -7643,6 +7719,182 @@ mod tests {
             1,
             "one occurrence, the first, went up under the name it was found \
              under: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_text_the_cache_already_holds_is_not_charged_again() {
+        // #28's cheapest half. The bounds charged every tool character on every
+        // turn, including the ones the cache answers — measured on the ten
+        // pinned Claude Code tool definitions at 9 193 of 20 000 characters and
+        // 20 of 40 calls, permanently, because the definitions are
+        // byte-identical after the first turn. About 46% of the budget was
+        // spent on work that never happens.
+        //
+        // Both bounds are on what the caller *waits* for, which
+        // `max_tool_chars`' own documentation states while denying it is a
+        // timeout budget. A cached text costs no wait.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        // Room for one description and not for two.
+        let (state, _dir, _path) = state_with_tool_bounds(&detector, &upstream, 30, 40);
+        let first = "a".repeat(20);
+        let second = "b".repeat(20);
+        let with = |descriptions: Vec<&str>| {
+            json!({"model": "gpt",
+                   "tools": descriptions.iter().map(|d| json!({
+                       "type": "function",
+                       "function": {"name": "f", "description": d}})).collect::<Vec<_>>(),
+                   "messages": [{"role": "user", "content": "hallo"}]})
+        };
+
+        // Turn one warms the cache with `first`, and fits on its own.
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            with(vec![&first]),
+            &session_headers("sk-tenant", "chat-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "one description must fit: {body}");
+
+        // Turn two carries both: 40 characters against a bound of 30, and only
+        // 20 of them are text this gateway has not seen. Before this change it
+        // was the sum that counted and this was a 400.
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            with(vec![&first, &second]),
+            &session_headers("sk-tenant", "chat-2"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "40 characters against a bound of 30, of which 20 were already cached: {body}"
+        );
+
+        // The control, and it is what makes the assertion above about the cache
+        // rather than about the bound having been widened: the same total size,
+        // none of it seen before, is still refused.
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            with(vec![&"c".repeat(20), &"d".repeat(20)]),
+            &session_headers("sk-tenant", "chat-3"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "40 characters of text nobody has detected must still exceed a bound of 30"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_text_costs_no_call_against_the_call_bound_either() {
+        // The other bound, and it moves for the same reason: a round-trip that
+        // the cache answers is not a round-trip. Charging it capped the number
+        // of *repeated* tool definitions a conversation could carry, which is
+        // the quantity that never costs anything after turn one.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        // Room for exactly one call.
+        let (state, _dir, _path) = state_with_tool_bounds(&detector, &upstream, 20_000, 1);
+        let describe = |names: Vec<&str>| {
+            json!({"model": "gpt",
+                   "tools": names.iter().map(|n| json!({
+                       "type": "function",
+                       "function": {"name": "f", "description": n}})).collect::<Vec<_>>(),
+                   "messages": [{"role": "user", "content": "hallo"}]})
+        };
+
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            describe(vec!["one"]),
+            &session_headers("sk-tenant", "calls-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            describe(vec!["one", "two"]),
+            &session_headers("sk-tenant", "calls-2"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "two descriptions against a bound of one call, of which one is cached: {body}"
+        );
+
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            describe(vec!["three", "four"]),
+            &session_headers("sk-tenant", "calls-3"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "two uncached descriptions must still exceed a bound of one call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_with_no_credential_is_charged_for_everything() {
+        // The cache refuses to answer without a credential — deliberately, so
+        // that credential-less callers do not share one bucket and learn about
+        // each other through response times. The bounds must charge the same
+        // way, and they do because they ask the same cache the same question:
+        // repeating a text buys such a caller nothing, and the second turn is
+        // refused exactly as the first would have been.
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with_tool_bounds(&detector, &upstream, 30, 40);
+        let text = "a".repeat(20);
+        let with = |descriptions: Vec<&str>| {
+            json!({"model": "gpt",
+                   "tools": descriptions.iter().map(|d| json!({
+                       "type": "function",
+                       "function": {"name": "f", "description": d}})).collect::<Vec<_>>(),
+                   "messages": [{"role": "user", "content": "hallo"}]})
+        };
+
+        let (status, body) = call(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            with(vec![&text]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, _) = call(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            with(vec![&text, &text]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "without a credential nothing is cached, so nothing is free"
         );
     }
 

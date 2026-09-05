@@ -506,11 +506,26 @@ cache's, exceeding either is a refusal rather than a miss: `max_tool_chars` (def
 detection costs rather than in what the request weighs. A document is **one call however
 many strings are in it**, so a schema of a thousand short values is a single round-trip;
 and the characters charged are the ones the detector reads, not the braces, quotes and
-property names carrying them, which cost it nothing. Both defaults are twice a measurement
+property names carrying them, which cost it nothing.
+
+**Nor the ones the detection cache will answer.** Both bounds are on what the caller waits
+for, and a text already detected under the same credential costs no wait — so it is not
+charged. That matters most for the traffic these bounds were sized against: the ten pinned
+Claude Code tool definitions are byte-identical on every turn, so charging them spent
+9 193 of the 20 000 characters and 20 of the 40 calls **permanently**, leaving about
+10 800 characters for a new tool result for the life of the session. That, rather than a low
+ceiling, is the real mechanism behind "the bounds admit roughly twenty tools".
+
+So what a caller is promised is **this many characters of text the gateway has not seen**,
+and a request can be admitted after a turn that warmed the cache and refused after an
+eviction. The direction is safe — a refusal is what that request already got — but the
+guarantee is the narrow number, not the wide one a warm cache happens to allow.
+
+Both defaults are twice a measurement
 taken on ten real Claude Code tool definitions, which charge 9 193 characters across 20
-calls. That payload is a **floor** and is stated as one: a stock session also carries tools
-the measurement did not, and an MCP server adds more, so a large enough tool payload is
-refused rather than served slowly. Issue #28 — making detection fast on a large text — is
+calls on the turn that first sees them. That payload is a **floor** and is stated as one: a
+stock session also carries tools the measurement did not, and an MCP server adds more, so a
+large enough tool payload is refused rather than served slowly. Issue #28 — making detection fast on a large text — is
 the work that lifts the ceiling; until it lands, the honest answer to a payload past these
 numbers is a refusal, not a wait long enough that the client's own HTTP timeout would cut
 it off anyway.

@@ -220,6 +220,57 @@ impl DetectionCache {
         self.get_at_version(version, credential, text)
     }
 
+    /// Whether `get` would answer this text, **without recording that it was
+    /// asked**.
+    ///
+    /// The admission bounds in `proxy::handle` charge a text only when it will
+    /// cost a detector call, and this is that question. It repeats `get`'s
+    /// derivation — capacity, credential, version, key — rather than calling it
+    /// for one reason: `get` bumps `clock` and stamps `entry.used`, so asking
+    /// through it would let a request that is merely being *priced* promote an
+    /// entry over one that is being used. The bounds would then decide what
+    /// stays cached, which is a decision they have no business in and a way for
+    /// a caller to steer another tenant's evictions by sending texts it never
+    /// intends to have detected.
+    ///
+    /// **A `true` here is not a promise.** An eviction between this and `detect`
+    /// turns a free text into a paid one, and the request is served anyway. The
+    /// bound is on expected work, not a guarantee about it, and the failure
+    /// direction is a request that waits longer than the bound predicted —
+    /// which is what every request did before the bounds could see this cache
+    /// at all.
+    pub fn contains(&self, credential: Option<&[u8]>, text: &str) -> bool {
+        if self.capacity == 0 {
+            return false;
+        }
+        // **Defence in depth, and a mutation proved it is only that.** `insert`
+        // refuses a credential-less detection too, so nothing is ever stored
+        // under an empty credential and removing this guard changes no
+        // observable answer — the lookup below would miss anyway. It stays for
+        // the same reason `get`'s capacity check does: the rule is "no
+        // credential, no cache", and a reader who finds it stated once and
+        // omitted once has to go and check which of the two is load-bearing.
+        let Some(credential) = credential else {
+            return false;
+        };
+        let Some(version) = self.known_version() else {
+            return false;
+        };
+        let key = self.key(version, credential, text);
+        let Ok(inner) = self.inner.lock() else {
+            // A poisoned lock is a miss here for the same reason it is in
+            // `get`: answering "not cached" costs a detector call the caller
+            // was already prepared to pay for, and answering "cached" would
+            // admit a request on a promise this cache cannot keep.
+            self.warn_poisoned();
+            return false;
+        };
+        // The same staleness recheck `get_at_version` makes, and for the same
+        // reason: a version bump between `known_version` and the lock would
+        // otherwise let this report a hit for a version the store has left.
+        inner.known_version == Some(version) && inner.entries.contains_key(&key)
+    }
+
     // Split out of `get` so a test can drive the race described above it
     // explicitly: capture a version, let a concurrent `insert` move
     // `known_version` past it, then call this directly with the
@@ -601,6 +652,79 @@ mod tests {
         assert!(cache.get(A, "first").is_some());
         assert!(cache.get(A, "second").is_none());
         assert!(cache.get(A, "third").is_some());
+    }
+
+    #[test]
+    fn asking_whether_a_text_is_cached_does_not_make_it_recently_used() {
+        // `contains` is the admission bounds' question, and they ask it about
+        // every tool text on every request. If it promoted entries the way
+        // `get` does, a request being *priced* would outrank one being served —
+        // and a caller could then steer another tenant's evictions by sending
+        // texts it never intends to have detected. So this repeats `get`'s
+        // derivation instead of calling it, and this test is what holds that.
+        let cache = DetectionCache::new(2, UNCAPPED);
+        cache.insert("v1", A, "first", &[span("PERSON", 0, 5)]);
+        cache.insert("v1", A, "second", &[span("PERSON", 0, 6)]);
+
+        // `get` here would make "second" the oldest, exactly as
+        // `saturation_evicts_the_least_recently_used` shows. Twenty asks must
+        // not.
+        for _ in 0..20 {
+            assert!(cache.contains(A, "first"));
+        }
+
+        cache.insert("v1", A, "third", &[span("PERSON", 0, 5)]);
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.get(A, "first").is_none(),
+            "asking about `first` promoted it over `second`, so the bounds are \
+             deciding what stays cached"
+        );
+        assert!(cache.get(A, "second").is_some());
+        assert!(cache.get(A, "third").is_some());
+    }
+
+    #[test]
+    fn contains_answers_exactly_what_get_would() {
+        // The bounds charge a text when this says no, so a disagreement with
+        // `get` charges for work that will not happen or admits work that will.
+        let cache = DetectionCache::new(4, UNCAPPED);
+        cache.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
+
+        assert_eq!(cache.contains(A, "Weber"), cache.get(A, "Weber").is_some());
+        assert_eq!(
+            cache.contains(A, "Meier"),
+            cache.get(A, "Meier").is_some(),
+            "a text nobody inserted"
+        );
+        assert_eq!(
+            cache.contains(B, "Weber"),
+            cache.get(B, "Weber").is_some(),
+            "the same text under another credential is another entry"
+        );
+        // No credential, no cache — the rule that keeps credential-less callers
+        // out of one shared bucket where a hit is a timing oracle. The bounds
+        // have to charge such a caller for everything, and they do because they
+        // get the same answer.
+        assert_eq!(
+            cache.contains(None, "Weber"),
+            cache.get(None, "Weber").is_some()
+        );
+        assert!(!cache.contains(None, "Weber"));
+        // This holds whether or not `contains` guards the credential itself,
+        // because `insert` refuses one too and nothing is stored under an empty
+        // one. Recorded rather than left implied: a mutation that removed the
+        // guard survived this assertion, and a surviving mutation is either a
+        // missing test or — here — a guard that is defence in depth. Writing
+        // "this test pins it" would have been the false half of that.
+
+        let disabled = DetectionCache::new(0, UNCAPPED);
+        disabled.insert("v1", A, "Weber", &[span("PERSON", 0, 5)]);
+        assert_eq!(
+            disabled.contains(A, "Weber"),
+            disabled.get(A, "Weber").is_some(),
+            "a disabled cache answers nothing and must promise nothing"
+        );
     }
 
     #[test]

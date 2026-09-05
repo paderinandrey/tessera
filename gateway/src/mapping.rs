@@ -2727,6 +2727,16 @@ impl Joined {
     /// leaves themselves. Counted against `max_tool_chars` because the detector
     /// reads them: that bound is denominated in characters sent, and separators
     /// are characters sent.
+    /// **Only tests need this now, and that is the improvement.** The admission
+    /// bounds used to charge separators through this function, which is a
+    /// second copy of the join's arithmetic sitting beside the join — two
+    /// places to keep in step for one number. They charge `joined.text()`
+    /// directly now, so the separators are counted by *being in the string the
+    /// detector reads* rather than by a parallel sum that could drift from it.
+    /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` still
+    /// reports the three figures apart, because the gap between them is what
+    /// that test exists to keep visible.
+    #[cfg(test)]
     pub fn separator_chars(leaf_count: usize) -> usize {
         leaf_count.saturating_sub(1) * JOIN_SEPARATOR.chars().count()
     }
