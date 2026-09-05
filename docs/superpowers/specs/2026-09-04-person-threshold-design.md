@@ -29,8 +29,16 @@ what I set out to build.
 
 **0.5 recovers eight of the twelve detections joining costs**, adds nothing to
 over-masking on the joined path and one span on the separate one. 0.4 buys
-nothing further and costs more, so this is an optimum rather than the end of a
-range — which is the check that distinguishes a measurement from a slide.
+nothing further and costs two more spans there.
+
+**That is a plateau, and 0.5 is its chosen end rather than a measured optimum.**
+An earlier version of this paragraph called it "an optimum rather than the end
+of a range — which is the check that distinguishes a measurement from a slide",
+and the resampling further down this document refutes it: the predeclared test
+fails at 86.4%, and 0.4 and 0.5 are indistinguishable on recall in every
+resample. A summary that reaches the opposite conclusion from the experiment in
+the same document is worse than no summary, because the summary is what gets
+quoted.
 
 A calibration set may still be worth building. It is not worth building *for
 this*, and finding that out cost one sweep.
