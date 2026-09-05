@@ -40,12 +40,29 @@ traffic, so a described `arguments` — the case the escaping work was written f
 
 ## The change
 
-**Refuse `stream: true` beside a `response_format` of `json_object` or
-`json_schema`**, in `request_pointers`, next to `reject_streamed_tools`. A 400
-before the upstream call, so the caller pays nothing.
+**Refuse `stream: true` beside any `response_format` that is not `text`**, in
+`request_pointers`, next to `reject_streamed_tools`. A 400 before the upstream
+call, so the caller pays nothing.
 
-`json_schema` as well as `json_object`: Structured Outputs declares a document
-exactly as JSON mode does, and #36 named only the older of the two.
+**The polarity is the rule, and the first version had it backwards.** That
+version matched `json_object | json_schema` — an allowlist of hazards, so a
+`response_format` type the provider adds tomorrow would be **admitted**, and
+admitting is the direction that injects. It had already needed widening once:
+#36's own framing named only `json_object`, and Structured Outputs' `json_schema`
+declares a document exactly as JSON mode does. Leaving it a list was betting
+there would not be a third.
+
+Inverted, an omission costs a refusal. `text` is the one type that declares the
+reply is *not* a document, so it is the one named. A new type that turns out to
+be prose can be added deliberately, with an argument; a new type that turns out
+to be a document needs nobody to notice.
+
+This is the repository's own rule — *a predicate whose omissions cause
+injections must become one whose omissions cost restorations* — and it took a
+re-read after the tests were green to see that the new guard was on the wrong
+side of it. A missing `response_format` and a `null` one are absence rather than
+an unreadable declaration, and are admitted; a `response_format` carrying no
+`type` is a declaration this gateway cannot read, and is not.
 
 Called for Anthropic as well, where it is inert today — the Messages API asks
 for structured output through tools, which the other refusal already covers. It
@@ -113,7 +130,12 @@ integrate.
 
 ## Testing
 
-- both declared types refused on a streamed request, and **neither half alone**:
+- **a `response_format` this gateway has never heard of, refused** —
+  `json_lines`, `xml`, `yaml`, `structured`, `""` and one carrying no `type`.
+  This is the only test that separates the two rules: the allowlist version
+  passes everything in that list and the inversion refuses it;
+- both known document types refused on a streamed request, and **neither half
+  alone**:
   a declared document without streaming is the case the buffered path restores
   structurally, and streaming without a declaration is an ordinary completion.
   Refusing either would cost requests handled correctly today;
@@ -129,8 +151,9 @@ integrate.
 
 Mutations, restored by inverse substitution:
 
-- **drop `json_schema` from the match** → the unit test fails, naming the type
-  that was admitted;
+- **revert the predicate to the `json_object | json_schema` allowlist** → the
+  unknown-type test fails, naming `json_lines` as admitted "by a rule that
+  cannot know whether it names a document";
 - **drop the `streaming` half** → the unit test fails on the buffered request it
   would now refuse;
 - **drop the Anthropic call** → the Anthropic test fails;

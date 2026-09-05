@@ -377,10 +377,17 @@ fn reject_streamed_tools(
 /// that separates them, and it separates them because the **caller** supplied
 /// it: they are telling us the reply is a document they will parse.
 ///
-/// **`json_schema` as well as `json_object`.** Structured Outputs declares a
-/// document exactly as JSON mode does; naming only the older one would have
-/// left the newer and more popular half open, which is the shape of gap this
-/// function exists to close.
+/// **Anything but `text`, rather than a list of the document types.** The first
+/// version matched `json_object | json_schema`, and that is an allowlist of
+/// hazards — so a `response_format` type added by the provider tomorrow would
+/// be *admitted*, and admitting is the direction that injects. Having already
+/// had to widen it once (`json_schema` was missing from #36's own framing),
+/// leaving it as a list was betting there would not be a third.
+///
+/// Inverted, an omission costs a refusal instead: `text` is the one type that
+/// declares the reply is *not* a document, so it is the one this names. A new
+/// type that turns out to be prose can be added deliberately, with an argument;
+/// a new type that turns out to be a document needs nobody to notice.
 ///
 /// **What it does not close, stated because the guard is on a declaration.** A
 /// streamed reply whose content happens to be JSON while the request set no
@@ -391,10 +398,12 @@ fn reject_streamed_tools(
 /// rediscovered.
 fn reject_streamed_json_mode(body: &Value, provider: &'static str) -> Result<(), ShapeError> {
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // `null` is how a client sends "unset" through a serializer that keeps the
+    // key, so it is absence rather than an unrecognised declaration.
     let declared = body
-        .pointer("/response_format/type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "json_object" | "json_schema"));
+        .get("response_format")
+        .filter(|format| !format.is_null())
+        .is_some_and(|format| format.pointer("/type").and_then(Value::as_str) != Some("text"));
     if streaming && declared {
         return Err(ShapeError::Unsupported(
             provider,
@@ -4477,14 +4486,76 @@ mod tests {
                                     "messages": [{"role": "user", "content": "hallo"}]});
         assert!(OpenAi.request_pointers(&streamed_prose).is_ok());
 
-        // `{"type": "text"}` is the default written out, and it declares the
-        // opposite of a document.
+        // `{"type": "text"}` is the default written out, and it is the one type
+        // that declares the reply is *not* a document. It is the only one
+        // admitted on a stream.
         let text_mode = json!({
             "model": "gpt", "stream": true,
             "response_format": {"type": "text"},
             "messages": [{"role": "user", "content": "hallo"}]
         });
         assert!(OpenAi.request_pointers(&text_mode).is_ok());
+
+        // `null` is how a client sends "unset" through a serializer that keeps
+        // the key, so it is absence and not an unrecognised declaration.
+        let unset = json!({
+            "model": "gpt", "stream": true,
+            "response_format": Value::Null,
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(OpenAi.request_pointers(&unset).is_ok());
+    }
+
+    #[test]
+    fn a_response_format_this_gateway_has_never_heard_of_is_refused_on_a_stream() {
+        // **The polarity, which is the whole rule.** A first version matched
+        // `json_object | json_schema` — an allowlist of hazards, so a type the
+        // provider adds tomorrow would be admitted, and admitting is the
+        // direction that injects. It had already needed widening once:
+        // `json_schema` was missing from #36's own framing of the fix.
+        //
+        // Inverted, an omission costs a refusal. This test is the difference
+        // between the two rules and the only thing that can tell them apart:
+        // under the allowlist it passes, under the inversion it fails.
+        for kind in ["json_lines", "xml", "yaml", "structured", ""] {
+            let unknown = json!({
+                "model": "gpt", "stream": true,
+                "response_format": {"type": kind},
+                "messages": [{"role": "user", "content": "hallo"}]
+            });
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&unknown),
+                    Err(ShapeError::Unsupported(
+                        "openai",
+                        "a streamed response declared as a JSON document"
+                    ))
+                ),
+                "response_format {kind:?} was admitted on a stream by a rule that \
+                 cannot know whether it names a document"
+            );
+        }
+
+        // A `response_format` carrying no `type` at all is a declaration this
+        // gateway cannot read, which is the same answer.
+        let typeless = json!({
+            "model": "gpt", "stream": true,
+            "response_format": {"schema": {"a": 1}},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(matches!(
+            OpenAi.request_pointers(&typeless),
+            Err(ShapeError::Unsupported(_, _))
+        ));
+
+        // And none of it fires without `stream: true`, where the buffered path
+        // restores structurally and needs no help.
+        let buffered = json!({
+            "model": "gpt",
+            "response_format": {"type": "json_lines"},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(OpenAi.request_pointers(&buffered).is_ok());
     }
 
     #[test]
