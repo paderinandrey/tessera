@@ -1,3 +1,7 @@
+import threading
+import time
+from collections.abc import Callable
+
 import pytest
 
 from tessera_detector.models import find_model
@@ -202,3 +206,70 @@ def test_the_lower_threshold_prices_a_role_phrase_and_still_masks_the_name(
         "the price recorded in `ner.yaml` moved with it and needs re-measuring"
     )
     assert text[0:9] == "Der Kunde"
+
+
+def test_windowing_and_inference_may_run_at_the_same_time(
+    recognizer: GlinerRecognizer,
+) -> None:
+    """The service is a sync route, so requests already arrive on threads.
+
+    `api.detect` is `def`, not `async def`, so Starlette runs it in a threadpool
+    and two requests share one `GlinerRecognizer`. That was safe until you look
+    at what it shares: one HuggingFace fast tokenizer. `transformers` calls
+    `set_truncation_and_padding` before each encode, which **mutates** it when
+    the strategy changes — and the two callers here want different strategies:
+    `_windows` asks for offset mappings unpadded, GLiNER pads for batching.
+
+    So every call flips the state, every flip is a mutable borrow of a Rust
+    object, and a concurrent reader dies with `RuntimeError: Already borrowed`.
+    Measured through the real app before the fix: 11 of 64 requests failed at
+    eight concurrent, 22 of 128 at sixteen.
+
+    **Neither caller races with itself**, because repeat calls in one strategy
+    skip the mutation. Isolating either one found nothing across hundreds of
+    calls, and a load test through `detect` — 24 requests on eight threads —
+    passed against the unfixed code too. It takes the two *interleaved* at rate,
+    so this drives that directly instead of hoping a load test lands on it: the
+    same loop reproduces in about a tenth of a second when the object is shared.
+    """
+    text = "Sehr geehrter Herr Röhrdanz, die Kundin Martina Weber aus Zürich rief an."
+    failures: list[str] = []
+    stop = threading.Event()
+
+    def until_stopped(work: Callable[[], object]) -> Callable[[], None]:
+        def run() -> None:
+            while not stop.is_set():
+                try:
+                    work()
+                except Exception as error:
+                    failures.append(f"{type(error).__name__}: {error}")
+                    return
+
+        return run
+
+    threads = [
+        threading.Thread(target=until_stopped(lambda: list(recognizer.windows(text)))),
+        threading.Thread(
+            target=until_stopped(
+                lambda: list(recognizer._spans_from(0, text, recognizer.passes[0]))
+            )
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    # Long enough that the shared-object failure is a near certainty and short
+    # enough to sit in a test suite. Two orders of magnitude over the observed
+    # time to first failure.
+    time.sleep(2)
+    stop.set()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not failures, f"windowing and inference cannot run together: {failures[0]}"
+
+
+def test_the_windowing_tokenizer_is_not_the_model_s(recognizer: GlinerRecognizer) -> None:
+    # The contract the test above rests on, stated where someone refactoring
+    # `__init__` will trip over it. Making these one object again is what the
+    # concurrency failure was.
+    assert recognizer._tokenizer is not recognizer._model.data_processor.transformer_tokenizer
