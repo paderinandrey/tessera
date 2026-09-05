@@ -4,8 +4,10 @@ from collections.abc import Callable
 
 import pytest
 
+import tessera_detector.ner as ner_module
 from tessera_detector.models import find_model
 from tessera_detector.ner import GlinerRecognizer, load_ner_types
+from tessera_detector.spans import Span
 
 pytestmark = pytest.mark.ner
 
@@ -273,3 +275,43 @@ def test_the_windowing_tokenizer_is_not_the_model_s(recognizer: GlinerRecognizer
     # `__init__` will trip over it. Making these one object again is what the
     # concurrency failure was.
     assert recognizer._tokenizer is not recognizer._model.data_processor.transformer_tokenizer
+
+
+def test_dispatching_windows_to_threads_changes_no_answer(
+    recognizer: GlinerRecognizer,
+) -> None:
+    """The same list, in order — not merely the same set.
+
+    `resolve` folds over spans in sorted order, and a fold is order-dependent
+    unless its operation is associative, which #39 established this one is not.
+    So "the same spans" is not the claim that matters; `map` preserving
+    submission order is, and this checks it on a text long enough to fill
+    several batches.
+    """
+    text = "Sehr geehrter Herr Röhrdanz, die Kundin Martina Weber aus Zürich rief an. " * 20
+
+    def without_the_pool() -> list[Span]:
+        spans: list[Span] = []
+        for base, piece in recognizer.windows(text):
+            at_boundary = base == 0 or text[base - 1].isspace()
+            for inference in recognizer.passes:
+                spans.extend(
+                    recognizer._spans_from(base, piece, inference, at_boundary=at_boundary)
+                )
+        return spans
+
+    def shape(spans: list[Span]) -> list[tuple[str, int, int, float, bool]]:
+        return [(s.entity_type, s.start, s.end, s.confidence, s.boosted) for s in spans]
+
+    assert shape(recognizer.detect(text)) == shape(without_the_pool())
+
+
+def test_one_text_does_not_take_the_whole_pool(recognizer: GlinerRecognizer) -> None:
+    # The bound that keeps a large document from queueing its whole self ahead
+    # of the next request. Measured before it existed: four small requests
+    # arriving behind one large one went from 0.47s to 3.31s.
+    #
+    # Asserted as a relationship rather than a number, so a machine with a
+    # different core count still says something true.
+    assert ner_module._IN_FLIGHT <= ner_module._POOL_SIZE // 2 or ner_module._POOL_SIZE <= 4
+    assert ner_module._IN_FLIGHT >= 2, "a bound of one is a `for` loop with extra steps"
