@@ -1711,6 +1711,72 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_value_the_buffered_allowlist_calls_dangerous_still_streams() {
+        // **The test that separates the two predicates**, and the measurement
+        // that made it necessary. A first version of this rule reused
+        // `json_string_inert`, the buffered path's allowlist. On the public
+        // corpus that rejects 3.1% of annotated values — and the offending
+        // characters are `/` and `&`: every German tax number, whose canonical
+        // form is `419/130/29933`, and company names like
+        // `Boerner AG & Co. KGaA`.
+        //
+        // Neither can close a string in any reader. The allowlist excludes them
+        // because on the buffered path being wrong costs a parse, which that
+        // path was happy to do — its own comment prices `/` that way, "it came
+        // out because it was cheap". Here being wrong costs a killed stream, so
+        // the question is the narrower one: `can_leave_a_string`.
+        //
+        // Under the allowlist this test fails on both values.
+        for value in ["419/130/29933", "Boerner AG & Co. KGaA"] {
+            let mut mapping = Mapping::new();
+            mapping
+                .mask(
+                    value,
+                    &[Span {
+                        entity_type: "ORG".into(),
+                        start: 0,
+                        end: value.chars().count(),
+                    }],
+                )
+                .unwrap();
+            let mut buffer = RestoreBuffer::new(&mapping);
+            let mut out = buffer.push(r#"{"x":"[ORG_1]"}"#).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(
+                out,
+                format!(r#"{{"x":"{value}"}}"#),
+                "a value that cannot close a string ended the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn every_way_out_of_a_string_is_refused() {
+        // The other side: the enumeration this rule is built from — a
+        // delimiter, the escape, a character the format forbids raw — asserted
+        // member by member, so a narrowing that drops one is a failing test
+        // rather than a silent injection.
+        for value in ["a\"b", "a'b", "a`b", "a\\b", "a\nb", "a\u{1}b"] {
+            let mut mapping = Mapping::new();
+            mapping
+                .mask(
+                    value,
+                    &[Span {
+                        entity_type: "ORG".into(),
+                        start: 0,
+                        end: value.chars().count(),
+                    }],
+                )
+                .unwrap();
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(r#"{"x":"[ORG_1]"}"#).is_err(),
+                "a value carrying {value:?} was substituted into a streamed structure"
+            );
+        }
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a

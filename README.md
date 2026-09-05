@@ -590,10 +590,18 @@ value in a leaf and escape it on the way out. A stream has no document to put it
 refuses where the buffered path would have succeeded, and a truncated answer the client can
 see is the better half of that trade against a silently altered one their agent may act on.
 
-Prose is untouched: no container opened means no string for the value to close. The cost is
-a stream that ends when a bracket and an apostrophe-bearing name meet in one reply — a
-markdown list beside a name like `O'Brien` — which is behaviour the buffered path already
-had for the same text.
+Prose is untouched: no container opened means no string for the value to close. The stream
+also asks a **narrower** question about the value than the buffered path does. That path's
+allowlist is conservative because being wrong there costs it a parse it was happy to make;
+on a stream being wrong costs the answer, so the test is the closed set of ways out of a
+string — a delimiter, the escape, a character the format forbids raw. Measured on the public
+corpus, the buffered allowlist would have ended a stream for 3.1% of detected values, all of
+them `/` in a German tax number or `&` in a company name, neither of which can close a
+string anywhere. The narrower test rejects none of them.
+
+The cost that remains is a stream that ends when a bracket and a genuine delimiter meet in
+one reply — a markdown list beside a name like `O'Brien` — which is behaviour the buffered
+path already had for the same text.
 
 Whatever was already restored is served before the error event, whether the stream ends
 because the connection broke or because a token could not be restored. It was safe to send a

@@ -41,7 +41,7 @@ remedy. It refuses instead.
 `Mapping::restore_in_stream(text, opened)` replaces `Mapping::restore` in
 `RestoreBuffer`. It walks `pieces` exactly as `restore` does, sets `opened` on
 any text run carrying `{` or `[`, and refuses a substitution when `opened` holds
-and the value is not wholly `json_string_inert`.
+and the value carries a character that `can_leave_a_string`.
 
 `opened` lives on the buffer, so it is scoped to one text run — the granularity
 at which `stream::handle` keys buffers, and the same granularity at which the
@@ -58,19 +58,61 @@ buffered path restores a slot. It is never reset, exactly as
 **One row differs and it is the price of the missing parse.** A stream is
 therefore strictly more likely to end than a buffered response is to fail.
 
-## What it costs
+## The predicate is not the buffered one, and a measurement is why
+
+The first version reused `json_string_inert`, the buffered path's allowlist,
+on the argument that sharing a hard-won rule beats inventing a second. Measuring
+the false-positive rate before merging said otherwise:
+
+```
+annotated values on the public corpus   196
+not wholly `json_string_inert`            6   (3.1%)
+offending characters                    `/` and `&`
+                                        419/130/29933
+                                        Börner AG & Co. KGaA
+```
+
+**Every German tax number.** Its canonical form carries slashes, so the
+allowlist rejects the type by construction — and `&` in a company name is as
+ordinary. Neither character can close a string in any reader.
+
+The allowlist excludes them deliberately, and its own comment prices the
+decision: *"`/` came out because it was cheap, not because removing it makes
+evaluation safe."* Cheap on the buffered path, where being wrong costs a parse
+that path was happy to do and the value is restored correctly anyway. **On a
+stream being wrong costs a killed stream.** Lifting a predicate priced against a
+free route into a place where it refuses is half a rule — the same mistake #54
+was written to avoid making in the other direction, arrived at from the other
+side.
+
+So `can_leave_a_string` asks the narrower question, from the closed enumeration
+`json_string_inert`'s own comment already makes: *the ways out of a string are
+its delimiter, the escape, and a character the format forbids raw* — `"`, `'`,
+`` ` ``, `\`, and the C0 controls. On the corpus it rejects **0 of 196**.
+
+**It is a blocklist, and that is the deliberate part.** The repository's rule is
+that a predicate whose omissions cause injections must become one whose
+omissions cost restorations. On the buffered path an omission from
+`json_string_inert` costs exactly that. Here the polarity of the *cost* is
+reversed — an omission from an allowlist costs a refused stream — so the
+enumeration has to be of the hazard. What makes that defensible is that the
+enumeration is closed and structural rather than a list of characters that
+looked alarming. The residual is a delimited-string format whose delimiter is
+none of the three; I know of none, and say so rather than implying the set is
+proven.
+
+## What it still costs
 
 **A stream that ends where the buffered path would have succeeded.** The
-conjunction is a bracket before a token, and a value carrying a character
-outside the inert set. In practice: a markdown list or a fenced example beside a
-name like `O'Brien`.
+conjunction is a bracket before a token and a value carrying a genuine
+delimiter — in practice a markdown list or a fenced example beside a name like
+`O'Brien`, which is why that name is what the tests use.
 
-That is a real regression against today's behaviour for that text — today it is
+That is a real regression against today's behaviour for that text: today it is
 substituted, correctly, because it is prose. It is *not* a new rule invented
-here: the buffered path already refuses exactly that text, in the fourth row
+here — the buffered path already refuses exactly that text, in the fourth row
 above, and six earlier readings that each claimed something about what a
-permissive reader accepts were each defeated in turn. Sharing a hard-won rule is
-worth more than being cleverer about brackets on one path only.
+permissive reader accepts were each defeated in turn.
 
 The client sees a truncated answer and an `error` event — the mechanism the
 README already describes for a token with no mapping — rather than a document
@@ -114,6 +156,10 @@ Mutations:
 - **drop the refusal** → three tests fail;
 - **ignore `opened` and refuse on the value alone** → three fail, including the
   prose one, which is the rejected design stated as a test;
+- **use `json_string_inert` instead** → the tax-number and company-name test
+  fails, which is the measurement above stated as a test;
+- **drop the apostrophe from the hazard set** → five fail;
+- **drop the control characters** → the enumeration test fails on `\n`;
 - **reset `opened` per fragment** → the split-fragment test fails;
 - **pre-scan the whole fragment for brackets before restoring it** → three fail,
   including the ordering test in its strengthened form.

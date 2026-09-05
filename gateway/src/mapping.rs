@@ -596,7 +596,7 @@ impl Mapping {
                         .get(candidate)
                         .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
 
-                    if *opened && !value.chars().all(json_string_inert) {
+                    if *opened && value.chars().any(can_leave_a_string) {
                         return Err(MappingError::Unrestorable(
                             "a value that could close a string, inside a streamed structure",
                         ));
@@ -1308,6 +1308,53 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// every timestamp, `@` in every e-mail address. Covering a reader nobody in
 /// this path has would leave an allowlist that refuses the values this gateway
 /// exists to restore.
+/// Whether this character is one of the ways *out* of a string, for the
+/// streamed path, which cannot repair and can only refuse.
+///
+/// **A different question from `json_string_inert`, and the difference is
+/// cost.** That function decides whether to attempt a structural restore, so
+/// its conservatism is free: a character wrongly called dangerous costs a parse
+/// the buffered path was happy to do, and the value is restored correctly
+/// either way. Its own documentation prices it that way — "`/` came out
+/// because it was cheap".
+///
+/// On a stream there is no structural route, so the same conservatism costs a
+/// **killed stream**. Measured on the public corpus before this existed:
+/// `json_string_inert` rejects 3.1% of annotated values, and the offending
+/// characters are `/` and `&` — every German tax number, whose canonical form
+/// is `419/130/29933`, and company names like `Boerner AG & Co. KGaA`. Neither
+/// can close a string in any reader. Lifting a predicate priced for a free
+/// route into a place where it refuses is half a rule, which is the mistake
+/// #54 was written to avoid making in the other direction.
+///
+/// So this asks the narrower question, from the closed enumeration
+/// `json_string_inert`'s own comment already makes: the ways out of a string
+/// are its delimiter, the escape, and a character the format forbids raw.
+///
+/// - **delimiters** — the double quote in JSON, the apostrophe in JSON5 and
+///   JS, the backtick in a template literal. Formats with longer delimiters
+///   build them from those two;
+/// - **the escape** — the backslash, which can consume the delimiter after it;
+/// - **forbidden raw** — the C0 controls, which JSON requires escaped inside a
+///   string and which a lenient reader may treat as a terminator.
+///
+/// **It is a blocklist, and that is the deliberate part.** The repository's
+/// rule is that a predicate whose omissions cause injections must become one
+/// whose omissions cost restorations — and on the buffered path an omission
+/// from `json_string_inert` costs exactly that, a restoration taken
+/// structurally. Here the polarity of the *cost* is reversed: an omission from
+/// an allowlist costs a refused stream, which is the expensive failure, so the
+/// enumeration has to be of the hazard rather than of the safe set. It is a
+/// closed structural enumeration rather than a list of characters that looked
+/// alarming, which is what makes that defensible.
+///
+/// **The residual:** a delimited-string format whose delimiter is none of the
+/// three above would be missed. I know of none, and say so rather than implying
+/// the set is proven.
+fn can_leave_a_string(character: char) -> bool {
+    matches!(character, '"' | '\'' | '`' | '\\') || character.is_control()
+}
+
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
