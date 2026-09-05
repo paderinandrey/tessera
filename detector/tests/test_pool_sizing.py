@@ -262,3 +262,88 @@ def test_the_shipped_constants_satisfy_it() -> None:
     # actually reads, and nothing else asserts they came from it.
     assert ner._in_flight(ner._POOL_SIZE) == ner._IN_FLIGHT
     assert ner._POOL_SIZE >= 1
+
+
+def test_a_mountpoint_with_a_space_is_decoded(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The kernel escapes spaces as `\040`, because mountinfo is space-separated.
+
+    Passing the raw field to `Path` inspects a directory that does not exist, so
+    the quota reads as absent and the pool is sized from affinity — the very
+    failure this function exists to stop, reached through a mountpoint with a
+    space in its name. Found in review of #63.
+    """
+    mount = tmp_path / "cgroup mount"
+    (mount / "svc").mkdir(parents=True)
+    escaped = str(mount).replace(" ", r"\040")
+    monkeypatch.setattr(
+        ner, "_PROC_SELF_MOUNTINFO", _write(tmp_path, "mountinfo", _mountinfo(escaped, v2=True))
+    )
+    monkeypatch.setattr(
+        ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup-of-self", "0::/svc\n")
+    )
+    (mount / "svc" / "cpu.max").write_text("200000 100000\n")
+    assert ner._cgroup_cpu_quota() == 2.0
+
+
+def test_a_v1_membership_is_not_joined_to_a_v2_mount(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hybrid host lists a path per hierarchy, and they are different things.
+
+    Managers mirror slice names across both, so a v1 path joined to a v2 mount
+    can land on a real directory belonging to something else — and reading its
+    limit would shrink this pool for a reason that has nothing to do with this
+    process. Found in review of #63.
+    """
+    v2_mount = tmp_path / "unified"
+    v1_mount = tmp_path / "cpu,cpuacct"
+    # The same name under both hierarchies, which is the shape that crosses.
+    (v2_mount / "shared.slice").mkdir(parents=True)
+    (v1_mount / "shared.slice").mkdir(parents=True)
+    monkeypatch.setattr(
+        ner,
+        "_PROC_SELF_MOUNTINFO",
+        _write(
+            tmp_path,
+            "mountinfo",
+            _mountinfo(str(v2_mount), v2=True) + _mountinfo(str(v1_mount)),
+        ),
+    )
+    # This process is at `shared.slice` under v2 and at the root under v1.
+    monkeypatch.setattr(
+        ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup-of-self", "0::/shared.slice\n5:cpu:/\n")
+    )
+    # The v1 directory of the same name belongs to somebody else and is tighter.
+    (v1_mount / "shared.slice" / "cpu.cfs_quota_us").write_text("50000\n")
+    (v1_mount / "shared.slice" / "cpu.cfs_period_us").write_text("100000\n")
+    (v2_mount / "shared.slice" / "cpu.max").write_text("400000 100000\n")
+
+    assert ner._cgroup_cpu_quota() == 4.0, (
+        "a v1 directory sharing a name with this process's v2 cgroup was read as its limit"
+    )
+
+
+def test_a_namespace_relative_path_still_resolves(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two proc files can use different coordinate systems.
+
+    In a private cgroup namespace `/proc/self/cgroup` is namespace-relative
+    while an inherited mount's root is not, so a process reports `/inner`
+    against a mount root of `/docker/abc`. Requiring the prefix discarded that
+    membership and missed a narrower limit one directory down. Found in review
+    of #63, and it pulls against the finding above — which is why the hierarchy
+    *version* is matched strictly and the path is not.
+    """
+    mount = tmp_path / "cgroup"
+    (mount / "inner").mkdir(parents=True)
+    monkeypatch.setattr(
+        ner,
+        "_PROC_SELF_MOUNTINFO",
+        _write(tmp_path, "mountinfo", _mountinfo(str(mount), "/docker/abc", v2=True)),
+    )
+    monkeypatch.setattr(
+        ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup-of-self", "0::/inner\n")
+    )
+    (mount / "inner" / "cpu.max").write_text("100000 100000\n")
+    assert ner._cgroup_cpu_quota() == 1.0

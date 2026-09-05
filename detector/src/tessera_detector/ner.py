@@ -304,15 +304,40 @@ _PROC_SELF_MOUNTINFO = Path("/proc/self/mountinfo")
 _WORKERS_ENV = "TESSERA_DETECT_WORKERS"
 
 
-def _cpu_hierarchies() -> list[tuple[Path, str]]:
-    """Every mounted cgroup hierarchy carrying a CPU limit: (mountpoint, mount root).
+def _unescape(field: str) -> str:
+    r"""A mountinfo path with its octal escapes decoded.
 
-    **The mountpoint is not `/sys/fs/cgroup/cpu`, and guessing it was the fourth
-    wrong answer here.** cgroup v1 usually mounts the controller *combined* —
-    `/sys/fs/cgroup/cpu,cpuacct` — and a mount can expose a subtree rather than
-    the whole hierarchy, in which case the path from `/proc/self/cgroup` has to
-    be taken relative to that subtree before it means anything on disk. Neither
-    is guessable; both are in `/proc/self/mountinfo`. Found in review of #63.
+    The kernel writes `\040` for a space, `\011` for a tab, `\012` for a
+    newline and `\134` for a backslash, because the file is space-separated.
+    Passing the raw field to `Path` inspects a directory that does not exist, so
+    the quota reads as absent and the pool is sized from affinity again — which
+    is the failure this whole function exists to stop, reached through a
+    mountpoint with a space in it. Found in review of #63.
+    """
+    if "\\" not in field:
+        return field
+    out, index = [], 0
+    while index < len(field):
+        if field[index] == "\\" and field[index + 1 : index + 4].isdigit():
+            try:
+                out.append(chr(int(field[index + 1 : index + 4], 8)))
+                index += 4
+                continue
+            except ValueError:
+                pass
+        out.append(field[index])
+        index += 1
+    return "".join(out)
+
+
+def _cpu_hierarchies() -> list[tuple[Path, str, bool]]:
+    """Mounted hierarchies carrying a CPU limit: (mountpoint, mount root, is v2).
+
+    **The mountpoint is not `/sys/fs/cgroup/cpu`, and guessing it was one of the
+    wrong answers here.** cgroup v1 usually mounts the controller *combined* —
+    `/sys/fs/cgroup/cpu,cpuacct` — and a mount may expose a subtree rather than
+    the whole hierarchy. Neither is guessable; both are in
+    `/proc/self/mountinfo`.
 
     A mountinfo line is
 
@@ -320,8 +345,14 @@ def _cpu_hierarchies() -> list[tuple[Path, str]]:
 
     where the separator is a bare `-`, so the optional fields before it are
     skipped by finding it rather than by counting.
+
+    **The version is carried out with the mountpoint** because `/proc/self/cgroup`
+    lists a membership path per hierarchy, and a v1 path joined to a v2 mount
+    can land on a real directory belonging to something else — managers mirror
+    slice names across both. Reading another cgroup's limit would shrink this
+    pool for a reason that has nothing to do with this process.
     """
-    hierarchies: list[tuple[Path, str]] = []
+    hierarchies: list[tuple[Path, str, bool]] = []
     try:
         lines = _PROC_SELF_MOUNTINFO.read_text().splitlines()
     except OSError:
@@ -335,40 +366,24 @@ def _cpu_hierarchies() -> list[tuple[Path, str]]:
         right = after.split()
         if len(left) < 5 or len(right) < 3:
             continue
-        mount_root, mountpoint = left[3], left[4]
+        mount_root, mountpoint = _unescape(left[3]), _unescape(left[4])
         fs_type, super_options = right[0], right[2]
         if fs_type == "cgroup2":
-            hierarchies.append((Path(mountpoint), mount_root))
+            hierarchies.append((Path(mountpoint), mount_root, True))
         elif fs_type == "cgroup" and "cpu" in super_options.split(","):
             # `cpu,cpuacct` is one mount answering to both names, and the
             # option list is where it says so.
-            hierarchies.append((Path(mountpoint), mount_root))
+            hierarchies.append((Path(mountpoint), mount_root, False))
     return hierarchies
 
 
-def _cgroup_paths() -> list[Path]:
-    """Every directory that could carry a CPU limit for this process.
-
-    **The process is usually not at the hierarchy root, and the first version
-    read the root.** A cgroup-v1 container sharing the host's namespace, or any
-    systemd-managed service, lives at a path recorded in `/proc/self/cgroup` —
-    `/system.slice/tessera.service`, `/docker/9f2c…`. Reading the root inspects
-    something unlimited, so the quota came back `None` and the pool was sized
-    from the affinity count again.
-
-    **Ancestors are included, because a limit on a parent slice binds too.** A
-    service under a `.slice` capped at two CPUs is capped at two whatever its
-    own directory says, so every level is a candidate and `_cgroup_cpu_quota`
-    takes the narrowest.
-    """
-    hierarchies = _cpu_hierarchies()
-    if not hierarchies:
-        return []
+def _cgroup_memberships() -> list[tuple[str, bool]]:
+    """This process's cgroup path per hierarchy: (path, is v2)."""
     try:
         lines = _PROC_SELF_CGROUP.read_text().splitlines()
     except OSError:
-        return [mountpoint for mountpoint, _ in hierarchies]
-    relative: list[str] = []
+        return []
+    memberships: list[tuple[str, bool]] = []
     for line in lines:
         fields = line.split(":", 2)
         if len(fields) != 3:
@@ -376,24 +391,62 @@ def _cgroup_paths() -> list[Path]:
         hierarchy, controllers, path = fields
         # v2 is the line with an empty controller list and hierarchy `0`; v1
         # gives one line per controller and only a `cpu` one matters here.
-        if (hierarchy == "0" and not controllers) or "cpu" in controllers.split(","):
-            relative.append(path)
+        if hierarchy == "0" and not controllers:
+            memberships.append((path, True))
+        elif "cpu" in controllers.split(","):
+            memberships.append((path, False))
+    return memberships
+
+
+def _cgroup_paths() -> list[Path]:
+    """Every directory that could carry a CPU limit for this process.
+
+    **The process is usually not at the hierarchy root, and an early version
+    read the root.** A cgroup-v1 container sharing the host's namespace, or any
+    systemd-managed service, lives at a path from `/proc/self/cgroup` —
+    `/system.slice/tessera.service`, `/docker/9f2c…`. The root is unlimited, so
+    the quota came back `None` and the pool was sized from affinity again.
+
+    **Ancestors are included, because a limit on a parent slice binds too.** A
+    service under a `.slice` capped at two CPUs is capped at two whatever its
+    own directory says, so every level is a candidate and `_cgroup_cpu_quota`
+    takes the narrowest.
+
+    **Both readings of the mount root are candidates, and that is a deliberate
+    looseness.** The two proc files can use different coordinate systems: in a
+    private cgroup namespace `/proc/self/cgroup` is namespace-relative while an
+    inherited mount's root is not, so a process can report `/inner` against a
+    mount root of `/docker/abc`. Requiring the prefix discards that membership
+    and misses a narrower limit one directory down. Trying both risks reading a
+    neighbour's limit instead — which is why the *hierarchy version* is matched
+    strictly above, and why a non-existent path costs nothing: `_quota_at`
+    answers `None` for a directory that is not there. The residual is a real
+    directory in the right hierarchy that belongs to another cgroup and happens
+    to sit at this name, and against that the honest answer is
+    `TESSERA_DETECT_WORKERS`.
+    """
+    hierarchies = _cpu_hierarchies()
+    if not hierarchies:
+        return []
+    memberships = _cgroup_memberships()
+    if not memberships:
+        return [mountpoint for mountpoint, _, _ in hierarchies]
 
     paths: list[Path] = []
-    for mountpoint, mount_root in hierarchies:
+    for mountpoint, mount_root, mount_is_v2 in hierarchies:
         paths.append(mountpoint)
-        for path in relative:
-            # A mount may expose a subtree. The cgroup path is relative to the
-            # hierarchy; on disk it is relative to what this mount shows of it.
-            if mount_root != "/":
-                if not path.startswith(mount_root):
-                    continue
-                path = path[len(mount_root) :]
-            here = mountpoint
-            for part in path.strip("/").split("/"):
-                if part:
-                    here = here / part
-                    paths.append(here)
+        for path, member_is_v2 in memberships:
+            if member_is_v2 != mount_is_v2:
+                continue
+            candidates = {path}
+            if mount_root != "/" and path.startswith(mount_root):
+                candidates.add(path[len(mount_root) :])
+            for candidate in candidates:
+                here = mountpoint
+                for part in candidate.strip("/").split("/"):
+                    if part:
+                        here = here / part
+                        paths.append(here)
     return paths
 
 
