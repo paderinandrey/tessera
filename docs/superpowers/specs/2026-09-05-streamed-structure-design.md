@@ -213,3 +213,61 @@ carried an odd number of quotes and set the string flag on its own. The test now
 uses text with no quotes at all, so the bracket is the only opener, and the
 mutation fails it. A test that passes for a reason other than the one it names
 is the same defect as a gate aggregating over the wrong quantity, one layer up.
+
+
+## Seven more, and they ended the approach rather than extending it **[third round]**
+
+A second review pass found seven, all P1, and read together they say something
+the individual fixes do not: **a character blocklist cannot be right without
+knowing where the character lands.**
+
+- an escape split across two fragments — a push ending `"foo\` and one beginning
+  `"` is an escaped quote, and per-run escape state read it as a closing one;
+- a quote inside a comment corrupting quote parity, so `/* " */ "[PERSON_1]"`
+  read as unenclosed;
+- a single-quoted top-level string, which no double-quote counter enters;
+- a comment at the top level, where the comment check required a container;
+- `*/` assembled from a value ending `*` and a carrier beginning `/`;
+- `${` in a template literal, which executes without carrying the backtick;
+- and the one that settled it: **a bare value position needs no hazardous
+  character at all.** `{safe:false,value:[ORG_1]}` is valid JSON5, and
+  `null,admin:true,pad:null` adds a member out of alphanumerics and punctuation
+  that must stay inert — an e-mail address needs `@`, a date needs `:`.
+
+The last cannot be patched. No blocklist closes it, because in that position the
+value is structure rather than content, and the buffered path is safe there only
+because it parses and re-serializes.
+
+## So it lexes
+
+Three string delimiters, escapes carried across fragments, block and line
+comments. **Not a parser** — no nesting, no grammar, no values — and it answers
+exactly one question: what kind of place is the next character in.
+
+#36 and #55 both rejected "track JSON structure across fragments" as a second
+parser on the path where a mistake cannot be taken back. That judgement was
+about a parser and this is a lexer, and the three rounds above are the argument:
+every smaller thing was defeated by a document shape it could not see, and each
+defeat named a shape rather than a character.
+
+The hazard test differs by place, because the ways out do:
+
+| place | refused |
+|---|---|
+| prose | nothing — no structure seen, nothing to close |
+| string | its own delimiter, the escape, forbidden-raw characters, `${` |
+| comment | `*` or `/`, either half of the way out |
+| bare | anything but alphanumerics and a few word marks |
+
+**And it made the rule less conservative where it mattered.** Knowing *which*
+delimiter opened a string means an apostrophe is a literal inside `"…"`, so
+`O'Brien` in a JSON object streams normally — the case the first version killed,
+and the one the tests were written around. Four of them asserted a refusal that
+was wrong, and they now carry a delimiter the string can actually be closed by.
+
+## What it still does not claim
+
+It cannot tell a document from prose. A reply that quotes something is not JSON,
+and the lexer treats the inside of that quotation as a string. The direction is
+safe — it refuses — and the cost falls only on a value that could act in the
+place it lands.

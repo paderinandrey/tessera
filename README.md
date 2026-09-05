@@ -590,20 +590,31 @@ value in a leaf and escape it on the way out. A stream has no document to put it
 refuses where the buffered path would have succeeded, and a truncated answer the client can
 see is the better half of that trade against a silently altered one their agent may act on.
 
-What counts as "inside" is two facts a stream can carry without parsing: a `{` or `[` has
-gone past, **or** an odd number of unescaped quotation marks has. The second exists because a
-document need not be a container — a reply whose whole content is `"[PERSON_1]"` is a valid
-JSON string, and the buffered path escapes it precisely because `serde_json` parses a bare
-string as a document. Values contribute to both: a value that restores to `{` opens a
-structure exactly as a brace in the model's own text does.
+What counts as "inside" is answered by a **lexer** — not a parser: three string delimiters,
+escapes carried across fragments, block and line comments, and no grammar or nesting. It
+answers one question, *what kind of place is the next character in*, and the hazard test
+differs by place because the ways out do:
 
-A value that could leave a **comment** is refused as well, because seeing a container does
-not prove the token is inside a string — `{/* [PERSON_1] */ safe:true}` is valid JSON5 with
-the token inside a comment. The test is the sequence `*/` rather than the characters apart,
-which is precise about the only way out of one and leaves `419/130/29933` alone.
+- **inside a string** — the delimiter that opened it, the escape, and characters the format
+  forbids raw. Only that delimiter: an apostrophe is a literal inside `"…"`, so `O'Brien` in
+  a JSON object streams normally. A `${` is refused too, because a backtick string is a
+  template literal and interpolation executes without carrying the delimiter;
+- **inside a comment** — `*` or `/`, since a value ending `*` before a carrier `/` is the
+  same escape as `*/` in the value itself;
+- **in a bare position** — inside a container but outside any string, only alphanumerics and
+  a few word marks pass. Nothing weaker works: `{safe:false,value:[PERSON_1]}` is valid JSON5
+  and `null,admin:true` adds a member out of characters that must stay inert, because an
+  e-mail address needs `@` and a date needs `:`;
+- **in prose** — nothing. No structure has been seen, so there is nothing to close, and prose
+  is most of what streams.
 
-Prose is untouched: no container, no unbalanced quote, no string for the value to close. The
-stream also asks a **narrower** question about the value than the buffered path does. That path's
+Values feed the lexer as well as the model's own text: a value restoring to `{` opens a
+structure exactly as a brace would.
+
+Three rounds of review took this from a single boolean to the above, and each round found a
+document shape the previous one could not see — a top-level string, a quote inside a
+comment, a single-quoted string, an escape split across two fragments, and finally a bare
+member position, which needs no hazardous character at all. That path's
 allowlist is conservative because being wrong there costs it a parse it was happy to make;
 on a stream being wrong costs the answer, so the test is the closed set of ways out of a
 string — a delimiter, the escape, a character the format forbids raw. Measured on the public

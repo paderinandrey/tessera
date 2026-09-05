@@ -195,59 +195,185 @@ pub const DETERMINISTIC_TYPES: [&str; 8] = [
 /// would be indistinguishable from this fallback.
 pub const REDACTED_TYPE: &str = "REDACTED";
 
-/// What a stream has gone past, as far as restoration needs to know it.
+/// Where in a document a stream currently is, as far as restoration needs it.
 ///
-/// **The two things a delta can carry forward without parsing anything.** A
-/// fragment cannot be parsed — that is the premise `restore_in_stream` starts
-/// from — but "has a container been opened" and "are we inside a quoted string"
-/// are facts about text already emitted, and a bool each is enough to hold
-/// them.
+/// **A lexer, and calling it anything smaller stopped being honest.** #36 and
+/// #55 both rejected "track JSON structure across fragments" as a second parser
+/// on the path where a mistake cannot be taken back, and two review rounds on
+/// #57 spent themselves demonstrating why a smaller thing does not work: a flag
+/// for "a container has opened" misses a top-level string; adding quote parity
+/// misses a quote inside a comment, a single-quoted string, and an escape split
+/// across two fragments; and none of them touches the finding that ended the
+/// argument — **in a bare value position no hazardous character is needed at
+/// all**. `{safe:false,value:[ORG_1]}` with a value of `null,admin:true` is
+/// valid JSON5 and injects a member out of alphanumerics and punctuation that
+/// must stay inert, because an e-mail address needs `@` and a date needs `:`.
+///
+/// So this lexes: three string delimiters, escapes carried across fragments,
+/// block and line comments. It is not a parser — no nesting, no grammar, no
+/// values — and it answers one question: *what kind of place is the next
+/// character in*. That is the question the hazard test needed all along, and
+/// every earlier version was guessing at it.
+///
+/// **What it still cannot do** is tell a document from prose. A reply that
+/// quotes something is not JSON, and this will treat the inside of that
+/// quotation as a string. That direction is safe — it refuses — and it is why
+/// the refusal only fires for a *value* that could act in the place it lands.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// No structure seen. Prose, until something says otherwise.
+    #[default]
+    Prose,
+    /// Inside a quoted string, and which delimiter opened it: only that one
+    /// closes it, so an apostrophe inside a double-quoted string is inert.
+    Text(char),
+    /// Inside `/* … */`.
+    Block,
+    /// Inside `// …`, until a newline.
+    Line,
+    /// Inside a container, outside any string or comment — a **bare** position,
+    /// where JSON5 accepts unquoted members and a value acts structurally.
+    Bare,
+}
+
+/// What a stream has gone past, as far as restoration needs to know it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamStructure {
-    /// A `{` or `[` has gone past. Never reset, exactly as
-    /// `structure_encloses_a_token` never resets its own local: a container
-    /// opened before a token is not un-opened by a brace this does not track.
-    opened: bool,
-    /// An odd number of unescaped `"` has gone past, so the next character
-    /// lands inside a string.
-    ///
-    /// **This exists because a document need not be a container.** A streamed
-    /// reply whose whole content is `"[PERSON_1]"` is a valid JSON document —
-    /// a top-level string — with no `{` or `[` anywhere, so `opened` stayed
-    /// false and a value carrying a quote was substituted raw, producing
-    /// `"Martina "Weber""` while the stream reported success. The buffered path
-    /// escapes that case because `serde_json` parses a bare string as a
-    /// document; this is the streamed reading of the same fact. Found in review
-    /// of #57.
-    ///
-    /// It only ever *adds* refusals: everything `opened` refused it still
-    /// refuses. The cost is prose carrying an odd number of quotation marks
-    /// before a value with a delimiter in it — a mismatched quote, which is
-    /// unusual enough to be worth the top-level document.
-    in_string: bool,
+    place: Place,
+    /// A `{` or `[` has gone past. **Kept apart from `place` because closing a
+    /// string does not put you in a container.** A first version returned to
+    /// `Bare` whenever a string ended, so `she said "hello" to [PERSON_1]` —
+    /// prose — was treated as a bare member position and refused a name with an
+    /// apostrophe in it. What a closing quote returns you to is where you were.
+    container: bool,
+    /// A backslash ended the last fragment. **Carried, because a fragment
+    /// boundary is not a token boundary**: a push ending `"foo\` followed by one
+    /// beginning `"` has an escaped quote, and recreating this per run read it
+    /// as a closing one.
+    escaped: bool,
+    /// The last character emitted, so a `*` at the end of a value and a `/` at
+    /// the start of the next run are seen as the `*/` they become.
+    last: Option<char>,
 }
 
 impl StreamStructure {
-    /// Fold a run of emitted text into the state.
-    fn saw(&mut self, text: &str) {
-        let mut escaped = false;
-        for character in text.chars() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match character {
-                '\\' => escaped = true,
-                '"' => self.in_string = !self.in_string,
-                '{' | '[' => self.opened = true,
-                _ => {}
-            }
+    /// Where a closing delimiter returns to: a container if one was opened,
+    /// and otherwise the prose it interrupted.
+    fn outside(&self) -> Place {
+        if self.container {
+            Place::Bare
+        } else {
+            Place::Prose
         }
     }
 
-    /// Whether a substituted value would land somewhere a delimiter matters.
-    fn encloses(&self) -> bool {
-        self.opened || self.in_string
+    /// Fold a run of emitted text into the state.
+    fn saw(&mut self, text: &str) {
+        for character in text.chars() {
+            self.step(character);
+        }
+    }
+
+    fn step(&mut self, character: char) {
+        let previous = self.last.replace(character);
+        if self.escaped {
+            self.escaped = false;
+            return;
+        }
+        match self.place {
+            Place::Text(delimiter) => match character {
+                '\\' => self.escaped = true,
+                c if c == delimiter => self.place = self.outside(),
+                _ => {}
+            },
+            Place::Block => {
+                if character == '/' && previous == Some('*') {
+                    self.place = self.outside();
+                    // The `*` is spent: `*/*` closes once, it does not close twice.
+                    self.last = None;
+                }
+            }
+            Place::Line => {
+                if character == '\n' {
+                    self.place = self.outside();
+                }
+            }
+            Place::Prose | Place::Bare => match character {
+                '"' | '\'' | '`' => self.place = Place::Text(character),
+                '*' if previous == Some('/') => self.place = Place::Block,
+                '/' if previous == Some('/') => self.place = Place::Line,
+                '{' | '[' => {
+                    self.container = true;
+                    self.place = Place::Bare;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Why a value must not be substituted here, or `None`.
+    ///
+    /// **One question per place, because the ways out differ.** A blocklist of
+    /// characters cannot be right without knowing where the characters land:
+    /// `,` and `:` are inert inside a string and structural in a bare position,
+    /// and `/` is inert everywhere except inside a comment.
+    fn refuses(&self, value: &str) -> Option<&'static str> {
+        match self.place {
+            // Nothing structural has been seen. A value cannot close what was
+            // never opened, and this is the case that keeps streamed prose —
+            // most of what streams — working.
+            Place::Prose => None,
+            // **Only the delimiter that opened it closes it**, which is a
+            // precision the earlier versions could not have: they knew a string
+            // was in play and not which kind, so they refused every delimiter
+            // and turned `O'Brien` inside `{"name":"…"}` into a dead stream.
+            // An apostrophe is a literal inside a double-quoted string in every
+            // reader this is written for.
+            Place::Text(delimiter) => {
+                if value
+                    .chars()
+                    .any(|c| c == delimiter || leaves_any_string(c))
+                {
+                    return Some("a value that could close a string, inside a streamed structure");
+                }
+                // A backtick string is a template literal to a JavaScript
+                // consumer, and `${` executes without carrying the delimiter.
+                // Cheap enough to refuse in every string rather than reason
+                // about which one this is.
+                if value.contains("${") {
+                    return Some("a value that could open an interpolation, inside a stream");
+                }
+                None
+            }
+            // The only way out of a comment is its delimiter, and either half of
+            // it is enough once the neighbouring character is considered — a
+            // value ending `*` before a carrier `/` is the same escape. Refusing
+            // both characters inside a comment costs nothing anyone needs: a
+            // masked value is not something to serve inside a comment anyway.
+            Place::Block | Place::Line => {
+                if value.contains(['*', '/', '\n', '\r']) {
+                    Some("a value that could close a comment, inside a stream")
+                } else {
+                    None
+                }
+            }
+            // **A bare position needs no hazardous character.**
+            // `{safe:false,value:[ORG_1]}` with `null,admin:true,pad:null` is
+            // valid JSON5 and adds a member out of nothing this could blocklist.
+            // So the test is inverted here: only a value that cannot act
+            // structurally passes, which is alphanumerics, spaces, and the few
+            // marks that separate words.
+            Place::Bare => {
+                if value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
+                {
+                    None
+                } else {
+                    Some("a value that could change the structure it was substituted into")
+                }
+            }
+        }
     }
 }
 
@@ -654,15 +780,8 @@ impl Mapping {
                         .get(candidate)
                         .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
 
-                    if state.encloses() && value.chars().any(can_leave_a_string) {
-                        return Err(MappingError::Unrestorable(
-                            "a value that could close a string, inside a streamed structure",
-                        ));
-                    }
-                    if state.opened && can_leave_a_comment(value) {
-                        return Err(MappingError::Unrestorable(
-                            "a value that could close a comment, inside a streamed structure",
-                        ));
+                    if let Some(reason) = state.refuses(value) {
+                        return Err(MappingError::Unrestorable(reason));
                     }
                     // **The value's own brackets count.** Only text runs updated
                     // this before, so a first token restoring to `{` emitted an
@@ -1422,30 +1541,14 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// **The residual:** a delimited-string format whose delimiter is none of the
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
-fn can_leave_a_string(character: char) -> bool {
-    // U+2028 and U+2029 are line terminators to a JSON5 reader and forbidden
-    // raw inside a string, and Rust's `is_control` covers only C0 and C1 — so
-    // they were in the hazard the enumeration names and outside the code that
-    // implements it. The detector normalizes both while keeping offsets, which
-    // is exactly how one reaches a restored value. Found in review of #57.
-    matches!(character, '"' | '\'' | '`' | '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
-}
-
-/// Whether a value could leave something that is not a string.
-///
-/// **Seeing a container does not prove the token is inside a string**, and the
-/// first version of this rule assumed it did. `{/* [PERSON_1] */ safe:true}` is
-/// valid JSON5 with the token inside a *comment*, and a value of
-/// `*/ admin:true, /*` passes `can_leave_a_string` — `/` and `*` are both
-/// inert, and have to be: a German tax number is `419/130/29933` and a company
-/// is `Börner AG & Co. KGaA`. Found in review of #57.
-///
-/// So the test is the two-character sequence rather than either character, which
-/// is precise about the only way out of a block comment and touches neither of
-/// those values. A line comment needs no entry: leaving one takes a newline,
-/// and `can_leave_a_string` already refuses those.
-fn can_leave_a_comment(value: &str) -> bool {
-    value.contains("*/")
+fn leaves_any_string(character: char) -> bool {
+    // The escape can consume the delimiter after it, and a character the format
+    // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
+    // line terminators to a JSON5 reader and Rust's `is_control` covers only C0
+    // and C1 — they were inside the hazard the enumeration names and outside the
+    // code implementing it, and the detector normalizes both while keeping
+    // offsets, which is how one reaches a restored value.
+    matches!(character, '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
 }
 
 fn json_string_inert(character: char) -> bool {

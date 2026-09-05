@@ -1614,20 +1614,24 @@ mod buffer_tests {
         mapping
     }
 
-    /// A mapping whose one value carries a character that can close a string.
-    /// `O'Brien` rather than `x","admin":true` on purpose: the apostrophe is
-    /// what makes this an ordinary name and not a crafted payload, and it fails
-    /// `json_string_inert` exactly as a quote does because a permissive reader
-    /// honours it exactly as well.
+    /// A mapping whose one value carries the delimiter of the string it will be
+    /// substituted into.
+    ///
+    /// **It used to be `O'Brien`, and the change is the point.** An apostrophe
+    /// cannot close a double-quoted string in any reader this is written for,
+    /// and the earlier rule refused it anyway — it knew a string was in play and
+    /// not which kind. Once the lexer tracks which delimiter opened the string,
+    /// the ordinary case goes through and the test has to carry a real hazard.
     fn mapped_to_a_non_inert_value() -> Mapping {
+        let value = r#"Weber" and ""#;
         let mut mapping = Mapping::new();
         mapping
             .mask(
-                "O'Brien",
+                value,
                 &[Span {
                     entity_type: "PERSON".into(),
                     start: 0,
-                    end: 7,
+                    end: value.chars().count(),
                 }],
             )
             .unwrap();
@@ -1674,7 +1678,7 @@ mod buffer_tests {
         let mut out = buffer.push("Guten Tag [PERSON_1], ").unwrap();
         out.push_str(&buffer.push("wie geht es Ihnen?").unwrap());
         out.push_str(&buffer.finish().unwrap());
-        assert_eq!(out, "Guten Tag O'Brien, wie geht es Ihnen?");
+        assert_eq!(out, r#"Guten Tag Weber" and ", wie geht es Ihnen?"#);
     }
 
     #[test]
@@ -1703,7 +1707,7 @@ mod buffer_tests {
         let mut buffer = RestoreBuffer::new(&mapping);
         let mut out = buffer.push(r#"[PERSON_1] wrote {"a":1} and "#).unwrap();
         out.push_str(&buffer.finish().unwrap());
-        assert_eq!(out, r#"O'Brien wrote {"a":1} and "#);
+        assert_eq!(out, r#"Weber" and " wrote {"a":1} and "#);
 
         // And once it has been opened it stays opened, in the same run: a
         // second token after the brace is refused.
@@ -1756,22 +1760,43 @@ mod buffer_tests {
 
     #[test]
     fn every_way_out_of_a_string_is_refused() {
-        // The other side: the enumeration this rule is built from — a
-        // delimiter, the escape, a character the format forbids raw — asserted
-        // member by member, so a narrowing that drops one is a failing test
-        // rather than a silent injection.
-        for value in ["a\"b", "a'b", "a`b", "a\\b", "a\nb", "a\u{1}b"] {
-            let mut mapping = Mapping::new();
-            mapping
-                .mask(
-                    value,
-                    &[Span {
-                        entity_type: "ORG".into(),
-                        start: 0,
-                        end: value.chars().count(),
-                    }],
-                )
-                .unwrap();
+        // The enumeration this rule is built from — a delimiter, the escape, a
+        // character the format forbids raw — asserted member by member, so a
+        // narrowing that drops one is a failing test rather than an injection.
+        //
+        // **Each delimiter against its own kind of string.** They are not
+        // interchangeable: an apostrophe is a literal inside `"…"` and a quote
+        // is a literal inside `'…'`, and refusing either everywhere is what made
+        // an ordinary Irish surname end a stream.
+        for (delimiter, carrier) in [
+            ('"', r#"{"x":"[ORG_1]"}"#),
+            ('\'', "{x:'[ORG_1]'}"),
+            ('`', "({x:`[ORG_1]`})"),
+        ] {
+            let value = format!("a{delimiter}b");
+            let mapping = mapped_to(&[(value.as_str(), "ORG")]);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "{value:?} was substituted into {carrier}"
+            );
+
+            // And it is inert inside a string of another kind.
+            let elsewhere = if delimiter == '"' {
+                "{x:'[ORG_1]'}"
+            } else {
+                r#"{"x":"[ORG_1]"}"#
+            };
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(elsewhere).is_ok(),
+                "{value:?} was refused inside {elsewhere}, which it cannot close"
+            );
+        }
+
+        // The escape and the forbidden-raw characters close any string.
+        for value in ["a\\\\b", "a\nb", "a\u{1}b", "a\u{2028}b", "a\u{2029}b"] {
+            let mapping = mapped_to(&[(value, "ORG")]);
             let mut buffer = RestoreBuffer::new(&mapping);
             assert!(
                 buffer.push(r#"{"x":"[ORG_1]"}"#).is_err(),
@@ -1887,6 +1912,105 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_bare_value_position_needs_no_hazardous_character() {
+        // **The finding that ended the character-blocklist argument.**
+        // `{safe:false,value:[ORG_1]}` is valid JSON5 with the token in an
+        // unquoted member position, and `null,admin:true,pad:null` adds a member
+        // out of alphanumerics and punctuation that must stay inert — an e-mail
+        // needs `@`, a date needs `:`. No blocklist closes this; only knowing
+        // the token is *not* inside a string does. Found in review of #64.
+        let mapping = mapped_to(&[("null,admin:true,pad:null", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push("{safe:false,value:[ORG_1]}").is_err());
+
+        // And a name in the same position still goes through, which is what
+        // stops this being "refuse everything once a brace appears".
+        let plain = mapped_to(&[("Martina Weber", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&plain);
+        let mut out = buffer.push(r#"{"name":"[PERSON_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"name":"Martina Weber"}"#);
+    }
+
+    #[test]
+    fn an_escape_split_across_two_fragments_is_still_an_escape() {
+        // A fragment boundary is not a token boundary. One push ending `"foo\`
+        // and the next beginning `"` is an *escaped* quote; recreating the
+        // escape state per run read it as a closing one, left the string, and
+        // let a quote-bearing value through. Found in review of #64.
+        let mapping = mapped_to(&[(r#"Martina "Weber""#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert_eq!(buffer.push(r#""foo\"#).unwrap(), r#""foo\"#);
+        assert!(
+            buffer.push(r#""[PERSON_1]"#).is_err(),
+            "the escaped quote did not close the string, so the token is still inside it"
+        );
+    }
+
+    #[test]
+    fn a_quote_inside_a_comment_does_not_open_a_string() {
+        // `/* " */ "[PERSON_1]"` — counting quotes without knowing about
+        // comments makes the one in the comment cancel the real one, so the
+        // token reads as unenclosed. Found in review of #64.
+        let mapping = mapped_to(&[(r#"Martina "Weber""#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push(r#"/* " */ "[PERSON_1]""#).is_err());
+    }
+
+    #[test]
+    fn a_single_quoted_string_is_a_string() {
+        // `'[PERSON_1]'` is a JSON5 document with no container and no double
+        // quote, and `can_leave_a_string` calls the apostrophe hazardous — so
+        // the enclosure state had to cover every delimiter the hazard names.
+        // Found in review of #64.
+        let mapping = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push("'[PERSON_1]'").is_err());
+
+        // The other delimiter is inert inside this one: an apostrophe cannot
+        // close a double-quoted string, and refusing it there would refuse the
+        // ordinary case.
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = buffer.push(r#"{"name":"[PERSON_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"name":"O'Brien"}"#);
+    }
+
+    #[test]
+    fn a_comment_at_the_top_level_is_still_a_comment() {
+        // The comment check used to require a container. `/* [ORG_1] */` with
+        // `*/ {"admin":true} /*` becomes a valid JSON5 document injecting an
+        // object the model wrote only inside a comment. Found in review of #64.
+        let mapping = mapped_to(&[(r#"*/ {"admin":true} /*"#, "ORG")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push("/* [ORG_1] */").is_err());
+    }
+
+    #[test]
+    fn a_comment_delimiter_assembled_across_the_boundary_is_refused() {
+        // `x*` followed by the carrier's `/` is the same `*/`. Checking the
+        // value alone missed it, so inside a comment either character is
+        // enough — a masked value is not something to serve inside a comment
+        // anyway. Found in review of #64.
+        let mapping = mapped_to(&[("x*", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer
+            .push("{/* [ORG_1]/ admin:true, /* fallback */ safe:false}")
+            .is_err());
+    }
+
+    #[test]
+    fn an_interpolation_opener_is_refused_inside_a_string() {
+        // A backtick string is a template literal to a JavaScript consumer, and
+        // `${…}` executes without carrying the delimiter — so a value with no
+        // quote, no backslash and no control character still runs code. Found
+        // in review of #64.
+        let mapping = mapped_to(&[("${globalThis.process.exit()}", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push("({message:`[ORG_1]`})").is_err());
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a
@@ -1896,7 +2020,10 @@ mod buffer_tests {
         let mut first = RestoreBuffer::new(&mapping);
         assert!(first.push(r#"{"name":"[PERSON_1]"}"#).is_err());
         let mut second = RestoreBuffer::new(&mapping);
-        assert_eq!(second.push("hallo [PERSON_1]").unwrap(), "hallo O'Brien");
+        assert_eq!(
+            second.push("hallo [PERSON_1]").unwrap(),
+            r#"hallo Weber" and ""#
+        );
     }
 
     #[test]
