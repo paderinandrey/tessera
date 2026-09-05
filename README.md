@@ -590,8 +590,20 @@ value in a leaf and escape it on the way out. A stream has no document to put it
 refuses where the buffered path would have succeeded, and a truncated answer the client can
 see is the better half of that trade against a silently altered one their agent may act on.
 
-Prose is untouched: no container opened means no string for the value to close. The stream
-also asks a **narrower** question about the value than the buffered path does. That path's
+What counts as "inside" is two facts a stream can carry without parsing: a `{` or `[` has
+gone past, **or** an odd number of unescaped quotation marks has. The second exists because a
+document need not be a container — a reply whose whole content is `"[PERSON_1]"` is a valid
+JSON string, and the buffered path escapes it precisely because `serde_json` parses a bare
+string as a document. Values contribute to both: a value that restores to `{` opens a
+structure exactly as a brace in the model's own text does.
+
+A value that could leave a **comment** is refused as well, because seeing a container does
+not prove the token is inside a string — `{/* [PERSON_1] */ safe:true}` is valid JSON5 with
+the token inside a comment. The test is the sequence `*/` rather than the characters apart,
+which is precise about the only way out of one and leaves `419/130/29933` alone.
+
+Prose is untouched: no container, no unbalanced quote, no string for the value to close. The
+stream also asks a **narrower** question about the value than the buffered path does. That path's
 allowlist is conservative because being wrong there costs it a parse it was happy to make;
 on a stream being wrong costs the answer, so the test is the closed set of ways out of a
 string — a delimiter, the escape, a character the format forbids raw. Measured on the public

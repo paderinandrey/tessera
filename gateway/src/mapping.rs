@@ -195,6 +195,62 @@ pub const DETERMINISTIC_TYPES: [&str; 8] = [
 /// would be indistinguishable from this fallback.
 pub const REDACTED_TYPE: &str = "REDACTED";
 
+/// What a stream has gone past, as far as restoration needs to know it.
+///
+/// **The two things a delta can carry forward without parsing anything.** A
+/// fragment cannot be parsed — that is the premise `restore_in_stream` starts
+/// from — but "has a container been opened" and "are we inside a quoted string"
+/// are facts about text already emitted, and a bool each is enough to hold
+/// them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StreamStructure {
+    /// A `{` or `[` has gone past. Never reset, exactly as
+    /// `structure_encloses_a_token` never resets its own local: a container
+    /// opened before a token is not un-opened by a brace this does not track.
+    opened: bool,
+    /// An odd number of unescaped `"` has gone past, so the next character
+    /// lands inside a string.
+    ///
+    /// **This exists because a document need not be a container.** A streamed
+    /// reply whose whole content is `"[PERSON_1]"` is a valid JSON document —
+    /// a top-level string — with no `{` or `[` anywhere, so `opened` stayed
+    /// false and a value carrying a quote was substituted raw, producing
+    /// `"Martina "Weber""` while the stream reported success. The buffered path
+    /// escapes that case because `serde_json` parses a bare string as a
+    /// document; this is the streamed reading of the same fact. Found in review
+    /// of #57.
+    ///
+    /// It only ever *adds* refusals: everything `opened` refused it still
+    /// refuses. The cost is prose carrying an odd number of quotation marks
+    /// before a value with a delimiter in it — a mismatched quote, which is
+    /// unusual enough to be worth the top-level document.
+    in_string: bool,
+}
+
+impl StreamStructure {
+    /// Fold a run of emitted text into the state.
+    fn saw(&mut self, text: &str) {
+        let mut escaped = false;
+        for character in text.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '"' => self.in_string = !self.in_string,
+                '{' | '[' => self.opened = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether a substituted value would land somewhere a delimiter matters.
+    fn encloses(&self) -> bool {
+        self.opened || self.in_string
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Mapping {
     by_value: HashMap<String, String>,
@@ -577,7 +633,11 @@ impl Mapping {
     /// its fourth row above, and six earlier readings that tried to be cleverer
     /// about which reader accepts what were each defeated in turn. Sharing the
     /// rule is worth more than being right about brackets.
-    pub fn restore_in_stream(&self, text: &str, opened: &mut bool) -> Result<String, MappingError> {
+    pub fn restore_in_stream(
+        &self,
+        text: &str,
+        state: &mut StreamStructure,
+    ) -> Result<String, MappingError> {
         let mut out = String::with_capacity(text.len());
         for piece in pieces(text) {
             match piece {
@@ -585,9 +645,7 @@ impl Mapping {
                     // Our own token's brackets never reach here: `pieces` yields
                     // a placeholder as its own piece, so the one reading of what
                     // is a token stays shared with `restore`.
-                    if run.contains(['{', '[']) {
-                        *opened = true;
-                    }
+                    state.saw(run);
                     out.push_str(run);
                 }
                 Piece::Placeholder(candidate) => {
@@ -596,11 +654,24 @@ impl Mapping {
                         .get(candidate)
                         .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
 
-                    if *opened && value.chars().any(can_leave_a_string) {
+                    if state.encloses() && value.chars().any(can_leave_a_string) {
                         return Err(MappingError::Unrestorable(
                             "a value that could close a string, inside a streamed structure",
                         ));
                     }
+                    if state.opened && can_leave_a_comment(value) {
+                        return Err(MappingError::Unrestorable(
+                            "a value that could close a comment, inside a streamed structure",
+                        ));
+                    }
+                    // **The value's own brackets count.** Only text runs updated
+                    // this before, so a first token restoring to `{` emitted an
+                    // opener nothing recorded, and a second token then
+                    // substituted freely into the object the first one had
+                    // opened. Mapped values carry no character restriction, so
+                    // that is reachable with two ordinary detections. Found in
+                    // review of #57.
+                    state.saw(value);
                     out.push_str(value);
                 }
             }
@@ -1352,7 +1423,29 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
 fn can_leave_a_string(character: char) -> bool {
-    matches!(character, '"' | '\'' | '`' | '\\') || character.is_control()
+    // U+2028 and U+2029 are line terminators to a JSON5 reader and forbidden
+    // raw inside a string, and Rust's `is_control` covers only C0 and C1 — so
+    // they were in the hazard the enumeration names and outside the code that
+    // implements it. The detector normalizes both while keeping offsets, which
+    // is exactly how one reaches a restored value. Found in review of #57.
+    matches!(character, '"' | '\'' | '`' | '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
+}
+
+/// Whether a value could leave something that is not a string.
+///
+/// **Seeing a container does not prove the token is inside a string**, and the
+/// first version of this rule assumed it did. `{/* [PERSON_1] */ safe:true}` is
+/// valid JSON5 with the token inside a *comment*, and a value of
+/// `*/ admin:true, /*` passes `can_leave_a_string` — `/` and `*` are both
+/// inert, and have to be: a German tax number is `419/130/29933` and a company
+/// is `Börner AG & Co. KGaA`. Found in review of #57.
+///
+/// So the test is the two-character sequence rather than either character, which
+/// is precise about the only way out of a block comment and touches neither of
+/// those values. A line comment needs no entry: leaving one takes a newline,
+/// and `can_leave_a_string` already refuses those.
+fn can_leave_a_comment(value: &str) -> bool {
+    value.contains("*/")
 }
 
 fn json_string_inert(character: char) -> bool {

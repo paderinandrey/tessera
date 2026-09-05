@@ -187,11 +187,11 @@ pub const MAX_HELD: usize = 64;
 pub struct RestoreBuffer<'a> {
     mapping: &'a Mapping,
     held: String,
-    /// Whether a `{` or `[` has gone past in this run's text, which is the one
-    /// thing a stream can know about the document it may be in without parsing
-    /// one. Carried across fragments, never reset, and scoped to this run
-    /// because a buffer is — see `Mapping::restore_in_stream`.
-    opened: bool,
+    /// What this run has gone past — a container opened, a string entered —
+    /// which is what a stream can know about the document it may be in without
+    /// parsing one. Carried across fragments and scoped to this run because a
+    /// buffer is. See `Mapping::restore_in_stream` and `StreamStructure`.
+    structure: crate::mapping::StreamStructure,
 }
 
 impl<'a> RestoreBuffer<'a> {
@@ -199,7 +199,7 @@ impl<'a> RestoreBuffer<'a> {
         Self {
             mapping,
             held: String::new(),
-            opened: false,
+            structure: crate::mapping::StreamStructure::default(),
         }
     }
 
@@ -214,7 +214,11 @@ impl<'a> RestoreBuffer<'a> {
             }
             let rest = self.held.split_off(split);
             let ready = std::mem::replace(&mut self.held, rest);
-            emitted.push_str(&self.mapping.restore_in_stream(&ready, &mut self.opened)?);
+            emitted.push_str(
+                &self
+                    .mapping
+                    .restore_in_stream(&ready, &mut self.structure)?,
+            );
             // Releasing a bracket that ran past the cap can expose a further
             // complete region behind it.
             if self.held.len() <= MAX_HELD {
@@ -227,7 +231,7 @@ impl<'a> RestoreBuffer<'a> {
     /// Emit whatever is still held: the text run has ended.
     pub fn finish(&mut self) -> Result<String, MappingError> {
         let ready = std::mem::take(&mut self.held);
-        self.mapping.restore_in_stream(&ready, &mut self.opened)
+        self.mapping.restore_in_stream(&ready, &mut self.structure)
     }
 
     /// Byte length of the prefix that cannot be part of a pending placeholder.
@@ -1772,6 +1776,112 @@ mod buffer_tests {
             assert!(
                 buffer.push(r#"{"x":"[ORG_1]"}"#).is_err(),
                 "a value carrying {value:?} was substituted into a streamed structure"
+            );
+        }
+    }
+
+    fn mapped_to(values: &[(&str, &str)]) -> Mapping {
+        let mut mapping = Mapping::new();
+        for (value, entity_type) in values {
+            mapping
+                .mask(
+                    value,
+                    &[Span {
+                        entity_type: (*entity_type).into(),
+                        start: 0,
+                        end: value.chars().count(),
+                    }],
+                )
+                .unwrap();
+        }
+        mapping
+    }
+
+    #[test]
+    fn a_bracket_a_value_restores_to_opens_a_structure_too() {
+        // **The hole the first version left, and it needs no crafted input to
+        // reach — only two ordinary detections.** Text runs updated the flag and
+        // substituted values did not, so a value restoring to `{` emitted an
+        // opener nothing recorded, and the next token substituted freely into
+        // the object the first one had just opened. Mapped values carry no
+        // character restriction at all. Found in review of #57.
+        // **No quotes anywhere in the carrier text**, deliberately. A first
+        // draft used `[ORG_1]"name":"[PERSON_2]"}`, where the run between the
+        // tokens carries an odd number of quotes and sets `in_string` on its
+        // own — so it passed with the value's bracket ignored, and a mutation
+        // removing exactly this line survived it. The bracket has to be the only
+        // opener for the test to be about the bracket.
+        let mapping = mapped_to(&[("{", "ORG"), ("a'b", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let error = buffer
+            .push("[ORG_1] then [PERSON_2]")
+            .expect_err("the first value opened the structure the second is written into");
+        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+
+        // And without that first value it is prose, which is what keeps this
+        // about the opener rather than about the second value.
+        let prose = mapped_to(&[("a'b", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&prose);
+        assert_eq!(buffer.push("then [PERSON_1]").unwrap(), "then a'b");
+    }
+
+    #[test]
+    fn a_top_level_string_is_a_document_without_a_container() {
+        // A streamed reply whose whole content is `"[PERSON_1]"` is a valid JSON
+        // document — a top-level string — with no `{` or `[` anywhere. The
+        // buffered path escapes it because `serde_json` parses a bare string as
+        // a document; this path saw no container and substituted raw, producing
+        // `"Martina "Weber""` while reporting success. Found in review of #57.
+        let mapping = mapped_to(&[(r#"Martina "Weber""#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let error = buffer
+            .push(r#""[PERSON_1]""#)
+            .expect_err("an unbalanced quote puts the token inside a string");
+        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+
+        // And a *balanced* one does not: prose that quoted something earlier is
+        // still prose, and this is where the rule stops.
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push(r#"she said "hello" to [PERSON_1]"#).is_ok());
+    }
+
+    #[test]
+    fn a_value_that_could_leave_a_comment_is_refused() {
+        // **Seeing a container does not prove the token is inside a string.**
+        // `{/* [PERSON_1] */ safe:true}` is valid JSON5 with the token inside a
+        // comment, and `*/ admin:true, /*` passes `can_leave_a_string` because
+        // `/` and `*` are inert — and have to be: a German tax number is
+        // `419/130/29933`. Found in review of #57.
+        let mapping = mapped_to(&[("*/ admin:true, /*", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let error = buffer
+            .push("{/* [ORG_1] */ safe:true}")
+            .expect_err("the value closes the comment it was substituted into");
+        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+
+        // The two characters apart are not the hazard, and refusing them would
+        // refuse every German tax number and half the company names.
+        let inert = mapped_to(&[("419/130/29933", "DE_STEUERNUMMER")]);
+        let mut buffer = RestoreBuffer::new(&inert);
+        let mut out = buffer.push(r#"{"tax":"[DE_STEUERNUMMER_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"tax":"419/130/29933"}"#);
+    }
+
+    #[test]
+    fn a_unicode_line_terminator_is_refused() {
+        // U+2028 and U+2029 are line terminators to a JSON5 reader and forbidden
+        // raw inside a string, and Rust's `is_control` covers neither. The
+        // detector normalizes both while keeping offsets, which is how one
+        // reaches a restored value. Found in review of #57.
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let value = format!("Weber{separator}Martina");
+            let mapping = mapped_to(&[(value.as_str(), "PERSON")]);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(r#"{"name":"[PERSON_1]"}"#).is_err(),
+                "U+{:04X} was substituted into a streamed structure",
+                separator as u32
             );
         }
     }

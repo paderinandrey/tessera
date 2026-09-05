@@ -169,3 +169,47 @@ and correctly: within one run nothing reads the flag between those two lines, so
 the two orderings are the same program. It is recorded because the test it was
 meant to challenge was, at that moment, too weak for a different reason, and the
 survival is what sent me to look.
+
+
+## Four holes, found by a retrospective review **[added after merge]**
+
+This landed without a review because credits were exhausted. Asking for one
+afterwards found four, all P1, and none of them needed a crafted input beyond
+the values a detector already produces.
+
+**A value that restores to `{` opens a structure nothing recorded.** Only text
+runs updated the flag. So a first token restoring to a brace emitted an opener,
+and the second token substituted freely into the object the first had just
+opened — two ordinary detections, no character restriction on either. The state
+folds substituted values in now.
+
+**A document need not be a container.** A reply whose whole content is
+`"[PERSON_1]"` is a valid JSON string with no `{` or `[` anywhere, so `opened`
+stayed false and a value carrying a quote produced `"Martina "Weber""` while the
+stream reported success. The buffered path escapes that case because
+`serde_json` parses a bare string as a document; the streamed reading of the
+same fact is the parity of unescaped quotation marks, which `StreamStructure`
+tracks beside the container flag. It only ever adds refusals — everything
+`opened` refused it still refuses — and its cost is prose carrying an odd number
+of quotes, which is a mismatched quote.
+
+**Seeing a container does not prove the token is inside a string.**
+`{/* [PERSON_1] */ safe:true}` is valid JSON5 with the token inside a *comment*,
+and `*/ admin:true, /*` passes `can_leave_a_string` because `/` and `*` are
+inert — and have to be, since a German tax number is `419/130/29933`. The test
+is the two-character sequence, which is precise about the only way out of a
+block comment and touches neither. A line comment needs no entry: leaving one
+takes a newline, which `can_leave_a_string` already refuses.
+
+**U+2028 and U+2029 are line terminators to a JSON5 reader** and forbidden raw
+inside a string, and Rust's `is_control` covers only C0 and C1. They were inside
+the hazard the enumeration names and outside the code implementing it — and the
+detector normalizes both while keeping offsets, which is exactly how one reaches
+a restored value.
+
+**What the mutations said about the tests.** Removing the value-contributes-an-
+opener line *survived* the test written for it, because that test's carrier text
+carried an odd number of quotes and set the string flag on its own. The test now
+uses text with no quotes at all, so the bracket is the only opener, and the
+mutation fails it. A test that passes for a reason other than the one it names
+is the same defect as a gate aggregating over the wrong quantity, one layer up.
