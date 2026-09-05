@@ -175,6 +175,23 @@ pub struct Config {
     ///
     /// Per-call overhead is no longer unmeasured; see above. It is the larger
     /// half of what both bounds permit.
+    ///
+    /// **It counts characters the detection cache will not answer**, not every
+    /// character in the request. Both readings are defensible and only one
+    /// matches the sentence above: a text the cache serves costs no wait, so
+    /// charging it spends this budget on work that never happens. Measured on
+    /// the ten pinned Claude Code tool definitions, that was 9 193 of 20 000
+    /// characters on **every** turn rather than the first, because the
+    /// definitions are byte-identical afterwards — about 46% of the budget,
+    /// permanently, and the real mechanism behind "the bounds admit roughly
+    /// twenty tools".
+    ///
+    /// So the promise to a caller is **this many characters of text this
+    /// gateway has not seen**, and the same request can be admitted after a
+    /// turn that warmed the cache and refused after an eviction. That is a
+    /// widening — a refusal is what the request got before — but a client who
+    /// comes to rely on the wider budget will meet the narrow one eventually,
+    /// and the narrow one is what they are owed.
     #[serde(default = "default_max_tool_chars")]
     pub max_tool_chars: usize,
 
@@ -206,6 +223,10 @@ pub struct Config {
     /// is roughly sixteen seconds of overhead containerised — still the larger
     /// half of what a request at both bounds costs, but against 63 seconds
     /// before batching.
+    /// Like `max_tool_chars`, it counts only what the cache will not answer: a
+    /// round-trip the cache serves is not a round-trip. Charging it capped how
+    /// many *repeated* tool definitions a conversation could carry, which is
+    /// the quantity that costs nothing after the first turn.
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: usize,
 }

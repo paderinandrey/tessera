@@ -69,6 +69,29 @@ impl DetectorClient {
     /// authenticates nobody — only to keep one tenant's cached results from
     /// answering another's request, which would report through response time
     /// that the two sent the same text.
+    /// Whether `detect` would answer this text without a call.
+    ///
+    /// **The admission bounds ask this, and they ask it of the same cache the
+    /// call will consult**, so a text charged as work is a text that will cost
+    /// work. `max_tool_chars` bounds how long a caller waits for the whole
+    /// request — its own documentation says so, and says it is not a timeout
+    /// budget — and a text the cache answers costs no wait at all.
+    ///
+    /// A hit here does not promise a hit later: an eviction between this and
+    /// `detect` turns a free text into a paid one, and the request is served
+    /// anyway. That direction is the safe one — the worst case is a request
+    /// that waits longer than the bound predicted, which is what every request
+    /// did before this existed. The other direction, a text charged and then
+    /// answered free, only under-uses the budget.
+    ///
+    /// Deliberately not `&mut self` and deliberately not refreshing the LRU
+    /// clock: this is a question about cost, not a use of the entry, and
+    /// promoting an entry because a request *asked about* it would let the
+    /// bounds decide what stays cached.
+    pub fn would_be_cached(&self, text: &str, credential: Option<&[u8]>) -> bool {
+        self.cache.contains(credential, text)
+    }
+
     pub async fn detect(
         &self,
         text: &str,
