@@ -140,3 +140,4 @@ def test_the_rule_works_with_no_articles_at_all() -> None:
     assert trimmed("Le Thi Mai") == "Le Thi Mai"
     # The price: an article in front of a role noun keeps both.
     assert trimmed("Der Kunde Karz") == "Der Kunde Karz"
+

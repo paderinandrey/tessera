@@ -16,7 +16,72 @@
 entities:
   - entity_type: PERSON
     label: person
-    threshold: 0.7
+    # **0.5, on a plateau that is measured; the exact value is a tie-break.**
+    # An earlier version of this note said "the number is measured rather than
+    # chosen", which the resampling below refutes — see it before quoting this
+    # number as calibrated. A threshold is a
+    # constant and the score it judges is not: the same name scores lower with
+    # more text around it and lower again when other labels share the inference
+    # call, so a bar set against isolated single-label text drops names in
+    # every other shape. The gateway joins a document's leaves into one text
+    # and asks three tier-2 labels at once, which is both shifts at once.
+    #
+    # Measured over the 130-document public corpus, entities counted as found
+    # when any span covers them:
+    #
+    #   threshold   joined found   lost to joining   joined over   separate over
+    #        0.7        174                 12               19             33
+    #        0.6        178                  8               19             33
+    #        0.5        182                  4               19             34
+    #        0.4        182                  4               19             36
+    #
+    # 0.5 recovers eight of the twelve entities joining costs, adds nothing to
+    # over-masking on the joined path and one span on the separate one. 0.4
+    # recovers nothing further and costs two more there, so 0.5 is the top of a
+    # plateau rather than a point on a slope.
+    #
+    # **Checked by re-running the sweep**, because a best-of-four on 130
+    # documents can find noise, and the reported result and the CI gate come
+    # from the same rows. `evaluation/threshold_bootstrap.py` resamples the
+    # documents 2000 times and re-runs the *selection* inside each resample —
+    # not the margin around the winner, which conditions on the winner and
+    # cannot answer whether it would win again. Predeclared at 95%:
+    #
+    #   selection returns   0.4  0.0%   0.5  86.4%   0.6  1.1%   0.7  0.0%
+    #                       undecided (a tie the rule cannot break)  12.4%
+    #
+    # **0.5 fails that bar, and is not calibrated as an exact value.** It must
+    # not be described as one. The number below is a choice on a plateau, not a
+    # measured optimum. The script exits non-zero on that verdict.
+    #
+    # What does survive is the plateau: **98.2% of resamples select 0.5 or
+    # cannot separate it from 0.4** — the two are tied on joined recall in every
+    # cached group, and so in every possible resample, separated only by two
+    # over-masked spans on the separate path. Nothing near 0.7 is selected at
+    # all. So the decision this change makes — lower the bar from 0.7 — is
+    # stable; the decision between 0.5 and 0.4 is a coin toss and either is
+    # defensible.
+    #
+    # 0.5 is taken over 0.4 for the two fewer over-masked spans, which is the
+    # tie-break the sweep applied and is worth exactly what a tie-break is
+    # worth. Moving it one notch either way is a catalog edit.
+    #
+    # This is resampling, not held-out validation — it bounds how much of the
+    # gap is sampling variation in *this* corpus and cannot tell whether the
+    # corpus resembles a client's text. The private corpus is the measure that
+    # answers that, and it is reported separately.
+    #
+    # The price, named because it is real: one span in sixty-eight becomes a
+    # role phrase with no name in it — `Der Kunde` in `mixed-0008`, which the
+    # trimming rule keeps whole because emptying a span could unmask a name.
+    # **It is over-masking and not a miss**: the name beside it, `Hoareau`,
+    # has its own span at 0.842, well clear of any of these bars. An earlier
+    # version of this note said the role phrase "does not save the name beside
+    # it", which was wrong and wrong in the alarming direction.
+    # `test_the_lower_threshold_prices_a_role_phrase_and_still_masks_the_name`
+    # holds both halves. At 0.4 there are two such spans; at 0.6 none, which is
+    # the other defensible answer.
+    threshold: 0.5
     tier: 2
     specificity: 30
     # Words a person span may not begin with. The model reads `Der Kunde Karz`
