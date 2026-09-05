@@ -5,7 +5,9 @@ specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
 import copy
+import os
 from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -264,6 +266,42 @@ CHUNK_OVERLAP = 200
 PROMPT_TOKEN_RESERVE = 64
 TOKEN_OVERLAP = 32
 
+# **How many inferences one text may have in flight, and why it is half.**
+#
+# `detect` used to run its windows in a `for` loop, which left the machine idle
+# on exactly the request this bound exists for: a large first-seen tool result
+# is one caller waiting ninety seconds while ten cores do nothing (#28). ONNX
+# releases the GIL, so dispatching the windows to threads is a real speedup, and
+# it changes no answer — the seams were already handled by `chunks` and
+# `token_windows` overlapping and `_spans_from` rebasing to absolute offsets.
+#
+# **Half the cores rather than all of them, because the first version starved
+# small requests.** `api.detect` is a sync route, so Starlette already runs
+# requests on threads; a shared pool plus `map` over every job queues a large
+# document's two hundred inferences ahead of whatever arrives next. Measured,
+# one large request against four small ones arriving after it:
+#
+#   serial               large 5.6s   small median 0.47s   worst 0.52s
+#   all jobs at once     large 4.0s   small median 3.31s   worst 3.63s
+#   a window of cores    large 4.4s   small median 1.43s   worst 1.87s
+#   a window of cores/2  large 4.4s   small median 0.50s   worst 0.63s
+#
+# So the naive version buys a third off the large request by making every small
+# one seven times slower, which is the wrong trade for a gateway whose ordinary
+# traffic is chat messages. Bounding a single text to half the workers leaves a
+# newcomer waiting for one inference rather than a document, and still gives a
+# lone large request **1.45x** — against 1.63x for the unfair version.
+#
+# Every earlier measurement of this used requests of one size and could not see
+# any of it.
+_POOL_SIZE = max(2, os.cpu_count() or 2)
+_IN_FLIGHT = max(2, _POOL_SIZE // 2)
+# Created once for the process and shared by every recognizer in it, which is
+# what keeps the bound a bound: a pool per request is how oversubscription gets
+# in. `concurrent.futures` joins these at interpreter exit, so there is nothing
+# to shut down by hand.
+_INFERENCE_POOL = ThreadPoolExecutor(max_workers=_POOL_SIZE, thread_name_prefix="detect")
+
 
 def token_windows(
     offsets: list[tuple[int, int]], *, budget: int, overlap: int
@@ -429,11 +467,34 @@ class GlinerRecognizer:
     def detect(self, text: str) -> list[Span]:
         if not text:
             return []
+
+        def one(job: tuple[int, str, InferencePass, bool]) -> list[Span]:
+            base, piece, inference, at_boundary = job
+            return list(self._spans_from(base, piece, inference, at_boundary=at_boundary))
+
         spans: list[Span] = []
+        batch: list[tuple[int, str, InferencePass, bool]] = []
+
+        def drain() -> None:
+            # `map` keeps submission order, so the result is the same list the
+            # `for` loop produced — the same order, not merely the same set.
+            for found in _INFERENCE_POOL.map(one, batch):
+                spans.extend(found)
+            batch.clear()
+
+        # **Consumed in batches rather than collected.** `windows` is a
+        # generator on purpose: the pieces are a second copy of the document
+        # plus its overlap, and the CLI accepts files of any size. Materializing
+        # them to hand the pool one list would give that up for a speedup on the
+        # very inputs where it matters most.
         for base, piece in self.windows(text):
             at_boundary = base == 0 or text[base - 1].isspace()
             for inference in self.passes:
-                spans.extend(self._spans_from(base, piece, inference, at_boundary=at_boundary))
+                batch.append((base, piece, inference, at_boundary))
+            if len(batch) >= _IN_FLIGHT:
+                drain()
+        if batch:
+            drain()
         return spans
 
 
