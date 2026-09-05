@@ -115,6 +115,21 @@ jobs:
       - run: cargo test
 
   frontend:
+    # **One job per major `engines` declares**, because a supported range tested
+    # at one point is untested everywhere else. `package.json` promises
+    # `^22.22.2 || ^24.15.0 || >=26.0.0` and CI read `.nvmrc`, which is 26 — so
+    # the two older majors were supported in writing and exercised by nothing.
+    # A client on Node 22 would have found that out instead of us.
+    #
+    # `.nvmrc` stays at 26 and stays the local default: it answers "what should
+    # I develop against", which is a different question from "what did we
+    # promise to keep working". The list here is the promise, and the two must
+    # be edited together — the check below fails when they disagree.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24', '26']
+    name: frontend (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -123,9 +138,42 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
-          node-version-file: frontend/.nvmrc
+          node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      # A matrix listing majors `engines` does not declare tests a promise
+      # nobody made, and one omitting a declared major is the gap this job was
+      # widened to close. Neither is visible by reading either file alone, so
+      # it is checked rather than remembered.
+      - name: The matrix and the engines range declare the same majors
+        run: |
+          set -euo pipefail
+          # The **leading** number of each `||` clause. Matching every `\d+.`
+          # instead reads the minors too — `^22.22.2 || ^24.15.0 || >=26.0.0`
+          # comes back as `0 15 22 24 26` — and the check then fails on a
+          # correct file, which is the way for a consistency check to be
+          # useless that people notice fastest and fix by deleting it.
+          declared="$(node -e '
+            const clauses = require("./package.json").engines.node.split("||")
+            const majors = clauses.map(clause => clause.match(/\d+/)[0])
+            console.log([...new Set(majors)].sort((a, b) => a - b).join(" "))
+          ')"
+          tested="22 24 26"
+          if [ "$declared" != "$tested" ]; then
+            echo "::error::engines declares majors [$declared] and the CI matrix "\
+                 "runs [$tested]. Edit both, in .github/workflows/ci.yml and "\
+                 "frontend/package.json."
+            exit 1
+          fi
+          echo "both declare: $declared"
+      - name: .nvmrc is one of the declared majors
+        run: |
+          set -euo pipefail
+          pinned="$(cat .nvmrc)"
+          case " 22 24 26 " in
+            *" ${pinned%%.*} "*) echo ".nvmrc pins $pinned, which the matrix covers" ;;
+            *) echo "::error::.nvmrc pins $pinned, which no tested major covers"; exit 1 ;;
+          esac
       # `ci` rather than `install`: it fails on a lockfile that disagrees with
       # the manifest instead of quietly resolving something else, which is the
       # difference between a build and a build of what was reviewed.
