@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -306,12 +307,60 @@ def test_dispatching_windows_to_threads_changes_no_answer(
     assert shape(recognizer.detect(text)) == shape(without_the_pool())
 
 
-def test_one_text_does_not_take_the_whole_pool(recognizer: GlinerRecognizer) -> None:
-    # The bound that keeps a large document from queueing its whole self ahead
-    # of the next request. Measured before it existed: four small requests
-    # arriving behind one large one went from 0.47s to 3.31s.
+def test_one_text_never_submits_more_than_the_bound(
+    recognizer: GlinerRecognizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound applied, not the bound advertised.
+
+    A large document queueing its whole self ahead of the next request is what
+    this exists to stop: measured before the bound existed, four small requests
+    arriving behind one large one went from 0.47s to 3.31s.
+
+    **An earlier version of this test asserted a relationship between two
+    constants**, which is a statement about arithmetic and not about the
+    executor. It passed while `detect` submitted `_IN_FLIGHT + passes - 1` jobs
+    at a time, because the drain sat after the pass loop rather than inside it —
+    the cap real in the comment and absent from the queue. Found in review of
+    #62, and this is the version that would have caught it.
+    """
+    submitted: list[int] = []
+    real_map = ner_module._INFERENCE_POOL.map
+
+    def counting_map(fn, jobs, *args, **kwargs):  # type: ignore[no-untyped-def]
+        jobs = list(jobs)
+        submitted.append(len(jobs))
+        return real_map(fn, jobs, *args, **kwargs)
+
+    monkeypatch.setattr(ner_module._INFERENCE_POOL, "map", counting_map)
+    # Long enough for several batches; short enough to stay a unit test.
+    recognizer.detect("Frau Martina Weber aus Zürich rief an. " * 40)
+
+    assert submitted, "the pool was never used"
+    assert max(submitted) <= ner_module._IN_FLIGHT, (
+        f"one text submitted {max(submitted)} inferences at once against a bound of "
+        f"{ner_module._IN_FLIGHT}; the batch was measured after a whole window's "
+        "passes were appended rather than while they were"
+    )
+    # No lower bound asserted here. `_in_flight` deliberately returns 1 on a
+    # single-CPU deployment, and a `>= 2` left behind from an earlier round
+    # would fail the whole NER suite in exactly the environment the sizing was
+    # taught to support. Found in review of #63.
+
+
+def test_the_pool_is_sized_by_what_this_process_may_use() -> None:
+    # The sizing rule itself — every wrong answer it has had, and why each was
+    # untestable from the machine the tests run on — is in
+    # `test_pool_sizing.py`, which drives the parser and the override rather
+    # than looking at whatever this host happens to be.
     #
-    # Asserted as a relationship rather than a number, so a machine with a
-    # different core count still says something true.
-    assert ner_module._IN_FLIGHT <= ner_module._POOL_SIZE // 2 or ner_module._POOL_SIZE <= 4
-    assert ner_module._IN_FLIGHT >= 2, "a bound of one is a `for` loop with extra steps"
+    # What is left here is the relationship, asserted so it says something true
+    # on this laptop and on a two-CPU container alike.
+    # **Unless a deployment said otherwise**, which beats every detected limit
+    # by design — so asserting the pool is no larger than this host's CPUs makes
+    # the suite fail on a four-CPU runner with `TESSERA_DETECT_WORKERS=8`,
+    # against a rule the same change documents. Found in review of #63.
+    if os.environ.get(ner_module._WORKERS_ENV) is None:
+        allowed = os.process_cpu_count() or 1
+        assert max(1, allowed) >= ner_module._POOL_SIZE
+    assert max(1, ner_module._POOL_SIZE // 2) >= ner_module._IN_FLIGHT
+    assert ner_module._IN_FLIGHT >= 1

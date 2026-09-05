@@ -5,7 +5,9 @@ specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
 import copy
+import math
 import os
+import warnings
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -294,8 +296,267 @@ TOKEN_OVERLAP = 32
 #
 # Every earlier measurement of this used requests of one size and could not see
 # any of it.
-_POOL_SIZE = max(2, os.cpu_count() or 2)
-_IN_FLIGHT = max(2, _POOL_SIZE // 2)
+# Where the kernel records this process's cgroup and where the hierarchies are
+# mounted. Both are read, because neither alone locates the quota files.
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_PROC_SELF_MOUNTINFO = Path("/proc/self/mountinfo")
+# The override, for a deployment that knows better than any of the guesses below.
+_WORKERS_ENV = "TESSERA_DETECT_WORKERS"
+
+
+def _unescape(field: str) -> str:
+    r"""A mountinfo path with its octal escapes decoded.
+
+    The kernel writes `\040` for a space, `\011` for a tab, `\012` for a
+    newline and `\134` for a backslash, because the file is space-separated.
+    Passing the raw field to `Path` inspects a directory that does not exist, so
+    the quota reads as absent and the pool is sized from affinity again — which
+    is the failure this whole function exists to stop, reached through a
+    mountpoint with a space in it. Found in review of #63.
+    """
+    if "\\" not in field:
+        return field
+    out, index = [], 0
+    while index < len(field):
+        if field[index] == "\\" and field[index + 1 : index + 4].isdigit():
+            try:
+                out.append(chr(int(field[index + 1 : index + 4], 8)))
+                index += 4
+                continue
+            except ValueError:
+                pass
+        out.append(field[index])
+        index += 1
+    return "".join(out)
+
+
+def _cpu_hierarchies() -> list[tuple[Path, str, bool]]:
+    """Mounted hierarchies carrying a CPU limit: (mountpoint, mount root, is v2).
+
+    **The mountpoint is not `/sys/fs/cgroup/cpu`, and guessing it was one of the
+    wrong answers here.** cgroup v1 usually mounts the controller *combined* —
+    `/sys/fs/cgroup/cpu,cpuacct` — and a mount may expose a subtree rather than
+    the whole hierarchy. Neither is guessable; both are in
+    `/proc/self/mountinfo`.
+
+    A mountinfo line is
+
+        id parent major:minor ROOT MOUNTPOINT options… - FSTYPE source SUPEROPTIONS
+
+    where the separator is a bare `-`, so the optional fields before it are
+    skipped by finding it rather than by counting.
+
+    **The version is carried out with the mountpoint** because `/proc/self/cgroup`
+    lists a membership path per hierarchy, and a v1 path joined to a v2 mount
+    can land on a real directory belonging to something else — managers mirror
+    slice names across both. Reading another cgroup's limit would shrink this
+    pool for a reason that has nothing to do with this process.
+    """
+    hierarchies: list[tuple[Path, str, bool]] = []
+    try:
+        lines = _PROC_SELF_MOUNTINFO.read_text().splitlines()
+    except OSError:
+        return hierarchies
+    for line in lines:
+        try:
+            before, after = line.split(" - ", 1)
+        except ValueError:
+            continue
+        left = before.split()
+        right = after.split()
+        if len(left) < 5 or len(right) < 3:
+            continue
+        mount_root, mountpoint = _unescape(left[3]), _unescape(left[4])
+        fs_type, super_options = right[0], right[2]
+        if fs_type == "cgroup2":
+            hierarchies.append((Path(mountpoint), mount_root, True))
+        elif fs_type == "cgroup" and "cpu" in super_options.split(","):
+            # `cpu,cpuacct` is one mount answering to both names, and the
+            # option list is where it says so.
+            hierarchies.append((Path(mountpoint), mount_root, False))
+    return hierarchies
+
+
+def _cgroup_memberships() -> list[tuple[str, bool]]:
+    """This process's cgroup path per hierarchy: (path, is v2)."""
+    try:
+        lines = _PROC_SELF_CGROUP.read_text().splitlines()
+    except OSError:
+        return []
+    memberships: list[tuple[str, bool]] = []
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy, controllers, path = fields
+        # v2 is the line with an empty controller list and hierarchy `0`; v1
+        # gives one line per controller and only a `cpu` one matters here.
+        if hierarchy == "0" and not controllers:
+            memberships.append((path, True))
+        elif "cpu" in controllers.split(","):
+            memberships.append((path, False))
+    return memberships
+
+
+def _cgroup_paths() -> list[Path]:
+    """Every directory that could carry a CPU limit for this process.
+
+    **The process is usually not at the hierarchy root, and an early version
+    read the root.** A cgroup-v1 container sharing the host's namespace, or any
+    systemd-managed service, lives at a path from `/proc/self/cgroup` —
+    `/system.slice/tessera.service`, `/docker/9f2c…`. The root is unlimited, so
+    the quota came back `None` and the pool was sized from affinity again.
+
+    **Ancestors are included, because a limit on a parent slice binds too.** A
+    service under a `.slice` capped at two CPUs is capped at two whatever its
+    own directory says, so every level is a candidate and `_cgroup_cpu_quota`
+    takes the narrowest.
+
+    **Both readings of the mount root are candidates, and that is a deliberate
+    looseness.** The two proc files can use different coordinate systems: in a
+    private cgroup namespace `/proc/self/cgroup` is namespace-relative while an
+    inherited mount's root is not, so a process can report `/inner` against a
+    mount root of `/docker/abc`. Requiring the prefix discards that membership
+    and misses a narrower limit one directory down. Trying both risks reading a
+    neighbour's limit instead — which is why the *hierarchy version* is matched
+    strictly above, and why a non-existent path costs nothing: `_quota_at`
+    answers `None` for a directory that is not there. The residual is a real
+    directory in the right hierarchy that belongs to another cgroup and happens
+    to sit at this name, and against that the honest answer is
+    `TESSERA_DETECT_WORKERS`.
+    """
+    hierarchies = _cpu_hierarchies()
+    if not hierarchies:
+        return []
+    memberships = _cgroup_memberships()
+    if not memberships:
+        return [mountpoint for mountpoint, _, _ in hierarchies]
+
+    paths: list[Path] = []
+    for mountpoint, mount_root, mount_is_v2 in hierarchies:
+        paths.append(mountpoint)
+        for path, member_is_v2 in memberships:
+            if member_is_v2 != mount_is_v2:
+                continue
+            candidates = {path}
+            if mount_root != "/" and path.startswith(mount_root):
+                candidates.add(path[len(mount_root) :])
+            for candidate in candidates:
+                here = mountpoint
+                for part in candidate.strip("/").split("/"):
+                    if part:
+                        here = here / part
+                        paths.append(here)
+    return paths
+
+
+def _quota_at(directory: Path) -> float | None:
+    """The CPU limit written in one cgroup directory, in CPUs, or `None`."""
+    try:
+        quota, period = (directory / "cpu.max").read_text().split()[:2]
+        if quota != "max" and float(period) > 0:
+            return float(quota) / float(period)
+        return None
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        v1_quota = float((directory / "cpu.cfs_quota_us").read_text().strip())
+        v1_period = float((directory / "cpu.cfs_period_us").read_text().strip())
+        if v1_quota > 0 and v1_period > 0:
+            return v1_quota / v1_period
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _cgroup_cpu_quota() -> float | None:
+    """CPUs this container may use, from its cgroup, or `None` if unlimited.
+
+    **A quota is not an affinity mask, and this is the difference that matters.**
+    `os.process_cpu_count()` reports `sched_getaffinity`, which a `cpuset`
+    changes and `docker --cpus` / a Kubernetes CPU *limit* do not — those write
+    a quota. So a container given two CPUs on a large host still sees the host's
+    count there, builds a pool for it, and lets one document enqueue far more
+    concurrent inferences than it can run. Confirmed in review, in an
+    environment with a two-CPU quota where `process_cpu_count()` returned three.
+
+    Both cgroup versions, every ancestor of the process's own path, narrowest
+    wins. Anything unreadable or unparseable contributes nothing — a wrong guess
+    here should cost the *default* sizing, never an exception at import.
+    """
+    quotas = [quota for path in _cgroup_paths() if (quota := _quota_at(path)) is not None]
+    return min(quotas) if quotas else None
+
+
+def _pool_size() -> int:
+    """How many inferences this process may usefully have running.
+
+    Three answers, narrowest wins, and the deployment's own beats all of them:
+
+    - `os.cpu_count()` — the *machine*. Wrong for any container, and the first
+      version of this used it: two CPUs on a 64-core host would have built 64
+      workers and let one document enqueue 32 inferences onto two;
+    - `os.process_cpu_count()` — the affinity mask. Right for a `cpuset`, still
+      wrong for a quota, which is what `docker --cpus` and a Kubernetes CPU
+      limit actually write;
+    - the cgroup quota — right for those, absent on a bare host;
+    - `TESSERA_DETECT_WORKERS` — because none of the above can know that this
+      process shares its CPUs with something the kernel is not telling us about.
+
+    Both findings that produced this came from review of #62 and #63, and both
+    were about the same mistake in different clothes: asking a question whose
+    answer describes something other than what the process may do.
+    """
+    override = os.environ.get(_WORKERS_ENV)
+    if override is not None:
+        # **Present-and-empty is malformed, not absent.** A Compose or Kubernetes
+        # variable that expands to nothing is a deployment that tried to set a
+        # cap and produced no cap, which is exactly the case where falling back
+        # to a much larger automatic pool in silence is worst. Found in review
+        # of #63, against a `if override:` that read "" as "unset".
+        try:
+            return max(1, int(override))
+        except ValueError:
+            # A malformed override is a deployment mistake, and guessing past it
+            # silently is how it stays one. Named, then ignored.
+            warnings.warn(
+                f"{_WORKERS_ENV}={override!r} is not usable as a worker count; "
+                "sizing from this process's own CPUs instead",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    allowed = float(os.process_cpu_count() or 1)
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        allowed = min(allowed, quota)
+    # **Rounded up, not down.** A worker consumes at most one CPU, so a
+    # container entitled to 1.5 of them and given one worker can never use the
+    # half — and every other request queues behind that one worker for CPU time
+    # the cgroup was willing to grant. Found in review of #63.
+    return max(1, math.ceil(allowed))
+
+
+def _in_flight(pool_size: int) -> int:
+    """How many of the pool one text may occupy.
+
+    **Half, and floored at one rather than two.** A floor of two on a
+    single-CPU deployment starts two CPU-heavy inferences on one core and
+    occupies every slot with them, adding contention exactly where there is
+    least to absorb it. One is the correct degradation: it gives up the
+    parallelism, and on one CPU there was none to give. Found in review of #63,
+    against a comment of mine calling a bound of one "a `for` loop with extra
+    steps" — which is precisely what it should be there.
+
+    A function rather than an expression so the invariant that matters — never
+    more in flight than there are workers — is checkable without a machine of
+    the right size to check it on. That is how the floor of two survived: it is
+    wrong only at one CPU, and no test ran on one.
+    """
+    return max(1, pool_size // 2)
+
+
+_POOL_SIZE = _pool_size()
+_IN_FLIGHT = _in_flight(_POOL_SIZE)
 # Created once for the process and shared by every recognizer in it, which is
 # what keeps the bound a bound: a pool per request is how oversubscription gets
 # in. `concurrent.futures` joins these at interpreter exit, so there is nothing
@@ -491,8 +752,15 @@ class GlinerRecognizer:
             at_boundary = base == 0 or text[base - 1].isspace()
             for inference in self.passes:
                 batch.append((base, piece, inference, at_boundary))
-            if len(batch) >= _IN_FLIGHT:
-                drain()
+                # **Inside the pass loop, not after it.** Draining only between
+                # windows lets the batch reach `_IN_FLIGHT + passes - 1` before
+                # anyone looks, so the cap this exists to enforce was advertised
+                # and not applied: at two passes and a limit of three, one
+                # document submitted four. On a small process that is the whole
+                # pool, which is the case the bound is for. Found in review
+                # of #62.
+                if len(batch) >= _IN_FLIGHT:
+                    drain()
         if batch:
             drain()
         return spans
