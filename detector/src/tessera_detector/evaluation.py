@@ -6,12 +6,29 @@ The one-to-one assignment maximizes the number of matched pairs, so counts do no
 depend on entity order; higher IoU is only a preference among equal-size matchings.
 """
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
 from .spans import Span
 
 IOU_THRESHOLD = 0.5
+# Words that are not personal data even inside an annotated span, so a
+# prediction that leaves one outside has still masked the entity.
+#
+# Kept small and closed: this exists to stop an annotation convention being
+# reported as a leak, not to excuse a missing word. The corpus annotates
+# `un diabète de type 2` and the detector returns `diabète de type 2`; `un` is
+# not personal data, which is the same argument the `PERSON` trimming rule makes
+# for `Der Kunde`.
+LEADING_ARTICLES = frozenset(
+    {
+        "un", "une", "des", "du", "de", "le", "la", "les",
+        "ein", "eine", "einen", "einem", "einer",
+        "der", "die", "das", "den", "dem",
+    }
+)
+_WORD = re.compile(r"\w+", re.UNICODE)
 # How much of a prediction must cover real data before it stops counting as
 # over-masking. Half: a span that is mostly padding is padding.
 OVERMASKING_SHARE = 0.5
@@ -211,3 +228,35 @@ __all__ = [
     "precision_gate_failures",
     "summarize",
 ]
+
+
+def unmasked_words(text: str, start: int, end: int, predictions: list[Span]) -> list[str]:
+    """Words of `text[start:end]` that no prediction covers and that carry data.
+
+    **Words, not characters, and not spans** — the three questions differ and
+    only one of them is what a masking gateway is for:
+
+    - a *span* test asks whether some prediction has these exact bounds, so it
+      reports a type disagreement or a boundary one character short as a leak;
+    - a *character* test asks whether every character is covered, so it reports
+      an annotation that includes the leading article as a leak;
+    - this asks whether anything a reader could use went out.
+
+    Every gate in this repository that has been wrong was wrong by aggregating
+    over one of the first two. `test_joined_detection`'s recall gate has now
+    been three: type-matched (the gap read 164 against 164 and was invisible),
+    net (3 against a real 4), and full containment (4 against a real 5, hiding
+    an Article 9 loss because the article shortfall made the *separate* path
+    fail the same test and the two errors cancelled).
+    """
+    covered: set[int] = set()
+    for span in predictions:
+        covered |= set(range(span.start, span.end))
+    out = []
+    for match in _WORD.finditer(text[start:end]):
+        at = start + match.start()
+        if any(index in covered for index in range(at, start + match.end())):
+            continue
+        if match.group().lower() not in LEADING_ARTICLES:
+            out.append(match.group())
+    return out

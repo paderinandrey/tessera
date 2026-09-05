@@ -804,6 +804,31 @@ Article 9 special categories, detected by the same layer at a lower threshold:
 | SEX_LIFE | 0.000 | 0.000 | 0.000 |
 | TRADE_UNION | 0.296 | 1.000 | 0.457 |
 
+**Annotated entities reaching the provider: 3 of 196.** The most direct statement of what
+this gateway is for, and until now nothing measured it: every other gate is about a *type*,
+and a type-matched gate cannot see an entity found under another label, found with the wrong
+bounds, or not found at all — three different rows in three different tables, none of which
+says "these characters went out". `make evaluate` counts it by position and by content, names
+each offender, and fails if the number grows.
+
+```
+GENETIC  'test génétique'   its own label at 0.288, bar 0.30
+ORG      'Tessier SA'       its own label at 0.697, bar 0.75
+PERSON   'Texier'           claimed by `location` at 0.585, whose bar is 0.7
+```
+
+Two are near misses on their own bar, by 0.012 and 0.053. The third is [#46][i46]: a
+quasi-identifier wins the argmax and then fails a bar the loser would have cleared — asked
+alone, `person` scores `Texier` at 0.704.
+
+A gold span whose **leading article** falls outside the prediction is not counted: masking
+`un diabète de type 2` as `diabète de type 2` sends `un` to the provider, and an article is
+not personal data — the same argument the `PERSON` trimming rule makes for `Der Kunde`.
+Without that exclusion the number reads 11, and eight of them are an annotation convention
+rather than a leak.
+
+[i46]: https://github.com/paderinandrey/tessera/issues/46
+
 **Article 9 coverage: 0.9783 (45/46)** — nearly every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
 across eleven detector types rather than eight: the regulation protects political opinions,

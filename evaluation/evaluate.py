@@ -20,6 +20,7 @@ from tessera_detector.evaluation import (
     overmasking_counts,
     precision_gate_failures,
     summarize,
+    unmasked_words,
 )
 from tessera_detector.models import ModelUnavailable
 from tessera_detector.pipeline import build_detector
@@ -48,6 +49,34 @@ ADVISORY_PRECISION_TYPES = {"ORG", "LOCATION"}
 # redacted. What must never happen is a special-category mention going
 # unnoticed by every one of the eight labels.
 ARTICLE_9_TARGET = 0.95
+# How many annotated entities may reach the provider with data words unmasked.
+#
+# **The most direct statement of what this gateway is for, and nothing measured
+# it.** Every gate above is about a *type* — Tier 1 recall, Article 9 coverage,
+# LOCATION over-masking — and a type-matched gate cannot see an entity that was
+# found under another label, or found with the wrong bounds, or not found at
+# all: those are three different rows in three different tables and none of them
+# says "these characters went out".
+#
+# Counted by position and by content. A gold span whose *leading article* falls
+# outside the prediction is not a leak — `un diabète de type 2` masked as
+# `diabète de type 2` sends `un` to the provider, and an article is not personal
+# data. That is the same argument the `PERSON` trimming rule makes for
+# `Der Kunde`, and without it this gate would read 11 where the truth is 3.
+#
+# Three, measured, and each one named in the report so the number cannot drift
+# into a shrug:
+#
+#   ORG      'Tessier SA'      its own label at 0.697, bar 0.75
+#   PERSON   'Texier'          claimed by `location` at 0.585, whose bar is 0.7
+#   GENETIC  'test génétique'  its own label at 0.288, bar 0.30
+#
+# **This is a defect being tracked, not a target** — see #46 for the middle one,
+# whose mechanism is a quasi-identifier winning the argmax and then failing a
+# bar the loser would have cleared. The gate stops it widening; it does not
+# bless it.
+UNMASKED_TARGET = 3
+
 ARTICLE_9_TYPES = {
     "HEALTH",
     "BIOMETRIC",
@@ -61,6 +90,23 @@ ARTICLE_9_TYPES = {
     "PHILOSOPHICAL_BELIEF",
     "SEX_LIFE",
 }
+
+
+def unmasked_entities(
+    text: str, entities: list[EvalEntity], predictions: list
+) -> list[tuple[str, str]]:
+    """Annotated entities with data words no prediction covers.
+
+    `unmasked_words` is in the package rather than here because it has three
+    callers now — this gate, the joined-detection gate, and the tests that pin
+    both. A second copy would be two definitions of what counts as a leak.
+    """
+    leaked = []
+    for entity in entities:
+        carrying = unmasked_words(text, entity.start, entity.end, predictions)
+        if carrying:
+            leaked.append((entity.entity_type, " ".join(carrying)))
+    return leaked
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     # in one language while the aggregate stays above target.
     article_9_buckets: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     overmasking: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    unmasked: list[tuple[str, str]] = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
         document = json.loads(line)
         entities = [EvalEntity(**e) for e in document["entities"]]
@@ -99,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             counts = overmasking[entity_type]
             counts[0] += kept
             counts[1] += total
+        unmasked.extend(unmasked_entities(document["text"], entities, predictions))
     summary = summarize(per_document, tier1_types=tier1_types)
 
     width = max(len(t) for t in summary.per_type)
@@ -130,6 +178,23 @@ def main(argv: list[str] | None = None) -> int:
             "and LOCATION over-masking gates are skipped."
         )
         return 0
+    # Before the type-shaped gates, because it is the one that asks what the
+    # gateway is for. Each offender is named: a bare count is a number somebody
+    # raises, and a list is three cases somebody has to argue with.
+    print(
+        f"\nAnnotated entities reaching the provider: {len(unmasked)} "
+        f"(tracked defect, must not exceed {UNMASKED_TARGET})"
+    )
+    for entity_type, words in sorted(unmasked):
+        print(f"  {entity_type}: {words!r}")
+    unmasked_over = len(unmasked) > UNMASKED_TARGET
+    if unmasked_over:
+        print(
+            f"FAIL: {len(unmasked)} annotated entities reach the provider with data "
+            f"words unmasked, against {UNMASKED_TARGET} being tracked",
+            file=sys.stderr,
+        )
+
     covered_total = sum(bucket[0] for bucket in article_9_buckets.values())
     gold_total = sum(bucket[1] for bucket in article_9_buckets.values())
     overall = covered_total / gold_total if gold_total else 0.0
@@ -180,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
             f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
             "(advisory on the synthetic corpus)"
         )
-    return 1 if overmasking_failures or article_9_missed else 0
+    return 1 if overmasking_failures or article_9_missed or unmasked_over else 0
 
 
 if __name__ == "__main__":
