@@ -549,6 +549,26 @@ and a tool block the model produces inside a stream that was allowed ends that s
 Extended thinking is refused before
 the upstream call rather than at its first streamed block, so the refusal costs no tokens.
 
+**A streamed response the caller declares will be a JSON document is refused the same way.**
+`stream: true` beside any `response_format` other than `{"type": "text"}` is a 400 before
+the upstream call — an unfamiliar type is refused rather than admitted, because a
+`response_format` the gateway cannot read is more likely to declare a document than prose,
+and an omission in this predicate must cost a refusal rather than an injection. The reason is the restoration path: a buffered `content` that parses as a
+document is restored *structurally*, so a value carrying a `"` — or an apostrophe, which
+closes a string for a permissive reader just as well — lands inside a leaf and is escaped on
+the way out. A delta is a fragment of a document and there is nothing to parse, so the
+streamed path substitutes as text and such a value would land in the client's document
+unescaped, mid-flight, with the bytes gone before anything could reconsider.
+
+The guard reads the caller's **declaration** rather than the values the detector found.
+Refusing whenever a masked value could close a string sounds tighter and is worse: a name
+like `O'Brien` qualifies, and a streamed prose reply mentioning one is neither a document
+nor a hazard. So a streamed reply whose content happens to be JSON while the request
+declared no `response_format` is still restored as text — the caller has not claimed a
+document contract there, and the alternative is a second JSON parser on the one path where a
+mistake cannot be taken back. Clients needing structured output can have it buffered, which
+restores it correctly, or streamed as undeclared text at their own risk.
+
 Whatever was already restored is served before the error event, whether the stream ends
 because the connection broke or because a token could not be restored. It was safe to send a
 moment earlier, and the failure does not change that; what stays behind is the hold-back

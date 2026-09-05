@@ -1134,19 +1134,27 @@ async fn handle(
             // an arbitrary prefix with no relation to a document boundary. See
             // `RestoreBuffer`, which says the same from the other side.
             //
-            // **What is closed there is the `arguments` half, by a different
-            // mechanism.** `reject_streamed_tools` refuses `stream: true` on
-            // any request carrying tool traffic, so a described `arguments` —
-            // the case the whole recursion was written for — never streams at
-            // all. The residue is a JSON-mode `content` on a streamed
-            // completion, where a value that is not inert can still reach the
-            // client mid-document — and "not inert" is wider than a `"`, since
-            // an apostrophe closes a string for a JSON5 reader just as well.
-            // Two other things sit near that path and
-            // neither closes it: the hold-back buffer is about placeholders and
-            // not documents, and the slot blanking in `stream::handle` is what
-            // routes delta text *away* from the escaping-aware `restore_value`
-            // in the first place.
+            // **Both halves are closed there by refusing a request shape, not
+            // by restoring differently.** `reject_streamed_tools` refuses
+            // `stream: true` on any request carrying tool traffic, so a
+            // described `arguments` — the case the whole recursion was written
+            // for — never streams at all; and `reject_streamed_json_mode`
+            // refuses it beside a `response_format` of `json_object` or
+            // `json_schema`, so a `content` the caller has declared will be a
+            // document does not stream either (#36).
+            //
+            // The residue is a streamed `content` that happens to be JSON while
+            // the request declared nothing, where a value that is not inert can
+            // still reach the client mid-document — and "not inert" is wider
+            // than a `"`, since an apostrophe closes a string for a JSON5
+            // reader just as well. That residue is deliberate: the guard is on
+            // the caller's declaration because nothing on the streamed path can
+            // tell a document from prose, and refusing on the *value* instead
+            // would refuse most streamed prose. Two other things sit near that
+            // path and neither closes it: the hold-back buffer is about
+            // placeholders and not documents, and the slot blanking in
+            // `stream::handle` is what routes delta text *away* from the
+            // escaping-aware `restore_value` in the first place.
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(&upstream, &pointer)?;
                 write_pointer(
@@ -3205,6 +3213,64 @@ mod tests {
             nested.get("admin").is_none(),
             "restoration wrote a field the upstream never sent: {nested}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_request_declaring_a_json_response_is_refused_before_the_upstream_call() {
+        // #36, end to end. The streamed path restores with plain textual
+        // substitution, so this payload — the same one the buffered test below
+        // proves is contained — would have been written into the client's
+        // document unescaped and mid-flight, adding an `admin` field the
+        // upstream never sent. There is no structural route from a fragment.
+        //
+        // **Refused at admission, so the caller pays nothing.** That is the
+        // property, and it is the reason the check sits in `request_pointers`
+        // beside `reject_streamed_tools` rather than anywhere the response is
+        // handled: a refusal after the upstream call spends the caller's tokens
+        // to hand back an error.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "stream": true,
+                   "response_format": {"type": "json_object"},
+                   "messages": [{"role": "user", "content": payload}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("a streamed response declared as a JSON document"),
+            "the refusal must name what it refused: {body}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the upstream was called for a request this gateway had already decided to refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_streamed_request_carrying_the_same_payload_is_admitted() {
+        // The other side of the same guard, and the reason it reads
+        // `response_format` rather than the values masking found. This request
+        // carries a value that fails `json_string_inert` in exactly the same
+        // way — refusing on the value would refuse this too, and it is a plain
+        // streamed completion whose reply is prose. Prose is most of what
+        // streams, and `O'Brien` fails the same predicate.
+        let payload = r#"x","admin":true,"pad":""#;
+        let detector = detector_finding_all_of(payload).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let admitted = OpenAi.request_pointers(&json!({
+            "model": "gpt", "stream": true,
+            "messages": [{"role": "user", "content": payload}]
+        }));
+        assert!(
+            admitted.is_ok(),
+            "a streamed completion was refused: {admitted:?}"
+        );
+        drop((detector, upstream));
     }
 
     #[tokio::test]
