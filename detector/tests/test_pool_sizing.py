@@ -20,9 +20,17 @@ which is why they survived. These drive the parser and the override directly.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 import tessera_detector.ner as ner
+
+
+def _write(directory, name: str, content: str) -> pathlib.Path:
+    path = directory / name
+    path.write_text(content)
+    return path
 
 
 def test_a_cgroup_v2_quota_is_read_as_cpus(tmp_path) -> None:
@@ -55,45 +63,93 @@ def test_an_unreadable_cgroup_costs_the_default_and_not_an_exception(tmp_path) -
         assert ner._quota_at(tmp_path) is None, f"{content!r} produced a number"
 
 
+def _mountinfo(mountpoint: str, mount_root: str = "/", *, v2: bool = False) -> str:
+    """One `/proc/self/mountinfo` line, in the kernel's own shape.
+
+    The separator is a bare `-` with optional fields before it, which is why the
+    parser finds it rather than counting columns.
+    """
+    if v2:
+        return f"30 25 0:25 {mount_root} {mountpoint} rw,relatime shared:9 - cgroup2 cgroup2 rw\n"
+    return (
+        f"31 25 0:26 {mount_root} {mountpoint} rw,relatime shared:15 "
+        "- cgroup cgroup rw,cpu,cpuacct\n"
+    )
+
+
 def test_the_quota_is_read_from_the_process_s_own_cgroup(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A container or a systemd unit is not at the hierarchy root.
 
-    The first version read `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` — the root,
+    An early version read `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` — the root,
     which is unlimited — while the process lived at `/system.slice/x.service`
     or `/docker/9f2c...`. So the quota came back `None` and the pool was sized
     from the affinity count again, one round after the quota itself was the
     finding.
     """
-    root = tmp_path / "sys"
-    (root / "cpu").mkdir(parents=True)
-    proc = tmp_path / "cgroup"
-    proc.write_text("12:cpu,cpuacct:/docker/abc123\n")
-    monkeypatch.setattr(ner, "_CGROUP_ROOT", root)
-    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", proc)
+    mount = tmp_path / "cpu,cpuacct"
+    mount.mkdir()
+    monkeypatch.setattr(ner, "_PROC_SELF_MOUNTINFO", _write(tmp_path, "mountinfo",
+                                                            _mountinfo(str(mount))))
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup",
+                                                         "12:cpu,cpuacct:/docker/abc123\n"))
 
-    leaf = root / "cpu" / "docker" / "abc123"
+    leaf = mount / "docker" / "abc123"
     leaf.mkdir(parents=True)
     (leaf / "cpu.cfs_quota_us").write_text("200000\n")
     (leaf / "cpu.cfs_period_us").write_text("100000\n")
     assert ner._cgroup_cpu_quota() == 2.0, "the root is unlimited; the leaf is not"
 
 
+def test_a_combined_v1_mount_is_found(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`cpu,cpuacct` is one mount answering to two names.
+
+    Guessing `/sys/fs/cgroup/cpu` missed it, and a guessed mountpoint was the
+    fourth wrong answer to this question. The option list in `mountinfo` is
+    where a mount says which controllers it carries.
+    """
+    mount = tmp_path / "cpu,cpuacct"
+    (mount / "svc").mkdir(parents=True)
+    monkeypatch.setattr(ner, "_PROC_SELF_MOUNTINFO", _write(tmp_path, "mountinfo",
+                                                            _mountinfo(str(mount))))
+    monkeypatch.setattr(
+        ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup", "5:cpu,cpuacct:/svc\n")
+    )
+    (mount / "svc" / "cpu.cfs_quota_us").write_text("400000\n")
+    (mount / "svc" / "cpu.cfs_period_us").write_text("100000\n")
+    assert ner._cgroup_cpu_quota() == 4.0
+
+
+def test_a_mount_showing_a_subtree_rebases_the_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A container often mounts its *own* cgroup as the hierarchy root, so
+    # `/proc/self/cgroup` says `/docker/abc/inner` while on disk only `inner`
+    # exists below the mountpoint. Joining the whole path would find nothing.
+    mount = tmp_path / "cgroup"
+    (mount / "inner").mkdir(parents=True)
+    monkeypatch.setattr(
+        ner, "_PROC_SELF_MOUNTINFO",
+        _write(tmp_path, "mountinfo", _mountinfo(str(mount), "/docker/abc", v2=True)),
+    )
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup-of-self",
+                                                         "0::/docker/abc/inner\n"))
+    (mount / "inner" / "cpu.max").write_text("150000 100000\n")
+    assert ner._cgroup_cpu_quota() == 1.5
+
+
 def test_a_limit_on_an_ancestor_binds_too(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A service under a slice capped at two CPUs is capped at two whatever its
     # own directory says, so the narrowest of every level wins.
-    root = tmp_path / "sys"
-    root.mkdir()
-    proc = tmp_path / "cgroup"
-    proc.write_text("0::/system.slice/tessera.service\n")
-    monkeypatch.setattr(ner, "_CGROUP_ROOT", root)
-    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", proc)
-
-    slice_dir = root / "system.slice"
-    unit = slice_dir / "tessera.service"
+    mount = tmp_path / "cgroup"
+    unit = mount / "system.slice" / "tessera.service"
     unit.mkdir(parents=True)
-    (slice_dir / "cpu.max").write_text("200000 100000\n")
+    monkeypatch.setattr(ner, "_PROC_SELF_MOUNTINFO", _write(tmp_path, "mountinfo",
+                                                            _mountinfo(str(mount), v2=True)))
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", _write(tmp_path, "cgroup-of-self",
+                                                         "0::/system.slice/tessera.service\n"))
+    (mount / "system.slice" / "cpu.max").write_text("200000 100000\n")
     (unit / "cpu.max").write_text("max 100000\n")
     assert ner._cgroup_cpu_quota() == 2.0, "the unit is unlimited; its slice is not"
 
@@ -104,10 +160,16 @@ def test_a_limit_on_an_ancestor_binds_too(tmp_path, monkeypatch: pytest.MonkeyPa
 def test_an_unreadable_proc_file_is_not_an_exception(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Not every kernel has one, and this runs at import.
-    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", tmp_path / "absent")
-    monkeypatch.setattr(ner, "_CGROUP_ROOT", tmp_path / "also-absent")
+    # Not every kernel has these, and this runs at import.
+    monkeypatch.setattr(ner, "_PROC_SELF_MOUNTINFO", tmp_path / "absent")
+    monkeypatch.setattr(ner, "_PROC_SELF_CGROUP", tmp_path / "also-absent")
     assert ner._cgroup_cpu_quota() is None
+
+    # A mountinfo this parser cannot read must cost the default, not a service
+    # that will not start.
+    for junk in ("", "nonsense", "31 25 0:26 / /mnt rw", "a - b"):
+        monkeypatch.setattr(ner, "_PROC_SELF_MOUNTINFO", _write(tmp_path, "junk", junk))
+        assert ner._cgroup_cpu_quota() is None, f"{junk!r} produced a quota"
 
 
 def test_the_quota_wins_when_it_is_narrower(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -125,12 +187,20 @@ def test_the_quota_wins_when_it_is_narrower(monkeypatch: pytest.MonkeyPatch) -> 
     assert ner._pool_size() == 4
 
 
-def test_a_fractional_quota_still_leaves_one_worker(monkeypatch: pytest.MonkeyPatch) -> None:
-    # `--cpus=0.5` is a real thing to write. Truncating it to zero would make an
-    # executor that runs nothing.
+def test_a_fractional_quota_rounds_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # **Up, not down.** A worker consumes at most one CPU, so a container
+    # entitled to 1.5 and given one worker can never use the half, and every
+    # other request queues behind that worker for CPU time the cgroup was
+    # willing to grant. Found in review of #63.
     monkeypatch.setattr(ner.os, "process_cpu_count", lambda: 8)
-    monkeypatch.setattr(ner, "_cgroup_cpu_quota", lambda: 0.5)
     monkeypatch.delenv(ner._WORKERS_ENV, raising=False)
+
+    monkeypatch.setattr(ner, "_cgroup_cpu_quota", lambda: 1.5)
+    assert ner._pool_size() == 2
+
+    # And `--cpus=0.5` is a real thing to write: truncating it to zero would
+    # make an executor that runs nothing.
+    monkeypatch.setattr(ner, "_cgroup_cpu_quota", lambda: 0.5)
     assert ner._pool_size() == 1
 
 

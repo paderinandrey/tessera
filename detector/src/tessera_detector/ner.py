@@ -5,6 +5,7 @@ specificity all come from ner.yaml, so adding a type never touches this module.
 """
 
 import copy
+import math
 import os
 import warnings
 from collections.abc import Iterable, Iterator, Mapping
@@ -295,35 +296,78 @@ TOKEN_OVERLAP = 32
 #
 # Every earlier measurement of this used requests of one size and could not see
 # any of it.
-# Where the cgroup filesystem is mounted, and where the process records which
-# cgroup it is in.
-_CGROUP_ROOT = Path("/sys/fs/cgroup")
+# Where the kernel records this process's cgroup and where the hierarchies are
+# mounted. Both are read, because neither alone locates the quota files.
 _PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_PROC_SELF_MOUNTINFO = Path("/proc/self/mountinfo")
 # The override, for a deployment that knows better than any of the guesses below.
 _WORKERS_ENV = "TESSERA_DETECT_WORKERS"
 
 
+def _cpu_hierarchies() -> list[tuple[Path, str]]:
+    """Every mounted cgroup hierarchy carrying a CPU limit: (mountpoint, mount root).
+
+    **The mountpoint is not `/sys/fs/cgroup/cpu`, and guessing it was the fourth
+    wrong answer here.** cgroup v1 usually mounts the controller *combined* —
+    `/sys/fs/cgroup/cpu,cpuacct` — and a mount can expose a subtree rather than
+    the whole hierarchy, in which case the path from `/proc/self/cgroup` has to
+    be taken relative to that subtree before it means anything on disk. Neither
+    is guessable; both are in `/proc/self/mountinfo`. Found in review of #63.
+
+    A mountinfo line is
+
+        id parent major:minor ROOT MOUNTPOINT options… - FSTYPE source SUPEROPTIONS
+
+    where the separator is a bare `-`, so the optional fields before it are
+    skipped by finding it rather than by counting.
+    """
+    hierarchies: list[tuple[Path, str]] = []
+    try:
+        lines = _PROC_SELF_MOUNTINFO.read_text().splitlines()
+    except OSError:
+        return hierarchies
+    for line in lines:
+        try:
+            before, after = line.split(" - ", 1)
+        except ValueError:
+            continue
+        left = before.split()
+        right = after.split()
+        if len(left) < 5 or len(right) < 3:
+            continue
+        mount_root, mountpoint = left[3], left[4]
+        fs_type, super_options = right[0], right[2]
+        if fs_type == "cgroup2":
+            hierarchies.append((Path(mountpoint), mount_root))
+        elif fs_type == "cgroup" and "cpu" in super_options.split(","):
+            # `cpu,cpuacct` is one mount answering to both names, and the
+            # option list is where it says so.
+            hierarchies.append((Path(mountpoint), mount_root))
+    return hierarchies
+
+
 def _cgroup_paths() -> list[Path]:
-    """Every directory that could carry a CPU limit for this process, tightest last.
+    """Every directory that could carry a CPU limit for this process.
 
     **The process is usually not at the hierarchy root, and the first version
     read the root.** A cgroup-v1 container sharing the host's namespace, or any
     systemd-managed service, lives at a path recorded in `/proc/self/cgroup` —
-    `/system.slice/tessera.service`, `/docker/9f2c…`. Reading
-    `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` inspects the *root*, which is
-    unlimited, so the quota came back `None` and the pool was sized from the
-    affinity count again. Found in review of #63, one round after the quota
-    itself was.
+    `/system.slice/tessera.service`, `/docker/9f2c…`. Reading the root inspects
+    something unlimited, so the quota came back `None` and the pool was sized
+    from the affinity count again.
 
     **Ancestors are included, because a limit on a parent slice binds too.** A
     service under a `.slice` capped at two CPUs is capped at two whatever its
-    own directory says, so every level from the root down is a candidate and
-    `_cgroup_cpu_quota` takes the narrowest.
+    own directory says, so every level is a candidate and `_cgroup_cpu_quota`
+    takes the narrowest.
     """
+    hierarchies = _cpu_hierarchies()
+    if not hierarchies:
+        return []
     try:
         lines = _PROC_SELF_CGROUP.read_text().splitlines()
     except OSError:
-        return [_CGROUP_ROOT]
+        return [mountpoint for mountpoint, _ in hierarchies]
     relative: list[str] = []
     for line in lines:
         fields = line.split(":", 2)
@@ -331,20 +375,25 @@ def _cgroup_paths() -> list[Path]:
             continue
         hierarchy, controllers, path = fields
         # v2 is the line with an empty controller list and hierarchy `0`; v1
-        # gives one line per controller and only the `cpu` one matters here.
+        # gives one line per controller and only a `cpu` one matters here.
         if (hierarchy == "0" and not controllers) or "cpu" in controllers.split(","):
             relative.append(path)
-    bases = [_CGROUP_ROOT, _CGROUP_ROOT / "cpu"]
-    candidates = [base for base in bases if base.is_dir()] or [_CGROUP_ROOT]
-    paths: list[Path] = list(candidates)
-    for base in candidates:
+
+    paths: list[Path] = []
+    for mountpoint, mount_root in hierarchies:
+        paths.append(mountpoint)
         for path in relative:
-            here = base
-            for part in path.strip("/").split("/"):
-                if not part:
+            # A mount may expose a subtree. The cgroup path is relative to the
+            # hierarchy; on disk it is relative to what this mount shows of it.
+            if mount_root != "/":
+                if not path.startswith(mount_root):
                     continue
-                here = here / part
-                paths.append(here)
+                path = path[len(mount_root) :]
+            here = mountpoint
+            for part in path.strip("/").split("/"):
+                if part:
+                    here = here / part
+                    paths.append(here)
     return paths
 
 
@@ -427,7 +476,11 @@ def _pool_size() -> int:
     quota = _cgroup_cpu_quota()
     if quota is not None:
         allowed = min(allowed, quota)
-    return max(1, int(allowed))
+    # **Rounded up, not down.** A worker consumes at most one CPU, so a
+    # container entitled to 1.5 of them and given one worker can never use the
+    # half — and every other request queues behind that one worker for CPU time
+    # the cgroup was willing to grant. Found in review of #63.
+    return max(1, math.ceil(allowed))
 
 
 def _in_flight(pool_size: int) -> int:
