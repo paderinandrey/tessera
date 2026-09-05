@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from tessera_detector.evaluation import EvalEntity, overmasking_counts
+from tessera_detector.evaluation import EvalEntity, overmasking_counts, unmasked_words
 from tessera_detector.pipeline import Detector, build_detector
 from tessera_detector.spans import Span
 
@@ -105,22 +105,47 @@ def _rebased(detector: Detector, group: list[dict]) -> tuple[list[Span], list[Sp
     return truth, separate, joined
 
 
-def _covered(truth: Span, predictions: list[Span]) -> bool:
-    """Whether the entity's characters are masked, whatever the mask is called.
+def _lost(text: str, truth: Span, separate: list[Span], joined: list[Span]) -> bool:
+    """Whether joining leaves words of this entity that reading leaves apart does not.
 
-    **Position, not label.** These gates are about what a caller's text costs
-    and what reaches a provider, and both are decided by which characters are
-    replaced. A prediction that marks a person's name and calls it a location
-    hides exactly the same bytes; the placeholder differs and nothing else does.
+    **A comparison of two sets, not two verdicts.** Every earlier version asked
+    each strategy a yes/no question and compared the answers, and every one was
+    wrong because the two strategies fail the same question for reasons that
+    have nothing to do with joining:
 
-    The first version asked for a type match and so reported a miss when joining
-    relabelled a span it still covered — a privacy gate failing on label churn,
-    while the over-masking metric two functions down already knew better.
+    - **type-matched.** Both found 164; the gap was invisible. A placeholder's
+      name protects nobody;
+    - **a net difference.** One truth only joining finds cancelled one of the
+      losses, so it read 3 against a real 4;
+    - **full containment.** The corpus annotates `eine Hepatitis-B-Infektion`
+      and the detector returns `Hepatitis-B-Infektion`, so *neither* strategy
+      contained it — and a HEALTH entity joining genuinely loses was hidden,
+      because the shortfall failed the separate path on the same test and the
+      two errors cancelled inside the gate written to catch it. 4 against 5;
+    - **words, minus a list of articles.** That saw the fifth, and bought it
+      with an exemption that fired in any position under any type, so a `PERSON`
+      annotated `Le Thi Mai` with only `Thi Mai` predicted would have read as
+      masked — `Le` being a Vietnamese family name that `ner.py` protects by
+      name. Found in review, and it is the trimming rule's own defect
+      reintroduced in the code that measures it.
+
+    Comparing the sets needs no list. A word both strategies leave — a gold
+    article neither predicts — is in both sets and cancels itself. A word only
+    joining leaves is the loss, and nothing has to decide what a word means.
     """
-    return any(
-        prediction.start <= truth.start and prediction.end >= truth.end
-        for prediction in predictions
-    )
+    apart = set(unmasked_words(text, truth.start, truth.end, separate))
+    together = set(unmasked_words(text, truth.start, truth.end, joined))
+    return bool(together - apart)
+
+
+def _covered(text: str, truth: Span, predictions: list[Span]) -> bool:
+    """Whether every word of the entity is completely masked.
+
+    Reported rather than gated — `separate_found` and `joined_found` are context
+    for the number below, and both carry the corpus's article shortfalls, which
+    is why the gate is `_lost` and not a difference of these two.
+    """
+    return not unmasked_words(text, truth.start, truth.end, predictions)
 
 
 def _redacted_types(detector: Detector) -> set[str]:
@@ -148,6 +173,9 @@ def _score(detector: Detector) -> dict[str, int]:
     for group in _documents():
         truth, separate, joined = _rebased(detector, group)
         ranges = _leaf_ranges(group)
+        # The joined text these coordinates are in. `_rebased` rebases truth and
+        # the separate predictions into it, so one string answers for all three.
+        text = JOIN.join(document["text"] for document in group)
 
         # A span that straddles two leaves or lands in a separator is not a
         # detection in production: `Joined::split` refuses it and the request
@@ -162,14 +190,16 @@ def _score(detector: Detector) -> dict[str, int]:
         # `Slot::Json` leaves. These are the entities reading leaves apart
         # covers and joining does not — the ones a caller loses.
         totals["lost_to_joining"] += sum(
-            1 for entity in truth if _covered(entity, separate) and not _covered(entity, joined)
+            1 for entity in truth if _lost(text, entity, separate, joined)
         )
         entities = [
             EvalEntity(entity_type=span.entity_type, start=span.start, end=span.end)
             for span in truth
         ]
         for name, predictions in (("separate", separate), ("joined", joined)):
-            totals[f"{name}_found"] += sum(1 for entity in truth if _covered(entity, predictions))
+            totals[f"{name}_found"] += sum(
+                1 for entity in truth if _covered(text, entity, predictions)
+            )
             # The established over-masking metric: a prediction is a cost when
             # most of what it hides holds no personal data. Its *type* being
             # wrong is not a cost — the span is redacted either way.
@@ -225,13 +255,24 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 # not that, and tightening the bound with the fix is what stops them being
 # forgotten behind a number that used to have slack in it.
 #
-# **Four, and directional.** This gated `separate_found - joined_found` and read
-# three, because one truth that only *joining* finds cancelled one of the four
-# that only joining loses. A net figure lets the gate hold at a constant while
-# names go unmasked, as long as unrelated ones turn up elsewhere — and the
-# caller whose tool-call JSON lost a name is not compensated by a different
-# document gaining one. Raised by review on #48, and the arithmetic was right.
-LOST_TO_JOINING = 4
+# **Five, directional, and counted by word.** Each of those three adjectives
+# replaced a version of this gate that was wrong, and every one was wrong the
+# same way — by aggregating over something that is not the caller's loss:
+#
+#   type-matched      both strategies found 164; the gap was invisible
+#   net difference    read 3, because one truth only *joining* finds cancelled
+#                     one of the losses. Raised by review on #48
+#   full containment  read 4 against a real 5, and the hidden one is HEALTH —
+#                     an Article 9 entity. The corpus annotates `eine
+#                     Hepatitis-B-Infektion` and the detector returns
+#                     `Hepatitis-B-Infektion`, so *neither* strategy contained
+#                     it, the separate path failed the same test, and the two
+#                     errors cancelled inside the gate written to catch this
+#
+# The fifth is not new behaviour: it was always there and this is the first
+# predicate that can see it. Raising the number is the measurement improving,
+# not the detector regressing.
+LOST_TO_JOINING = 5
 
 
 def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector) -> None:
@@ -241,19 +282,37 @@ def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector
     # per-leaf detection would have hidden, in `Slot::Json` leaves, which is
     # where a tool call keeps its names.
     #
-    # Two earlier versions of this test were wrong the same way, by aggregating
-    # over something that is not the caller's loss:
+    # Three earlier versions of this test were wrong the same way, by
+    # aggregating over something that is not the caller's loss:
     #
     # - it required the covering span to carry the *gold type*, under which both
     #   strategies found 164 and the gap was invisible. Position is the question
     #   a masking gateway asks; the placeholder's name protects nobody;
     # - it then gated `separate_found - joined_found`, a net figure that a truth
-    #   found only by joining can pay for. It read 3 against a real 4.
+    #   found only by joining can pay for. It read 3 against a real 4;
+    # - and it asked for *full containment*, which the corpus's leading articles
+    #   fail on both paths at once — hiding a HEALTH entity joining genuinely
+    #   loses, because the separate path failed the same test and the errors
+    #   cancelled. It read 4 against a real 5.
     totals = _score(detector)
 
-    assert totals["lost_to_joining"] <= LOST_TO_JOINING, (
-        "joining left more annotated entities unmasked than the gap being tracked: "
-        f"{totals['lost_to_joining']} against {LOST_TO_JOINING}, of {totals['truth']}"
+    # **Asserted exactly, and that is the fourth thing this gate got wrong.**
+    # `<=` cannot catch a predicate that stops seeing things: every mutation of
+    # `_covered` that makes it *blinder* lowers the count and passes an upper
+    # bound. Two did — ignoring the article list, and reverting to full
+    # containment — and both left the gate green while it measured less than it
+    # claims to.
+    #
+    # A number that goes down is an improvement and this fails on it too. That
+    # is the assertion working: an improvement is a measurement to re-record,
+    # and the alternative is a bound that silently accommodates a gate going
+    # dark. The same rule `a_real_tool_payload_fits_the_bounds_this_gateway_
+    # ships_with` states one crate over — do not relax it, re-measure.
+    assert totals["lost_to_joining"] == LOST_TO_JOINING, (
+        "the entities joining leaves unmasked and per-leaf detection does not: "
+        f"{totals['lost_to_joining']} against {LOST_TO_JOINING} recorded, of "
+        f"{totals['truth']}. Up is a regression; down is an improvement and a "
+        "constant to re-record — neither is something to widen a bound for."
     )
 
 

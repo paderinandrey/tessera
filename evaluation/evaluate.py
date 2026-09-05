@@ -20,6 +20,7 @@ from tessera_detector.evaluation import (
     overmasking_counts,
     precision_gate_failures,
     summarize,
+    unmasked_words,
 )
 from tessera_detector.models import ModelUnavailable
 from tessera_detector.pipeline import build_detector
@@ -48,6 +49,66 @@ ADVISORY_PRECISION_TYPES = {"ORG", "LOCATION"}
 # redacted. What must never happen is a special-category mention going
 # unnoticed by every one of the eight labels.
 ARTICLE_9_TARGET = 0.95
+# Annotated entities this configuration is known to leave partly unmasked, each
+# with the words it leaves and the reason it leaves them.
+#
+# **A named allowlist rather than a count, because a count cancels.** A bound of
+# "no more than three" lets a fixed leak pay for a new one: `Tessier SA` starts
+# being detected, some other name stops, the total holds and CI is green. That
+# is the same cross-entity cancellation the joined-detection gate spent three
+# revisions removing, and it would have been reintroduced here in the same pull
+# request. Raised in review.
+#
+# **The words are part of the key**, so a shortfall that grows is a new fact and
+# not a matching entry: if `un diabète de type 2` begins leaving `diabète` too,
+# this stops matching and the gate fails.
+#
+# **Five of the eight are an annotation convention and three are real.** The
+# convention is the gold span including a leading article the detector does not
+# predict — `un diabète de type 2` masked as `diabète de type 2` — and `un` is
+# not personal data, the same argument the `PERSON` trimming rule makes for
+# `Der Kunde`. An earlier version encoded that as a list of article words
+# dropped from *any* position under *any* type, which reports a `PERSON`
+# annotated `Le Thi Mai` as masked when only `Thi Mai` is predicted — and `Le`
+# is a Vietnamese family name that `ner.py` protects by name. Naming the
+# entities instead means each forgiveness is a sentence somebody wrote, and
+# `Le Thi Mai` would simply not be in this table.
+KNOWN_UNMASKED: dict[tuple[str, str], tuple[frozenset[str], str]] = {
+    ("HEALTH", "un diabète de type 2"): (
+        frozenset({"un"}),
+        "the gold includes the article; the condition is masked",
+    ),
+    ("HEALTH", "une sclérose en plaques"): (
+        frozenset({"une"}),
+        "the gold includes the article; the condition is masked",
+    ),
+    ("HEALTH", "eine Hepatitis-B-Infektion"): (
+        frozenset({"eine"}),
+        "the gold includes the article; the condition is masked",
+    ),
+    ("SEX_LIFE", "une interruption de grossesse"): (
+        frozenset({"une"}),
+        "the gold includes the article; the mention is masked as HEALTH",
+    ),
+    ("SEX_LIFE", "eine Kinderwunschbehandlung"): (
+        frozenset({"eine"}),
+        "the gold includes the article; the mention is masked as HEALTH",
+    ),
+    ("ORG", "Tessier SA"): (
+        frozenset({"Tessier", "SA"}),
+        "organization 0.697 against ORG's bar of 0.75 — a near miss on its own label",
+    ),
+    ("PERSON", "Texier"): (
+        frozenset({"Texier"}),
+        "claimed by `location` at 0.585, whose bar is 0.7; asked alone, `person` "
+        "scores it 0.704 — issue #46",
+    ),
+    ("GENETIC", "test génétique"): (
+        frozenset({"test", "génétique"}),
+        "genetic data 0.288 against a bar of 0.30 — a near miss by twelve thousandths",
+    ),
+}
+
 ARTICLE_9_TYPES = {
     "HEALTH",
     "BIOMETRIC",
@@ -61,6 +122,25 @@ ARTICLE_9_TYPES = {
     "PHILOSOPHICAL_BELIEF",
     "SEX_LIFE",
 }
+
+
+def unmasked_entities(
+    text: str, entities: list[EvalEntity], predictions: list
+) -> list[tuple[str, str, frozenset[str]]]:
+    """Annotated entities with words no prediction covers completely.
+
+    `unmasked_words` is in the package rather than here because it has three
+    callers — this gate, the joined-detection gate, and the tests that pin both.
+    A second copy would be two definitions of what counts as a leak.
+    """
+    leaked = []
+    for entity in entities:
+        carrying = unmasked_words(text, entity.start, entity.end, predictions)
+        if carrying:
+            leaked.append(
+                (entity.entity_type, text[entity.start : entity.end], frozenset(carrying))
+            )
+    return leaked
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -82,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     # in one language while the aggregate stays above target.
     article_9_buckets: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     overmasking: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    unmasked: list[tuple[str, str]] = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
         document = json.loads(line)
         entities = [EvalEntity(**e) for e in document["entities"]]
@@ -99,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             counts = overmasking[entity_type]
             counts[0] += kept
             counts[1] += total
+        unmasked.extend(unmasked_entities(document["text"], entities, predictions))
     summary = summarize(per_document, tier1_types=tier1_types)
 
     width = max(len(t) for t in summary.per_type)
@@ -130,6 +212,42 @@ def main(argv: list[str] | None = None) -> int:
             "and LOCATION over-masking gates are skipped."
         )
         return 0
+    # Before the type-shaped gates, because it is the one that asks what the
+    # gateway is for. Every entry is checked against `KNOWN_UNMASKED` by
+    # identity rather than counted: a count lets a fixed leak pay for a new one.
+    # A known entry that stops appearing is an improvement and passes silently;
+    # anything else fails and says what it is.
+    # Occurrences and distinct entities both, because the two numbers answer
+    # different questions and quoting one where the other is meant is how a
+    # README and a gate come to disagree: `eine Hepatitis-B-Infektion` appears
+    # twice in the corpus and is one entry in the table.
+    distinct = {(entity_type, value) for entity_type, value, _ in unmasked}
+    print(
+        f"\nAnnotated entities with words reaching the provider: {len(unmasked)} "
+        f"occurrences of {len(distinct)} entities"
+    )
+    surprises = []
+    for entity_type, value, words in sorted(unmasked):
+        known = KNOWN_UNMASKED.get((entity_type, value))
+        if known is not None and known[0] == words:
+            print(f"  {entity_type} {value!r}: {sorted(words)} — {known[1]}")
+        else:
+            surprises.append((entity_type, value, words, known))
+    for entity_type, value, words, known in surprises:
+        if known is None:
+            print(
+                f"FAIL: {entity_type} {value!r} reaches the provider as {sorted(words)} "
+                f"and is not a tracked defect",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"FAIL: {entity_type} {value!r} reaches the provider as {sorted(words)}, "
+                f"where {sorted(known[0])} is recorded",
+                file=sys.stderr,
+            )
+    unmasked_over = bool(surprises)
+
     covered_total = sum(bucket[0] for bucket in article_9_buckets.values())
     gold_total = sum(bucket[1] for bucket in article_9_buckets.values())
     overall = covered_total / gold_total if gold_total else 0.0
@@ -180,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
             "(advisory on the synthetic corpus)"
         )
-    return 1 if overmasking_failures or article_9_missed else 0
+    return 1 if overmasking_failures or article_9_missed or unmasked_over else 0
 
 
 if __name__ == "__main__":

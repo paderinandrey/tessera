@@ -804,6 +804,43 @@ Article 9 special categories, detected by the same layer at a lower threshold:
 | SEX_LIFE | 0.000 | 0.000 | 0.000 |
 | TRADE_UNION | 0.296 | 1.000 | 0.457 |
 
+**Every annotated entity with a word reaching the provider is named.** The most direct
+statement of what this gateway is for, and until now nothing measured it: every other gate is
+about a *type*, and a type-matched gate cannot see an entity found under another label, found
+with the wrong bounds, or not found at all — three different rows in three different tables,
+none of which says "these characters went out". `make evaluate` asks by position and by
+content, and fails on anything not already written down.
+
+Three are real, and all three are threshold misses:
+
+```
+GENETIC  'test génétique'   its own label at 0.288, bar 0.30
+ORG      'Tessier SA'       its own label at 0.697, bar 0.75
+PERSON   'Texier'           claimed by `location` at 0.585, whose bar is 0.7
+```
+
+Two are near misses by 0.012 and 0.053. The third is [#46][i46]: a quasi-identifier wins the
+argmax and then fails a bar the loser would have cleared — asked alone, `person` scores
+`Texier` at 0.704.
+
+The other five are an annotation convention. The gold span includes a leading article the
+detector does not predict — `un diabète de type 2` masked as `diabète de type 2` — and `un`
+is not personal data, the same argument the `PERSON` trimming rule makes for `Der Kunde`.
+
+**Named individually rather than counted, and that is the gate.** A bound of "no more than
+three" lets a fixed leak pay for a new one: one entity starts being detected, another stops,
+the total holds and CI stays green. Each entry records the entity *and the words it leaves*,
+so a shortfall that grows stops matching and fails. An entry that disappears is an
+improvement and passes quietly.
+
+It also replaced the first design, which forgave any word spelled like an article, in any
+position, under any type — so a `PERSON` annotated `Le Thi Mai` with only `Thi Mai` predicted
+would have read as fully masked, and `Le` is a Vietnamese family name this repository already
+protects by name in the trimming rule. Forgiving a convention is a decision somebody writes
+down about a specific entity, not a spelling rule.
+
+[i46]: https://github.com/paderinandrey/tessera/issues/46
+
 **Article 9 coverage: 0.9783 (45/46)** — nearly every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
 across eleven detector types rather than eight: the regulation protects political opinions,

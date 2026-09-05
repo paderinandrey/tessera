@@ -6,12 +6,14 @@ The one-to-one assignment maximizes the number of matched pairs, so counts do no
 depend on entity order; higher IoU is only a preference among equal-size matchings.
 """
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
 from .spans import Span
 
 IOU_THRESHOLD = 0.5
+_WORD = re.compile(r"\w+", re.UNICODE)
 # How much of a prediction must cover real data before it stops counting as
 # over-masking. Half: a span that is mostly padding is padding.
 OVERMASKING_SHARE = 0.5
@@ -211,3 +213,47 @@ __all__ = [
     "precision_gate_failures",
     "summarize",
 ]
+
+
+def unmasked_words(text: str, start: int, end: int, predictions: list[Span]) -> list[str]:
+    """Words of `text[start:end]` that no prediction covers **completely**.
+
+    **Words, not characters, and not spans** — the three questions differ and
+    only one is what a masking gateway is for. A *span* test reports a type
+    disagreement as a leak; a *character* test reports an annotation convention
+    as one; this asks whether anything a reader could use went out.
+
+    **Completely, and that is not a detail.** A first version asked whether
+    *any* character of the word was covered, which reports `Texier` as masked
+    when a prediction covers only the `T` and `exier` goes to the provider — a
+    gate blind to exactly the truncated and shifted boundaries it exists to
+    catch. Found in review.
+
+    **No word is exempt here, and that is a change of place rather than of
+    policy.** A first version dropped a leading article, on the grounds that the
+    corpus annotates `un diabète de type 2` where the detector returns
+    `diabète de type 2` and `un` is not personal data. That reasoning is sound
+    and the implementation was not: it exempted the token in any position, under
+    any type, so a `PERSON` annotated `Le Thi Mai` with only `Thi Mai` predicted
+    reported as fully masked — and `ner.py` already documents `Le` as a
+    Vietnamese family name and `Das` as an Indian one, protected by name in the
+    trimming rule. The same defect, reintroduced one layer up, in the code that
+    measures whether the first one worked.
+
+    So this function has no list. A caller that needs to forgive an annotation
+    convention names the entity it is forgiving — see `evaluate.py`'s
+    `KNOWN_UNMASKED` — and a caller comparing two strategies compares their
+    unmasked sets, where a shortfall both share cancels itself without anyone
+    having to decide what a word means.
+    """
+    covered: set[int] = set()
+    for span in predictions:
+        covered |= set(range(span.start, span.end))
+    return [
+        match.group()
+        for match in _WORD.finditer(text[start:end])
+        if not all(
+            index in covered
+            for index in range(start + match.start(), start + match.end())
+        )
+    ]
