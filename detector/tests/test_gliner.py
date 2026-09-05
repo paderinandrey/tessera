@@ -345,13 +345,14 @@ def test_one_text_never_submits_more_than_the_bound(
 
 
 def test_the_pool_is_sized_by_what_this_process_may_use() -> None:
-    # `os.cpu_count()` answers a question about the machine. A container pinned
-    # to two CPUs on a 64-core host gets 64 from it, builds 64 workers, and lets
-    # one document enqueue 32 inferences onto two CPUs — the fairness bound
-    # inverted, in the deployment this service actually ships as.
+    # The sizing rule itself — every wrong answer it has had, and why each was
+    # untestable from the machine the tests run on — is in
+    # `test_pool_sizing.py`, which drives the parser and the override rather
+    # than looking at whatever this host happens to be.
     #
-    # Asserted against `process_cpu_count` rather than a literal, so it says
-    # something true on every machine including the one that motivated it.
-    allowed = os.process_cpu_count() or 2
-    assert max(2, allowed) >= ner_module._POOL_SIZE
-    assert max(2, ner_module._POOL_SIZE // 2) >= ner_module._IN_FLIGHT
+    # What is left here is the relationship, asserted so it says something true
+    # on this laptop and on a two-CPU container alike.
+    allowed = os.process_cpu_count() or 1
+    assert max(1, allowed) >= ner_module._POOL_SIZE
+    assert max(1, ner_module._POOL_SIZE // 2) >= ner_module._IN_FLIGHT
+    assert ner_module._IN_FLIGHT >= 1

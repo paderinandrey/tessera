@@ -6,6 +6,7 @@ specificity all come from ner.yaml, so adding a type never touches this module.
 
 import copy
 import os
+import warnings
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -294,15 +295,106 @@ TOKEN_OVERLAP = 32
 #
 # Every earlier measurement of this used requests of one size and could not see
 # any of it.
-# **`process_cpu_count`, not `cpu_count`.** The first version asked the machine
-# how many CPUs exist; what matters is how many this process may use. A
-# container pinned to two CPUs on a 64-core host reports 64 to `cpu_count`, so
-# it would build 64 workers and let one document enqueue 32 inferences on two
-# CPUs — the fairness bound not merely loosened but inverted, in exactly the
-# deployment this service ships as. `requires-python = ">=3.14"`, so the
-# affinity-aware answer is simply available. Found in review of #62.
-_POOL_SIZE = max(2, os.process_cpu_count() or 2)
-_IN_FLIGHT = max(2, _POOL_SIZE // 2)
+# Where a cgroup writes the CPU limit a container was actually given.
+_CGROUP_V2_QUOTA = Path("/sys/fs/cgroup/cpu.max")
+_CGROUP_V1_QUOTA = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+_CGROUP_V1_PERIOD = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+# The override, for a deployment that knows better than any of the guesses below.
+_WORKERS_ENV = "TESSERA_DETECT_WORKERS"
+
+
+def _cgroup_cpu_quota() -> float | None:
+    """CPUs this container may use, from its cgroup, or `None` if unlimited.
+
+    **A quota is not an affinity mask, and this is the difference that matters.**
+    `os.process_cpu_count()` reports `sched_getaffinity`, which a `cpuset`
+    changes and `docker --cpus` / a Kubernetes CPU *limit* do not — those write
+    a quota. So a container given two CPUs on a large host still sees the host's
+    count here, builds a pool for it, and lets one document enqueue far more
+    concurrent inferences than it can run. Confirmed in review, in an
+    environment with a two-CPU quota where `process_cpu_count()` returned three.
+
+    Both cgroup versions, because a deployment does not choose which one its
+    kernel exposes. Anything unreadable or unparseable is `None` — a wrong guess
+    here should cost the *default* sizing, never an exception at import.
+    """
+    try:
+        quota, period = _CGROUP_V2_QUOTA.read_text().split()[:2]
+        if quota != "max" and float(period) > 0:
+            return float(quota) / float(period)
+        return None
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        v1_quota = float(_CGROUP_V1_QUOTA.read_text().strip())
+        v1_period = float(_CGROUP_V1_PERIOD.read_text().strip())
+        if v1_quota > 0 and v1_period > 0:
+            return v1_quota / v1_period
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _pool_size() -> int:
+    """How many inferences this process may usefully have running.
+
+    Three answers, narrowest wins, and the deployment's own beats all of them:
+
+    - `os.cpu_count()` — the *machine*. Wrong for any container, and the first
+      version of this used it: two CPUs on a 64-core host would have built 64
+      workers and let one document enqueue 32 inferences onto two;
+    - `os.process_cpu_count()` — the affinity mask. Right for a `cpuset`, still
+      wrong for a quota, which is what `docker --cpus` and a Kubernetes CPU
+      limit actually write;
+    - the cgroup quota — right for those, absent on a bare host;
+    - `TESSERA_DETECT_WORKERS` — because none of the above can know that this
+      process shares its CPUs with something the kernel is not telling us about.
+
+    Both findings that produced this came from review of #62 and #63, and both
+    were about the same mistake in different clothes: asking a question whose
+    answer describes something other than what the process may do.
+    """
+    override = os.environ.get(_WORKERS_ENV)
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            # A malformed override is a deployment mistake, and guessing past it
+            # silently is how it stays one. Named, then ignored.
+            warnings.warn(
+                f"{_WORKERS_ENV}={override!r} is not an integer; sizing from the "
+                "process's own CPUs instead",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    allowed = float(os.process_cpu_count() or 1)
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        allowed = min(allowed, quota)
+    return max(1, int(allowed))
+
+
+def _in_flight(pool_size: int) -> int:
+    """How many of the pool one text may occupy.
+
+    **Half, and floored at one rather than two.** A floor of two on a
+    single-CPU deployment starts two CPU-heavy inferences on one core and
+    occupies every slot with them, adding contention exactly where there is
+    least to absorb it. One is the correct degradation: it gives up the
+    parallelism, and on one CPU there was none to give. Found in review of #63,
+    against a comment of mine calling a bound of one "a `for` loop with extra
+    steps" — which is precisely what it should be there.
+
+    A function rather than an expression so the invariant that matters — never
+    more in flight than there are workers — is checkable without a machine of
+    the right size to check it on. That is how the floor of two survived: it is
+    wrong only at one CPU, and no test ran on one.
+    """
+    return max(1, pool_size // 2)
+
+
+_POOL_SIZE = _pool_size()
+_IN_FLIGHT = _in_flight(_POOL_SIZE)
 # Created once for the process and shared by every recognizer in it, which is
 # what keeps the bound a bound: a pool per request is how oversubscription gets
 # in. `concurrent.futures` joins these at interpreter exit, so there is nothing
