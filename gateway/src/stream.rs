@@ -2954,6 +2954,63 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_value_that_would_anchor_a_yaml_node_is_refused() {
+        // **Found in review of #78, in code #72 had already merged.** `&` was
+        // admitted at a bare position on the argument that no parser in the
+        // stated model gives it a token role. True, and not the question: the
+        // question is which parser the *consumer* runs, and a consumer that
+        // reads a response's content as YAML gets an anchor and an alias.
+        //
+        // No fence and no block style needed — flow mappings take anchors.
+        let anchoring = mapped_to(&[("&victim secret", "ORG")]);
+        for carrier in [
+            "{key: [ORG_1], other: *victim}",
+            "{key:[ORG_1]}",
+            "[ [ORG_1] ]",
+        ] {
+            let mut buffer = RestoreBuffer::new(&anchoring);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a value that begins an anchor was admitted into {carrier:?}"
+            );
+        }
+
+        // Leading blanks do not save it: YAML skips them before the node
+        // begins, so the anchor is still the first thing in the node.
+        let padded = mapped_to(&[("  &victim secret", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&padded);
+        assert!(buffer.push("{key: [ORG_1]}").is_err());
+
+        // An alias is the same shape and the same hazard, and it is refused
+        // one layer earlier: `json_bare_inert` admits no `*` at all. Asserted
+        // so the coverage is real, and `anchors_a_node` deliberately does not
+        // test for it — a guard no input can reach is a claim rather than a
+        // defence.
+        let aliasing = mapped_to(&[("*victim", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&aliasing);
+        assert!(buffer.push("{key: [ORG_1]}").is_err());
+
+        // **And the narrowing is a narrowing, not a retreat.** An ampersand
+        // inside a plain scalar is an ampersand; German company forms are 4 of
+        // 12 ORG values in the corpus and they keep working.
+        for value in ["Boerner AG & Co. KGaA", "Beckmann AG & Co. KG", "R & D"] {
+            let map = mapped_to(&[(value, "ORG")]);
+            let mut buffer = RestoreBuffer::new(&map);
+            let mut out = buffer.push("{value:[ORG_1]}").unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(out, format!("{{value:{value}}}"));
+        }
+
+        // Inside a string the value is data in every reader named here, YAML
+        // included, so nothing changes there.
+        let map = mapped_to(&[("&victim secret", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&map);
+        let mut out = buffer.push(r#"{"value":"[ORG_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"value":"&victim secret"}"#);
+    }
+
+    #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
         // backtick is ordinary content inside a triple-backtick block — and

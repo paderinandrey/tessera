@@ -642,7 +642,10 @@ impl StreamStructure {
             // must be as strict as any place the parser could be in, and for
             // those three that place is unknown.
             Place::Bare if !self.poisoned => {
-                if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
+                if value.chars().all(json_bare_inert)
+                    && !opens_a_comment(value)
+                    && !anchors_a_node(value)
+                {
                     None
                 } else {
                     Some("a value that could change the structure it was substituted into")
@@ -1877,7 +1880,9 @@ fn ends_a_line_comment(character: char) -> bool {
 ///
 /// - `@` — every e-mail address. No JSON, JSON5, JSONC or repairing parser
 ///   gives it a token role anywhere;
-/// - `&` — `Beckmann AG & Co. KG` and every other German company form. Same;
+/// - `&` — `Beckmann AG & Co. KG` and every other German company form. Same
+///   for a JSON-family parser, **and that turned out not to be the question**:
+///   see `anchors_a_node`;
 /// - `/` — `419/130/29933`, how a German tax number is written. **Not the same,
 ///   and it is the one that needs `opens_a_comment`**: `//` and `/*` open
 ///   comments in JSON5, and a comment can delete the rest of a line including a
@@ -1912,6 +1917,44 @@ fn json_bare_inert(character: char) -> bool {
 /// depth, it is a claim the next reader will believe.** The dependency runs the
 /// other way and is recorded on `json_bare_inert`: admitting `*` there means
 /// coming back here.
+/// Whether a value would be read as a YAML anchor where it lands.
+///
+/// **The question `json_bare_inert` answers is not the one that matters here.**
+/// That list asks whether a character has a token role in a parser of the
+/// stated model, and `&` has none — no JSON, JSON5, JSONC or repairing parser
+/// gives it one. The question the gateway actually has to answer is which
+/// parser the *consumer* runs, and it does not know.
+///
+/// A consumer that extracts a response's content and reads it as YAML gets an
+/// anchor and an alias:
+///
+/// ```text
+///   {key: [ORG_1], other: *victim}   with   &victim secret
+///   → other becomes "secret"
+/// ```
+///
+/// YAML flow mappings take anchors, so this needs no fence and no block style.
+/// **Found in review of #78, in code #72 had already merged.** The reasoning
+/// that admitted `&` was checked against the stated model rather than against
+/// the consumer, which is the same mistake one level up from the one #78 was
+/// closed for.
+///
+/// The narrow fix rather than dropping `&`: an anchor is `&name` at the *start
+/// of a node*. `Boerner AG & Co. KGaA` is a plain scalar with an ampersand in
+/// it and stays admissible — 4 of 12 ORG values in the corpus are German
+/// company forms — while a value that begins with one does not. Leading blanks
+/// do not save it: YAML skips them before the node begins.
+///
+/// **An alias — `*victim` — is the same hazard and is deliberately not tested
+/// for here.** `json_bare_inert` admits no `*` at all, so no value carrying one
+/// reaches this function. A check for it was written and removed once a
+/// mutation could not kill it, which is the second time in this file: a guard
+/// no input can reach is not defence in depth, it is a claim the next reader
+/// will believe. Admitting `*` there means coming back.
+fn anchors_a_node(value: &str) -> bool {
+    value.trim_start().starts_with('&')
+}
+
 fn opens_a_comment(value: &str) -> bool {
     value.contains("//") || value.starts_with('/') || value.ends_with('/')
 }
