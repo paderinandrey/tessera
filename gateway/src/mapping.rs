@@ -783,14 +783,27 @@ impl Mapping {
                     if let Some(reason) = state.refuses(value) {
                         return Err(MappingError::Unrestorable(reason));
                     }
-                    // **The value's own brackets count.** Only text runs updated
-                    // this before, so a first token restoring to `{` emitted an
-                    // opener nothing recorded, and a second token then
-                    // substituted freely into the object the first one had
-                    // opened. Mapped values carry no character restriction, so
-                    // that is reachable with two ordinary detections. Found in
-                    // review of #57.
-                    state.saw(value);
+                    // **The value's own brackets count — unless the value *is*
+                    // the token.** Only text runs updated this at first, so a
+                    // first token restoring to `{` emitted an opener nothing
+                    // recorded and a second substituted freely into the object
+                    // the first had opened (found in review of #57).
+                    //
+                    // A self-mapping literal is the exception, and it is not a
+                    // special case so much as the existing rule applied twice.
+                    // `reserve_literals` maps a caller's own `[PERSON_1]` to
+                    // itself, so restoring it emits exactly the bytes that were
+                    // already there — and `pieces` never showed those bytes to
+                    // the lexer on the way in, because it yields a token as its
+                    // own piece. Counting them on the way out makes restoration
+                    // change a document that restoration did not touch: measured,
+                    // `the caller wrote [PERSON_1] and then [PERSON_2] replied`
+                    // opened a bare position on the first token and refused an
+                    // ordinary name on the second. That is prose, and it is the
+                    // traffic the reserve-literals mechanism exists for (#32).
+                    if value != candidate {
+                        state.saw(value);
+                    }
                     out.push_str(value);
                 }
             }
