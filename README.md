@@ -597,8 +597,14 @@ differs by place because the ways out do:
 
 - **inside a string** — the delimiter that opened it, the escape, and characters the format
   forbids raw. Only that delimiter: an apostrophe is a literal inside `"…"`, so `O'Brien` in
-  a JSON object streams normally. A `${` is refused too, because a backtick string is a
-  template literal and interpolation executes without carrying the delimiter;
+  a JSON object streams normally;
+- **inside a backtick region** — the bare rule, because a backtick cannot be classified.
+  Read as a string delimiter, an unclosed markdown fence — what every streamed fenced block
+  looks like until it closes — hid the JSON object after it. Read as ordinary text, a `"`
+  inside `` `…` `` opened a string that is not one and a value carrying backticks injected
+  members a backtick-aware repairing parser reads. Both were measured; whichever reading is
+  right, a value that can act structurally can act, so the region takes word characters only
+  and closes on the next backtick;
 - **inside a comment** — `*` or `/`, since a value ending `*` before a carrier `/` is the
   same escape as `*/` in the value itself;
 - **in a bare position** — inside a container but outside any string, only alphanumerics and

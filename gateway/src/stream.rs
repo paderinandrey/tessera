@@ -2003,14 +2003,30 @@ mod buffer_tests {
     }
 
     #[test]
-    fn an_interpolation_opener_is_refused_inside_a_string() {
-        // A backtick string is a template literal to a JavaScript consumer, and
-        // `${…}` executes without carrying the delimiter — so a value with no
-        // quote, no backslash and no control character still runs code. Found
-        // in review of #64.
-        let mapping = mapped_to(&[("${globalThis.process.exit()}", "ORG")]);
-        let mut buffer = RestoreBuffer::new(&mapping);
-        assert!(buffer.push("({message:`[ORG_1]`})").is_err());
+    fn an_interpolation_opener_is_refused_where_it_can_act() {
+        // The `${` hazard used to sit in the string rule and is deleted: a
+        // backtick region is judged by the bare rule now, so the string arm is
+        // only ever `"` or `'`, where `${` is inert for every parser in the
+        // stated model — and the check still refused `Account ${name}` inside
+        // `{"label":"…"}`.
+        //
+        // **This test used to pass without the check**, which is why it survived
+        // a round: the backtick carrier is refused by the region, not by the
+        // hazard. It asserts both halves now.
+        let interpolating = mapped_to(&[("${globalThis.process.exit()}", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&interpolating);
+        assert!(
+            buffer.push("({message:`[ORG_1]`})").is_err(),
+            "a backtick region takes word characters only"
+        );
+
+        // And a value that merely looks like interpolation, inside a real JSON
+        // string, is data.
+        let label = mapped_to(&[("Account ${name}", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&label);
+        let mut out = buffer.push(r#"{"label":"[ORG_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"label":"Account ${name}"}"#);
     }
 
     #[test]
@@ -2361,6 +2377,147 @@ mod buffer_tests {
             buffer.push(&deep).is_err(),
             "nesting past the bound unwound to prose"
         );
+    }
+
+    #[test]
+    fn a_markdown_backtick_does_not_open_a_string() {
+        // **The backtick was a delimiter for a threat this module declines**, and
+        // it cost the model it does cover. A backtick is markdown punctuation
+        // and a reply is full of it — most damningly an *unclosed fence*, which
+        // is what every streamed fenced block looks like until it closes. That
+        // put the lexer inside a string for the rest of the run, so a real JSON
+        // object after it was invisible and the payload went through.
+        //
+        // Found by taking #65's remaining doubt seriously rather than filing it.
+        let payload = r#"x","admin":true,"pad":"y"#;
+        let mapping = mapped_to(&[(payload, "PERSON")]);
+        for carrier in [
+            "Use `json to format. {\"name\":\"[PERSON_1]\"}",
+            "Use `json` to format. {\"name\":\"[PERSON_1]\"}",
+            "```json\n{\"a\":1}\n```\nDann {\"name\":\"[PERSON_1]\"}",
+            // The one that matters: a fence the model has not closed yet.
+            "```json\n{\"name\":\"[PERSON_1]\"}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a backtick hid a real JSON object: {carrier}"
+            );
+        }
+
+        // And a backtick *in a value* is inert inside a JSON string: whatever a
+        // backtick means outside one, inside `"…"` only the double quote closes.
+        let ticked = mapped_to(&[("a`b", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&ticked);
+        let mut out = buffer.push(r#"{"x":"[ORG_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"x":"a`b"}"#);
+    }
+
+    #[test]
+    fn a_backtick_region_is_judged_like_a_bare_position() {
+        // **Both readings of a backtick are wrong, so it gets neither.** As a
+        // string delimiter, an unclosed markdown fence hid a JSON object. As
+        // ordinary text, a `"` inside `` `…` `` opened a string that is not one
+        // — and a value carrying backticks then injected members that a
+        // backtick-aware repairing parser reads. Both measured, both reachable,
+        // and repairing parsers are in this module's client model by name.
+        //
+        // The region is judged by the bare rule instead: whichever reading is
+        // right, a value that can act structurally can act. Raised across two
+        // rounds of review on #68 — the second round was my own objection in the
+        // review request, returned with the carrier that makes it real.
+        let injecting = mapped_to(&[("x`,admin:true,pad:`y", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&injecting);
+        assert!(
+            buffer.push("{name:`prefix \"[ORG_1]\" suffix`}").is_err(),
+            "a quote inside a backtick region opened a string that is not one"
+        );
+
+        // It closes on the next backtick, which bounds the cost to the region
+        // rather than the rest of the run: an ordinary name after a code span
+        // is prose again.
+        let names = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&names);
+        let mut out = buffer.push("use `code` then [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "use `code` then O'Brien");
+
+        // Inside an open region it is bare, which is the cost and is bounded.
+        let mut buffer = RestoreBuffer::new(&names);
+        assert!(buffer.push("```\nHallo [PERSON_1]").is_err());
+    }
+
+    #[test]
+    fn a_token_immediately_after_the_run_is_inside_the_region() {
+        // A run only becomes a region once something that is not a backtick
+        // follows it — and a token is not a character the lexer steps through,
+        // so `` `[PERSON_1]` `` reaches the judgement with the run still
+        // pending. Judging it then reads the place *before* the backticks.
+        let quoting = mapped_to(&[(r#"x","admin":true"#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&quoting);
+        assert!(
+            buffer.push("`[PERSON_1]`").is_err(),
+            "the run that opened the region had not been resolved yet"
+        );
+    }
+
+    #[test]
+    fn the_fence_rule_prices_an_apostrophe() {
+        // What the strict region costs, as a fixture rather than a surprise in
+        // someone's traffic: a fence does not say which language it holds, and
+        // the apostrophe opens a string in four of the likely ones, so a real
+        // name refuses the response it appears in.
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&irish);
+        assert!(
+            buffer.push("Siehe:\n```yaml\nname: [PERSON_1]\n").is_err(),
+            "an apostrophe in a fence of unknown language is not admissible"
+        );
+
+        // The same name outside a fence is data, so the cost is the region's
+        // and not the rule's.
+        let mut buffer = RestoreBuffer::new(&irish);
+        let mut out = buffer.push(r#"{"name":"[PERSON_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"name":"O'Brien"}"#);
+
+        // Collateral, not a decision: U+2019 closes nothing in any parser and
+        // is refused anyway, because the bare rule is a list of what is known
+        // safe. #69 carries this and the fence's own language tag.
+        let typographic = mapped_to(&[("O\u{2019}Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&typographic);
+        assert!(buffer.push("```\n[PERSON_1]\n").is_err());
+    }
+
+    #[test]
+    fn a_lone_backtick_does_not_close_a_fence() {
+        // **Markdown closes a fence only with a run at least as long.** A lone
+        // backtick is ordinary content inside a triple-backtick block — and
+        // closing on it put the lexer back in prose having ignored the braces
+        // and quotes of the object it was inside, so the payload went through.
+        // Third round on this one character, and the first two both closed on
+        // any backtick.
+        let payload = mapped_to(&[(r#"x","admin":true,"pad":"y"#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&payload);
+        assert!(
+            buffer
+                .push("```json\n{\"name\":\"prefix ` [PERSON_1]\"}\n```")
+                .is_err(),
+            "a lone backtick inside a fence returned the lexer to prose"
+        );
+
+        // A run as long as the one that opened it does close, so this cannot
+        // become "a fence never ends".
+        let names = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&names);
+        let mut out = buffer.push("```json\n{}\n``` dann [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "```json\n{}\n``` dann O'Brien");
+
+        // And a single-backtick span still closes on a single backtick.
+        let mut buffer = RestoreBuffer::new(&names);
+        assert!(buffer.push("use `code` then [PERSON_1]").is_ok());
     }
 
     #[test]
