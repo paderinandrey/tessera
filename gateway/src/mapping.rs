@@ -564,7 +564,7 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                '\n' | '\r' if self.depth > 0 => {
+                c if ends_a_line_comment(c) && self.depth > 0 => {
                     // **Poisoned, not merely left.** Leaving the string was the
                     // #79 fix and it was half of one: it assumed the repairing
                     // parser *terminates* the string at the break. A repairing
@@ -606,10 +606,20 @@ impl StreamStructure {
                 // document is structured, `outside()` yields the bare rule, and
                 // this only ever tightens.
                 //
-                // U+2028 and U+2029 deliberately do not trigger it: they are
-                // *valid* raw in a JSON string, so no parser here ends one at
-                // them, and refusing would be cost with no threat. They end a
-                // comment, which is why the two sets differ.
+                // **U+2028 and U+2029 are in the set, and excluding them was
+                // wrong twice over.** #79 argued they are valid raw in a JSON
+                // string so no parser ends one there — while
+                // `leaves_any_string`, forty lines away, refuses them in a value
+                // precisely because they *are* line terminators to a JSON5
+                // reader. The file contradicted itself and the rule took the
+                // weaker half:
+                //
+                //   {"note":"Kunde\u{2028}[PERSON_1]}   with  x,admin:true,pad:1
+                //
+                // served, because the value carries no quote and the string rule
+                // wants one. Found in review of #84, and it is the second time
+                // this exact knowledge was present in the file and unused — the
+                // first was the comment rule in #70.
                 _ => {}
             },
             // Content inside the region: only a long enough run leaves it, and

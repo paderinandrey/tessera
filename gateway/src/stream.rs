@@ -2654,14 +2654,25 @@ mod buffer_tests {
         let mut buffer = RestoreBuffer::new(&quoting);
         assert!(buffer.push("Das 5\" Display\nund dann [PERSON_1]").is_err());
 
-        // U+2028 is *valid* raw in a JSON string, so no parser ends one there
-        // and this must not tighten on it — the two terminator sets differ on
-        // purpose. Pinned so a later reader cannot unify them by tidiness.
-        let mut buffer = RestoreBuffer::new(&structural);
-        let carrier = "{\"note\":\"Kunde\u{2028}[PERSON_1]}";
-        let mut out = buffer.push(carrier).unwrap();
-        out.push_str(&buffer.finish().unwrap());
-        assert_eq!(out, "{\"note\":\"Kunde\u{2028}x,admin:true,pad:1}");
+        // **U+2028 and U+2029 are in the set now, and this assertion used to
+        // say the opposite.** #79 argued they are valid raw in a JSON string so
+        // no parser ends one there — while `leaves_any_string`, in the same
+        // file, refuses them in a value precisely because they *are* line
+        // terminators to a JSON5 reader. A repairing parser that terminates the
+        // string at one leaves the token at a bare position, and the value below
+        // carries no quote for the string rule to catch. Raised in review of
+        // #84.
+        for terminator in ['\u{2028}', '\u{2029}'] {
+            let mut buffer = RestoreBuffer::new(&structural);
+            let carrier = format!("{{\"note\":\"Kunde{terminator}[PERSON_1]}}");
+            assert!(
+                buffer
+                    .push(&carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "{terminator:?} left the lexer in a string a repairing parser had ended"
+            );
+        }
     }
 
     #[test]
