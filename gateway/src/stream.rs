@@ -2697,11 +2697,13 @@ mod buffer_tests {
     /// What the strict rule costs, measured against the corpus rather than
     /// argued from an example.
     ///
-    /// **Two places, two rules, and this measures both.** A bare position inside
-    /// a container is a place whose language is known, so it takes the
-    /// JSON-family rule; a backtick region says nothing about what will read it,
-    /// so it takes word characters only. Pricing them together is the point —
-    /// the split exists because one number was hiding two.
+    /// **Two places, one rule, and this measures both to keep it one.** #72
+    /// gave a bare position inside a container a wider rule than a backtick
+    /// region, on the argument that a container's language is known; four
+    /// rounds of review on #79 took that back. Both carriers exercise the same
+    /// rule now, and the first assertion is that their refusals are the *same
+    /// set* — so a future place-specific widening fails here rather than
+    /// showing up as a number nobody compares.
     ///
     /// **This drives the real predicates through the real seam.** A copy of a
     /// rule in a test is a copy that drifts; a carrier that puts the token where

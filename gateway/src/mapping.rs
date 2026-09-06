@@ -627,6 +627,27 @@ impl StreamStructure {
             // comment anyway" when it made either half of `*/` enough, and a
             // refusal is not a corruption. Found sweeping the lexer for #65.
             Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
+                // **A guard that looked at the carrier was written here and removed.**
+                //
+                // `completes_an_indicator` refused a token whose immediately preceding carrier
+                // character was `&` or `*`, because a word-like value cannot be made safe by
+                // any allowlist once the carrier has opened a YAML anchor or alias name —
+                // `{key: &victim secret, other: *[ORG_1]}` with the value `victim`.
+                //
+                // It went because it was a quarter of a fix with a whole cost. It missed the
+                // verbatim tag `!<[ORG_1]>`, where the preceding character is `<`; it missed
+                // block style entirely, where the lexer never leaves `Place::Prose` and
+                // nothing is refused at all; and **it refused correct restorations**:
+                // `{company: R&[ORG_1]}` with `Development` is the plain scalar
+                // `R&Development` to every YAML reader, and a refusal there kills a stream
+                // that had nothing wrong with it. Same for `*[PERSON_1]*` inside a fence,
+                // which is markdown emphasis.
+                //
+                // One character of lookback cannot tell a node start from the middle of a
+                // scalar, and the thing that could — knowing when the document might be YAML
+                // at all — is #80. Raised across three rounds of review on #79, the last of
+                // which found the false refusal.
+                //
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
@@ -1819,27 +1840,16 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// **The residual:** a delimited-string format whose delimiter is none of the
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
-/// **A guard that looked at the carrier was written here and removed.**
-///
-/// `completes_an_indicator` refused a token whose immediately preceding carrier
-/// character was `&` or `*`, because a word-like value cannot be made safe by
-/// any allowlist once the carrier has opened a YAML anchor or alias name —
-/// `{key: &victim secret, other: *[ORG_1]}` with the value `victim`.
-///
-/// It went because it was a quarter of a fix with a whole cost. It missed the
-/// verbatim tag `!<[ORG_1]>`, where the preceding character is `<`; it missed
-/// block style entirely, where the lexer never leaves `Place::Prose` and
-/// nothing is refused at all; and **it refused correct restorations**:
-/// `{company: R&[ORG_1]}` with `Development` is the plain scalar
-/// `R&Development` to every YAML reader, and a refusal there kills a stream
-/// that had nothing wrong with it. Same for `*[PERSON_1]*` inside a fence,
-/// which is markdown emphasis.
-///
-/// One character of lookback cannot tell a node start from the middle of a
-/// scalar, and the thing that could — knowing when the document might be YAML
-/// at all — is #80. Raised across three rounds of review on #79, the last of
-/// which found the false refusal.
-///
+fn leaves_any_string(character: char) -> bool {
+    // The escape can consume the delimiter after it, and a character the format
+    // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
+    // line terminators to a JSON5 reader and Rust's `is_control` covers only C0
+    // and C1 — they were inside the hazard the enumeration names and outside the
+    // code implementing it, and the detector normalizes both while keeping
+    // offsets, which is how one reaches a restored value.
+    matches!(character, '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
+}
+
 /// Characters that end a `//` comment.
 ///
 /// **Not just `\n`.** A JSON5 line comment is ECMAScript's, and ECMAScript ends
@@ -1859,16 +1869,6 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// terminator, so a parser in this model does not end a comment there.
 fn ends_a_line_comment(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
-fn leaves_any_string(character: char) -> bool {
-    // The escape can consume the delimiter after it, and a character the format
-    // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
-    // line terminators to a JSON5 reader and Rust's `is_control` covers only C0
-    // and C1 — they were inside the hazard the enumeration names and outside the
-    // code implementing it, and the detector normalizes both while keeping
-    // offsets, which is how one reaches a restored value.
-    matches!(character, '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
 }
 
 fn json_string_inert(character: char) -> bool {
