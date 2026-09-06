@@ -669,6 +669,24 @@ impl StreamStructure {
         // A token can sit immediately after the run that opened its region.
         self.settle();
 
+        // **Poisoned outranks the place, and did not before.** `poisoned`
+        // reached the judgement only through `outside()`, so it held the
+        // strictest rule until the next character moved the lexer somewhere
+        // with a rule of its own — and a quote does exactly that:
+        //
+        //   {"note":"Kunde\n'[PERSON_1]}   with   x","admin":true
+        //
+        // The break poisons; the apostrophe then puts the lexer in
+        // `Text('\'')`, whose rule admits a double quote — while a parser that
+        // repaired the break by escaping it is still in `Text('"')`, which the
+        // value's double quote closes. So `poisoned` has to mean **no
+        // place-specific rule applies**, because the place is the thing that is
+        // not trusted. Found in review of #84, one round after the poisoning it
+        // corrects was itself a review finding.
+        if self.poisoned {
+            return word_characters_only(value);
+        }
+
         match self.place {
             // Nothing structural has been seen. A value cannot close what was
             // never opened, and this is the case that keeps streamed prose —
@@ -787,14 +805,7 @@ impl StreamStructure {
                 // at all — is #80. Raised across three rounds of review on #79, the last of
                 // which found the false refusal.
                 //
-                if value
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
-                {
-                    None
-                } else {
-                    Some("a value that could change the structure it was substituted into")
-                }
+                word_characters_only(value)
             }
         }
     }
@@ -2050,6 +2061,23 @@ fn opens_a_comment(value: &str) -> bool {
 ///
 /// U+0085 (NEL) is deliberately absent: ECMAScript does not treat it as a line
 /// terminator, so a parser in this model does not end a comment there.
+/// The strictest rule there is, and the one every place the lexer cannot
+/// vouch for takes: word characters, a space, a hyphen and a full stop.
+///
+/// A bare position needs no hazardous character — `{safe:false,value:[ORG_1]}`
+/// with `null,admin:true,pad:null` adds a member out of punctuation — so the
+/// test is inverted here: only a value that cannot act structurally passes.
+fn word_characters_only(value: &str) -> Option<&'static str> {
+    if value
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
+    {
+        None
+    } else {
+        Some("a value that could change the structure it was substituted into")
+    }
+}
+
 fn ends_a_line_comment(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }

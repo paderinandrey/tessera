@@ -3358,6 +3358,31 @@ mod buffer_tests {
             );
         }
 
+        // **And the poison has to outrank the place, not merely feed it.**
+        // `poisoned` reached the judgement through `outside()` alone, so it
+        // held the strictest rule until the next character moved the lexer
+        // somewhere with a rule of its own — and a quote does exactly that.
+        // The apostrophe below puts the lexer in `Text('\'')`, whose rule
+        // admits a double quote, while the parser that escaped the break is
+        // still in `Text('\"')`, which the value's double quote closes. Second
+        // round of review on this fix.
+        let quoting = mapped_to(&[(r#"x","admin":true"#, "PERSON")]);
+        for carrier in [
+            "{\"note\":\"Kunde\n'[PERSON_1]}",
+            "{\"note\":\"Kunde\n\"[PERSON_1]}",
+            "{\"note\":\"Kunde\n{a:[PERSON_1]}",
+            "{\"note\":\"Kunde\n// [PERSON_1]\n}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&quoting);
+            assert!(
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a place after the poison applied its own looser rule: {carrier:?}"
+            );
+        }
+
         // Poisoning is the whole fix, so it has to be poisoning and not a
         // refusal of everything: a word-like value still streams after the
         // break, under the strictest rule.
