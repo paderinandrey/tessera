@@ -2852,6 +2852,17 @@ mod buffer_tests {
         // `{safe:false,value:[ORG_1]}` with `null,admin:true,pad:null` is valid
         // JSON5 and adds two members out of punctuation — so every character
         // that does that is still out.
+        // **Every shape below was confirmed to inject against a real parser**,
+        // not reasoned about: `{safe:false,value:V}` was fed to json5 2.2.3 and
+        // to jsonrepair 3.15.0, and each of these comes back as an object with
+        // an `admin` key the carrier never had. The two disagree about which —
+        // `+1,…` injects only in json5, while `a\nadmin:true` and the quoted
+        // form inject only after repair — which is the argument for the model
+        // naming both rather than picking one.
+        //
+        // The differential run itself cannot live here: it needs node and two
+        // packages this repository does not depend on. Its *result* can, and
+        // this is it.
         for value in [
             "null,admin:true,pad:null",
             r#"x","admin":true"#,
@@ -2859,6 +2870,16 @@ mod buffer_tests {
             "a\nadmin:true",
             "a[0]",
             "a{b}",
+            // a value that begins with a JSON5 literal or number: the comma is
+            // what carries the injection, and the prefix is what makes the
+            // document parse rather than throw
+            "1,admin:true",
+            "true,admin:true",
+            "null,admin:true",
+            "0x41,admin:true",
+            "Infinity,admin:true",
+            ".5,admin:true",
+            "+1,admin:true",
         ] {
             let mapping = mapped_to(&[(value, "ORG")]);
             let mut buffer = RestoreBuffer::new(&mapping);
