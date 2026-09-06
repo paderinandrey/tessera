@@ -3791,6 +3791,220 @@ mod tests {
         }
     }
 
+    /// A deterministic generator, so a failure is a bug rather than a Tuesday.
+    ///
+    /// xorshift64* rather than a dependency: three properties do not justify a
+    /// crate, and a fixed seed is what makes the counterexample in a failure
+    /// message worth pasting into a new test.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// **The alphabet is the design of this test.**
+    ///
+    /// Multi-byte characters because `mask` indexes chars and the wire carries
+    /// bytes, and the brackets, underscores and digits a placeholder is made of
+    /// so that near-misses occur. Whole placeholders come from `LITERALS`
+    /// instead — see the measurement there for why an alphabet alone is not
+    /// enough, which is a mistake this generator made before it was checked.
+    const ALPHABET: &[char] = &[
+        'a', 'b', 'é', 'ß', '中', '🙂', ' ', '.', '[', ']', '_', '0', '1', '2', 'P', 'E', 'R', 'S',
+        'O', 'N', 'I', 'B', 'A',
+    ];
+
+    const TYPES: &[&str] = &["PERSON", "IBAN", "EMAIL", "ORG"];
+
+    /// Whole placeholders, spliced in rather than hoped for.
+    ///
+    /// **The first version of this generator drew every character from
+    /// `ALPHABET` and claimed that reached `reserve_literals`.** It does not:
+    /// `[PERSON_1]` is nine specific characters from a twenty-three character
+    /// alphabet, so five thousand texts produced **zero**. Measured, after
+    /// writing the claim down and then checking it rather than shipping it.
+    ///
+    /// Two kinds, because they take different paths: one the mapping issues
+    /// itself, so a caller's literal collides with an allocation, and one it
+    /// never will.
+    const LITERALS: &[&str] = &["[PERSON_1]", "[IBAN_1]", "[ZZZ_9]", "[A_0]"];
+
+    fn generated(rng: &mut Rng) -> (String, Vec<Span>) {
+        let length = 1 + rng.below(40);
+        let mut text = String::new();
+        for _ in 0..length {
+            if rng.below(12) == 0 {
+                text.push_str(LITERALS[rng.below(LITERALS.len())]);
+            } else {
+                text.push(ALPHABET[rng.below(ALPHABET.len())]);
+            }
+        }
+        let count = text.chars().count();
+
+        // Non-overlapping, in order, non-empty — what `check_spans` accepts.
+        // Built by walking forward so the generator cannot produce a shape the
+        // function rejects and quietly test nothing.
+        let mut spans = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < count {
+            // **Wide enough that text survives between spans.** With a gap of
+            // 0-3 the spans cover nearly everything, so a placeholder literal
+            // the caller wrote is almost always inside a span — and the case
+            // that matters is the one where it is *not*, and has to survive as
+            // text next to an allocation that would otherwise take its name.
+            let gap = rng.below(10);
+            let start = cursor + gap;
+            if start >= count {
+                break;
+            }
+            let end = (start + 1 + rng.below(6)).min(count);
+            spans.push(Span {
+                entity_type: TYPES[rng.below(TYPES.len())].to_string(),
+                start,
+                end,
+            });
+            cursor = end;
+        }
+        (text, spans)
+    }
+
+    /// **The properties are worth what the generator reaches.**
+    ///
+    /// Twice now this generator has looked thorough and not been. The first
+    /// version drew every character from `ALPHABET` and never produced a whole
+    /// placeholder — nine specific characters out of twenty-three — so five
+    /// thousand texts reached `reserve_literals` **zero** times while the
+    /// docstring claimed they did. The second spliced literals in but placed
+    /// spans with a gap of 0–3, covering nearly the whole text, so a literal was
+    /// almost always *inside* a span; deleting the `reserve_literals` call left
+    /// the round-trip property passing. Both were found by mutation, not by
+    /// reading.
+    ///
+    /// So the three placements are asserted rather than assumed. Naming the
+    /// members: a narrowing of the generator fails here, where it is legible,
+    /// instead of silently weakening every property above it.
+    #[test]
+    fn the_generator_places_a_literal_inside_outside_and_astride_a_span() {
+        let mut rng = Rng(0x2026_0906_0001);
+        let (mut inside, mut outside, mut astride) = (0, 0, 0);
+        for _ in 0..5_000 {
+            let (text, spans) = generated(&mut rng);
+            let chars: Vec<char> = text.chars().collect();
+            for literal in LITERALS {
+                let width = literal.chars().count();
+                for at in 0..chars.len().saturating_sub(width - 1) {
+                    if chars[at..at + width].iter().collect::<String>() != **literal {
+                        continue;
+                    }
+                    let (from, to) = (at, at + width);
+                    if spans.iter().any(|s| s.start <= from && s.end >= to) {
+                        inside += 1;
+                    } else if spans.iter().any(|s| s.start < to && from < s.end) {
+                        astride += 1;
+                    } else {
+                        outside += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            inside > 100 && outside > 100 && astride > 100,
+            "a placeholder the caller wrote lands inside a span {inside} times, \
+             outside every span {outside} times, and across a boundary {astride} \
+             times — each is a different path through `reserve_literals`"
+        );
+    }
+
+    /// **The promise the whole gateway rests on**, and it was tested only by
+    /// example.
+    ///
+    /// A caller's text goes to a provider with its identifiers replaced and
+    /// comes back with them restored. If that round trip is not exact, the
+    /// client receives a document the caller did not write — which is the
+    /// failure this product exists to prevent, one direction over from a leak.
+    ///
+    /// Examples covered the shapes somebody thought of. This covers the ones
+    /// the alphabet reaches: a value that is itself placeholder-shaped, a
+    /// carrier that already contains `[PERSON_1]`, an emoji astride a span
+    /// boundary, a span at either end of the text.
+    #[test]
+    fn masking_and_restoring_returns_the_text_unchanged() {
+        let mut rng = Rng(0x2026_0906_0001);
+        for trial in 0..5_000 {
+            let (text, spans) = generated(&mut rng);
+            let mut mapping = Mapping::new();
+            let Ok(masked) = mapping.mask(&text, &spans) else {
+                continue;
+            };
+            let restored = mapping
+                .restore(&masked)
+                .unwrap_or_else(|e| panic!("trial {trial}: {text:?} masked to {masked:?}: {e}"));
+            assert_eq!(
+                restored, text,
+                "trial {trial}: {text:?} with {spans:?} masked to {masked:?}"
+            );
+        }
+    }
+
+    /// Two different values must never share a placeholder, or restoration is a
+    /// guess. The reverse — one value always getting the same placeholder — is
+    /// what makes a conversation coherent across turns.
+    #[test]
+    fn a_placeholder_names_exactly_one_value() {
+        let mut rng = Rng(0x2026_0906_0002);
+        for trial in 0..5_000 {
+            let mut mapping = Mapping::new();
+            // Several texts through one mapping, which is the session shape:
+            // stability is a claim across calls, not within one.
+            let mut expected: std::collections::HashMap<String, String> = Default::default();
+            let mut stable: std::collections::HashMap<String, String> = Default::default();
+            for _ in 0..3 {
+                let (text, spans) = generated(&mut rng);
+                let chars: Vec<char> = text.chars().collect();
+                if mapping.mask(&text, &spans).is_err() {
+                    continue;
+                }
+                for span in &spans {
+                    let value: String = chars[span.start..span.end].iter().collect();
+                    // The test module is inside this one, so the index is
+                    // reachable directly rather than through an accessor added
+                    // for a test.
+                    let Some(placeholder) = mapping.by_value.get(&value) else {
+                        continue;
+                    };
+                    if let Some(seen) = expected.insert(placeholder.to_string(), value.clone()) {
+                        assert_eq!(
+                            seen, value,
+                            "trial {trial}: {placeholder} named {seen:?} and then {value:?}"
+                        );
+                    }
+                    // **And the reverse, which injectivity alone does not
+                    // give.** One value must keep one placeholder across calls,
+                    // or the same person arrives at the provider as two people
+                    // and the conversation stops being coherent — the property
+                    // the whole session argument rests on. Dropping the
+                    // `by_value` shortcut leaves injectivity intact and breaks
+                    // this, which is why both directions are here.
+                    if let Some(first) = stable.insert(value.clone(), placeholder.to_string()) {
+                        assert_eq!(
+                            first, *placeholder,
+                            "trial {trial}: {value:?} became {first} and then {placeholder}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn masking_replaces_a_span_with_a_typed_placeholder() {
         let mut mapping = Mapping::new();
