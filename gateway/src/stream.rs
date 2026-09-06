@@ -2150,8 +2150,8 @@ mod buffer_tests {
             Case {
                 carrier: "{org: *[ORG_1]}",
                 values: &[("victim", "ORG")],
-                refuses: true,
-                why: "the carrier wrote the indicator, so a word-like value completes an alias",
+                refuses: false,
+                why: "an indicator the carrier wrote is not something a rule about values reaches — #80",
             },
             Case {
                 carrier: "{tax:[DE_STEUERNUMMER_1]}",
@@ -2780,9 +2780,22 @@ mod buffer_tests {
         // DE_STEUERNUMMER on the `/`, four German company forms on the `&`.
         // Two entity types refused outright, which is a format and not a hard
         // case within one. #69 is open about it.
+        // **The members, not the counts** — and this was a count in the first
+        // version, one line below a comment explaining why counts are the wrong
+        // shape. Raised in review of #79. Two places admitting a different four
+        // values each keep the lengths equal while the invariant this asserts
+        // is gone, and every assertion after it reads `region` alone, so the
+        // cancellation would go unnoticed twice over.
+        let container: std::collections::BTreeSet<(&str, &str)> = refused["container"]
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let region: std::collections::BTreeSet<(&str, &str)> = refused["region"]
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         assert_eq!(
-            refused["container"].len(),
-            refused["region"].len(),
+            container, region,
             "the two places have one rule again; a difference means one was widened"
         );
 
@@ -2954,14 +2967,12 @@ mod buffer_tests {
     }
 
     #[test]
-    fn a_value_that_would_anchor_a_yaml_node_is_refused() {
-        // **Found in review of #78, in code #72 had already merged.** `&` was
-        // admitted at a bare position on the argument that no parser in the
-        // stated model gives it a token role. True, and not the question: the
-        // question is which parser the *consumer* runs, and a consumer that
-        // reads a response's content as YAML gets an anchor and an alias.
-        //
-        // No fence and no block style needed — flow mappings take anchors.
+    fn a_yaml_anchor_is_refused_by_the_word_rule_and_not_by_a_rule_about_yaml() {
+        // **What the revert covers, and what it does not.** #72 admitted `&` at
+        // a bare position; four review rounds produced four YAML constructs it
+        // did not survive, and the rule is word characters again. So a value
+        // carrying an anchor is refused — for containing an ampersand, not for
+        // being an anchor.
         let anchoring = mapped_to(&[("&victim secret", "ORG")]);
         for carrier in [
             "{key: [ORG_1], other: *victim}",
@@ -2975,59 +2986,48 @@ mod buffer_tests {
             );
         }
 
-        // Leading blanks do not save it: YAML skips them before the node
-        // begins, so the anchor is still the first thing in the node.
-        let padded = mapped_to(&[("  &victim secret", "ORG")]);
-        let mut buffer = RestoreBuffer::new(&padded);
-        assert!(buffer.push("{key: [ORG_1]}").is_err());
-
-        // An alias is the same shape and the same hazard, and it is refused
-        // one layer earlier: `json_bare_inert` admits no `*` at all. Asserted
-        // so the coverage is real, and `anchors_a_node` deliberately does not
-        // test for it — a guard no input can reach is a claim rather than a
-        // defence.
-        let aliasing = mapped_to(&[("*victim", "ORG")]);
-        let mut buffer = RestoreBuffer::new(&aliasing);
-        assert!(buffer.push("{key: [ORG_1]}").is_err());
-
-        // **The narrowing that would have kept these was tried and killed.**
-        // `- &victim secret` anchors the node of a block-sequence entry, so `&`
-        // need not be a value's first non-blank character, and enumerating
-        // YAML's node openers by hand is not a thing to be confident about. So
-        // the ampersand goes entirely and the German company forms go with it —
-        // four of twelve ORG values in the corpus, at a bare position only.
-        for value in ["Boerner AG & Co. KGaA", "Beckmann AG & Co. KG", "R & D"] {
-            let map = mapped_to(&[(value, "ORG")]);
-            let mut buffer = RestoreBuffer::new(&map);
-            assert!(
-                buffer.push("{value:[ORG_1]}").is_err(),
-                "{value} is the price of not enumerating YAML's node openers"
-            );
-        }
-
-        // **And the indicator does not have to come from the value.** A carrier
-        // that writes the `*` itself turns a word-like value into an alias
-        // name, which no predicate over the value can see. Raised in review,
-        // and it is what killed the value-only fix.
-        let word = mapped_to(&[("victim", "ORG")]);
-        for carrier in [
-            "{key: &victim secret, other: *[ORG_1]}",
-            "{key: &[ORG_1] secret, other: x}",
-        ] {
-            let mut buffer = RestoreBuffer::new(&word);
-            assert!(
-                buffer.push(carrier).is_err(),
-                "the carrier's own indicator completed an alias: {carrier}"
-            );
-        }
-
-        // Inside a string the value is data in every reader named here, YAML
-        // included, so nothing changes there.
-        let map = mapped_to(&[("&victim secret", "ORG")]);
-        let mut buffer = RestoreBuffer::new(&map);
-        let mut out = buffer.push(r#"{"value":"[ORG_1]"}"#).unwrap();
+        // **And what no character rule reaches**, recorded here so the coverage
+        // is not read as wider than it is. The carrier writes the indicator and
+        // the value is word characters throughout, so nothing about the value
+        // can refuse it:
+        //
+        //   {key: &victim secret, other: *[ORG_1]}   with `victim`
+        //
+        // A guard on the preceding carrier character was written for exactly
+        // this and removed in the same review that asked for it: it missed the
+        // verbatim tag `!<[ORG_1]>`, missed block style entirely, and refused
+        // `{company: R&[ORG_1]}` with `Development`, which is the ordinary
+        // plain scalar `R&Development`.
+        //
+        // This asserts the *current* behaviour rather than the desired one,
+        // which is what #80 is for. A test that pretended otherwise would be
+        // worse than none.
+        // Block style is the same gap and needs no indicator at all: `- [ORG_1]`
+        // is a sequence entry, there is no `{` or `[` for the lexer to count —
+        // the token's own brackets are not carrier characters — so the place is
+        // prose and prose refuses nothing. **I wrote this case into the refusal
+        // list above and the test caught it**, which is the whole argument for
+        // asserting current behaviour rather than intended behaviour.
+        let mut buffer = RestoreBuffer::new(&anchoring);
+        let mut out = buffer.push("- [ORG_1]").unwrap();
         out.push_str(&buffer.finish().unwrap());
-        assert_eq!(out, r#"{"value":"&victim secret"}"#);
+        assert_eq!(out, "- &victim secret");
+
+        let word = mapped_to(&[("victim", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&word);
+        let mut out = buffer
+            .push("{key: &victim secret, other: *[ORG_1]}")
+            .expect("admitted today, and #80 is about whether it should be");
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "{key: &victim secret, other: *victim}");
+
+        // The false refusal that removing the guard fixes, kept so restoring it
+        // has a cost somebody has to look at.
+        let development = mapped_to(&[("Development", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&development);
+        let mut out = buffer.push("{company: R&[ORG_1]}").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "{company: R&Development}");
     }
 
     #[test]

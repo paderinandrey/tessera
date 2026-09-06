@@ -627,11 +627,6 @@ impl StreamStructure {
             // comment anyway" when it made either half of `*/` enough, and a
             // refusal is not a corruption. Found sweeping the lexer for #65.
             Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
-                // Asked before the value, because it is not about the value —
-                // see `completes_an_indicator`.
-                if completes_an_indicator(self.last) {
-                    return Some("a value completing an indicator the carrier opened, in a stream");
-                }
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
@@ -1824,6 +1819,27 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// **The residual:** a delimited-string format whose delimiter is none of the
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
+/// **A guard that looked at the carrier was written here and removed.**
+///
+/// `completes_an_indicator` refused a token whose immediately preceding carrier
+/// character was `&` or `*`, because a word-like value cannot be made safe by
+/// any allowlist once the carrier has opened a YAML anchor or alias name —
+/// `{key: &victim secret, other: *[ORG_1]}` with the value `victim`.
+///
+/// It went because it was a quarter of a fix with a whole cost. It missed the
+/// verbatim tag `!<[ORG_1]>`, where the preceding character is `<`; it missed
+/// block style entirely, where the lexer never leaves `Place::Prose` and
+/// nothing is refused at all; and **it refused correct restorations**:
+/// `{company: R&[ORG_1]}` with `Development` is the plain scalar
+/// `R&Development` to every YAML reader, and a refusal there kills a stream
+/// that had nothing wrong with it. Same for `*[PERSON_1]*` inside a fence,
+/// which is markdown emphasis.
+///
+/// One character of lookback cannot tell a node start from the middle of a
+/// scalar, and the thing that could — knowing when the document might be YAML
+/// at all — is #80. Raised across three rounds of review on #79, the last of
+/// which found the false refusal.
+///
 /// Characters that end a `//` comment.
 ///
 /// **Not just `\n`.** A JSON5 line comment is ECMAScript's, and ECMAScript ends
@@ -1843,30 +1859,6 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// terminator, so a parser in this model does not end a comment there.
 fn ends_a_line_comment(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
-/// Whether the carrier has already written the character that makes an
-/// otherwise word-like value into a YAML anchor or alias name.
-///
-/// **Every other rule in this file asks what the value is. This one asks what
-/// is in front of it**, because the indicator does not have to come from the
-/// value at all:
-///
-/// ```text
-///   {key: &victim secret, other: *[ORG_1]}   with the value `victim`
-///   → `other` resolves to "secret"
-/// ```
-///
-/// `victim` is word characters throughout, so no allowlist can refuse it and no
-/// predicate over the value can see the `*` the carrier put in front of it.
-/// Raised in review of #79, and it is what killed the value-only narrowing that
-/// PR opened with.
-///
-/// `self.last` is the character the lexer stepped immediately before the token,
-/// which is exactly the one that matters. The same one-character memory already
-/// assembles `*/` across a substitution boundary.
-fn completes_an_indicator(previous: Option<char>) -> bool {
-    matches!(previous, Some('&' | '*'))
 }
 
 fn leaves_any_string(character: char) -> bool {
