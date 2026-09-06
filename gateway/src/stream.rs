@@ -2662,7 +2662,16 @@ mod buffer_tests {
         // string at one leaves the token at a bare position, and the value below
         // carries no quote for the string rule to catch. Raised in review of
         // #84.
-        for terminator in ['\u{2028}', '\u{2029}'] {
+        // **Every character a string cannot hold raw, not the line terminators
+        // alone.** Three review rounds narrowed this set from `\n` and `\r`:
+        // the separators were added, then every control, because
+        // `leaves_any_string` classifies them all the same way and a repairing
+        // reader may end a string at a tab. The predicate is shared with that
+        // one now, minus the backslash — the single character in both sets that
+        // is legal raw, being an escape the lexer already tracks.
+        for terminator in [
+            '\u{2028}', '\u{2029}', '\t', '\u{b}', '\u{c}', '\u{0}', '\u{1b}', '\u{7f}', '\u{85}',
+        ] {
             let mut buffer = RestoreBuffer::new(&structural);
             let carrier = format!("{{\"note\":\"Kunde{terminator}[PERSON_1]}}");
             assert!(
@@ -2673,6 +2682,16 @@ mod buffer_tests {
                 "{terminator:?} left the lexer in a string a repairing parser had ended"
             );
         }
+
+        // A backslash is legal raw and must not poison, or every escaped string
+        // in every response is refused.
+        let plain = mapped_to(&[("Weber", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&plain);
+        let mut out = buffer
+            .push(r#"{"note":"a\\b","who":"[PERSON_1]"}"#)
+            .unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"note":"a\\b","who":"Weber"}"#);
     }
 
     #[test]

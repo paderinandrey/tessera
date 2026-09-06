@@ -564,7 +564,7 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                c if ends_a_line_comment(c) && self.depth > 0 => {
+                c if leaves_any_string(c) && self.depth > 0 => {
                     // **Poisoned, not merely left.** Leaving the string was the
                     // #79 fix and it was half of one: it assumed the repairing
                     // parser *terminates* the string at the break. A repairing
@@ -606,8 +606,30 @@ impl StreamStructure {
                 // document is structured, `outside()` yields the bare rule, and
                 // this only ever tightens.
                 //
-                // **U+2028 and U+2029 are in the set, and excluding them was
-                // wrong twice over.** #79 argued they are valid raw in a JSON
+                // **The set is every character a string cannot hold raw, and
+                // it took three review rounds to get there.** #79 took `\n` and
+                // `\r`; review added U+2028 and U+2029; review then pointed out
+                // that `leaves_any_string` classifies *every* control the same
+                // way and a repairing reader may end a string at a tab:
+                //
+                //   {"note":"Kunde\t[PERSON_1]}   with   ,admin:true,pad:1
+                //
+                // Three narrowings of one set, each argued from a different
+                // half of the same file. **So the arm uses
+                // `leaves_any_string` itself** — the predicate that already
+                // held the knowledge — rather than a second list beside it.
+                // There is no second half left to disagree with.
+                //
+                // A backslash is in that set and is legal raw, being an escape.
+                // It never reaches here: the `'\\'` arm above matches first.
+                // **A separate predicate excluding it was written and removed
+                // once a mutation could not kill it** — adding the backslash
+                // back changed nothing, because arm order already decided. The
+                // fifth unreachable guard taken out of this file, and the
+                // dependency runs on that arm staying above this one.
+                //
+                // **U+2028 and U+2029 were excluded and that was wrong twice
+                // over.** #79 argued they are valid raw in a JSON
                 // string so no parser ends one there — while
                 // `leaves_any_string`, forty lines away, refuses them in a value
                 // precisely because they *are* line terminators to a JSON5
