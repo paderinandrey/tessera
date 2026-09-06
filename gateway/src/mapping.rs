@@ -289,6 +289,26 @@ impl StreamStructure {
     /// So the token advances escapes and delimiters like any other text, and
     /// only its brackets are silenced — which is the whole of what
     /// `reserve_literals` restoring a token to itself should mean.
+    ///
+    /// **What silencing them gives up, decided rather than overlooked.** In
+    /// JavaScript `[PERSON_1]` is an array literal and the bracket *is*
+    /// structure, so `var PERSON_1; [PERSON_1]; [PERSON_2]` leaves this in
+    /// `Prose` where counting the bracket would have refused the second value.
+    /// Raised in review of #66, and correct as a behaviour change.
+    ///
+    /// It is taken anyway, because the protection it removes was accidental and
+    /// belongs to a threat this module has already declined by name:
+    /// `json_string_inert` says a client that *evaluates* the text cannot be
+    /// covered at all — "under evaluation `,`, `:`, `+`, `.` and a bare word are
+    /// each enough, so no allowlist short of nothing at all would help". The
+    /// carrier in that example is JavaScript being run, not JSON being parsed.
+    ///
+    /// What it buys is the case this module is for: a templating client's own
+    /// `[PERSON_1]` in ordinary prose, which is the traffic `reserve_literals`
+    /// exists to serve (#32) and which the counting version killed. A real
+    /// threat in scope against an accidental defence out of it is not a close
+    /// call — but it is a trade, and this is the third round on this exception,
+    /// so it is written down rather than moved again.
     fn saw_token(&mut self, text: &str) {
         for character in text.chars() {
             self.step(character, false);

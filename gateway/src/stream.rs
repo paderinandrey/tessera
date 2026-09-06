@@ -2207,6 +2207,39 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_javascript_carrier_is_out_of_scope_and_says_so() {
+        // **The cost of silencing a self-mapped token's brackets, pinned so it
+        // is a decision rather than a surprise.** In JavaScript `[PERSON_1]` is
+        // an array literal and the bracket is structure, so this stays in prose
+        // where counting it would have refused the second value.
+        //
+        // Taken deliberately: `json_string_inert` already declines a client that
+        // *evaluates* the text — "under evaluation `,`, `:`, `+`, `.` and a bare
+        // word are each enough, so no allowlist short of nothing at all would
+        // help" — and this carrier is JavaScript being run, not JSON being
+        // parsed. The protection given up was accidental and came attached to a
+        // false positive on the prose `reserve_literals` exists for. Raised in
+        // review of #66.
+        let mut mapping = Mapping::new();
+        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .mask(
+                "null,globalThis.admin=true",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 26,
+                }],
+            )
+            .unwrap();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(
+            buffer.push("var PERSON_1; [PERSON_1]; [PERSON_2]").is_ok(),
+            "an evaluated carrier is outside what this module claims to cover"
+        );
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a
