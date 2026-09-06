@@ -581,10 +581,20 @@ def test_resolution_leaves_nothing_overlapping() -> None:
 def test_resolution_is_a_fixed_point() -> None:
     """Resolving an already-resolved list must change nothing.
 
-    A rule that merged spans into something a *later* rule would merge again
-    would make the result depend on how many times it was called — and #39
-    established that this fold is not associative, so "called twice" is not a
-    theoretical concern in this module.
+    #39 established that this fold is not associative, so "called twice" is not
+    a theoretical concern in this module.
+
+    **It is implied by the loop rather than independent of it, and no mutation
+    kills it alone.** `resolve` runs until no pair overlaps, so its output is
+    conflict-free by construction and a second call finds nothing to do. Cutting
+    the loop to a single pass does fail this — and fails
+    `test_resolution_leaves_nothing_overlapping` in the same run, every time.
+
+    Kept anyway, and labelled: the property is what a reader wants to know about
+    this function, and a test that only ever fails alongside another is
+    redundant rather than misleading. If it is ever the *only* failure, that is
+    information — it would mean the sort or the dedupe stopped being
+    deterministic, which no other test here would name.
     """
     rng = random.Random(RANDOM_SEED)
     for trial in range(2000):
