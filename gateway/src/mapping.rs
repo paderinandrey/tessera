@@ -223,6 +223,35 @@ pub const REDACTED_TYPE: &str = "REDACTED";
 /// any document a model emits, and shallow enough that the state stays small.
 const MAX_NESTING: usize = 32;
 
+/// Where the lexer thinks the next character is.
+///
+/// **The safety argument, which this type went three designs without having.**
+/// The lexer can be wrong about the place — it is not a parser, and a response
+/// is prose as often as it is a document. So correctness cannot mean "the place
+/// is right". It means:
+///
+/// > for every place the lexer can be in, the rule applied there must be at
+/// > least as strict as the rule of any place the parser could actually be in.
+///
+/// Ordered by strictness, the rules are: bare (word characters only) ⊃ string
+/// (no delimiter, no backslash, no line separator, no control) ⊃ prose
+/// (nothing). Checking every variant against that:
+///
+/// | the lexer says | rule | where the parser could be instead | holds? |
+/// |---|---|---|---|
+/// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
+/// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
+/// | `Prose` | nothing | nowhere, unless a `{` or a quote went uncounted | yes, with one recorded exception |
+///
+/// The exception is deliberate and is `saw_token`'s: a self-mapped token's own
+/// `[` does not count as structure, traded for #32 and argued where it is
+/// taken. Everything else the lexer sees, in the carrier and in every value it
+/// substitutes, so `Prose` cannot be reached with structure outstanding.
+///
+/// **`Block` and `Line` were the variants that failed this**, until they had a
+/// rule of their own and a URL's `//` could put the lexer in one. Being able to
+/// state the check is what found that; three rounds of hunting individual
+/// hazards did not.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Place {
     /// No structure seen. Prose, until something says otherwise.
@@ -435,6 +464,32 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
+                '\n' | '\r' if self.depth > 0 => self.place = self.outside(),
+                // **A raw line break in a string is a place two parsers read
+                // differently, and only inside a container.** No JSON-family
+                // grammar allows one unescaped, so the document is already
+                // malformed; a repairing parser resolves that by ending the
+                // string at the break, and this lexer went on believing the
+                // string was open. The string rule permits `,` and `:` — the
+                // bare rule does not — so `{"note":"Kunde\n[PERSON_1]}` admitted
+                // `x,admin:true,pad:1` and the caller received two members the
+                // upstream never sent. Same class as `ends_a_line_comment`
+                // above, found by the same sweep for #65.
+                //
+                // **Guarded on depth, and the guard is the whole reason this is
+                // free.** At depth 0 the place is far more likely to be prose
+                // that quotes something — `Das 5" Display` — than a top-level
+                // JSON string, this module says so already, and the two parsers
+                // disagree there in the other direction: one still reads a
+                // string, and calling it prose would admit a closing quote. So
+                // depth 0 is left exactly as it was. Inside a container the
+                // document is structured, `outside()` yields the bare rule, and
+                // this only ever tightens.
+                //
+                // U+2028 and U+2029 deliberately do not trigger it: they are
+                // *valid* raw in a JSON string, so no parser here ends one at
+                // them, and refusing would be cost with no threat. They end a
+                // comment, which is why the two sets differ.
                 _ => {}
             },
             // Content inside the region: only a long enough run leaves it, and
@@ -448,7 +503,7 @@ impl StreamStructure {
                 }
             }
             Place::Line => {
-                if character == '\n' {
+                if ends_a_line_comment(character) {
                     self.place = self.outside();
                 }
             }
@@ -531,13 +586,6 @@ impl StreamStructure {
             // value ending `*` before a carrier `/` is the same escape. Refusing
             // both characters inside a comment costs nothing anyone needs: a
             // masked value is not something to serve inside a comment anyway.
-            Place::Block | Place::Line => {
-                if value.contains(['*', '/', '\n', '\r']) {
-                    Some("a value that could close a comment, inside a stream")
-                } else {
-                    None
-                }
-            }
             // **A bare position needs no hazardous character.**
             // `{safe:false,value:[ORG_1]}` with `null,admin:true,pad:null` is
             // valid JSON5 and adds a member out of nothing this could blocklist.
@@ -547,7 +595,38 @@ impl StreamStructure {
             // A backtick region is judged like a bare position, for the reason
             // `Place::Ticked` gives: whichever of the two readings is right, a
             // value that can act structurally can act.
-            Place::Bare | Place::Ticked(_) => {
+            // **A comment is judged by the bare rule too, because the lexer
+            // can be in one when the parser is not.** A rule of its own —
+            // refuse what closes a comment — was three injections, and none of
+            // them needed a comment to exist at all:
+            //
+            //   Siehe https://acme.example {"name":"[PERSON_1]"}
+            //
+            // the `//` of an ordinary URL opens a line comment that never
+            // closes, so the `{` and the quotes after it are swallowed as
+            // comment content and the token is judged by the one rule that
+            // permits exactly those characters. Prose quoting a `/*` does the
+            // same across newlines.
+            //
+            // The argument this file needed and did not have: **for every place
+            // the lexer can be in, the rule applied there must be at least as
+            // strict as the rule of any place the parser could actually be in.**
+            // A string misread as prose is safe because the string rule is
+            // stricter than prose's; anything misread as bare is safe because
+            // bare is strictest. The comment rule was the one that failed that
+            // test, and it failed against every other place at once.
+            //
+            // Nothing about comments is lost by folding it in — the lexer still
+            // tracks them, which is what keeps a quote inside one from opening a
+            // string (#64). What goes is only the *looser judgement* that being
+            // inside one used to buy.
+            //
+            // The price: a value in a genuine comment must be word-like, so
+            // `// Kunde: O'Brien` refuses where it streamed. This module already
+            // held that "a masked value is not something to serve inside a
+            // comment anyway" when it made either half of `*/` enough, and a
+            // refusal is not a corruption. Found sweeping the lexer for #65.
+            Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
@@ -1740,6 +1819,27 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// **The residual:** a delimited-string format whose delimiter is none of the
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
+/// Characters that end a `//` comment.
+///
+/// **Not just `\n`.** A JSON5 line comment is ECMAScript's, and ECMAScript ends
+/// one at any LineTerminator: line feed, carriage return, U+2028 and U+2029.
+/// The lexer knew only the line feed, so `// note\r{"name":"[PERSON_1]"}` left
+/// it believing it was still in a comment while the parser was already inside a
+/// string — and the comment rule permits the quotes and braces the string rule
+/// refuses, so being wrong here is wrong in the admitting direction. All three
+/// were reachable and all three are tested.
+///
+/// `leaves_any_string` in this same file already knew U+2028 and U+2029 are
+/// line terminators to a JSON5 reader. The knowledge was there and the comment
+/// rule did not use it, which is the shape of defect a second reader finds and
+/// the author does not. Found attacking the lexer for #65.
+///
+/// U+0085 (NEL) is deliberately absent: ECMAScript does not treat it as a line
+/// terminator, so a parser in this model does not end a comment there.
+fn ends_a_line_comment(character: char) -> bool {
+    matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
 fn leaves_any_string(character: char) -> bool {
     // The escape can consume the delimiter after it, and a character the format
     // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
