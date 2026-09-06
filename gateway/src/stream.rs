@@ -2032,6 +2032,213 @@ mod buffer_tests {
         assert_eq!(out, r#"She called "Acme [Europe]" and O'Brien replied"#);
     }
 
+    /// One adversarial case: what the model streamed, what the detector mapped,
+    /// whether the stream must end, and the sentence that says why.
+    struct Case {
+        carrier: &'static str,
+        values: &'static [(&'static str, &'static str)],
+        refuses: bool,
+        why: &'static str,
+    }
+
+    #[test]
+    fn the_lexer_survives_being_attacked() {
+        // **Written to break it, not to confirm it**, after #65 recorded three
+        // doubts about the design. All three turned out unfounded, and one for
+        // an interesting reason: a `*/` split between two adjacent values cannot
+        // reach the one-character window, because refusing either `*` or `/`
+        // inside a comment stops the first value before the second arrives.
+        //
+        // The last case is not a defect. A bare position takes word characters
+        // and an ampersand is not one, so a company name there ends the stream —
+        // recorded as the cost of the rule rather than left to be discovered.
+        let cases = [
+            Case {
+                carrier: "{/* [ORG_1][ORG_2] */ x:1}",
+                values: &[("a*", "ORG"), ("/b", "ORG")],
+                refuses: true,
+                why: "a comment closed by two values meeting",
+            },
+            Case {
+                carrier: r#"{"a":"/*","b":"[PERSON_1]"}"#,
+                values: &[(r#"x","admin":true,"p":"y"#, "PERSON")],
+                refuses: true,
+                why: "a comment opener inside a string is a literal",
+            },
+            Case {
+                carrier: "{// \" \n x:[ORG_1]}",
+                values: &[("null,admin:true", "ORG")],
+                refuses: true,
+                why: "a quote in a line comment does not open a string",
+            },
+            Case {
+                carrier: r#"{"a":1} then [PERSON_1]"#,
+                values: &[("null,admin:true", "PERSON")],
+                refuses: true,
+                why: "a closed container does not return to prose",
+            },
+            Case {
+                carrier: r#"{"a":"x\\","b":"[PERSON_1]"}"#,
+                values: &[(r#"y","admin":true,"p":"z"#, "PERSON")],
+                refuses: true,
+                why: "an escaped backslash does not escape the quote after it",
+            },
+            Case {
+                carrier: "{x:[ORG_1] admin:true */ y:1}",
+                values: &[("1 /*", "ORG")],
+                refuses: true,
+                why: "a value opening a comment the carrier closes",
+            },
+            Case {
+                carrier: "Guten Tag [PERSON_1], wie geht es?",
+                values: &[("O'Brien", "PERSON")],
+                refuses: false,
+                why: "prose is prose",
+            },
+            Case {
+                carrier: r#"{"name":"[PERSON_1]"}"#,
+                values: &[("O'Brien", "PERSON")],
+                refuses: false,
+                why: "an apostrophe cannot close a double-quoted string",
+            },
+            Case {
+                carrier: r#"{"tax":"[DE_STEUERNUMMER_1]"}"#,
+                values: &[("419/130/29933", "DE_STEUERNUMMER")],
+                refuses: false,
+                why: "slashes are inert inside a string",
+            },
+            Case {
+                carrier: "{org:[ORG_1]}",
+                values: &[("Boerner AG & Co", "ORG")],
+                refuses: true,
+                why: "a bare position takes only word characters — the cost, not a bug",
+            },
+        ];
+        for case in cases {
+            let mapping = mapped_to(case.values);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            let outcome = buffer.push(case.carrier).and_then(|mut out| {
+                buffer.finish().map(|tail| {
+                    out.push_str(&tail);
+                    out
+                })
+            });
+            assert_eq!(
+                outcome.is_err(),
+                case.refuses,
+                "{}: {} produced {outcome:?}",
+                case.why,
+                case.carrier
+            );
+        }
+    }
+
+    #[test]
+    fn a_caller_s_own_token_does_not_open_a_structure() {
+        // `reserve_literals` maps a caller's own `[PERSON_1]` to itself, so
+        // restoring it emits exactly the bytes that were already there — and
+        // `pieces` never showed those bytes to the lexer on the way in, because
+        // it yields a token as its own piece. Counting them on the way out made
+        // restoration change a document restoration did not touch: this prose
+        // opened a bare position on the first token and refused an ordinary
+        // name on the second.
+        //
+        // **It is the traffic the reserve-literals mechanism exists for** (#32):
+        // a templating client, or one echoing an earlier turn. Found by
+        // attacking the lexer rather than by review, which is the only finding
+        // in this file that arrived that way.
+        let mut mapping = Mapping::new();
+        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .mask(
+                "O'Brien",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 7,
+                }],
+            )
+            .unwrap();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        let mut out = buffer
+            .push("the caller wrote [PERSON_1] and then [PERSON_2] replied")
+            .expect("a token restored to itself changes nothing about the document");
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "the caller wrote [PERSON_1] and then O'Brien replied");
+    }
+
+    #[test]
+    fn a_value_that_is_not_the_token_still_counts() {
+        // The other half, so the exception above cannot widen into "values
+        // never open anything". A value that genuinely restores to a bracket is
+        // an opener exactly as a bracket in the model's own text is.
+        let mapping = mapped_to(&[("[", "ORG"), ("null,admin:true", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push("[ORG_1] then [PERSON_2]").is_err());
+    }
+
+    #[test]
+    fn a_self_mapped_token_still_advances_the_lexer() {
+        // **Skipping it entirely left the state mid-character.** A backslash
+        // before the token stayed pending, so the quote *after* it was consumed
+        // as escaped, the string never closed, and the next token read as quoted
+        // content — where `null,admin:true` is inert, so it went through and
+        // added a member. Found in review of #66, against the exception that
+        // pull request introduced two commits earlier.
+        let mut mapping = Mapping::new();
+        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .mask(
+                "null,admin:true",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 15,
+                }],
+            )
+            .unwrap();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(
+            buffer
+                .push(r#"{"x":"\[PERSON_1]","y":[PERSON_2]}"#)
+                .is_err(),
+            "the escape before the token was still pending when the quote after it arrived"
+        );
+    }
+
+    #[test]
+    fn a_javascript_carrier_is_out_of_scope_and_says_so() {
+        // **The cost of silencing a self-mapped token's brackets, pinned so it
+        // is a decision rather than a surprise.** In JavaScript `[PERSON_1]` is
+        // an array literal and the bracket is structure, so this stays in prose
+        // where counting it would have refused the second value.
+        //
+        // Taken deliberately: `json_string_inert` already declines a client that
+        // *evaluates* the text — "under evaluation `,`, `:`, `+`, `.` and a bare
+        // word are each enough, so no allowlist short of nothing at all would
+        // help" — and this carrier is JavaScript being run, not JSON being
+        // parsed. The protection given up was accidental and came attached to a
+        // false positive on the prose `reserve_literals` exists for. Raised in
+        // review of #66.
+        let mut mapping = Mapping::new();
+        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .mask(
+                "null,globalThis.admin=true",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 26,
+                }],
+            )
+            .unwrap();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(
+            buffer.push("var PERSON_1; [PERSON_1]; [PERSON_2]").is_ok(),
+            "an evaluated carrier is outside what this module claims to cover"
+        );
+    }
+
     #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per

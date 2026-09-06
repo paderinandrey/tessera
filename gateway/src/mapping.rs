@@ -270,11 +270,52 @@ impl StreamStructure {
     /// Fold a run of emitted text into the state.
     fn saw(&mut self, text: &str) {
         for character in text.chars() {
-            self.step(character);
+            self.step(character, true);
         }
     }
 
-    fn step(&mut self, character: char) {
+    /// Fold in text whose brackets are **not** structure: a token restored to
+    /// itself.
+    ///
+    /// **It still has to be fed through.** Skipping it entirely leaves the
+    /// state mid-character — a backslash before the token stays pending, so the
+    /// quote *after* it is consumed as escaped, the string never closes, and a
+    /// later token reads as quoted content where structural punctuation is
+    /// inert. Measured: `{"x":"\[PERSON_1]","y":[PERSON_2]}` admitted
+    /// `null,admin:true` into a bare position it had mis-lexed as a string.
+    /// Found in review of #66, against the exception the same pull request
+    /// introduced.
+    ///
+    /// So the token advances escapes and delimiters like any other text, and
+    /// only its brackets are silenced — which is the whole of what
+    /// `reserve_literals` restoring a token to itself should mean.
+    ///
+    /// **What silencing them gives up, decided rather than overlooked.** In
+    /// JavaScript `[PERSON_1]` is an array literal and the bracket *is*
+    /// structure, so `var PERSON_1; [PERSON_1]; [PERSON_2]` leaves this in
+    /// `Prose` where counting the bracket would have refused the second value.
+    /// Raised in review of #66, and correct as a behaviour change.
+    ///
+    /// It is taken anyway, because the protection it removes was accidental and
+    /// belongs to a threat this module has already declined by name:
+    /// `json_string_inert` says a client that *evaluates* the text cannot be
+    /// covered at all — "under evaluation `,`, `:`, `+`, `.` and a bare word are
+    /// each enough, so no allowlist short of nothing at all would help". The
+    /// carrier in that example is JavaScript being run, not JSON being parsed.
+    ///
+    /// What it buys is the case this module is for: a templating client's own
+    /// `[PERSON_1]` in ordinary prose, which is the traffic `reserve_literals`
+    /// exists to serve (#32) and which the counting version killed. A real
+    /// threat in scope against an accidental defence out of it is not a close
+    /// call — but it is a trade, and this is the third round on this exception,
+    /// so it is written down rather than moved again.
+    fn saw_token(&mut self, text: &str) {
+        for character in text.chars() {
+            self.step(character, false);
+        }
+    }
+
+    fn step(&mut self, character: char, structural: bool) {
         let previous = self.last.replace(character);
         if self.escaped {
             self.escaped = false;
@@ -302,7 +343,7 @@ impl StreamStructure {
                 '"' | '\'' | '`' => self.place = Place::Text(character),
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
-                '{' | '[' => {
+                '{' | '[' if structural => {
                     self.container = true;
                     self.place = Place::Bare;
                 }
@@ -783,14 +824,29 @@ impl Mapping {
                     if let Some(reason) = state.refuses(value) {
                         return Err(MappingError::Unrestorable(reason));
                     }
-                    // **The value's own brackets count.** Only text runs updated
-                    // this before, so a first token restoring to `{` emitted an
-                    // opener nothing recorded, and a second token then
-                    // substituted freely into the object the first one had
-                    // opened. Mapped values carry no character restriction, so
-                    // that is reachable with two ordinary detections. Found in
-                    // review of #57.
-                    state.saw(value);
+                    // **The value's own brackets count — unless the value *is*
+                    // the token.** Only text runs updated this at first, so a
+                    // first token restoring to `{` emitted an opener nothing
+                    // recorded and a second substituted freely into the object
+                    // the first had opened (found in review of #57).
+                    //
+                    // A self-mapping literal is the exception, and it is not a
+                    // special case so much as the existing rule applied twice.
+                    // `reserve_literals` maps a caller's own `[PERSON_1]` to
+                    // itself, so restoring it emits exactly the bytes that were
+                    // already there — and `pieces` never showed those bytes to
+                    // the lexer on the way in, because it yields a token as its
+                    // own piece. Counting them on the way out makes restoration
+                    // change a document that restoration did not touch: measured,
+                    // `the caller wrote [PERSON_1] and then [PERSON_2] replied`
+                    // opened a bare position on the first token and refused an
+                    // ordinary name on the second. That is prose, and it is the
+                    // traffic the reserve-literals mechanism exists for (#32).
+                    if value == candidate {
+                        state.saw_token(value);
+                    } else {
+                        state.saw(value);
+                    }
                     out.push_str(value);
                 }
             }
