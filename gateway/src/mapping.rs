@@ -564,7 +564,27 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                '\n' | '\r' if self.depth > 0 => self.place = self.outside(),
+                c if leaves_any_string(c) && self.depth > 0 => {
+                    // **Poisoned, not merely left.** Leaving the string was the
+                    // #79 fix and it was half of one: it assumed the repairing
+                    // parser *terminates* the string at the break. A repairing
+                    // parser that **escapes** the break instead stays inside
+                    // it, and the lexer that left goes on counting — so the
+                    // next `}` takes the depth to zero and the token after it
+                    // is judged as prose, which refuses nothing:
+                    //
+                    //   {"note":"Kunde\n} then [PERSON_1]
+                    //     with  x","admin":true}
+                    //
+                    // Both repairs exist, so the structure from here is
+                    // unknown, and unknown is what `poisoned` is for: every
+                    // place after this is the strictest rule, whatever the
+                    // depth counter goes on to say. Found in review of #84 —
+                    // the first counterexample to the invariant itself rather
+                    // than to a rule under it.
+                    self.poisoned = true;
+                    self.place = self.outside();
+                }
                 // **A raw line break in a string is a place two parsers read
                 // differently, and only inside a container.** No JSON-family
                 // grammar allows one unescaped, so the document is already
@@ -586,10 +606,42 @@ impl StreamStructure {
                 // document is structured, `outside()` yields the bare rule, and
                 // this only ever tightens.
                 //
-                // U+2028 and U+2029 deliberately do not trigger it: they are
-                // *valid* raw in a JSON string, so no parser here ends one at
-                // them, and refusing would be cost with no threat. They end a
-                // comment, which is why the two sets differ.
+                // **The set is every character a string cannot hold raw, and
+                // it took three review rounds to get there.** #79 took `\n` and
+                // `\r`; review added U+2028 and U+2029; review then pointed out
+                // that `leaves_any_string` classifies *every* control the same
+                // way and a repairing reader may end a string at a tab:
+                //
+                //   {"note":"Kunde\t[PERSON_1]}   with   ,admin:true,pad:1
+                //
+                // Three narrowings of one set, each argued from a different
+                // half of the same file. **So the arm uses
+                // `leaves_any_string` itself** — the predicate that already
+                // held the knowledge — rather than a second list beside it.
+                // There is no second half left to disagree with.
+                //
+                // A backslash is in that set and is legal raw, being an escape.
+                // It never reaches here: the `'\\'` arm above matches first.
+                // **A separate predicate excluding it was written and removed
+                // once a mutation could not kill it** — adding the backslash
+                // back changed nothing, because arm order already decided. The
+                // fifth unreachable guard taken out of this file, and the
+                // dependency runs on that arm staying above this one.
+                //
+                // **U+2028 and U+2029 were excluded and that was wrong twice
+                // over.** #79 argued they are valid raw in a JSON
+                // string so no parser ends one there — while
+                // `leaves_any_string`, forty lines away, refuses them in a value
+                // precisely because they *are* line terminators to a JSON5
+                // reader. The file contradicted itself and the rule took the
+                // weaker half:
+                //
+                //   {"note":"Kunde\u{2028}[PERSON_1]}   with  x,admin:true,pad:1
+                //
+                // served, because the value carries no quote and the string rule
+                // wants one. Found in review of #84, and it is the second time
+                // this exact knowledge was present in the file and unused — the
+                // first was the comment rule in #70.
                 _ => {}
             },
             // Content inside the region: only a long enough run leaves it, and
@@ -648,6 +700,24 @@ impl StreamStructure {
     fn refuses(&mut self, value: &str) -> Option<&'static str> {
         // A token can sit immediately after the run that opened its region.
         self.settle();
+
+        // **Poisoned outranks the place, and did not before.** `poisoned`
+        // reached the judgement only through `outside()`, so it held the
+        // strictest rule until the next character moved the lexer somewhere
+        // with a rule of its own — and a quote does exactly that:
+        //
+        //   {"note":"Kunde\n'[PERSON_1]}   with   x","admin":true
+        //
+        // The break poisons; the apostrophe then puts the lexer in
+        // `Text('\'')`, whose rule admits a double quote — while a parser that
+        // repaired the break by escaping it is still in `Text('"')`, which the
+        // value's double quote closes. So `poisoned` has to mean **no
+        // place-specific rule applies**, because the place is the thing that is
+        // not trusted. Found in review of #84, one round after the poisoning it
+        // corrects was itself a review finding.
+        if self.poisoned {
+            return word_characters_only(value);
+        }
 
         match self.place {
             // Nothing structural has been seen. A value cannot close what was
@@ -767,14 +837,7 @@ impl StreamStructure {
                 // at all — is #80. Raised across three rounds of review on #79, the last of
                 // which found the false refusal.
                 //
-                if value
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
-                {
-                    None
-                } else {
-                    Some("a value that could change the structure it was substituted into")
-                }
+                word_characters_only(value)
             }
         }
     }
@@ -2034,6 +2097,41 @@ fn ends_a_line_comment(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
+/// The strictest rule there is, and the one every place the lexer cannot
+/// vouch for takes: word characters, a space, a hyphen and a full stop.
+///
+/// A bare position needs no hazardous character — `{safe:false,value:[ORG_1]}`
+/// with `null,admin:true,pad:null` adds a member out of punctuation — so the
+/// test is inverted here: only a value that cannot act structurally passes.
+fn word_characters_only(value: &str) -> Option<&'static str> {
+    if value
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
+    {
+        None
+    } else {
+        Some("a value that could change the structure it was substituted into")
+    }
+}
+
+/// Characters that cannot act inside a JSON string **on the buffered path**.
+///
+/// The buffered path parses and re-serializes, so being wrong here costs a
+/// parse the path was going to do anyway and the value is restored correctly
+/// either way. That is why this list can be conservative where
+/// `leaves_any_string` cannot: on a stream the same conservatism costs a killed
+/// response, which is the whole reason the two predicates exist separately and
+/// is argued at length above `leaves_any_string`.
+///
+/// **It had no documentation of its own**, and a test added in review of #84
+/// is what noticed — the block above `leaves_any_string` discusses this
+/// function in the third person, which reads like documentation until you look
+/// for the declaration it precedes.
+///
+/// Measured cost, from that argument: this list rejects 3.1% of the corpus's
+/// annotated values, on `/` and `&` — every German tax number and the company
+/// forms. Free on the buffered path, and the reason the streamed path does not
+/// reuse it.
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
@@ -4289,6 +4387,73 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every predicate whose documentation is the argument for the rule.
+    ///
+    /// **Named rather than "all of them"**, because a blanket rule would force
+    /// prose onto helpers that do not need it and would be deleted the first
+    /// time it was inconvenient. These are the ones where the comment *is* the
+    /// security reasoning: what ends a comment, what leaves a string, what is
+    /// inert where, and what the strictest rule is.
+    const DOCUMENTED: &[&str] = &[
+        "ends_a_line_comment",
+        "word_characters_only",
+        "leaves_any_string",
+        "json_string_inert",
+        "json_bare_inert",
+        "opens_a_comment",
+        "is_type_characters",
+    ];
+
+    /// **Four review rounds have reported the same defect, so it is checked
+    /// rather than remembered.**
+    ///
+    /// Rust attaches a `///` block to the next item. Inserting a function
+    /// immediately above the one you were reading therefore takes its
+    /// documentation — silently, because it still compiles — and the prose
+    /// explaining why a terminator set must be exact ends up describing an
+    /// allowlist helper while the predicate it belongs to has none.
+    ///
+    /// `leaves_any_string` lost its documentation that way in #70 and nobody
+    /// noticed for nine PRs. The others were caught in review of #79 and #84,
+    /// twice each, by a reviewer reading the diff.
+    ///
+    /// This is the detection: a function inserted above one of these leaves it
+    /// with no `///` line above, and the test fails naming it.
+    #[test]
+    fn the_predicates_that_carry_an_argument_still_carry_it() {
+        let source = include_str!("mapping.rs");
+        let lines: Vec<&str> = source.lines().collect();
+
+        for wanted in DOCUMENTED {
+            // Visibility varies — `pub(crate) fn is_type_characters` is one —
+            // so the declaration is matched on the name rather than on a
+            // prefix. A matcher that missed a function would report it as
+            // *gone*, which is a failure and not a hole, but a confusing one.
+            let declaration = format!("fn {wanted}");
+            let at = lines
+                .iter()
+                .position(|line| {
+                    let trimmed = line
+                        .trim_start_matches("pub(crate) ")
+                        .trim_start_matches("pub ");
+                    trimmed.starts_with(&declaration) && !line.starts_with(' ')
+                })
+                .unwrap_or_else(|| panic!("{wanted} is gone; this list has to move with it"));
+            let mut above = at - 1;
+            while lines[above].starts_with("#[") {
+                above -= 1;
+            }
+            assert!(
+                lines[above].starts_with("///"),
+                "{wanted} has no documentation above it — most likely a function was \
+                 inserted between it and its `///` block, which Rust reattaches silently. \
+                 Line {}: {:?}",
+                above + 1,
+                lines[above]
+            );
         }
     }
 
