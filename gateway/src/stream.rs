@@ -3152,7 +3152,20 @@ mod buffer_tests {
     ///
     /// Ordered from the rule that refuses least to the rule that refuses most,
     /// which is the ordering the invariant on `Place` is built out of.
-    const PLACES: &[(&str, &str, crate::mapping::ClientFormat)] = &[
+    /// **Two chains, because the rules are a partial order and not a total
+    /// one.** `Text('"')` refuses a double quote and admits an apostrophe;
+    /// `Text('\'')` does the reverse. Neither is stricter than the other, so
+    /// asserting one chain through both was wrong — the first version of this
+    /// test did, and adding the single-quoted carrier is what showed it.
+    ///
+    /// The invariant never compares them: at any moment the lexer is in one
+    /// specific `Text(delimiter)`, and the alternatives its row argues about
+    /// are prose and the bare rules, not the other delimiter. Whether the lexer
+    /// can be in one while a parser is in the other is a real question and an
+    /// open one — see the note on `Place`.
+    const CHAINS: &[&[(&str, &str, crate::mapping::ClientFormat)]] = &[DOUBLE, SINGLE];
+
+    const DOUBLE: &[(&str, &str, crate::mapping::ClientFormat)] = &[
         (
             "prose",
             "plain [ORG_1] text",
@@ -3175,10 +3188,45 @@ mod buffer_tests {
             crate::mapping::ClientFormat::Unknown,
         ),
         (
-            "comment",
+            "block comment",
             "{/* [ORG_1] */ a:1}",
             crate::mapping::ClientFormat::Unknown,
         ),
+        // The block carrier reaches `Place::Block` only, so before this the
+        // last row was a second `Bare` in disguise and `Place::Line` was not
+        // tested at all. If the shared arm is later split and the line rule
+        // becomes looser, that would have stayed green. Also review of #84.
+        (
+            "line comment",
+            "{a:1, // [ORG_1]\n b:2}",
+            crate::mapping::ClientFormat::Unknown,
+        ),
+    ];
+
+    /// The same chain with the other string delimiter.
+    ///
+    /// **`Place::Text(char)` is two refusal sets, not one**, and the
+    /// double-quoted carrier reaches only one: adding `'` to the declared-bare
+    /// allowlist would leave the ordering green, because a double-quoted string
+    /// admits apostrophes while a single-quoted one refuses them. Raised in
+    /// review of #84.
+    const SINGLE: &[(&str, &str, crate::mapping::ClientFormat)] = &[
+        (
+            "prose",
+            "plain [ORG_1] text",
+            crate::mapping::ClientFormat::Unknown,
+        ),
+        (
+            "single-quoted string",
+            "{k:'[ORG_1]'}",
+            crate::mapping::ClientFormat::Unknown,
+        ),
+        (
+            "bare, declared json",
+            "{k:[ORG_1]}",
+            crate::mapping::ClientFormat::JsonFamily,
+        ),
+        ("bare", "{k:[ORG_1]}", crate::mapping::ClientFormat::Unknown),
     ];
 
     /// **The first test of the invariant itself rather than of a rule it
@@ -3253,31 +3301,79 @@ mod buffer_tests {
 
         for value in &interesting {
             let mapping = mapped_to(&[(value.as_str(), "ORG")]);
-            let mut refused_at: Vec<(&str, bool)> = Vec::new();
-            for (name, carrier, format) in PLACES {
-                let mut buffer = RestoreBuffer::declaring(&mapping, *format);
-                let refused = buffer
-                    .push(carrier)
-                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
-                    .is_err();
-                refused_at.push((name, refused));
-            }
+            for places in CHAINS {
+                let mut refused_at: Vec<(&str, bool)> = Vec::new();
+                for (name, carrier, format) in *places {
+                    let mut buffer = RestoreBuffer::declaring(&mapping, *format);
+                    let refused = buffer
+                        .push(carrier)
+                        .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                        .is_err();
+                    refused_at.push((name, refused));
+                }
 
-            // Monotone: once refused, refused for every stricter place after.
-            let mut seen_refusal: Option<&str> = None;
-            for (name, refused) in &refused_at {
-                if let Some(earlier) = seen_refusal {
-                    assert!(
-                        *refused,
-                        "{value:?} is refused in {earlier} and admitted in {name}, so the \
+                // Monotone: once refused, refused for every stricter place after.
+                let mut seen_refusal: Option<&str> = None;
+                for (name, refused) in &refused_at {
+                    if let Some(earlier) = seen_refusal {
+                        assert!(
+                            *refused,
+                            "{value:?} is refused in {earlier} and admitted in {name}, so the \
                          rules are not ordered and every row of the table reasoning from \
                          \"stricter than\" is unsound"
-                    );
-                } else if *refused {
-                    seen_refusal = Some(name);
+                        );
+                    } else if *refused {
+                        seen_refusal = Some(name);
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_repaired_string_does_not_unwind_the_lexer_to_prose() {
+        // **The first counterexample to the invariant itself**, rather than to
+        // a rule under it. Found in review of #84.
+        //
+        // #79 made a raw line break inside a string leave the string, on the
+        // ground that a repairing parser terminates it there. That is one of
+        // two repairs. A parser that **escapes** the break instead stays inside
+        // the string — and the lexer that left goes on counting, so the next
+        // `}` takes the depth to zero and the token after it is judged as
+        // prose, which refuses nothing.
+        let payload = mapped_to(&[(r#"x","admin":true}"#, "PERSON")]);
+        for carrier in [
+            "{\"note\":\"Kunde\n} then [PERSON_1]",
+            "{\"note\":\"Kunde\n} [PERSON_1]",
+            "{\"note\":\"Kunde\n[PERSON_1]",
+            "{\"note\":\"Kunde\r} then [PERSON_1]",
+        ] {
+            let mut buffer = RestoreBuffer::new(&payload);
+            assert!(
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "the lexer unwound to prose and served an injection: {carrier:?}"
+            );
+        }
+
+        // Poisoning is the whole fix, so it has to be poisoning and not a
+        // refusal of everything: a word-like value still streams after the
+        // break, under the strictest rule.
+        let plain = mapped_to(&[("Weber", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&plain);
+        let mut out = buffer.push("{\"note\":\"Kunde\n} then [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "{\"note\":\"Kunde\n} then Weber");
+
+        // At depth 0 nothing changes: a quote in prose is not a container, so
+        // there is no structure to lose and #79's guard still holds there.
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&irish);
+        let mut out = buffer.push("Das 5\" Display\nund dann [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "Das 5\" Display\nund dann O'Brien");
     }
 
     #[test]

@@ -564,7 +564,27 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                '\n' | '\r' if self.depth > 0 => self.place = self.outside(),
+                '\n' | '\r' if self.depth > 0 => {
+                    // **Poisoned, not merely left.** Leaving the string was the
+                    // #79 fix and it was half of one: it assumed the repairing
+                    // parser *terminates* the string at the break. A repairing
+                    // parser that **escapes** the break instead stays inside
+                    // it, and the lexer that left goes on counting — so the
+                    // next `}` takes the depth to zero and the token after it
+                    // is judged as prose, which refuses nothing:
+                    //
+                    //   {"note":"Kunde\n} then [PERSON_1]
+                    //     with  x","admin":true}
+                    //
+                    // Both repairs exist, so the structure from here is
+                    // unknown, and unknown is what `poisoned` is for: every
+                    // place after this is the strictest rule, whatever the
+                    // depth counter goes on to say. Found in review of #84 —
+                    // the first counterexample to the invariant itself rather
+                    // than to a rule under it.
+                    self.poisoned = true;
+                    self.place = self.outside();
+                }
                 // **A raw line break in a string is a place two parsers read
                 // differently, and only inside a container.** No JSON-family
                 // grammar allows one unescaped, so the document is already
