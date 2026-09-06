@@ -2664,6 +2664,95 @@ mod buffer_tests {
         );
     }
 
+    /// What the bare rule costs, measured against the corpus rather than
+    /// argued from an example.
+    ///
+    /// The rule is the strictest thing in the restoration path and #70 widened
+    /// what it governs — a bare position, a backtick region, and now every
+    /// comment. So the question "which values can it never carry" stopped being
+    /// about one anecdote and became a property worth watching.
+    ///
+    /// **This drives the real predicate through the real seam.** A copy of the
+    /// rule in a test is a copy that drifts; a carrier that puts the token in a
+    /// bare position and asks the buffer cannot.
+    ///
+    /// **The members are named, not counted.** A count passes while the set
+    /// changes underneath it — the joined-recall gate in this repository was
+    /// wrong four times that way. Adding an entity type whose format cannot pass
+    /// this rule is a decision, and this is where it gets made rather than
+    /// discovered.
+    #[test]
+    fn the_bare_rule_refuses_two_formats_outright() {
+        let corpus = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../evaluation/corpus/public.jsonl"
+        ));
+
+        let mut refused: Vec<(String, String)> = Vec::new();
+        let mut totals: std::collections::BTreeMap<String, usize> = Default::default();
+        for line in corpus.lines() {
+            let document: serde_json::Value = serde_json::from_str(line).unwrap();
+            let text: Vec<char> = document["text"].as_str().unwrap().chars().collect();
+            for entity in document["entities"].as_array().unwrap() {
+                let kind = entity["entity_type"].as_str().unwrap().to_string();
+                let start = entity["start"].as_u64().unwrap() as usize;
+                let end = entity["end"].as_u64().unwrap() as usize;
+                let value: String = text[start..end].iter().collect();
+                *totals.entry(kind.clone()).or_default() += 1;
+
+                // `{value:[KIND_1]}` — the brace opens a container, so the token
+                // is judged at a bare position by the rule under test.
+                let mapping = mapped_to(&[(&value, &kind)]);
+                let mut buffer = RestoreBuffer::new(&mapping);
+                if buffer.push(&format!("{{value:[{kind}_1]}}")).is_err() {
+                    refused.push((kind, value));
+                }
+            }
+        }
+
+        let kinds: std::collections::BTreeSet<&str> =
+            refused.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["DE_STEUERNUMMER", "EMAIL", "ORG"].into_iter().collect(),
+            "the set of formats the bare rule cannot carry changed: {refused:#?}"
+        );
+
+        // **Two of them are refused outright — every value of the type, not a
+        // hard case in it.** An `@` is not optional in an e-mail address and a
+        // German tax number is written `419/130/29933`. This is the number that
+        // makes the rule's cost a fact rather than an anecdote, and it is
+        // asserted with `==` because a bound that only tightens cannot notice a
+        // format going from partly to wholly unrepresentable.
+        for kind in ["EMAIL", "DE_STEUERNUMMER"] {
+            let hit = refused.iter().filter(|(k, _)| k == kind).count();
+            assert_eq!(
+                hit, totals[kind],
+                "{kind}: {hit} of {} refused, and it used to be all of them",
+                totals[kind]
+            );
+        }
+
+        // ORG is the mixed one: `Beckmann AG & Co. KG` fails on the ampersand
+        // and `Deutsche Bank` does not. Named so that a change in either
+        // direction has to be looked at.
+        assert_eq!(
+            refused.iter().filter(|(k, _)| k == "ORG").count(),
+            4,
+            "the German company forms are what the ampersand costs"
+        );
+
+        // And the apostrophe, which is what #69 was opened about, costs nothing
+        // here — the corpus is synthetic and has no name carrying one. Recorded
+        // so the absence is read as "unmeasured" rather than "measured zero".
+        assert!(
+            !refused
+                .iter()
+                .any(|(_, v)| v.contains('\'') || v.contains('\u{2019}')),
+            "the corpus grew an apostrophe name; #69's premise is measurable now"
+        );
+    }
+
     #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
