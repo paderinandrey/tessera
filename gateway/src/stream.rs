@@ -2704,8 +2704,22 @@ mod buffer_tests {
                 // is judged at a bare position by the rule under test.
                 let mapping = mapped_to(&[(&value, &kind)]);
                 let mut buffer = RestoreBuffer::new(&mapping);
-                if buffer.push(&format!("{{value:[{kind}_1]}}")).is_err() {
-                    refused.push((kind, value));
+                match buffer.push(&format!("{{value:[{kind}_1]}}")) {
+                    Err(_) => refused.push((kind, value)),
+                    // **A value the buffer did not recognise would count as
+                    // admitted**, and a whole entity type could leave this
+                    // measurement by having its placeholder spelled differently.
+                    // So each streaming case is checked to have actually
+                    // restored, which is the difference between "not refused"
+                    // and "not looked at".
+                    Ok(out) => {
+                        let out = out + &buffer.finish().unwrap();
+                        assert_eq!(
+                            out,
+                            format!("{{value:{value}}}"),
+                            "{kind} was never substituted, so it was never judged"
+                        );
+                    }
                 }
             }
         }
