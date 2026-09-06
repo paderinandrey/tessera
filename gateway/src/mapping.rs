@@ -223,6 +223,35 @@ pub const REDACTED_TYPE: &str = "REDACTED";
 /// any document a model emits, and shallow enough that the state stays small.
 const MAX_NESTING: usize = 32;
 
+/// Where the lexer thinks the next character is.
+///
+/// **The safety argument, which this type went three designs without having.**
+/// The lexer can be wrong about the place — it is not a parser, and a response
+/// is prose as often as it is a document. So correctness cannot mean "the place
+/// is right". It means:
+///
+/// > for every place the lexer can be in, the rule applied there must be at
+/// > least as strict as the rule of any place the parser could actually be in.
+///
+/// Ordered by strictness, the rules are: bare (word characters only) ⊃ string
+/// (no delimiter, no backslash, no line separator, no control) ⊃ prose
+/// (nothing). Checking every variant against that:
+///
+/// | the lexer says | rule | where the parser could be instead | holds? |
+/// |---|---|---|---|
+/// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
+/// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
+/// | `Prose` | nothing | nowhere, unless a `{` or a quote went uncounted | yes, with one recorded exception |
+///
+/// The exception is deliberate and is `saw_token`'s: a self-mapped token's own
+/// `[` does not count as structure, traded for #32 and argued where it is
+/// taken. Everything else the lexer sees, in the carrier and in every value it
+/// substitutes, so `Prose` cannot be reached with structure outstanding.
+///
+/// **`Block` and `Line` were the variants that failed this**, until they had a
+/// rule of their own and a URL's `//` could put the lexer in one. Being able to
+/// state the check is what found that; three rounds of hunting individual
+/// hazards did not.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Place {
     /// No structure seen. Prose, until something says otherwise.
