@@ -3118,35 +3118,34 @@ mod buffer_tests {
     }
 
     #[test]
-    fn the_declaration_is_read_from_the_header_and_nothing_else_is() {
-        use crate::mapping::{ClientFormat, FORMAT_HEADER};
-        use axum::http::HeaderMap;
+    fn the_declaration_is_read_from_configuration_and_nothing_else_is() {
+        use crate::mapping::ClientFormat;
 
-        let declared = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                axum::http::HeaderName::from_static(FORMAT_HEADER),
-                value.parse().unwrap(),
-            );
-            ClientFormat::declared(&headers)
-        };
-
+        // **This was a header, and review moved it.** Behind an application
+        // proxy that forwards end-user headers, the end user would be sending
+        // the declaration while the application bears the risk — a party that
+        // might be attacking, selecting the policy that protects someone else,
+        // which is #78's defect in different clothes.
         for value in ["json", "JSON", " json5 ", "jsonc"] {
-            assert_eq!(declared(value), ClientFormat::JsonFamily, "{value:?}");
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::JsonFamily,
+                "{value:?}"
+            );
         }
 
-        // **Every unrecognised value is `Unknown`, including a near miss.** A
-        // caller that misspells its format gets a refused stream it can debug
-        // rather than a widened rule it did not ask for — the failure direction
-        // has to cost a restoration, not a guarantee.
+        // Every unrecognised value is `Unknown`, including a near miss. An
+        // operator who misspells it gets refused streams they can debug rather
+        // than a widened rule they did not ask for.
         for value in ["yaml", "jsonx", "json5x", "", "application/json", "toml"] {
-            assert_eq!(declared(value), ClientFormat::Unknown, "{value:?}");
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::Unknown,
+                "{value:?}"
+            );
         }
 
-        assert_eq!(
-            ClientFormat::declared(&HeaderMap::new()),
-            ClientFormat::Unknown
-        );
+        assert_eq!(ClientFormat::configured(None), ClientFormat::Unknown);
     }
 
     #[test]

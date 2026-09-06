@@ -252,23 +252,34 @@ pub enum ClientFormat {
     JsonFamily,
 }
 
-/// The header a caller uses to declare it.
-pub const FORMAT_HEADER: &str = "x-tessera-response-format";
-
 impl ClientFormat {
-    /// Read the declaration, defaulting to `Unknown` for anything at all.
+    /// Read the declaration from configuration.
     ///
-    /// **Every unrecognised value is `Unknown`, including a malformed one.**
-    /// A caller that misspells its format gets the strict rule and a refused
-    /// stream it can debug, rather than a widened rule it did not ask for —
-    /// the failure direction has to be the one that costs a restoration, not
-    /// the one that costs a guarantee.
-    pub fn declared(headers: &axum::http::HeaderMap) -> Self {
-        let Some(raw) = headers.get(FORMAT_HEADER) else {
-            return Self::Unknown;
-        };
-        match raw.to_str().map(str::trim).map(str::to_ascii_lowercase) {
-            Ok(value) if matches!(value.as_str(), "json" | "json5" | "jsonc") => Self::JsonFamily,
+    /// **It is configuration and not a header, and that was a review finding
+    /// rather than a preference.** The first version of this took
+    /// `x-tessera-response-format` off the request, on the argument that the
+    /// caller is the party at risk. In the deployment this gateway is actually
+    /// for — an application in front, forwarding an end user's headers, parsing
+    /// the SSE itself — **the end user sends the header and the application
+    /// bears the risk**, which is #78's defect wearing a different hat: a party
+    /// that might be attacking, selecting the policy that protects someone
+    /// else.
+    ///
+    /// The operator running the process is the party who knows what parses
+    /// these responses and the only one who cannot be a stranger. So it is a
+    /// line in the config file, and there is no header.
+    ///
+    /// **Every unrecognised value is `Unknown`**, including a near miss like
+    /// `json5x`. An operator who misspells it gets the strict rule and refused
+    /// streams they can debug, rather than a widened rule they did not ask for
+    /// — the failure direction has to cost a restoration, not a guarantee.
+    pub fn configured(declared: Option<&str>) -> Self {
+        match declared
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("json" | "json5" | "jsonc") => Self::JsonFamily,
             _ => Self::Unknown,
         }
     }
