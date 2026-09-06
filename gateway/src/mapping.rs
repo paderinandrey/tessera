@@ -244,9 +244,8 @@ enum Place {
     ///
     /// So a backtick opens a region judged by the **bare** rule — word
     /// characters only — because whichever of the two it is, a value that can
-    /// act structurally can act. It closes on the next backtick, which bounds
-    /// the cost to the region rather than the rest of the run. Found across two
-    /// rounds of review on #68.
+    /// act structurally can act. The region bounds that cost to itself rather
+    /// than to the rest of the run. Found across two rounds of review on #68.
     ///
     /// **It carries the length of the run that opened it**, because markdown
     /// closes a fence only with a run at least as long. A lone backtick is
@@ -254,6 +253,20 @@ enum Place {
     /// lexer back in prose having ignored the braces and quotes of the object
     /// it was inside, which admitted a payload. Found in the third round on
     /// this one character.
+    ///
+    /// **The price, measured rather than discovered later: a value carrying an
+    /// apostrophe refuses a response that puts it in a fence.** `O'Brien`,
+    /// `D'Angelo`, `dell'Orto` — common in exactly the European names this
+    /// gateway exists for. The apostrophe is a string delimiter in YAML, shell,
+    /// SQL and Python, and a fence does not say which of those it holds, so the
+    /// bare rule cannot admit it. That is the strict reading being right and
+    /// still costing something.
+    ///
+    /// Two things narrow it and neither is done here. A fence carries its
+    /// language — ```` ```json ```` says the place *is* JSON — and the
+    /// typographic apostrophe U+2019 closes nothing in any parser, so it is
+    /// collateral rather than a decision. Both are #69, because widening an
+    /// allowlist is a measurement and this is the third round on this file.
     Ticked(usize),
     /// Inside `/* … */`.
     Block,

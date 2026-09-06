@@ -2463,6 +2463,34 @@ mod buffer_tests {
     }
 
     #[test]
+    fn the_fence_rule_prices_an_apostrophe() {
+        // What the strict region costs, as a fixture rather than a surprise in
+        // someone's traffic: a fence does not say which language it holds, and
+        // the apostrophe opens a string in four of the likely ones, so a real
+        // name refuses the response it appears in.
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&irish);
+        assert!(
+            buffer.push("Siehe:\n```yaml\nname: [PERSON_1]\n").is_err(),
+            "an apostrophe in a fence of unknown language is not admissible"
+        );
+
+        // The same name outside a fence is data, so the cost is the region's
+        // and not the rule's.
+        let mut buffer = RestoreBuffer::new(&irish);
+        let mut out = buffer.push(r#"{"name":"[PERSON_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"name":"O'Brien"}"#);
+
+        // Collateral, not a decision: U+2019 closes nothing in any parser and
+        // is refused anyway, because the bare rule is a list of what is known
+        // safe. #69 carries this and the fence's own language tag.
+        let typographic = mapped_to(&[("O\u{2019}Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&typographic);
+        assert!(buffer.push("```\n[PERSON_1]\n").is_err());
+    }
+
+    #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
         // backtick is ordinary content inside a triple-backtick block — and
