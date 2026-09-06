@@ -179,10 +179,14 @@ TEXTS = [
     "Steuernummer 419/130/29933, Rechnung vom 14.03.",
     "Le NIR 2 84 11 20 102 728 71 figure au dossier de Fischer.",
     "Bitte an m.wolf@example.de senden, Kundennummer 88213.",
-    # A shape the service *refuses*, kept in the run on purpose. An
-    # input-validation path that consults shared state is as much a sharing bug
-    # as a detection path that does, and it is the one a 200-hammer never
-    # visits.
+    # A shape the service *refuses*, kept in the run on purpose — and worth
+    # exactly what it is worth, no more. `DetectRequest.text` has
+    # `min_length=1`, so pydantic rejects this before the endpoint body runs and
+    # before `Depends(get_detector)` resolves: **it never touches the shared
+    # detector at all.** What it does check is that a refusal stays a refusal
+    # under load, which is a claim about the service and not about sharing. It
+    # is one of five texts rather than the point of the fixture, and the
+    # docstring above should not be read as saying otherwise.
     "",
 ]
 
