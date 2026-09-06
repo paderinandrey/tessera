@@ -435,6 +435,32 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
+                '\n' | '\r' if self.depth > 0 => self.place = self.outside(),
+                // **A raw line break in a string is a place two parsers read
+                // differently, and only inside a container.** No JSON-family
+                // grammar allows one unescaped, so the document is already
+                // malformed; a repairing parser resolves that by ending the
+                // string at the break, and this lexer went on believing the
+                // string was open. The string rule permits `,` and `:` — the
+                // bare rule does not — so `{"note":"Kunde\n[PERSON_1]}` admitted
+                // `x,admin:true,pad:1` and the caller received two members the
+                // upstream never sent. Same class as `ends_a_line_comment`
+                // above, found by the same sweep for #65.
+                //
+                // **Guarded on depth, and the guard is the whole reason this is
+                // free.** At depth 0 the place is far more likely to be prose
+                // that quotes something — `Das 5" Display` — than a top-level
+                // JSON string, this module says so already, and the two parsers
+                // disagree there in the other direction: one still reads a
+                // string, and calling it prose would admit a closing quote. So
+                // depth 0 is left exactly as it was. Inside a container the
+                // document is structured, `outside()` yields the bare rule, and
+                // this only ever tightens.
+                //
+                // U+2028 and U+2029 deliberately do not trigger it: they are
+                // *valid* raw in a JSON string, so no parser here ends one at
+                // them, and refusing would be cost with no threat. They end a
+                // comment, which is why the two sets differ.
                 _ => {}
             },
             // Content inside the region: only a long enough run leaves it, and

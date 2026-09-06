@@ -2545,6 +2545,50 @@ mod buffer_tests {
     }
 
     #[test]
+    fn an_unterminated_string_in_a_container_is_not_still_a_string() {
+        // No JSON-family grammar allows a raw line break in a string, so a
+        // carrier carrying one is already malformed and a repairing parser
+        // resolves it by ending the string there. The lexer went on believing
+        // the string was open — and the string rule permits `,` and `:` while
+        // the bare rule does not.
+        let structural = mapped_to(&[("x,admin:true,pad:1", "PERSON")]);
+        for terminator in ['\n', '\r'] {
+            let carrier = format!(r#"{{"note":"Kunde{terminator}[PERSON_1]}}"#);
+            let mut buffer = RestoreBuffer::new(&structural);
+            assert!(
+                buffer.push(&carrier).is_err(),
+                "{terminator:?} ended the string for the parser and not for the lexer"
+            );
+        }
+
+        // **Depth 0 is untouched, and that is the point of the guard.** Prose
+        // that quotes something is far more likely there than a top-level JSON
+        // string, and the two readings disagree the other way round: one still
+        // reads a string, so calling it prose would admit a closing quote. This
+        // carrier was admitted before the change and is admitted after it.
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&irish);
+        let mut out = buffer.push("Das 5\" Display\nund dann [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "Das 5\" Display\nund dann O'Brien");
+
+        // And a value that could close the string it is still inside stays
+        // refused at depth 0, so leaving the guard in is not leaving a hole.
+        let quoting = mapped_to(&[(r#"x","admin":true"#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&quoting);
+        assert!(buffer.push("Das 5\" Display\nund dann [PERSON_1]").is_err());
+
+        // U+2028 is *valid* raw in a JSON string, so no parser ends one there
+        // and this must not tighten on it — the two terminator sets differ on
+        // purpose. Pinned so a later reader cannot unify them by tidiness.
+        let mut buffer = RestoreBuffer::new(&structural);
+        let carrier = "{\"note\":\"Kunde\u{2028}[PERSON_1]}";
+        let mut out = buffer.push(carrier).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "{\"note\":\"Kunde\u{2028}x,admin:true,pad:1}");
+    }
+
+    #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
         // backtick is ordinary content inside a triple-backtick block — and
