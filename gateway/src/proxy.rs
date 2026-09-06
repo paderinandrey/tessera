@@ -5735,6 +5735,179 @@ mod tests {
         );
     }
 
+    /// The exact set of names a journal line may carry, per event.
+    ///
+    /// **A blocklist of canaries is the wrong shape for this.** It catches the
+    /// secret somebody thought to name and passes the one they did not — and
+    /// the thing that reaches a journal by accident is request metadata nobody
+    /// classified as identifying. A fine-tuned model id names its tenant; so
+    /// can a route on a dedicated deployment, or a header echoed "for
+    /// support".
+    ///
+    /// So the assertion is the **set**: any new field is a failing test until
+    /// somebody writes it here, which is the moment to ask whether it
+    /// identifies the caller. Raised in review of #77, and it is the stronger
+    /// half of that finding rather than the canary half.
+    const MASKED_FIELDS: &[&str] = &[
+        "ts",
+        "event",
+        "request",
+        "provider",
+        "route",
+        "tenant",
+        "session",
+        "stream",
+        "texts",
+        "documents",
+        "spans",
+        "types",
+        "redacted",
+        "forwarded",
+    ];
+
+    const OUTCOME_FIELDS: &[&str] = &[
+        "ts", "event", "request", "tenant", "session", "upstream", "status", "result", "error",
+        "ms",
+    ];
+
+    /// Every line, checked against the field set and against the canaries.
+    fn journal_is_evidence_and_not_a_copy(lines: &[Value], canaries: &[(&str, &str)]) {
+        assert!(
+            !lines.is_empty(),
+            "the request wrote no journal line at all"
+        );
+        for line in lines {
+            let object = line.as_object().expect("a JSON object per line");
+            let allowed: std::collections::BTreeSet<&str> = match object["event"].as_str() {
+                Some("masked") => MASKED_FIELDS.iter().copied().collect(),
+                Some("outcome") => OUTCOME_FIELDS.iter().copied().collect(),
+                other => panic!("an event nobody has classified: {other:?} in {line}"),
+            };
+            let actual: std::collections::BTreeSet<&str> =
+                object.keys().map(String::as_str).collect();
+            assert_eq!(
+                actual, allowed,
+                "the journal's fields changed; each one has to be looked at for whether it \
+                 identifies the caller: {line}"
+            );
+
+            let rendered = line.to_string();
+            for (what, canary) in canaries {
+                assert!(
+                    !rendered.contains(canary),
+                    "the {what} reached a journal line in clear: {line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_journal_names_the_caller_in_no_line_it_writes() {
+        // **What this adds, stated narrowly**, because the first draft claimed
+        // to be the first test to read a journal line and that was false:
+        // `the_journal_never_carries_the_submitted_value` already reads the
+        // file and rejects the value and the placeholder. Raised in review, and
+        // it was right — I had grepped for `Audit::` in this file and never for
+        // the journal being read.
+        //
+        // What was missing is everything that identifies the *caller* rather
+        // than the data: the credential, the session id, and the model — a
+        // fine-tuned or dedicated model id names a tenant as surely as their
+        // name does. And the field set, so the next one is a failing test.
+        //
+        // Three shapes, because they write different lines and had different
+        // lifetimes: a served buffered request, a streamed one, and a refusal
+        // that never reaches upstream. Also raised in review.
+        let canaries = [
+            ("value", SECRET),
+            ("credential", "sk-acme-canary"),
+            ("session id", "session-canary"),
+            ("model", "ft:gpt-4:acme-tenant-canary"),
+        ];
+
+        // 1. Buffered and served.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "Alles klar, [PERSON_1]."}}]}),
+        )
+        .await;
+        let (state, _dir, journal_path) = state_with(&detector, &upstream, test_limits());
+        let (status, body) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "ft:gpt-4:acme-tenant-canary",
+                // `person_span` covers 0..5, so the value starts the message.
+                "messages": [{"role": "user", "content": format!("{SECRET} bittet um Rueckruf")}],
+            }),
+            &session_headers("Bearer sk-acme-canary", "session-canary"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(SECRET), "the caller does get the value back");
+        journal_is_evidence_and_not_a_copy(&journal(&journal_path), &canaries);
+
+        // 2. Streamed. The record lives until the stream completes, so its
+        // lines are written at a different time and by a different path.
+        let streaming = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Alles klar, [PERSON_1].\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                )
+                .as_bytes()
+                .to_vec(),
+                "text/event-stream",
+            ))
+            .mount(&streaming)
+            .await;
+        let (state, _dir, journal_path) = state_with(&detector, &streaming, test_limits());
+        let (status, served) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "ft:gpt-4:acme-tenant-canary",
+                "stream": true,
+                "messages": [{"role": "user", "content": format!("{SECRET} bittet um Rueckruf")}],
+            }),
+            &session_headers("Bearer sk-acme-canary", "session-canary"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{served}");
+        journal_is_evidence_and_not_a_copy(&journal(&journal_path), &canaries);
+
+        // 3. Refused before it reaches upstream, which writes an outcome line
+        // and no masked line — so the field set of a lone outcome is checked
+        // too, and it is the line an investigator reads first.
+        let refusing = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&refusing)
+            .await;
+        let (state, _dir, journal_path) = state_with(&refusing, &upstream, test_limits());
+        let (status, _) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({
+                "model": "ft:gpt-4:acme-tenant-canary",
+                "messages": [{"role": "user", "content": format!("{SECRET} bittet um Rueckruf")}],
+            }),
+            &session_headers("Bearer sk-acme-canary", "session-canary"),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "this shape is meant to be refused");
+        let lines = journal(&journal_path);
+        assert!(
+            lines.iter().all(|line| line["event"] == "outcome"),
+            "a refusal before upstream should write no masked line: {lines:?}"
+        );
+        journal_is_evidence_and_not_a_copy(&lines, &canaries);
+    }
+
     #[tokio::test]
     async fn a_request_refused_by_the_journal_leaves_the_session_untouched() {
         // The other refusal class: masking succeeded, so the values exist and
