@@ -1,3 +1,5 @@
+import random
+
 from tessera_detector.resolution import resolve
 from tessera_detector.spans import Span
 
@@ -489,3 +491,184 @@ def test_a_widened_rule_4_span_reports_both_inputs_as_dropped() -> None:
                  recognizer="ner:g", tier=2)
     (decision,) = resolve([equal, person], specificity={"PERSON": 30, "LOCATION": 20}).trace
     assert decision.dropped == (equal,)
+
+
+# --- the properties, as opposed to the twenty-eight cases above ---------------
+#
+# Every test before this one is an example. Examples are how each rule got
+# written and they are also how this resolver has been wrong twice: #39, where a
+# checksum span lost to one containing it, and #50, where rule 4 kept a winner
+# instead of the union and **351 tests passed with and without the defect** —
+# two of the three that should have caught it were named "partial overlap" and
+# built equal ranges.
+#
+# What both had in common is that they narrowed the masked region. That is not a
+# property any single example states, so it went unstated, so nothing checked
+# it. The generator below states it.
+
+RANDOM_SEED = 20260906
+TYPES = ["IBAN", "FR_NIR", "CREDIT_CARD", "ORG", "PERSON", "EMAIL"]
+RECOGNIZERS = ["catalog:iban", "catalog:nir", "ner:gliner", "catalog:email"]
+
+
+def _random_spans(rng: random.Random, count: int) -> list[Span]:
+    spans = []
+    for _ in range(count):
+        # Short ranges over a short text, so overlaps and containments are the
+        # common case rather than a rarity the generator has to be lucky to hit.
+        start = rng.randrange(0, 24)
+        end = start + rng.randrange(1, 8)
+        spans.append(
+            span(
+                entity_type=rng.choice(TYPES),
+                start=start,
+                end=end,
+                confidence=rng.choice([0.3, 0.5, 0.75, 0.9, 1.0]),
+                recognizer=rng.choice(RECOGNIZERS),
+                tier=rng.choice([1, 2, 3]),
+                boosted=rng.choice([True, False]),
+            )
+        )
+    return spans
+
+
+def _covered(spans: list[Span]) -> set[int]:
+    return {i for s in spans for i in range(s.start, s.end)}
+
+
+def test_resolution_never_narrows_the_masked_region() -> None:
+    """**The property both known defects violated**, and the one no example
+    states.
+
+    Every character some detector claimed is still claimed after resolution.
+    Resolution may change a span's *type*, merge two spans into one, or drop a
+    span contained in another — none of those unmask a character. Keeping a
+    winner and discarding the part of the loser that stuck out does, and that is
+    what #50 was.
+
+    It holds by construction today: every branch of `_resolve_pair` returns
+    either `_union(...)` or the strictly-containing `outer`. That sentence is
+    the design, and this is the test that makes it one.
+    """
+    rng = random.Random(RANDOM_SEED)
+    for trial in range(2000):
+        spans = _random_spans(rng, rng.randrange(2, 7))
+        resolved = resolve(spans, specificity=SPEC).spans
+        missing = _covered(spans) - _covered(resolved)
+        assert not missing, (
+            f"trial {trial}: resolution unmasked {sorted(missing)}\n"
+            f"  in:  {[(s.entity_type, s.start, s.end) for s in spans]}\n"
+            f"  out: {[(s.entity_type, s.start, s.end) for s in resolved]}"
+        )
+
+
+def test_resolution_leaves_nothing_overlapping() -> None:
+    """The other half of what `resolve` is for, and the loop's termination
+    condition — so a rule that returned something still overlapping its
+    neighbour would spin rather than fail. Asserted at the boundary instead.
+    """
+    rng = random.Random(RANDOM_SEED)
+    for trial in range(2000):
+        spans = _random_spans(rng, rng.randrange(2, 7))
+        resolved = resolve(spans, specificity=SPEC).spans
+        for i, a in enumerate(resolved):
+            for b in resolved[i + 1 :]:
+                assert a.end <= b.start or b.end <= a.start, (
+                    f"trial {trial}: {a} and {b} still overlap"
+                )
+
+
+def test_resolution_is_a_fixed_point() -> None:
+    """Resolving an already-resolved list must change nothing.
+
+    #39 established that this fold is not associative, so "called twice" is not
+    a theoretical concern in this module.
+
+    **It is implied by the loop rather than independent of it, and no mutation
+    kills it alone.** `resolve` runs until no pair overlaps, so its output is
+    conflict-free by construction and a second call finds nothing to do. Cutting
+    the loop to a single pass does fail this — and fails
+    `test_resolution_leaves_nothing_overlapping` in the same run, every time.
+
+    Kept anyway, and labelled: the property is what a reader wants to know about
+    this function, and a test that only ever fails alongside another is
+    redundant rather than misleading. If it is ever the *only* failure, that is
+    information — it would mean the sort or the dedupe stopped being
+    deterministic, which no other test here would name.
+    """
+    rng = random.Random(RANDOM_SEED)
+    for trial in range(2000):
+        spans = _random_spans(rng, rng.randrange(2, 7))
+        once = resolve(spans, specificity=SPEC).spans
+        twice = resolve(once, specificity=SPEC).spans
+        assert once == twice, f"trial {trial}: {once} became {twice}"
+
+
+def test_two_adjacent_spans_are_two_spans() -> None:
+    """The boundary of `_overlaps`, which nothing pinned.
+
+    `a.start < b.end and b.start < a.end` — strict on both sides, so spans that
+    merely touch are left alone. Relax either to `<=` and **all thirty-one tests
+    above still pass** while `[IBAN][PERSON]` written without a separator
+    becomes one span of one type: two entities collapse into one placeholder,
+    the second one's type is lost, and the same person gets a different token in
+    the next turn where they appear with a space in front of them.
+
+    Nothing here leaks — the union covers both — which is exactly why no
+    coverage property catches it and why it needs an example.
+    """
+    first = span(entity_type="IBAN", start=0, end=10)
+    second = span(entity_type="PERSON", start=10, end=18, recognizer="ner:gliner", tier=2)
+    result = resolve([first, second], specificity=SPEC)
+    assert result.spans == [first, second]
+    assert result.trace == []
+
+    # And one character of genuine overlap is still an overlap, so this is a
+    # boundary rather than a hole.
+    touching = span(entity_type="PERSON", start=9, end=18, recognizer="ner:gliner", tier=2)
+    assert len(resolve([first, touching], specificity=SPEC).spans) == 1
+
+
+# Every rule `_resolve_pair` can return. Hard-coded rather than derived, so
+# adding a rule fails this until the generator is shown to reach it.
+RULES = {
+    "same-type-merge",
+    "untouchable-inner-merge",
+    "specific-inner-merge",
+    "nested-specificity-merge",
+    "nested-sensitivity-merge",
+    "nesting-outer-wins",
+    "untouchable-wins",
+    "specificity",
+    "confidence",
+    "tie-merge-sensitive",
+}
+
+
+def test_the_generator_reaches_every_rule() -> None:
+    """**The properties are worth what the generator reaches, and nothing more.**
+
+    Three tests above assert an invariant over 2000 random span sets, which is a
+    claim about the rules those sets happen to exercise. Left unstated, that is
+    the same kind of gap the properties exist to close one level down: a test
+    that looks exhaustive because of its shape rather than its coverage.
+
+    Measured, the ten rules fire 781, 710, 488, 344, 338, 148, 40, 20, 7 and 1
+    times. **The tail is thin** — `nested-sensitivity-merge` is reached once —
+    so a change to the generator could stop reaching it while every property
+    above still passed, and the seed is fixed precisely so that this is a
+    property of the code rather than of the day.
+
+    Naming the members rather than counting them: a rule added to
+    `_resolve_pair` fails here until somebody shows the generator reaches it.
+    """
+    rng = random.Random(RANDOM_SEED)
+    reached: set[str] = set()
+    for _ in range(2000):
+        spans = _random_spans(rng, rng.randrange(2, 7))
+        reached.update(d.rule for d in resolve(spans, specificity=SPEC).trace)
+
+    assert reached == RULES, (
+        f"never reached: {sorted(RULES - reached)}; "
+        f"unknown rules seen: {sorted(reached - RULES)}"
+    )
