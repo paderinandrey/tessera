@@ -3955,6 +3955,96 @@ mod tests {
         }
     }
 
+    /// **The same promise over the two paths production actually uses.**
+    ///
+    /// `restore` above is `#[cfg(test)]`. Stating the round trip over it alone
+    /// would be a property about a function no request ever reaches, which is a
+    /// comfortable kind of coverage and the wrong kind. A serving request goes
+    /// through `restore_in_string_strictly` when the body is buffered and
+    /// through `RestoreBuffer` when it is streamed.
+    ///
+    /// The streamed half is stated as a **disjunction**, because refusing is a
+    /// correct outcome there: a value that could act structurally where it lands
+    /// kills the response rather than corrupting it. So either the stream
+    /// refuses, or what it produces is the original text — never something else.
+    /// "Never something else" is the whole claim, and it is the one a silent
+    /// corruption would break while every refusal test still passed.
+    ///
+    /// Fragmenting at random offsets is the point of the streamed half: a
+    /// placeholder split across two pushes, an escape split across two pushes,
+    /// and a multi-byte character split across two pushes are all the same bug
+    /// class and all reachable from here.
+    #[test]
+    fn both_serving_paths_return_the_text_or_refuse_it() {
+        let mut rng = Rng(0x2026_0906_0003);
+        let (mut buffered, mut buffered_refused) = (0, 0);
+        let (mut streamed, mut refused) = (0, 0);
+        for trial in 0..5_000 {
+            let (text, spans) = generated(&mut rng);
+            let mut mapping = Mapping::new();
+            let Ok(masked) = mapping.mask(&text, &spans) else {
+                continue;
+            };
+
+            // **The buffered path refuses too, which I had assumed it did not.**
+            // The first version of this test called `unwrap` here on the
+            // argument that re-serializing means a value cannot change a
+            // structure it is not being parsed into. It failed on trial 1: the
+            // strict door also declines a string this gateway cannot parse but
+            // a client may. So both halves are disjunctions, and the assumption
+            // is written down where it was wrong rather than removed.
+            match mapping.restore_in_string_strictly(&masked) {
+                Ok(whole) => {
+                    assert_eq!(whole, text, "trial {trial}: buffered path changed {text:?}");
+                    buffered += 1;
+                }
+                Err(_) => buffered_refused += 1,
+            }
+
+            let mut buffer = crate::stream::RestoreBuffer::new(&mapping);
+            let mut out = String::new();
+            let mut cut = 0usize;
+            let bytes = masked.len();
+            let mut killed = false;
+            while cut < bytes {
+                let mut next = (cut + 1 + rng.below(7)).min(bytes);
+                while !masked.is_char_boundary(next) {
+                    next += 1;
+                }
+                match buffer.push(&masked[cut..next]) {
+                    Ok(part) => out.push_str(&part),
+                    Err(_) => {
+                        killed = true;
+                        break;
+                    }
+                }
+                cut = next;
+            }
+            if !killed {
+                match buffer.finish() {
+                    Ok(tail) => out.push_str(&tail),
+                    Err(_) => killed = true,
+                }
+            }
+            if killed {
+                refused += 1;
+            } else {
+                assert_eq!(out, text, "trial {trial}: streamed path changed {text:?}");
+                streamed += 1;
+            }
+        }
+
+        // **Both outcomes have to occur or the assertion above is decoration.**
+        // All-refused would mean the streamed equality never ran; none-refused
+        // would mean the generator stopped producing anything structural, which
+        // is most of what makes this text interesting.
+        assert!(
+            buffered > 500 && buffered_refused > 100 && streamed > 500 && refused > 500,
+            "buffered intact {buffered}, buffered refused {buffered_refused}, \
+             streamed intact {streamed}, streamed refused {refused}"
+        );
+    }
+
     /// Two different values must never share a placeholder, or restoration is a
     /// guess. The reverse — one value always getting the same placeholder — is
     /// what makes a conversation coherent across turns.
