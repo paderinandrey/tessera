@@ -179,6 +179,36 @@ message content are masked too — OpenAI's `user` and per-message `name`, Anthr
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.
 
+### Telling the gateway how you read a streamed response
+
+**Optional, and worth sending if you parse the assistant's content as JSON.**
+
+```
+x-tessera-response-format: json        # or json5, or jsonc
+```
+
+On the streamed path, a value has to be substituted into text that has already
+gone past — so when a placeholder sits at a *bare* position, outside a string
+and inside a structure, the gateway has to decide what a value may safely
+contain there without knowing what will read the result. Without a declaration
+it assumes the worst reader it can imagine and admits word characters, a space,
+a hyphen and a full stop. **An e-mail address does not pass that**, nor does a
+German tax number like `419/130/29933`, nor `Beckmann AG & Co. KG` — and a value
+that cannot be restored means the response is refused rather than served
+corrupted.
+
+Declaring `json` says the content is read by a JSON-family parser, where `@`,
+`&` and `/` cannot act, and those values are restored. It changes nothing inside
+a string, which is where such values ordinarily sit and where they were always
+restored. It changes nothing in a markdown code fence or a comment either, whose
+language the caller has not spoken for.
+
+**The declaration is a promise about your own parser.** If you send `json` and
+then feed the content to a YAML reader, the characters it admits can act there —
+that is the risk you are taking on, and it is yours rather than a stranger's,
+which is the whole reason the gateway will take your word for it and not the
+upstream's. An unrecognised or missing value is the strict rule.
+
 Tool traffic is masked on the buffered path, for both providers and in both directions: a
 tool definition's description and the whole of its schema — `enum` members, `default`,
 `title`, `examples`, not `description` alone — a tool call's arguments, and a tool result.

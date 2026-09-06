@@ -1041,6 +1041,7 @@ async fn handle(
             provider,
             mapping,
             returned,
+            crate::mapping::ClientFormat::declared(&headers),
             record.clone(),
         )));
     }
@@ -5906,6 +5907,74 @@ mod tests {
             "a refusal before upstream should write no masked line: {lines:?}"
         );
         journal_is_evidence_and_not_a_copy(&lines, &canaries);
+    }
+
+    #[tokio::test]
+    async fn the_format_header_reaches_the_streamed_rule() {
+        // **The unit tests prove the rule; this proves the wire.** A header the
+        // proxy reads and never passes on is the failure mode that looks like a
+        // working feature, and the plumbing runs from `handle`'s request
+        // headers through `restore_stream` and `StreamRestorer` to every
+        // `RestoreBuffer` it opens.
+        //
+        // The value is an e-mail address at a *bare* position, which is the
+        // whole of what a declaration buys — inside a string it streamed
+        // already.
+        // A span covering the whole address, because `Weber` alone is word
+        // characters and would stream under either rule — the test has to turn
+        // on the `@`, which is the character the declaration is about.
+        let address = "Weber@example.org";
+        let detector = detector_returning(json!([{
+            "entity_type": "EMAIL", "start": 0, "end": address.chars().count(),
+            "confidence": 1.0, "recognizer": "catalog:email", "tier": 2, "boosted": false
+        }]))
+        .await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{mail:[EMAIL_1]}\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        for (declared, expect_value) in [(None, false), (Some("json"), true), (Some("yaml"), false)]
+        {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+                )
+                .mount(&upstream)
+                .await;
+            let (state, _dir, _journal) = state_with(&detector, &upstream, test_limits());
+
+            let mut headers = vec![
+                ("authorization", "Bearer k"),
+                (crate::session::SESSION_HEADER, "s1"),
+            ];
+            if let Some(value) = declared {
+                headers.push((crate::mapping::FORMAT_HEADER, value));
+            }
+
+            let (status, served) = call_with_headers(
+                state,
+                "/v1/chat/completions",
+                json!({
+                    "model": "gpt-4",
+                    "stream": true,
+                    // `person_span` covers 0..5, so the value starts the message.
+                    "messages": [{"role": "user", "content": format!("{address} bittet")}],
+                }),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{served}");
+            assert_eq!(
+                served.contains(address),
+                expect_value,
+                "declared {declared:?}: the value should {} have been restored: {served}",
+                if expect_value { "" } else { "not" }
+            );
+        }
     }
 
     #[tokio::test]
