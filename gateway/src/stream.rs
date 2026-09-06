@@ -2491,6 +2491,60 @@ mod buffer_tests {
     }
 
     #[test]
+    fn every_line_terminator_ends_a_line_comment() {
+        // A JSON5 line comment is ECMAScript's, and ECMAScript ends one at any
+        // LineTerminator. The lexer knew only `\n`, so a comment ended by any of
+        // the other three left it believing it was still inside one — and the
+        // comment rule permits the quotes and braces the string rule refuses.
+        // Being wrong about a place is wrong in the admitting direction here.
+        let payload = mapped_to(&[(r#"x","admin":true,"pad":"y"#, "PERSON")]);
+        for terminator in ['\n', '\r', '\u{2028}', '\u{2029}'] {
+            let carrier = format!(r#"// note{terminator}{{"name":"[PERSON_1]"}}"#);
+            let mut buffer = RestoreBuffer::new(&payload);
+            assert!(
+                buffer.push(&carrier).is_err(),
+                "{terminator:?} ended the comment for the parser and not for the lexer"
+            );
+        }
+
+        // And the comment still holds while it is open, so this is not "every
+        // comment is now ignored": inside one, the token is judged by the
+        // comment rule and a safe value streams.
+        let plain = mapped_to(&[("Weber", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&plain);
+        let mut out = buffer.push("// kunde [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "// kunde Weber");
+    }
+
+    #[test]
+    fn a_value_carrying_a_line_terminator_cannot_end_a_comment() {
+        // The other half: the carrier's comment is open, and the *value* ends
+        // it. `\n` and `\r` were already refused; U+2028 and U+2029 are line
+        // terminators to the same reader and were not.
+        for terminator in ['\n', '\r', '\u{2028}', '\u{2029}'] {
+            let escaping = mapped_to(&[(&format!(r#"a{terminator}"admin":true"#), "PERSON")]);
+            let mut buffer = RestoreBuffer::new(&escaping);
+            assert!(
+                buffer.push("// note [PERSON_1]").is_err(),
+                "{terminator:?} in a value ended the comment it was substituted into"
+            );
+        }
+
+        // **The set's far edge, asserted rather than left to a comment.**
+        // Widening it is invisible to every test above — more refusals break
+        // nothing — so the four members are pinned from both sides. U+0085 is a
+        // control character and not an ECMAScript LineTerminator, so a parser in
+        // this model does not end a comment there and refusing it would be cost
+        // with no threat behind it. Anyone adding it has to edit this.
+        let nel = mapped_to(&[("a\u{85}b", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&nel);
+        let mut out = buffer.push("// note [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "// note a\u{85}b");
+    }
+
+    #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
         // backtick is ordinary content inside a triple-backtick block — and

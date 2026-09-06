@@ -448,7 +448,7 @@ impl StreamStructure {
                 }
             }
             Place::Line => {
-                if character == '\n' {
+                if ends_a_line_comment(character) {
                     self.place = self.outside();
                 }
             }
@@ -532,7 +532,15 @@ impl StreamStructure {
             // both characters inside a comment costs nothing anyone needs: a
             // masked value is not something to serve inside a comment anyway.
             Place::Block | Place::Line => {
-                if value.contains(['*', '/', '\n', '\r']) {
+                // The union of both closings: `*` and `/` assemble a block
+                // comment's `*/`, and `ends_a_line_comment` is every character
+                // that ends a line one. Each rule is wider than the place it is
+                // applied to needs, which costs a value nobody has and saves the
+                // two arms from drifting apart.
+                if value
+                    .chars()
+                    .any(|c| matches!(c, '*' | '/') || ends_a_line_comment(c))
+                {
                     Some("a value that could close a comment, inside a stream")
                 } else {
                     None
@@ -1740,6 +1748,27 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// **The residual:** a delimited-string format whose delimiter is none of the
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
+/// Characters that end a `//` comment.
+///
+/// **Not just `\n`.** A JSON5 line comment is ECMAScript's, and ECMAScript ends
+/// one at any LineTerminator: line feed, carriage return, U+2028 and U+2029.
+/// The lexer knew only the line feed, so `// note\r{"name":"[PERSON_1]"}` left
+/// it believing it was still in a comment while the parser was already inside a
+/// string — and the comment rule permits the quotes and braces the string rule
+/// refuses, so being wrong here is wrong in the admitting direction. All three
+/// were reachable and all three are tested.
+///
+/// `leaves_any_string` in this same file already knew U+2028 and U+2029 are
+/// line terminators to a JSON5 reader. The knowledge was there and the comment
+/// rule did not use it, which is the shape of defect a second reader finds and
+/// the author does not. Found attacking the lexer for #65.
+///
+/// U+0085 (NEL) is deliberately absent: ECMAScript does not treat it as a line
+/// terminator, so a parser in this model does not end a comment there.
+fn ends_a_line_comment(character: char) -> bool {
+    matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
 fn leaves_any_string(character: char) -> bool {
     // The escape can consume the delimiter after it, and a character the format
     // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
