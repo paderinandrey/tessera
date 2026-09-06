@@ -2144,8 +2144,14 @@ mod buffer_tests {
             Case {
                 carrier: "{org:[ORG_1]}",
                 values: &[("Boerner AG & Co", "ORG")],
-                refuses: false,
-                why: "an ampersand has no role in a JSON-family bare position",
+                refuses: true,
+                why: "an ampersand anchors a node for a reader this cannot rule out",
+            },
+            Case {
+                carrier: "{org: *[ORG_1]}",
+                values: &[("victim", "ORG")],
+                refuses: true,
+                why: "the carrier wrote the indicator, so a word-like value completes an alias",
             },
             Case {
                 carrier: "{tax:[DE_STEUERNUMMER_1]}",
@@ -2719,7 +2725,7 @@ mod buffer_tests {
     /// either rule is a decision, and this is where it gets made rather than
     /// discovered.
     #[test]
-    fn the_strict_rules_cost_nothing_in_a_container_and_three_formats_in_a_region() {
+    fn the_strict_rules_cost_the_ampersand_in_a_container_and_three_formats_in_a_region() {
         let corpus = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../evaluation/corpus/public.jsonl"
@@ -2775,15 +2781,30 @@ mod buffer_tests {
             }
         }
 
-        // **Inside a container the corpus costs nothing at all.** It used to cost
-        // 14 of 196 — every EMAIL on the `@`, both DE_STEUERNUMMER on the `/`,
-        // and four German company forms on the `&`. Two entity types were
-        // refused outright, which is not a hard case within a format, it is the
-        // format.
+        // **Inside a container the corpus costs the ampersand and nothing
+        // else.** It used to cost 14 of 196 — every EMAIL on the `@`, both
+        // DE_STEUERNUMMER on the `/`, and four German company forms on the `&`.
+        // The first two are recovered; the third is paid, because a consumer
+        // reading the content as YAML turns a leading `&` into an anchor and
+        // the narrowing that would have kept these was killed in review of #79.
+        //
+        // Named rather than counted, so that recovering them later is a change
+        // somebody makes on purpose.
+        let containers: std::collections::BTreeSet<&str> = refused["container"]
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .collect();
         assert_eq!(
-            refused["container"],
-            Vec::new(),
-            "a format that cannot be restored at a bare position is a decision, not a discovery"
+            containers,
+            [
+                "Beckmann AG & Co. KG",
+                "Börner AG & Co. KGaA",
+                "Patberg GmbH & Co. OHG",
+                "Römer Stiftung & Co. KG",
+            ]
+            .into_iter()
+            .collect(),
+            "the ampersand is the whole of what a bare position still costs"
         );
 
         // **In a region the price is the full 14**, and it stays there on
@@ -2911,7 +2932,6 @@ mod buffer_tests {
         for (value, kind) in [
             ("uschihiller@example.org", "EMAIL"),
             ("419/130/29933", "DE_STEUERNUMMER"),
-            ("Börner AG & Co. KGaA", "ORG"),
         ] {
             let mapping = mapped_to(&[(value, kind)]);
             let mut buffer = RestoreBuffer::new(&mapping);
@@ -2990,15 +3010,35 @@ mod buffer_tests {
         let mut buffer = RestoreBuffer::new(&aliasing);
         assert!(buffer.push("{key: [ORG_1]}").is_err());
 
-        // **And the narrowing is a narrowing, not a retreat.** An ampersand
-        // inside a plain scalar is an ampersand; German company forms are 4 of
-        // 12 ORG values in the corpus and they keep working.
+        // **The narrowing that would have kept these was tried and killed.**
+        // `- &victim secret` anchors the node of a block-sequence entry, so `&`
+        // need not be a value's first non-blank character, and enumerating
+        // YAML's node openers by hand is not a thing to be confident about. So
+        // the ampersand goes entirely and the German company forms go with it —
+        // four of twelve ORG values in the corpus, at a bare position only.
         for value in ["Boerner AG & Co. KGaA", "Beckmann AG & Co. KG", "R & D"] {
             let map = mapped_to(&[(value, "ORG")]);
             let mut buffer = RestoreBuffer::new(&map);
-            let mut out = buffer.push("{value:[ORG_1]}").unwrap();
-            out.push_str(&buffer.finish().unwrap());
-            assert_eq!(out, format!("{{value:{value}}}"));
+            assert!(
+                buffer.push("{value:[ORG_1]}").is_err(),
+                "{value} is the price of not enumerating YAML's node openers"
+            );
+        }
+
+        // **And the indicator does not have to come from the value.** A carrier
+        // that writes the `*` itself turns a word-like value into an alias
+        // name, which no predicate over the value can see. Raised in review,
+        // and it is what killed the value-only fix.
+        let word = mapped_to(&[("victim", "ORG")]);
+        for carrier in [
+            "{key: &victim secret, other: *[ORG_1]}",
+            "{key: &[ORG_1] secret, other: x}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&word);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "the carrier's own indicator completed an alias: {carrier}"
+            );
         }
 
         // Inside a string the value is data in every reader named here, YAML
