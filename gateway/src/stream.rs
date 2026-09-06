@@ -2887,7 +2887,7 @@ mod buffer_tests {
         //
         // So the rule is word characters, a space, a hyphen and a full stop,
         // as it was before #72. What that costs is measured in
-        // `the_bare_rule_refuses_two_formats_outright` and is not small.
+        // `the_strict_rule_costs_three_formats_in_every_place_it_applies` and is not small.
         for value in [
             "null,admin:true,pad:null",
             r#"x","admin":true"#,
