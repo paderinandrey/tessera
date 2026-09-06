@@ -3,7 +3,16 @@ from pathlib import Path
 
 import pytest
 
+from tessera_detector.deterministic import DeterministicDetector
+from tessera_detector.resolution import resolve
 from tessera_detector.validators import CHECKSUM_VALIDATORS, VALIDATORS
+
+
+def _specificity() -> dict[str, int]:
+    """The catalog's own ordering, read rather than restated — a copy here would
+    make the test pass while the file it is about said something else."""
+    rules = DeterministicDetector(None).rules
+    return {rule.entity_type: rule.specificity for rule in rules}
 
 CORPUS_PATH = Path(__file__).resolve().parents[2] / "evaluation" / "corpus" / "public.jsonl"
 
@@ -171,3 +180,43 @@ def test_the_structural_validator_is_excluded_because_it_cannot_do_that() -> Non
         f"de_stnr rejected {total - survivors} of {total} one-digit changes; if it has "
         "grown a checksum it belongs in CHECKSUM_VALIDATORS"
     )
+
+
+def test_two_untouchable_rules_can_claim_one_range_and_specificity_decides() -> None:
+    """**What untouchable actually rests on, which is not the checksum alone.**
+
+    Found while measuring the property above: a French NIR is a Luhn-valid
+    digit run of card length, so `catalog:credit_card` and `catalog:fr_nir`
+    **both** match `1 71 07 10 830 660 47`, on the identical range, both at
+    confidence 1.0, and both untouchable. Two exemptions from the resolver's
+    ordering, claiming one span.
+
+    What separates them is `specificity` — 80 for FR_NIR against 40 for
+    CREDIT_CARD — and nothing said so. Nothing leaks either way, because both
+    mask the same characters. What changes is the **type**: the model sees
+    `[CREDIT_CARD_1]` where the truth is a social security number, and the
+    audit journal records a payment card. For a product whose evidence layer
+    is the thing a regulator reads, that is the wrong answer with the right
+    coverage.
+
+    So the ordering is pinned where it is load-bearing rather than left to be
+    the reason a corpus check happens to pass.
+    """
+    detector = DeterministicDetector(None)
+    text = "Le client Marty (NIR 1 71 07 10 830 660 47) a demandé la clôture de son dossier."
+
+    claimants = {
+        (span.entity_type, span.recognizer, span.confidence)
+        for span in detector.detect(text)
+        if span.start == 21 and span.end == 42
+    }
+    assert claimants == {
+        ("CREDIT_CARD", "catalog:credit_card", 1.0),
+        ("FR_NIR", "catalog:fr_nir", 1.0),
+    }, f"the overlap this test is about no longer happens: {claimants}"
+
+    # And the one that survives is the specific one. Lower FR_NIR's specificity
+    # below CREDIT_CARD's in identifiers.yaml and this flips.
+    resolved = [s for s in resolve(detector.detect(text), specificity=_specificity()).spans
+                if s.start == 21 and s.end == 42]
+    assert [s.entity_type for s in resolved] == ["FR_NIR"]
