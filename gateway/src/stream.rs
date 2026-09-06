@@ -2733,12 +2733,28 @@ mod buffer_tests {
             );
         }
 
-        // ORG is the mixed one: `Beckmann AG & Co. KG` fails on the ampersand
-        // and `Deutsche Bank` does not. Named so that a change in either
-        // direction has to be looked at.
+        // ORG is the mixed one — `Beckmann AG & Co. KG` fails on the ampersand
+        // and `Deutsche Bank` does not — so it is the type whose *members*
+        // matter and not its count. **This was a count in the first version of
+        // this test**, which is the aggregation this repository has been wrong
+        // by four times: four ORG values refused stays four while a different
+        // four are refused, and the difference is exactly what a reader of this
+        // test would want to know.
+        let orgs: std::collections::BTreeSet<&str> = refused
+            .iter()
+            .filter(|(k, _)| k == "ORG")
+            .map(|(_, v)| v.as_str())
+            .collect();
         assert_eq!(
-            refused.iter().filter(|(k, _)| k == "ORG").count(),
-            4,
+            orgs,
+            [
+                "Beckmann AG & Co. KG",
+                "Börner AG & Co. KGaA",
+                "Patberg GmbH & Co. OHG",
+                "Römer Stiftung & Co. KG",
+            ]
+            .into_iter()
+            .collect(),
             "the German company forms are what the ampersand costs"
         );
 
