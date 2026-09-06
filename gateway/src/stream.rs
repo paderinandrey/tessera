@@ -2389,13 +2389,47 @@ mod buffer_tests {
             );
         }
 
-        // And a backtick *in a value* is inert inside a JSON string, because no
-        // parser in the stated client model quotes with one.
+        // And a backtick *in a value* is inert inside a JSON string: whatever a
+        // backtick means outside one, inside `"…"` only the double quote closes.
         let ticked = mapped_to(&[("a`b", "ORG")]);
         let mut buffer = RestoreBuffer::new(&ticked);
         let mut out = buffer.push(r#"{"x":"[ORG_1]"}"#).unwrap();
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, r#"{"x":"a`b"}"#);
+    }
+
+    #[test]
+    fn a_backtick_region_is_judged_like_a_bare_position() {
+        // **Both readings of a backtick are wrong, so it gets neither.** As a
+        // string delimiter, an unclosed markdown fence hid a JSON object. As
+        // ordinary text, a `"` inside `` `…` `` opened a string that is not one
+        // — and a value carrying backticks then injected members that a
+        // backtick-aware repairing parser reads. Both measured, both reachable,
+        // and repairing parsers are in this module's client model by name.
+        //
+        // The region is judged by the bare rule instead: whichever reading is
+        // right, a value that can act structurally can act. Raised across two
+        // rounds of review on #68 — the second round was my own objection in the
+        // review request, returned with the carrier that makes it real.
+        let injecting = mapped_to(&[("x`,admin:true,pad:`y", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&injecting);
+        assert!(
+            buffer.push("{name:`prefix \"[ORG_1]\" suffix`}").is_err(),
+            "a quote inside a backtick region opened a string that is not one"
+        );
+
+        // It closes on the next backtick, which bounds the cost to the region
+        // rather than the rest of the run: an ordinary name after a code span
+        // is prose again.
+        let names = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&names);
+        let mut out = buffer.push("use `code` then [PERSON_1]").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "use `code` then O'Brien");
+
+        // Inside an open region it is bare, which is the cost and is bounded.
+        let mut buffer = RestoreBuffer::new(&names);
+        assert!(buffer.push("```\nHallo [PERSON_1]").is_err());
     }
 
     #[test]

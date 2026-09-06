@@ -231,6 +231,23 @@ enum Place {
     /// Inside a quoted string, and which delimiter opened it: only that one
     /// closes it, so an apostrophe inside a double-quoted string is inert.
     Text(char),
+    /// Inside a backtick region, which this cannot classify.
+    ///
+    /// **Both readings of a backtick are wrong, so it gets neither.** Treating
+    /// it as a string delimiter meant an unclosed markdown fence — what every
+    /// streamed fenced block looks like until it closes — hid the JSON object
+    /// after it, and a payload went through. Treating it as ordinary text meant
+    /// a `"` inside `` `…` `` opened a string that is not one, so a value
+    /// carrying backticks injected members a backtick-aware repairing parser
+    /// reads. Both measured, both reachable, and repairing parsers are in this
+    /// module's client model by name.
+    ///
+    /// So a backtick opens a region judged by the **bare** rule — word
+    /// characters only — because whichever of the two it is, a value that can
+    /// act structurally can act. It closes on the next backtick, which bounds
+    /// the cost to the region rather than the rest of the run. Found across two
+    /// rounds of review on #68.
+    Ticked,
     /// Inside `/* … */`.
     Block,
     /// Inside `// …`, until a newline.
@@ -368,6 +385,11 @@ impl StreamStructure {
                 c if c == delimiter => self.place = self.outside(),
                 _ => {}
             },
+            Place::Ticked => {
+                if character == '`' {
+                    self.place = self.outside();
+                }
+            }
             Place::Block => {
                 if character == '/' && previous == Some('*') {
                     self.place = self.outside();
@@ -381,16 +403,10 @@ impl StreamStructure {
                 }
             }
             Place::Prose | Place::Bare => match character {
-                // **No backtick.** It was here for a JavaScript template
-                // literal — an *evaluation* threat this module declines by name
-                // — and it cost the model it does cover. A backtick is markdown
-                // punctuation, and a reply is full of it: an unclosed fence,
-                // which is what every streamed fenced block looks like until it
-                // closes, put the lexer inside a string for the rest of the run
-                // and admitted `x","admin":true` into a real JSON object.
-                // Measured. No parser in the stated client model — JSON, JSON5,
-                // JSONC, a repairing parser — accepts a backtick-quoted string.
                 '"' | '\'' => self.place = Place::Text(character),
+                // Neither a string nor ordinary text — see `Place::Ticked`.
+                '`' => self.place = Place::Ticked,
+
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
                 '{' | '[' if structural => {
@@ -474,7 +490,10 @@ impl StreamStructure {
             // So the test is inverted here: only a value that cannot act
             // structurally passes, which is alphanumerics, spaces, and the few
             // marks that separate words.
-            Place::Bare => {
+            // A backtick region is judged like a bare position, for the reason
+            // `Place::Ticked` gives: whichever of the two readings is right, a
+            // value that can act structurally can act.
+            Place::Bare | Place::Ticked => {
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
