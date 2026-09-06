@@ -381,7 +381,16 @@ impl StreamStructure {
                 }
             }
             Place::Prose | Place::Bare => match character {
-                '"' | '\'' | '`' => self.place = Place::Text(character),
+                // **No backtick.** It was here for a JavaScript template
+                // literal — an *evaluation* threat this module declines by name
+                // — and it cost the model it does cover. A backtick is markdown
+                // punctuation, and a reply is full of it: an unclosed fence,
+                // which is what every streamed fenced block looks like until it
+                // closes, put the lexer inside a string for the rest of the run
+                // and admitted `x","admin":true` into a real JSON object.
+                // Measured. No parser in the stated client model — JSON, JSON5,
+                // JSONC, a repairing parser — accepts a backtick-quoted string.
+                '"' | '\'' => self.place = Place::Text(character),
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
                 '{' | '[' if structural => {
@@ -436,10 +445,12 @@ impl StreamStructure {
                 {
                     return Some("a value that could close a string, inside a streamed structure");
                 }
-                // A backtick string is a template literal to a JavaScript
-                // consumer, and `${` executes without carrying the delimiter.
-                // Cheap enough to refuse in every string rather than reason
-                // about which one this is.
+                // `${` executes in a JavaScript template literal without
+                // carrying its delimiter. That is the evaluation threat this
+                // module declines, so it is **defence in depth rather than a
+                // claim** — kept because a detected value containing `${` is
+                // vanishingly rare, so it costs nothing, and dropped the moment
+                // it costs something.
                 if value.contains("${") {
                     return Some("a value that could open an interpolation, inside a stream");
                 }

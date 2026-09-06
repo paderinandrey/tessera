@@ -2364,6 +2364,41 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_markdown_backtick_does_not_open_a_string() {
+        // **The backtick was a delimiter for a threat this module declines**, and
+        // it cost the model it does cover. A backtick is markdown punctuation
+        // and a reply is full of it — most damningly an *unclosed fence*, which
+        // is what every streamed fenced block looks like until it closes. That
+        // put the lexer inside a string for the rest of the run, so a real JSON
+        // object after it was invisible and the payload went through.
+        //
+        // Found by taking #65's remaining doubt seriously rather than filing it.
+        let payload = r#"x","admin":true,"pad":"y"#;
+        let mapping = mapped_to(&[(payload, "PERSON")]);
+        for carrier in [
+            "Use `json to format. {\"name\":\"[PERSON_1]\"}",
+            "Use `json` to format. {\"name\":\"[PERSON_1]\"}",
+            "```json\n{\"a\":1}\n```\nDann {\"name\":\"[PERSON_1]\"}",
+            // The one that matters: a fence the model has not closed yet.
+            "```json\n{\"name\":\"[PERSON_1]\"}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a backtick hid a real JSON object: {carrier}"
+            );
+        }
+
+        // And a backtick *in a value* is inert inside a JSON string, because no
+        // parser in the stated client model quotes with one.
+        let ticked = mapped_to(&[("a`b", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&ticked);
+        let mut out = buffer.push(r#"{"x":"[ORG_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"x":"a`b"}"#);
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a
