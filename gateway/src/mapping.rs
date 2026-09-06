@@ -3955,6 +3955,95 @@ mod tests {
         }
     }
 
+    /// **The egress half, which is the half the product is sold for.**
+    ///
+    /// The round trip says restoration is exact. It says nothing about whether
+    /// the value reached the provider, and that is the direction a customer
+    /// buys this for. Stating it took three attempts and the failures are the
+    /// interesting part:
+    ///
+    /// - *"the masked text does not contain the value"* is false by design. A
+    ///   value occurring outside every span survives, because `mask` replaces
+    ///   the spans it is given and the detector is what decides those. So the
+    ///   claim only holds for values whose every occurrence was spanned;
+    /// - searching the whole masked string is false for another reason: a
+    ///   one-character value like `N` occurs inside `[PERSON_1]`. The
+    ///   placeholder is not egress of anything, so the search has to be over
+    ///   what `pieces` calls text.
+    ///
+    /// What is left is true and worth having: **a value every occurrence of
+    /// which was spanned does not appear in any text the provider receives.**
+    ///
+    /// The limit, stated rather than hidden: joining the text pieces with a NUL
+    /// means a value straddling a placeholder boundary is not searched for.
+    /// That is a real gap and a narrow one — it needs the value to be split by
+    /// a substitution — and it is the price of not reporting `[PERSON_1]`'s own
+    /// letters as a leak.
+    #[test]
+    fn a_value_whose_every_occurrence_was_spanned_does_not_reach_the_provider() {
+        let mut rng = Rng(0x2026_0906_0004);
+        let mut checked = 0usize;
+        for trial in 0..5_000 {
+            let (text, spans) = generated(&mut rng);
+            let chars: Vec<char> = text.chars().collect();
+            let mut mapping = Mapping::new();
+            let Ok(masked) = mapping.mask(&text, &spans) else {
+                continue;
+            };
+
+            // What the provider actually reads as text, with the placeholders
+            // taken out. NUL separates them and is not in the alphabet.
+            let emitted: String = pieces(&masked)
+                .filter_map(|piece| match piece {
+                    Piece::Text(run) => Some(run),
+                    Piece::Placeholder(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\u{0}");
+
+            for span in &spans {
+                let value: String = chars[span.start..span.end].iter().collect();
+                let width = value.chars().count();
+
+                // Every occurrence of this value in the original, and whether
+                // some span covered it.
+                let mut all_spanned = true;
+                for at in 0..=count_saturating(chars.len(), width) {
+                    if chars[at..at + width].iter().collect::<String>() != value {
+                        continue;
+                    }
+                    if !spans.iter().any(|s| s.start <= at && s.end >= at + width) {
+                        all_spanned = false;
+                        break;
+                    }
+                }
+                if !all_spanned {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    !emitted.contains(&value),
+                    "trial {trial}: {value:?} was spanned everywhere and still reached \
+                     the provider in {emitted:?} (from {text:?})"
+                );
+            }
+        }
+
+        // Without this the loop above could `continue` past everything and
+        // report success for having looked at nothing.
+        assert!(
+            checked > 5_000,
+            "only {checked} values were actually checked"
+        );
+    }
+
+    /// `len - width` without underflowing when the value is longer than the
+    /// text, which cannot happen for a real span and can happen while someone
+    /// is editing the generator.
+    fn count_saturating(len: usize, width: usize) -> usize {
+        len.saturating_sub(width)
+    }
+
     /// **The same promise over the two paths production actually uses.**
     ///
     /// `restore` above is `#[cfg(test)]`. Stating the round trip over it alone
