@@ -270,11 +270,32 @@ impl StreamStructure {
     /// Fold a run of emitted text into the state.
     fn saw(&mut self, text: &str) {
         for character in text.chars() {
-            self.step(character);
+            self.step(character, true);
         }
     }
 
-    fn step(&mut self, character: char) {
+    /// Fold in text whose brackets are **not** structure: a token restored to
+    /// itself.
+    ///
+    /// **It still has to be fed through.** Skipping it entirely leaves the
+    /// state mid-character — a backslash before the token stays pending, so the
+    /// quote *after* it is consumed as escaped, the string never closes, and a
+    /// later token reads as quoted content where structural punctuation is
+    /// inert. Measured: `{"x":"\[PERSON_1]","y":[PERSON_2]}` admitted
+    /// `null,admin:true` into a bare position it had mis-lexed as a string.
+    /// Found in review of #66, against the exception the same pull request
+    /// introduced.
+    ///
+    /// So the token advances escapes and delimiters like any other text, and
+    /// only its brackets are silenced — which is the whole of what
+    /// `reserve_literals` restoring a token to itself should mean.
+    fn saw_token(&mut self, text: &str) {
+        for character in text.chars() {
+            self.step(character, false);
+        }
+    }
+
+    fn step(&mut self, character: char, structural: bool) {
         let previous = self.last.replace(character);
         if self.escaped {
             self.escaped = false;
@@ -302,7 +323,7 @@ impl StreamStructure {
                 '"' | '\'' | '`' => self.place = Place::Text(character),
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
-                '{' | '[' => {
+                '{' | '[' if structural => {
                     self.container = true;
                     self.place = Place::Bare;
                 }
@@ -801,7 +822,9 @@ impl Mapping {
                     // opened a bare position on the first token and refused an
                     // ordinary name on the second. That is prose, and it is the
                     // traffic the reserve-literals mechanism exists for (#32).
-                    if value != candidate {
+                    if value == candidate {
+                        state.saw_token(value);
+                    } else {
                         state.saw(value);
                     }
                     out.push_str(value);

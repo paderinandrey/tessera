@@ -2178,6 +2178,35 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_self_mapped_token_still_advances_the_lexer() {
+        // **Skipping it entirely left the state mid-character.** A backslash
+        // before the token stayed pending, so the quote *after* it was consumed
+        // as escaped, the string never closed, and the next token read as quoted
+        // content — where `null,admin:true` is inert, so it went through and
+        // added a member. Found in review of #66, against the exception that
+        // pull request introduced two commits earlier.
+        let mut mapping = Mapping::new();
+        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .mask(
+                "null,admin:true",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 15,
+                }],
+            )
+            .unwrap();
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(
+            buffer
+                .push(r#"{"x":"\[PERSON_1]","y":[PERSON_2]}"#)
+                .is_err(),
+            "the escape before the token was still pending when the quote after it arrived"
+        );
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a
