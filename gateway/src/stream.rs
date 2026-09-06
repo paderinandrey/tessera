@@ -2954,6 +2954,98 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_fence_that_says_it_holds_json_is_judged_as_json() {
+        // The info string is the one word a region ever says about what will
+        // read it, and throwing it away meant an e-mail address could not be
+        // restored into a JSON example a model wrote — while the same value in
+        // the same JSON outside a fence streamed fine.
+        for (value, kind) in [
+            ("uschihiller@example.org", "EMAIL"),
+            ("419/130/29933", "DE_STEUERNUMMER"),
+            ("Boerner AG & Co. KGaA", "ORG"),
+        ] {
+            let map = mapped_to(&[(value, kind)]);
+            let mut buffer = RestoreBuffer::new(&map);
+            let carrier = format!("```json\n{{\"v\":\"[{kind}_1]\"}}\n```");
+            let mut out = buffer.push(&carrier).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(out, format!("```json\n{{\"v\":\"{value}\"}}\n```"));
+        }
+
+        // **And it is the tag that does it, not the fence.** Untagged, and
+        // tagged with anything this does not recognise, stay strict — which is
+        // the direction an attacker-influenced tag has to fail in.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        // `json5x` is the one that matters: its first five characters *are* a
+        // tag, so a buffer that truncates instead of rejecting reads it as one.
+        // Found by mutation — the four obvious openers below all pass either
+        // way.
+        for opener in [
+            "```",
+            "```yaml",
+            "```sh",
+            "```jsonx",
+            "```jsonnet",
+            "```json5x",
+            "``",
+        ] {
+            let mut buffer = RestoreBuffer::new(&mail);
+            assert!(
+                buffer
+                    .push(&format!("{opener}\n{{\"v\":\"[EMAIL_1]\"}}\n"))
+                    .is_err(),
+                "{opener} was treated as a place whose language is known"
+            );
+        }
+
+        // The tag is read case-insensitively and past a following attribute,
+        // because markdown puts the language first and tools put other things
+        // after it.
+        for opener in ["```JSON", "```json title=\"a.json\""] {
+            let mut buffer = RestoreBuffer::new(&mail);
+            assert!(
+                buffer
+                    .push(&format!("{opener}\n{{\"v\":\"[EMAIL_1]\"}}\n"))
+                    .is_ok(),
+                "{opener} names JSON and was judged as though it did not"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_fence_is_still_a_fence_and_not_a_string() {
+        // Widening it to the container rule must not widen it to the *string*
+        // rule: a value that could add a member is refused inside a JSON fence
+        // exactly as it is inside a JSON document.
+        let payload = mapped_to(&[(r#"x","admin":true"#, "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&payload);
+        assert!(buffer.push("```json\n{\"v\":\"[PERSON_1]\"}\n").is_err());
+
+        let comment = mapped_to(&[("a//b", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&comment);
+        assert!(buffer.push("```json\n{\"v\":\"[PERSON_1]\"}\n").is_err());
+
+        // A token in the info line itself is judged before the fence has said
+        // anything, so it takes the strict rule — the region cannot claim to
+        // hold JSON until the word is finished.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        let mut buffer = RestoreBuffer::new(&mail);
+        assert!(buffer.push("```json [EMAIL_1]\n{}\n").is_err());
+
+        // **Only a fenced block has an info string.** An inline span does not,
+        // and markdown gives it no newline either — so `` `json …` `` is a span
+        // whose first word happens to be a language name, not a fence. Reading
+        // an info string from a run of one would let that widen the rule.
+        // Found by mutation: every other test here passes with the run length
+        // relaxed to one.
+        let mut buffer = RestoreBuffer::new(&mail);
+        assert!(
+            buffer.push("`json\n{\"v\":\"[EMAIL_1]\"}\n").is_err(),
+            "a one-backtick span claimed to hold JSON"
+        );
+    }
+
+    #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
         // backtick is ordinary content inside a triple-backtick block — and

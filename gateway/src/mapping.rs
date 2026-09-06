@@ -223,6 +223,29 @@ pub const REDACTED_TYPE: &str = "REDACTED";
 /// any document a model emits, and shallow enough that the state stays small.
 const MAX_NESTING: usize = 32;
 
+/// Info strings that say the fence holds a JSON-family document.
+///
+/// **An allowlist, and short on purpose.** The tag is text the upstream wrote,
+/// so it is attacker-influenced — but a tag this does not recognise, or a
+/// missing one, falls to the strict rule, so the worst an attacker does by
+/// writing one is get the treatment they would have got anyway. Widening the
+/// rule takes a match, never a default.
+///
+/// What it buys: the same `{"mail":"[EMAIL_1]"}` streams inside a fence that
+/// already streamed outside one. Before this, an e-mail address could not be
+/// restored into a JSON example a model wrote, which is one of the more likely
+/// things for a model to write.
+///
+/// `yaml`, `sh` and `sql` are deliberately absent and would be wrong to add:
+/// the container rule admits `@`, `&` and `/`, which are an indicator, an
+/// anchor and a path separator there. This list may only grow with languages
+/// where `json_bare_inert` is inert.
+const FENCE_TAGS: &[&str] = &["json", "json5", "jsonc"];
+
+/// Longest tag worth remembering. A longer one cannot match `FENCE_TAGS`, so
+/// the buffer stops rather than growing, and the region stays strict.
+const FENCE_TAG_MAX: usize = 5;
+
 /// Where the lexer thinks the next character is.
 ///
 /// **The safety argument, which this type went three designs without having.**
@@ -296,7 +319,14 @@ enum Place {
     /// typographic apostrophe U+2019 closes nothing in any parser, so it is
     /// collateral rather than a decision. Both are #69, because widening an
     /// allowlist is a measurement and this is the third round on this file.
-    Ticked(usize),
+    ///
+    /// **It also carries what the fence said it holds.** A fenced block has an
+    /// info string — ```` ```json ```` — and throwing it away meant an e-mail
+    /// address could not be restored inside a JSON example, while the same
+    /// value in the same JSON outside a fence could. The tag is the one place
+    /// a region says what will read it, and this rule is entirely about not
+    /// knowing that. See `FENCE_TAGS`.
+    Ticked { opened_with: usize, json: bool },
     /// Inside `/* … */`.
     Block,
     /// Inside `// …`, until a newline.
@@ -349,6 +379,18 @@ pub struct StreamStructure {
     /// Consecutive backticks seen but not yet resolved: a run is only a fence
     /// once something that is not a backtick follows it.
     ticks: usize,
+    /// The fence's info string while it is still being read, and whether it
+    /// named a JSON-family language once it was. A token judged before the
+    /// info line ends is judged strictly — at that point the region has not
+    /// said anything yet.
+    info: [u8; FENCE_TAG_MAX],
+    info_len: usize,
+    reading_info: bool,
+    /// The first word of the info string is finished. Markdown puts the
+    /// language first and tools put other things after it, so
+    /// ```` ```json title="a.json" ```` is a fence of JSON — without this the
+    /// attribute overflowed the buffer and the fence read as untagged.
+    info_settled: bool,
     open: [char; MAX_NESTING],
     depth: usize,
     /// Nesting past `MAX_NESTING`, which stops the stack being a memory bound a
@@ -431,15 +473,40 @@ impl StreamStructure {
     /// neither until something that is not a backtick follows it. Called both
     /// when that character arrives and before judging a value, since a token can
     /// sit immediately after the run that opened its region.
+    /// Whether the info string just read names a JSON-family language.
+    ///
+    /// The first word only — ```` ```json title="a.json" ```` is a fence of
+    /// JSON, and markdown puts the language first. Anything unrecognised is
+    /// `false`, which is the strict rule, so this cannot widen by accident.
+    fn tagged_json(&self) -> bool {
+        if self.info_len > FENCE_TAG_MAX {
+            return false;
+        }
+        let word = &self.info[..self.info_len];
+        FENCE_TAGS.iter().any(|tag| tag.as_bytes() == word)
+    }
+
     fn settle(&mut self) {
         if self.ticks == 0 {
             return;
         }
         match self.place {
-            Place::Ticked(opened_with) if self.ticks >= opened_with => {
+            Place::Ticked { opened_with, .. } if self.ticks >= opened_with => {
+                self.reading_info = false;
                 self.place = self.outside();
             }
-            Place::Prose | Place::Bare => self.place = Place::Ticked(self.ticks),
+            Place::Prose | Place::Bare => {
+                // Only a fenced block has an info string; an inline `code`
+                // span never does, so a run under three opens a region that
+                // can never claim to hold JSON.
+                self.reading_info = self.ticks >= 3;
+                self.info_len = 0;
+                self.info_settled = false;
+                self.place = Place::Ticked {
+                    opened_with: self.ticks,
+                    json: false,
+                };
+            }
             _ => {}
         }
         self.ticks = 0;
@@ -453,7 +520,10 @@ impl StreamStructure {
         }
         // Backticks are punctuation only outside a string or comment; inside
         // one they are ordinary content.
-        if matches!(self.place, Place::Prose | Place::Bare | Place::Ticked(_)) {
+        if matches!(
+            self.place,
+            Place::Prose | Place::Bare | Place::Ticked { .. }
+        ) {
             if character == '`' {
                 self.ticks += 1;
                 return;
@@ -493,8 +563,38 @@ impl StreamStructure {
                 _ => {}
             },
             // Content inside the region: only a long enough run leaves it, and
-            // `settle` is what decides that.
-            Place::Ticked(_) => {}
+            // `settle` is what decides that. The one thing read here is the
+            // info string, which ends at the first newline.
+            Place::Ticked { opened_with, .. } if self.reading_info => {
+                if ends_a_line_comment(character) {
+                    self.reading_info = false;
+                    self.place = Place::Ticked {
+                        opened_with,
+                        json: self.tagged_json(),
+                    };
+                } else if self.info_settled {
+                    // Past the first word; the rest of the line is an
+                    // attribute, a filename, or noise, and none of it says
+                    // what the fence holds.
+                } else if character.is_whitespace() {
+                    // Leading space before the tag is nothing; a space after it
+                    // ends the word.
+                    self.info_settled = self.info_len > 0;
+                } else if self.info_len < FENCE_TAG_MAX && character.is_ascii() {
+                    // ASCII only: every tag in the list is one, and a
+                    // multi-byte character means this is not. Lowercased here
+                    // so ```JSON is the same fence as ```json.
+                    self.info[self.info_len] = (character as u8).to_ascii_lowercase();
+                    self.info_len += 1;
+                } else {
+                    // Longer than any tag, or not ASCII, so it is not one.
+                    // Marked past the bound rather than wrapped, which would
+                    // make `jsonxxxx` read as a prefix of itself.
+                    self.info_len = FENCE_TAG_MAX + 1;
+                    self.info_settled = true;
+                }
+            }
+            Place::Ticked { .. } => {}
             Place::Block => {
                 if character == '/' && previous == Some('*') {
                     self.place = self.outside();
@@ -641,14 +741,26 @@ impl StreamStructure {
             // the invariant on `Place` applied rather than restated: the rule
             // must be as strict as any place the parser could be in, and for
             // those three that place is unknown.
-            Place::Bare if !self.poisoned => {
+            // A fence that named a JSON-family language is a place whose
+            // language is known — it is the *only* thing a region ever says
+            // about what will read it, and it says it in the one word markdown
+            // puts there for the purpose.
+            //
+            // Safe under the invariant on `Place`: inside such a fence the
+            // parser is at a bare position (this rule exactly), inside a string
+            // (the string rule, which is looser, so this is stricter than it
+            // needs to be), or inside a JSONC comment (whose content is
+            // discarded, and `json_bare_inert` admits no `*` and no line
+            // terminator, so a value cannot end one). Never anywhere this rule
+            // is too weak for.
+            Place::Bare | Place::Ticked { json: true, .. } if !self.poisoned => {
                 if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
                     None
                 } else {
                     Some("a value that could change the structure it was substituted into")
                 }
             }
-            Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
+            Place::Bare | Place::Ticked { .. } | Place::Block | Place::Line => {
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
