@@ -179,6 +179,39 @@ message content are masked too — OpenAI's `user` and per-message `name`, Anthr
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.
 
+### Telling the gateway how your application reads a streamed response
+
+**Optional, and worth setting if the thing in front of this gateway parses the
+assistant's content as JSON.**
+
+```toml
+response_format = "json"        # or json5, or jsonc
+```
+
+On the streamed path a value has to be substituted into text that has already
+gone past — so when a placeholder sits at a *bare* position, outside a string
+and inside a structure, the gateway has to decide what a value may safely
+contain there without knowing what will read the result. Undeclared, it assumes
+the worst reader it can imagine and admits word characters, a space, a hyphen
+and a full stop. **An e-mail address does not pass that**, nor does a German tax
+number like `419/130/29933`, nor `Beckmann AG & Co. KG` — and a value that
+cannot be restored means the response is refused rather than served corrupted.
+
+Declaring `json` says a JSON-family parser reads the content, where `@`, `&` and
+`/` cannot act, and those values are restored. It changes nothing inside a
+string, which is where such values ordinarily sit and where they were always
+restored. It changes nothing in a markdown code fence or a comment either, whose
+language nobody has spoken for.
+
+**It is configuration and not a request header, on purpose.** A header would be
+sent by whoever calls the gateway — and behind an application proxy that
+forwards end-user headers, that is the end user, while the application is the
+party whose parser is at risk. The operator running this process is the one who
+knows what parses these responses, and the only one who cannot be a stranger.
+
+An unrecognised value is the strict rule rather than an error, so a typo costs
+restorations rather than a guarantee.
+
 Tool traffic is masked on the buffered path, for both providers and in both directions: a
 tool definition's description and the whole of its schema — `enum` members, `default`,
 `title`, `examples`, not `description` alone — a tool call's arguments, and a tool result.

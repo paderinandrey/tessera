@@ -195,11 +195,28 @@ pub struct RestoreBuffer<'a> {
 }
 
 impl<'a> RestoreBuffer<'a> {
+    /// A buffer for a caller that declared nothing.
+    ///
+    /// `#[cfg(test)]` because production always has an answer — `declared`
+    /// returns `Unknown` for a request with no header, so the serving path
+    /// passes a format either way. This is the convenience for the several
+    /// dozen tests that are about something else.
+    #[cfg(test)]
     pub fn new(mapping: &'a Mapping) -> Self {
+        Self::declaring(mapping, crate::mapping::ClientFormat::Unknown)
+    }
+
+    /// A buffer for a response whose caller has said how it will read it.
+    ///
+    /// `new` is `Unknown`, which is the strict rule, so every existing caller
+    /// and every test that does not care is unchanged — the widening is opt-in
+    /// by construction rather than by a default somebody has to remember to
+    /// override.
+    pub fn declaring(mapping: &'a Mapping, format: crate::mapping::ClientFormat) -> Self {
         Self {
             mapping,
             held: String::new(),
-            structure: crate::mapping::StreamStructure::default(),
+            structure: crate::mapping::StreamStructure::declaring(format),
         }
     }
 
@@ -470,6 +487,9 @@ pub struct StreamRestorer<'a> {
     queued_bytes: usize,
     /// Output that was already safe to serve when a failure stopped the stream.
     salvage: String,
+    /// Threaded to every buffer this restorer opens. Set once from the request
+    /// and never from anything the response says.
+    format: crate::mapping::ClientFormat,
 }
 
 /// A run of text in progress, and where its event wrote it last.
@@ -488,7 +508,19 @@ struct Pending {
 }
 
 impl<'a> StreamRestorer<'a> {
+    /// A restorer for a caller that declared nothing — see `RestoreBuffer::new`
+    /// for why this is test-only.
+    #[cfg(test)]
     pub fn new(provider: &'a dyn Provider, mapping: &'a Mapping) -> Self {
+        Self::declaring(provider, mapping, crate::mapping::ClientFormat::Unknown)
+    }
+
+    /// A restorer for a response whose caller has said how it will read it.
+    pub fn declaring(
+        provider: &'a dyn Provider,
+        mapping: &'a Mapping,
+        format: crate::mapping::ClientFormat,
+    ) -> Self {
         Self {
             provider,
             mapping,
@@ -498,6 +530,7 @@ impl<'a> StreamRestorer<'a> {
             queued: Vec::new(),
             queued_bytes: 0,
             salvage: String::new(),
+            format,
         }
     }
 
@@ -610,6 +643,7 @@ impl<'a> StreamRestorer<'a> {
         for slot in &slots {
             write_pointer(&mut scrubbed, &slot.pointer, "")?;
         }
+        let format = self.format;
         let mut rewritten = mapping.restore_value(&scrubbed)?;
         let mut carried = BTreeMap::new();
         for slot in &slots {
@@ -623,7 +657,7 @@ impl<'a> StreamRestorer<'a> {
                 .buffers
                 .entry(slot.key.clone())
                 .or_insert_with(|| Held {
-                    buffer: RestoreBuffer::new(mapping),
+                    buffer: RestoreBuffer::declaring(mapping, format),
                     pointer: slot.pointer.clone(),
                 });
             held.pointer = slot.pointer.clone();
@@ -740,11 +774,12 @@ pub fn restore_stream(
     provider: &'static dyn Provider,
     mapping: Mapping,
     headers: HeaderMap,
+    format: crate::mapping::ClientFormat,
     record: crate::audit::Record,
 ) -> Response {
     let body = async_stream::stream! {
         let mut upstream = response.bytes_stream();
-        let mut restorer = StreamRestorer::new(provider, &mapping);
+        let mut restorer = StreamRestorer::declaring(provider, &mapping, format);
         while let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -3030,6 +3065,87 @@ mod buffer_tests {
         let mut out = buffer.push("{company: R&[ORG_1]}").unwrap();
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, "{company: R&Development}");
+    }
+
+    #[test]
+    fn a_caller_that_says_it_reads_json_gets_the_json_rule_and_nobody_else_does() {
+        // **The one signal in this system that the attacker does not write.**
+        // #78 read a fence's own ```` ```json ```` tag and was closed for it in
+        // a sentence: the tag and the content come from the same upstream. #72
+        // inferred the grammar from a counted `{`, which is upstream-written
+        // too, and four YAML constructs took it apart. A caller declaring the
+        // format is the party whose data is at risk saying what it will do, and
+        // being wrong costs it and nobody else.
+        use crate::mapping::ClientFormat;
+
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+
+        // Undeclared is unchanged, which is the point of the default.
+        let mut buffer = RestoreBuffer::new(&mail);
+        assert!(buffer.push("{mail:[EMAIL_1]}").is_err());
+
+        // Declared, and the three formats the corpus showed cannot otherwise be
+        // written at a bare position stream.
+        for (value, kind) in [
+            ("uschihiller@example.org", "EMAIL"),
+            ("419/130/29933", "DE_STEUERNUMMER"),
+            ("Boerner AG & Co. KGaA", "ORG"),
+        ] {
+            let map = mapped_to(&[(value, kind)]);
+            let mut buffer = RestoreBuffer::declaring(&map, ClientFormat::JsonFamily);
+            let mut out = buffer.push(&format!("{{v:[{kind}_1]}}")).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(out, format!("{{v:{value}}}"));
+        }
+
+        // **A declaration widens a bare position and nothing else.** The caller
+        // said how it reads the content, not that every region inside it is
+        // that format — a fence's language is still unknown and a comment may
+        // be one the parser is not in.
+        for carrier in ["``[EMAIL_1]``", "{/* [EMAIL_1] */ a:1}"] {
+            let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::JsonFamily);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a declaration widened a place the caller said nothing about: {carrier}"
+            );
+        }
+
+        // And what a declaration must never buy: the injection the bare rule
+        // exists for is refused whatever the caller says.
+        let payload = mapped_to(&[("null,admin:true,pad:null", "ORG")]);
+        let mut buffer = RestoreBuffer::declaring(&payload, ClientFormat::JsonFamily);
+        assert!(buffer.push("{safe:false,value:[ORG_1]}").is_err());
+    }
+
+    #[test]
+    fn the_declaration_is_read_from_configuration_and_nothing_else_is() {
+        use crate::mapping::ClientFormat;
+
+        // **This was a header, and review moved it.** Behind an application
+        // proxy that forwards end-user headers, the end user would be sending
+        // the declaration while the application bears the risk — a party that
+        // might be attacking, selecting the policy that protects someone else,
+        // which is #78's defect in different clothes.
+        for value in ["json", "JSON", " json5 ", "jsonc"] {
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::JsonFamily,
+                "{value:?}"
+            );
+        }
+
+        // Every unrecognised value is `Unknown`, including a near miss. An
+        // operator who misspells it gets refused streams they can debug rather
+        // than a widened rule they did not ask for.
+        for value in ["yaml", "jsonx", "json5x", "", "application/json", "toml"] {
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::Unknown,
+                "{value:?}"
+            );
+        }
+
+        assert_eq!(ClientFormat::configured(None), ClientFormat::Unknown);
     }
 
     #[test]

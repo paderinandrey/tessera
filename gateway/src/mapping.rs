@@ -223,6 +223,68 @@ pub const REDACTED_TYPE: &str = "REDACTED";
 /// any document a model emits, and shallow enough that the state stays small.
 const MAX_NESTING: usize = 32;
 
+/// How the **caller** says it will read the response content.
+///
+/// **The one signal in this system that is not written by the party who might
+/// be attacking it.** #78 tried to read a markdown fence's ```` ```json ````
+/// info string and widen the rule for the region it opened; review closed it in
+/// one sentence — the tag and the content come from the same upstream, so
+/// writing one is worth exactly the widening it unlocks. #72 tried to infer the
+/// grammar from a counted `{`, which is upstream-written too, and four YAML
+/// constructs defeated four successive fixes before it was reverted.
+///
+/// A caller declaring the format is different in kind. It is the party whose
+/// data is at risk, saying what it will do with the response, and being wrong
+/// costs it and nobody else. That is the property both earlier attempts lacked
+/// and the reason this one is not the same mistake a third time.
+///
+/// Absent or unrecognised is `Unknown`, which is the strict rule — so the
+/// default is unchanged and a header nobody sends changes nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ClientFormat {
+    /// Nothing declared. Every place is judged as though any parser might read
+    /// it, which is what #79 left the rule at.
+    #[default]
+    Unknown,
+    /// The caller parses the content with a JSON-family reader. A bare position
+    /// is then a JSON bare position, and `json_bare_inert` says what is inert
+    /// *there* — the sentence #72 could not justify and a declaration can.
+    JsonFamily,
+}
+
+impl ClientFormat {
+    /// Read the declaration from configuration.
+    ///
+    /// **It is configuration and not a header, and that was a review finding
+    /// rather than a preference.** The first version of this took
+    /// `x-tessera-response-format` off the request, on the argument that the
+    /// caller is the party at risk. In the deployment this gateway is actually
+    /// for — an application in front, forwarding an end user's headers, parsing
+    /// the SSE itself — **the end user sends the header and the application
+    /// bears the risk**, which is #78's defect wearing a different hat: a party
+    /// that might be attacking, selecting the policy that protects someone
+    /// else.
+    ///
+    /// The operator running the process is the party who knows what parses
+    /// these responses and the only one who cannot be a stranger. So it is a
+    /// line in the config file, and there is no header.
+    ///
+    /// **Every unrecognised value is `Unknown`**, including a near miss like
+    /// `json5x`. An operator who misspells it gets the strict rule and refused
+    /// streams they can debug, rather than a widened rule they did not ask for
+    /// — the failure direction has to cost a restoration, not a guarantee.
+    pub fn configured(declared: Option<&str>) -> Self {
+        match declared
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("json" | "json5" | "jsonc") => Self::JsonFamily,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Where the lexer thinks the next character is.
 ///
 /// **The safety argument, which this type went three designs without having.**
@@ -360,6 +422,9 @@ pub struct StreamStructure {
     /// boundary is not a token boundary**: a push ending `"foo\` followed by one
     /// beginning `"` has an escaped quote, and recreating this per run read it
     /// as a closing one.
+    /// What the caller said it would do with this response. Set once, at
+    /// construction, and never from anything the upstream sends.
+    format: ClientFormat,
     escaped: bool,
     /// The last character emitted, so a `*` at the end of a value and a `/` at
     /// the start of the next run are seen as the `*/` they become.
@@ -367,6 +432,14 @@ pub struct StreamStructure {
 }
 
 impl StreamStructure {
+    /// A lexer for a response whose caller has said how it will read it.
+    pub fn declaring(format: ClientFormat) -> Self {
+        Self {
+            format,
+            ..Self::default()
+        }
+    }
+
     /// Where a closing delimiter returns to: a container if one was opened,
     /// and otherwise the prose it interrupted.
     fn outside(&self) -> Place {
@@ -626,6 +699,25 @@ impl StreamStructure {
             // held that "a masked value is not something to serve inside a
             // comment anyway" when it made either half of `*/` enough, and a
             // refusal is not a corruption. Found sweeping the lexer for #65.
+            // **The widened rule, and what it now rests on.** #72 applied this
+            // wherever a `{` had been counted, arguing that a counted brace
+            // means a JSON-family reader. The brace is written by the upstream,
+            // so it argued from the attacker's own text, and four YAML
+            // constructs took it apart. The declaration is the caller's, and
+            // being wrong about it costs the caller — which is the difference
+            // between a signal and a claim.
+            //
+            // Only a bare position widens. A backtick region, a comment and a
+            // poisoned state stay strict even under a declaration: the caller
+            // said how it reads the *content*, not that every region inside it
+            // is that format, and a comment may be one the parser is not in.
+            Place::Bare if self.format == ClientFormat::JsonFamily && !self.poisoned => {
+                if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
+                    None
+                } else {
+                    Some("a value that could change the structure it was substituted into")
+                }
+            }
             Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
                 // **A guard that looked at the carrier was written here and removed.**
                 //
@@ -1848,6 +1940,50 @@ fn leaves_any_string(character: char) -> bool {
     // code implementing it, and the detector normalizes both while keeping
     // offsets, which is how one reaches a restored value.
     matches!(character, '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
+}
+
+/// Characters that cannot act structurally at a bare position **in a document
+/// the caller has told us it reads with a JSON-family parser**.
+///
+/// **The qualifier is the whole of what changed.** This list existed in #72
+/// without it, justified by "no parser in the stated model gives these a token
+/// role" — and the model sentence says it covers *a client that parses the text
+/// as data*, which a YAML reader does. Four constructs followed: an anchor, an
+/// anchor after a block-entry indicator, an indicator written by the carrier
+/// rather than the value, and custom and verbatim tags. The list was right
+/// about JSON and answering the wrong question.
+///
+/// A caller that declares `json` has answered the right one. Each character is
+/// here because a format in the corpus cannot be written without it:
+///
+/// - `@` — every e-mail address, 8 of 8 in the corpus;
+/// - `&` — `Beckmann AG & Co. KG` and every other German company form;
+/// - `/` — `419/130/29933`, how a German tax number is written, and the one
+///   that is inert alone and structural in a pair, hence `opens_a_comment`.
+///
+/// Deliberately absent: `,` `:` `{` `}` `[` `]` `"` `'` and every line
+/// terminator, which are the injection at a bare position; and `*`, whose
+/// absence `opens_a_comment` depends on.
+fn json_bare_inert(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, ' ' | '-' | '.' | '@' | '&' | '/')
+}
+
+/// Whether a value could open a comment where it lands.
+///
+/// A `/` is inert on its own and structural in a pair, and `refuses` sees the
+/// value rather than its neighbours — so the pair has to be ruled out from
+/// inside the value. `//` is checked directly; a `/` at either end is refused
+/// because the character on the other side of it belongs to the carrier or to
+/// whatever is substituted next, and this cannot see either.
+///
+/// **There is deliberately no test for `/*`.** It cannot occur: this is reached
+/// only for a value every character of which passed `json_bare_inert`, and that
+/// does not admit `*`. A check for it was written, and removed once a mutation
+/// showed nothing could kill it — a guard no input can reach is not defence in
+/// depth, it is a claim the next reader will believe. Admitting `*` there means
+/// coming back here.
+fn opens_a_comment(value: &str) -> bool {
+    value.contains("//") || value.starts_with('/') || value.ends_with('/')
 }
 
 /// Characters that end a `//` comment.

@@ -218,6 +218,9 @@ const RETURNED_HEADERS: [&str; 6] = [
 ];
 
 pub struct AppState {
+    /// How the application in front of this gateway reads a streamed response,
+    /// from configuration rather than from a request — see `ClientFormat`.
+    pub response_format: crate::mapping::ClientFormat,
     pub detector: DetectorClient,
     pub upstream: reqwest::Client,
     pub openai_base: String,
@@ -247,6 +250,9 @@ impl AppState {
                 config.max_spans_per_entry,
             ),
             upstream: reqwest::Client::new(),
+            response_format: crate::mapping::ClientFormat::configured(
+                config.response_format.as_deref(),
+            ),
             openai_base: config.openai_base.clone(),
             anthropic_base: config.anthropic_base.clone(),
             sessions: SessionStore::new(Limits {
@@ -1041,6 +1047,7 @@ async fn handle(
             provider,
             mapping,
             returned,
+            state.response_format,
             record.clone(),
         )));
     }
@@ -1538,6 +1545,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
@@ -1564,6 +1572,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
@@ -4976,6 +4985,7 @@ mod tests {
         let audit =
             Arc::new(crate::audit::Audit::open(&dir.path().join("audit.jsonl")).expect("opens"));
         Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream_base.clone(),
@@ -5909,6 +5919,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_configured_format_reaches_the_streamed_rule() {
+        // **The unit tests prove the rule; this proves the wire.** A header the
+        // proxy reads and never passes on is the failure mode that looks like a
+        // working feature, and the plumbing runs from `handle`'s request
+        // headers through `restore_stream` and `StreamRestorer` to every
+        // `RestoreBuffer` it opens.
+        //
+        // The value is an e-mail address at a *bare* position, which is the
+        // whole of what a declaration buys — inside a string it streamed
+        // already.
+        // A span covering the whole address, because `Weber` alone is word
+        // characters and would stream under either rule — the test has to turn
+        // on the `@`, which is the character the declaration is about.
+        let address = "Weber@example.org";
+        let detector = detector_returning(json!([{
+            "entity_type": "EMAIL", "start": 0, "end": address.chars().count(),
+            "confidence": 1.0, "recognizer": "catalog:email", "tier": 2, "boosted": false
+        }]))
+        .await;
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{mail:[EMAIL_1]}\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        for (declared, expect_value) in [(None, false), (Some("json"), true), (Some("yaml"), false)]
+        {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+                )
+                .mount(&upstream)
+                .await;
+            let (state, _dir, _journal) = state_with(&detector, &upstream, test_limits());
+
+            let state = Arc::new(AppState {
+                response_format: crate::mapping::ClientFormat::configured(declared),
+                ..Arc::try_unwrap(state).ok().expect("sole owner")
+            });
+
+            let (status, served) = call_with_headers(
+                state,
+                "/v1/chat/completions",
+                json!({
+                    "model": "gpt-4",
+                    "stream": true,
+                    // `person_span` covers 0..5, so the value starts the message.
+                    "messages": [{"role": "user", "content": format!("{address} bittet")}],
+                }),
+                &session_headers("Bearer k", "s1"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{served}");
+            assert_eq!(
+                served.contains(address),
+                expect_value,
+                "declared {declared:?}: the value should {} have been restored: {served}",
+                if expect_value { "" } else { "not" }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_request_refused_by_the_journal_leaves_the_session_untouched() {
         // The other refusal class: masking succeeded, so the values exist and
         // are ready to commit, and the journal is what refuses. Nothing left
@@ -5921,6 +5996,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
@@ -6324,6 +6400,7 @@ mod tests {
         )
         .await;
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
@@ -6382,6 +6459,7 @@ mod tests {
             .await;
 
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: upstream.uri(),
@@ -6420,6 +6498,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),
@@ -7002,6 +7081,7 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let audit = Arc::new(crate::audit::Audit::open(&path).expect("opens"));
         let state = Arc::new(AppState {
+            response_format: crate::mapping::ClientFormat::Unknown,
             detector: DetectorClient::new(detector.uri(), Duration::from_secs(5), 16, UNCAPPED),
             upstream: reqwest::Client::new(),
             openai_base: base.clone(),

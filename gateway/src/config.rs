@@ -69,6 +69,28 @@ pub struct Config {
     /// a large result into a refusal.
     #[serde(default = "default_max_spans_per_entry")]
     pub max_spans_per_entry: usize,
+    /// How the application in front of this gateway reads a streamed response.
+    ///
+    /// **`json`, `json5` or `jsonc`, and absent means "assume the worst".**
+    /// On the streamed path a value has to be substituted into text that has
+    /// already gone past, so when a placeholder sits at a bare position —
+    /// outside a string, inside a structure — the rule has to hold against
+    /// whatever will read the result. Undeclared, that is word characters, a
+    /// space, a hyphen and a full stop, which **an e-mail address does not
+    /// pass**, nor `419/130/29933`, nor `Beckmann AG & Co. KG`.
+    ///
+    /// Declaring `json` says a JSON-family parser reads the content, where
+    /// `@`, `&` and `/` cannot act, and those values are restored instead of
+    /// refused.
+    ///
+    /// **It is here rather than on the request, and that is a review finding.**
+    /// A header would be sent by whoever calls the gateway — behind an
+    /// application proxy that forwards end-user headers, that is the end user,
+    /// while the application is the party whose parser is at risk. The operator
+    /// running this process is the one who knows, and the only one who cannot
+    /// be a stranger.
+    #[serde(default)]
+    pub response_format: Option<String>,
     /// How many **characters of text** one request's tool structures will hand
     /// to the detector, summed across every definition, argument and result.
     ///
@@ -348,6 +370,35 @@ mod tests {
     /// tests about the setting each one is actually exercising.
     fn with_audit(body: &str) -> String {
         format!("audit_path = \"/tmp/tessera-test-audit.jsonl\"\n{body}")
+    }
+
+    #[test]
+    fn the_response_format_is_read_from_the_file_and_reaches_the_state() {
+        // **A setting nothing reads is the shape of this defect**, and a
+        // mutation found it: `from_config` could drop `response_format` on the
+        // floor and every test about the rule still passed, because they all
+        // build `AppState` directly. This drives the line in the file.
+        let declared = Config::from_toml(&with_audit(r#"response_format = "json""#))
+            .expect("a config declaring a format is valid");
+        assert_eq!(declared.response_format.as_deref(), Some("json"));
+        let state = crate::proxy::AppState::from_config(
+            &declared,
+            std::sync::Arc::new(crate::audit::failing_audit_for_tests()),
+        );
+        assert_eq!(
+            state.response_format,
+            crate::mapping::ClientFormat::JsonFamily
+        );
+
+        // Absent is the strict rule, which is the default a deployment gets by
+        // saying nothing.
+        let silent = Config::from_toml(&with_audit("")).expect("valid");
+        assert_eq!(silent.response_format, None);
+        let state = crate::proxy::AppState::from_config(
+            &silent,
+            std::sync::Arc::new(crate::audit::failing_audit_for_tests()),
+        );
+        assert_eq!(state.response_format, crate::mapping::ClientFormat::Unknown);
     }
 
     #[test]
