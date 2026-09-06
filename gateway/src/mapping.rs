@@ -295,15 +295,42 @@ impl ClientFormat {
 /// > for every place the lexer can be in, the rule applied there must be at
 /// > least as strict as the rule of any place the parser could actually be in.
 ///
-/// Ordered by strictness, the rules are: bare (word characters only) ⊃ string
-/// (no delimiter, no backslash, no line separator, no control) ⊃ prose
+/// Ordered by strictness, the rules are: bare (word characters only) ⊃
+/// JSON-family bare (`@`, `&`, a non-pairing `/`, and only under a declaration)
+/// ⊃ string (no delimiter, no backslash, no line separator, no control) ⊃ prose
 /// (nothing). Checking every variant against that:
 ///
 /// | the lexer says | rule | where the parser could be instead | holds? |
 /// |---|---|---|---|
 /// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
+/// | `Bare`, under `ClientFormat::JsonFamily` | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
 /// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
 /// | `Prose` | nothing | nowhere, unless a `{` or a quote went uncounted | yes, with one recorded exception |
+///
+/// **The second row is the one that has been wrong three times, and it is worth
+/// being exact about what changed.** The invariant quantifies over "any place
+/// the parser could actually be in", and everything turns on who narrows
+/// *could*.
+///
+/// - **#72 narrowed it with a counted `{`** — upstream-written, so it narrowed
+///   the set using the attacker's own text. Four YAML constructs followed and
+///   it was reverted.
+/// - **#78 narrowed it with a fence's ```` ```json ```` tag** — upstream-written
+///   again. Closed unmerged.
+/// - **#81 narrows it with `response_format` in the config file.** The operator
+///   is outside the request, so nothing in the traffic moves the row. That is
+///   the difference, and it is the whole of the difference: the rule is the
+///   same three characters that review took apart twice.
+///
+/// So the row holds exactly as far as the configuration is true. A deployment
+/// that declares `json` and pipes the content to a YAML reader has moved the
+/// "could" back where it was, and the invariant with it — which is why the
+/// README says declaring it is a promise about your own parser.
+///
+/// A first version of #81 put the declaration in a request header. Review
+/// pointed out that behind an application proxy the *end user* sends it while
+/// the application bears the risk, which is #78 again in different clothes.
+/// That is the shape of mistake this row invites.
 ///
 /// The exception is deliberate and is `saw_token`'s: a self-mapped token's own
 /// `[` does not count as structure, traded for #32 and argued where it is
