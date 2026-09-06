@@ -2061,6 +2061,10 @@ fn opens_a_comment(value: &str) -> bool {
 ///
 /// U+0085 (NEL) is deliberately absent: ECMAScript does not treat it as a line
 /// terminator, so a parser in this model does not end a comment there.
+fn ends_a_line_comment(character: char) -> bool {
+    matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
 /// The strictest rule there is, and the one every place the lexer cannot
 /// vouch for takes: word characters, a space, a hyphen and a full stop.
 ///
@@ -2078,10 +2082,24 @@ fn word_characters_only(value: &str) -> Option<&'static str> {
     }
 }
 
-fn ends_a_line_comment(character: char) -> bool {
-    matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
+/// Characters that cannot act inside a JSON string **on the buffered path**.
+///
+/// The buffered path parses and re-serializes, so being wrong here costs a
+/// parse the path was going to do anyway and the value is restored correctly
+/// either way. That is why this list can be conservative where
+/// `leaves_any_string` cannot: on a stream the same conservatism costs a killed
+/// response, which is the whole reason the two predicates exist separately and
+/// is argued at length above `leaves_any_string`.
+///
+/// **It had no documentation of its own**, and a test added in review of #84
+/// is what noticed — the block above `leaves_any_string` discusses this
+/// function in the third person, which reads like documentation until you look
+/// for the declaration it precedes.
+///
+/// Measured cost, from that argument: this list rejects 3.1% of the corpus's
+/// annotated values, on `/` and `&` — every German tax number and the company
+/// forms. Free on the buffered path, and the reason the streamed path does not
+/// reuse it.
 fn json_string_inert(character: char) -> bool {
     character.is_alphanumeric()
         || matches!(
@@ -4337,6 +4355,73 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every predicate whose documentation is the argument for the rule.
+    ///
+    /// **Named rather than "all of them"**, because a blanket rule would force
+    /// prose onto helpers that do not need it and would be deleted the first
+    /// time it was inconvenient. These are the ones where the comment *is* the
+    /// security reasoning: what ends a comment, what leaves a string, what is
+    /// inert where, and what the strictest rule is.
+    const DOCUMENTED: &[&str] = &[
+        "ends_a_line_comment",
+        "word_characters_only",
+        "leaves_any_string",
+        "json_string_inert",
+        "json_bare_inert",
+        "opens_a_comment",
+        "is_type_characters",
+    ];
+
+    /// **Four review rounds have reported the same defect, so it is checked
+    /// rather than remembered.**
+    ///
+    /// Rust attaches a `///` block to the next item. Inserting a function
+    /// immediately above the one you were reading therefore takes its
+    /// documentation — silently, because it still compiles — and the prose
+    /// explaining why a terminator set must be exact ends up describing an
+    /// allowlist helper while the predicate it belongs to has none.
+    ///
+    /// `leaves_any_string` lost its documentation that way in #70 and nobody
+    /// noticed for nine PRs. The others were caught in review of #79 and #84,
+    /// twice each, by a reviewer reading the diff.
+    ///
+    /// This is the detection: a function inserted above one of these leaves it
+    /// with no `///` line above, and the test fails naming it.
+    #[test]
+    fn the_predicates_that_carry_an_argument_still_carry_it() {
+        let source = include_str!("mapping.rs");
+        let lines: Vec<&str> = source.lines().collect();
+
+        for wanted in DOCUMENTED {
+            // Visibility varies — `pub(crate) fn is_type_characters` is one —
+            // so the declaration is matched on the name rather than on a
+            // prefix. A matcher that missed a function would report it as
+            // *gone*, which is a failure and not a hole, but a confusing one.
+            let declaration = format!("fn {wanted}");
+            let at = lines
+                .iter()
+                .position(|line| {
+                    let trimmed = line
+                        .trim_start_matches("pub(crate) ")
+                        .trim_start_matches("pub ");
+                    trimmed.starts_with(&declaration) && !line.starts_with(' ')
+                })
+                .unwrap_or_else(|| panic!("{wanted} is gone; this list has to move with it"));
+            let mut above = at - 1;
+            while lines[above].starts_with("#[") {
+                above -= 1;
+            }
+            assert!(
+                lines[above].starts_with("///"),
+                "{wanted} has no documentation above it — most likely a function was \
+                 inserted between it and its `///` block, which Rust reattaches silently. \
+                 Line {}: {:?}",
+                above + 1,
+                lines[above]
+            );
         }
     }
 
