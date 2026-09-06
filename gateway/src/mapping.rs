@@ -626,29 +626,28 @@ impl StreamStructure {
             // held that "a masked value is not something to serve inside a
             // comment anyway" when it made either half of `*/` enough, and a
             // refusal is not a corruption. Found sweeping the lexer for #65.
-            // **A bare position inside a container is a place whose language
-            // is known; a region and a comment are not.** They shared one rule
-            // and it was word characters only, which meant an e-mail address
-            // could never be restored at a bare position — 8 of 8 EMAIL in the
-            // corpus, and 2 of 2 DE_STEUERNUMMER, refused on `@` and `/`. A
-            // format refused outright is not a hard case, it is the type.
-            //
-            // Reaching `Place::Bare` unpoisoned means a `{` or `[` was counted
-            // at a structural position, so a JSON-family parser is reading this
-            // and `json_bare_inert` may say what is inert *to that parser*. A
-            // backtick region, a comment and a poisoned state say nothing about
-            // what will read them, so they keep the word-only rule — which is
-            // the invariant on `Place` applied rather than restated: the rule
-            // must be as strict as any place the parser could be in, and for
-            // those three that place is unknown.
-            Place::Bare if !self.poisoned => {
-                if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
-                    None
-                } else {
-                    Some("a value that could change the structure it was substituted into")
-                }
-            }
             Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
+                // **A guard that looked at the carrier was written here and removed.**
+                //
+                // `completes_an_indicator` refused a token whose immediately preceding carrier
+                // character was `&` or `*`, because a word-like value cannot be made safe by
+                // any allowlist once the carrier has opened a YAML anchor or alias name —
+                // `{key: &victim secret, other: *[ORG_1]}` with the value `victim`.
+                //
+                // It went because it was a quarter of a fix with a whole cost. It missed the
+                // verbatim tag `!<[ORG_1]>`, where the preceding character is `<`; it missed
+                // block style entirely, where the lexer never leaves `Place::Prose` and
+                // nothing is refused at all; and **it refused correct restorations**:
+                // `{company: R&[ORG_1]}` with `Development` is the plain scalar
+                // `R&Development` to every YAML reader, and a refusal there kills a stream
+                // that had nothing wrong with it. Same for `*[PERSON_1]*` inside a fence,
+                // which is markdown emphasis.
+                //
+                // One character of lookback cannot tell a node start from the middle of a
+                // scalar, and the thing that could — knowing when the document might be YAML
+                // at all — is #80. Raised across three rounds of review on #79, the last of
+                // which found the false refusal.
+                //
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
@@ -1841,6 +1840,16 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// **The residual:** a delimited-string format whose delimiter is none of the
 /// three above would be missed. I know of none, and say so rather than implying
 /// the set is proven.
+fn leaves_any_string(character: char) -> bool {
+    // The escape can consume the delimiter after it, and a character the format
+    // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
+    // line terminators to a JSON5 reader and Rust's `is_control` covers only C0
+    // and C1 — they were inside the hazard the enumeration names and outside the
+    // code implementing it, and the detector normalizes both while keeping
+    // offsets, which is how one reaches a restored value.
+    matches!(character, '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
+}
+
 /// Characters that end a `//` comment.
 ///
 /// **Not just `\n`.** A JSON5 line comment is ECMAScript's, and ECMAScript ends
@@ -1860,70 +1869,6 @@ impl<'de> Visitor<'de> for DuplicateScanVisitor {
 /// terminator, so a parser in this model does not end a comment there.
 fn ends_a_line_comment(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
-/// Characters that cannot act structurally at a bare position in a JSON-family
-/// document.
-///
-/// **An allowlist, for the reason `Place::Bare` gives**: at a bare position no
-/// blocklist works, because `{safe:false,value:[ORG_1]}` with
-/// `null,admin:true,pad:null` adds a member out of nothing a blocklist would
-/// name. So the question each character has to answer is not "is it dangerous"
-/// but "does any parser in the stated model give it a role here".
-///
-/// Word characters, spaces, hyphens and full stops answered it first. These
-/// answer it too, and each is here because the corpus showed a format that
-/// cannot be written without it:
-///
-/// - `@` — every e-mail address. No JSON, JSON5, JSONC or repairing parser
-///   gives it a token role anywhere;
-/// - `&` — `Beckmann AG & Co. KG` and every other German company form. Same;
-/// - `/` — `419/130/29933`, how a German tax number is written. **Not the same,
-///   and it is the one that needs `opens_a_comment`**: `//` and `/*` open
-///   comments in JSON5, and a comment can delete the rest of a line including a
-///   closing brace.
-///
-/// Deliberately absent: `,` `:` `{` `}` `[` `]` `"` `'` and every line
-/// terminator, which are the injection at a bare position; and `*`.
-///
-/// **`*`'s absence is load-bearing elsewhere.** `opens_a_comment` does not test
-/// for `/*` precisely because no value carrying a `*` reaches it, and a `*`
-/// admitted here would also pair with a `/` on the carrier's side that neither
-/// function can see. Adding it means revisiting both.
-///
-/// `&` is an anchor in YAML and `@` a reserved indicator, which is why this rule
-/// is not the one applied to a backtick region — see `Place::Bare`'s arm.
-fn json_bare_inert(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, ' ' | '-' | '.' | '@' | '&' | '/')
-}
-
-/// Whether a value could open a comment where it lands.
-///
-/// A `/` is inert on its own and structural in a pair, and `refuses` sees the
-/// value rather than its neighbours — so the pair has to be ruled out from
-/// inside the value. `//` is checked directly; a `/` at either end is refused
-/// because the character on the other side of it belongs to the carrier or to
-/// whatever is substituted next, and this cannot see either.
-///
-/// **There is deliberately no test for `/*`.** It cannot occur: this is reached
-/// only for a value every character of which passed `json_bare_inert`, and that
-/// does not admit `*`. A check for it was written, and removed once a mutation
-/// showed nothing could kill it — **a guard no input can reach is not defence in
-/// depth, it is a claim the next reader will believe.** The dependency runs the
-/// other way and is recorded on `json_bare_inert`: admitting `*` there means
-/// coming back here.
-fn opens_a_comment(value: &str) -> bool {
-    value.contains("//") || value.starts_with('/') || value.ends_with('/')
-}
-
-fn leaves_any_string(character: char) -> bool {
-    // The escape can consume the delimiter after it, and a character the format
-    // forbids raw ends the string wherever it appears. U+2028 and U+2029 are
-    // line terminators to a JSON5 reader and Rust's `is_control` covers only C0
-    // and C1 — they were inside the hazard the enumeration names and outside the
-    // code implementing it, and the detector normalizes both while keeping
-    // offsets, which is how one reaches a restored value.
-    matches!(character, '\\' | '\u{2028}' | '\u{2029}') || character.is_control()
 }
 
 fn json_string_inert(character: char) -> bool {
