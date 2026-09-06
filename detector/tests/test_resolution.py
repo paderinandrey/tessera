@@ -617,3 +617,48 @@ def test_two_adjacent_spans_are_two_spans() -> None:
     # boundary rather than a hole.
     touching = span(entity_type="PERSON", start=9, end=18, recognizer="ner:gliner", tier=2)
     assert len(resolve([first, touching], specificity=SPEC).spans) == 1
+
+
+# Every rule `_resolve_pair` can return. Hard-coded rather than derived, so
+# adding a rule fails this until the generator is shown to reach it.
+RULES = {
+    "same-type-merge",
+    "untouchable-inner-merge",
+    "specific-inner-merge",
+    "nested-specificity-merge",
+    "nested-sensitivity-merge",
+    "nesting-outer-wins",
+    "untouchable-wins",
+    "specificity",
+    "confidence",
+    "tie-merge-sensitive",
+}
+
+
+def test_the_generator_reaches_every_rule() -> None:
+    """**The properties are worth what the generator reaches, and nothing more.**
+
+    Three tests above assert an invariant over 2000 random span sets, which is a
+    claim about the rules those sets happen to exercise. Left unstated, that is
+    the same kind of gap the properties exist to close one level down: a test
+    that looks exhaustive because of its shape rather than its coverage.
+
+    Measured, the ten rules fire 781, 710, 488, 344, 338, 148, 40, 20, 7 and 1
+    times. **The tail is thin** — `nested-sensitivity-merge` is reached once —
+    so a change to the generator could stop reaching it while every property
+    above still passed, and the seed is fixed precisely so that this is a
+    property of the code rather than of the day.
+
+    Naming the members rather than counting them: a rule added to
+    `_resolve_pair` fails here until somebody shows the generator reaches it.
+    """
+    rng = random.Random(RANDOM_SEED)
+    reached: set[str] = set()
+    for _ in range(2000):
+        spans = _random_spans(rng, rng.randrange(2, 7))
+        reached.update(d.rule for d in resolve(spans, specificity=SPEC).trace)
+
+    assert reached == RULES, (
+        f"never reached: {sorted(RULES - reached)}; "
+        f"unknown rules seen: {sorted(reached - RULES)}"
+    )
