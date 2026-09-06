@@ -240,12 +240,34 @@ enum Place {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamStructure {
     place: Place,
-    /// A `{` or `[` has gone past. **Kept apart from `place` because closing a
-    /// string does not put you in a container.** A first version returned to
-    /// `Bare` whenever a string ended, so `she said "hello" to [PERSON_1]` —
-    /// prose — was treated as a bare member position and refused a name with an
-    /// apostrophe in it. What a closing quote returns you to is where you were.
-    container: bool,
+    /// How many containers are open. **Depth rather than a flag, and the
+    /// difference is most of what this rule costs.**
+    ///
+    /// A flag never came down, so the first `{` in a run armed the bare-position
+    /// rule for everything after it — and a model reply is full of JSON
+    /// snippets. Measured against the flag version, every one of these ended the
+    /// stream:
+    ///
+    /// ```text
+    /// Here is the data: {"a":1}. The customer is [PERSON_1].   O'Brien
+    /// Beispiel: {"x":2}  Die Firma [ORG_1] hat angerufen.      Boerner AG & Co
+    /// Result: [1,2,3]. Steuernummer [DE_STEUERNUMMER_1].       419/130/29933
+    /// Kontakt nach dem Beispiel {"k":1}: [EMAIL_1]             martina@…
+    /// ```
+    ///
+    /// All four are prose with a closed container behind them, and all four are
+    /// ordinary. Counting down returns them to prose, where nothing is refused.
+    ///
+    /// **Kept apart from `place` because closing a string does not put you in a
+    /// container.** A first version returned to `Bare` whenever a string ended,
+    /// so `she said "hello" to [PERSON_1]` — prose — was treated as a bare
+    /// member position. What a closing delimiter returns you to is where you
+    /// were, which is what `outside` answers.
+    ///
+    /// Unbalanced text stays armed, which is the safe direction: `the set {a, b`
+    /// never closes, and a stray `}` in prose clamps at zero rather than
+    /// unwinding a container nobody opened.
+    depth: usize,
     /// A backslash ended the last fragment. **Carried, because a fragment
     /// boundary is not a token boundary**: a push ending `"foo\` followed by one
     /// beginning `"` has an escaped quote, and recreating this per run read it
@@ -260,7 +282,7 @@ impl StreamStructure {
     /// Where a closing delimiter returns to: a container if one was opened,
     /// and otherwise the prose it interrupted.
     fn outside(&self) -> Place {
-        if self.container {
+        if self.depth > 0 {
             Place::Bare
         } else {
             Place::Prose
@@ -344,9 +366,16 @@ impl StreamStructure {
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
                 '{' | '[' if structural => {
-                    self.container = true;
+                    self.depth += 1;
                     self.place = Place::Bare;
                 }
+                '}' | ']' if structural => {
+                    // Saturating, because a closing brace in prose closes
+                    // nothing and must not unwind a container nobody opened.
+                    self.depth = self.depth.saturating_sub(1);
+                    self.place = self.outside();
+                }
+
                 _ => {}
             },
         }
