@@ -557,21 +557,6 @@ impl StreamStructure {
             // value ending `*` before a carrier `/` is the same escape. Refusing
             // both characters inside a comment costs nothing anyone needs: a
             // masked value is not something to serve inside a comment anyway.
-            Place::Block | Place::Line => {
-                // The union of both closings: `*` and `/` assemble a block
-                // comment's `*/`, and `ends_a_line_comment` is every character
-                // that ends a line one. Each rule is wider than the place it is
-                // applied to needs, which costs a value nobody has and saves the
-                // two arms from drifting apart.
-                if value
-                    .chars()
-                    .any(|c| matches!(c, '*' | '/') || ends_a_line_comment(c))
-                {
-                    Some("a value that could close a comment, inside a stream")
-                } else {
-                    None
-                }
-            }
             // **A bare position needs no hazardous character.**
             // `{safe:false,value:[ORG_1]}` with `null,admin:true,pad:null` is
             // valid JSON5 and adds a member out of nothing this could blocklist.
@@ -581,7 +566,38 @@ impl StreamStructure {
             // A backtick region is judged like a bare position, for the reason
             // `Place::Ticked` gives: whichever of the two readings is right, a
             // value that can act structurally can act.
-            Place::Bare | Place::Ticked(_) => {
+            // **A comment is judged by the bare rule too, because the lexer
+            // can be in one when the parser is not.** A rule of its own —
+            // refuse what closes a comment — was three injections, and none of
+            // them needed a comment to exist at all:
+            //
+            //   Siehe https://acme.example {"name":"[PERSON_1]"}
+            //
+            // the `//` of an ordinary URL opens a line comment that never
+            // closes, so the `{` and the quotes after it are swallowed as
+            // comment content and the token is judged by the one rule that
+            // permits exactly those characters. Prose quoting a `/*` does the
+            // same across newlines.
+            //
+            // The argument this file needed and did not have: **for every place
+            // the lexer can be in, the rule applied there must be at least as
+            // strict as the rule of any place the parser could actually be in.**
+            // A string misread as prose is safe because the string rule is
+            // stricter than prose's; anything misread as bare is safe because
+            // bare is strictest. The comment rule was the one that failed that
+            // test, and it failed against every other place at once.
+            //
+            // Nothing about comments is lost by folding it in — the lexer still
+            // tracks them, which is what keeps a quote inside one from opening a
+            // string (#64). What goes is only the *looser judgement* that being
+            // inside one used to buy.
+            //
+            // The price: a value in a genuine comment must be word-like, so
+            // `// Kunde: O'Brien` refuses where it streamed. This module already
+            // held that "a masked value is not something to serve inside a
+            // comment anyway" when it made either half of `*/` enough, and a
+            // refusal is not a corruption. Found sweeping the lexer for #65.
+            Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))

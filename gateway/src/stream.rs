@@ -2518,30 +2518,41 @@ mod buffer_tests {
     }
 
     #[test]
-    fn a_value_carrying_a_line_terminator_cannot_end_a_comment() {
-        // The other half: the carrier's comment is open, and the *value* ends
-        // it. `\n` and `\r` were already refused; U+2028 and U+2029 are line
-        // terminators to the same reader and were not.
+    fn the_line_terminator_set_is_exactly_four_characters() {
+        // Once a comment is judged by the bare rule, a stale comment state is
+        // no longer *loose* — bare is the strictest rule there is. What it still
+        // costs is the container depth, which is what
+        // `a_comment_the_lexer_never_leaves_loses_the_container` is about. This
+        // one pins the set itself.
+        //
+        // `a,b` is the probe: the bare rule refuses the comma and the string
+        // rule does not, so recognising a terminator is visible as the token
+        // being judged where it actually is rather than one place behind.
         for terminator in ['\n', '\r', '\u{2028}', '\u{2029}'] {
-            let escaping = mapped_to(&[(&format!(r#"a{terminator}"admin":true"#), "PERSON")]);
-            let mut buffer = RestoreBuffer::new(&escaping);
-            assert!(
-                buffer.push("// note [PERSON_1]").is_err(),
-                "{terminator:?} in a value ended the comment it was substituted into"
+            let comma = mapped_to(&[("a,b", "PERSON")]);
+            let carrier = format!(r#"// note{terminator}{{"x":"[PERSON_1]"}}"#);
+            let mut buffer = RestoreBuffer::new(&comma);
+            let mut out = buffer.push(&carrier).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(
+                out,
+                format!(r#"// note{terminator}{{"x":"a,b"}}"#),
+                "{terminator:?} ends a comment, so the token is inside the string"
             );
         }
 
-        // **The set's far edge, asserted rather than left to a comment.**
-        // Widening it is invisible to every test above — more refusals break
-        // nothing — so the four members are pinned from both sides. U+0085 is a
-        // control character and not an ECMAScript LineTerminator, so a parser in
-        // this model does not end a comment there and refusing it would be cost
-        // with no threat behind it. Anyone adding it has to edit this.
-        let nel = mapped_to(&[("a\u{85}b", "PERSON")]);
-        let mut buffer = RestoreBuffer::new(&nel);
-        let mut out = buffer.push("// note [PERSON_1]").unwrap();
-        out.push_str(&buffer.finish().unwrap());
-        assert_eq!(out, "// note a\u{85}b");
+        // **The far edge, asserted rather than left to a comment.** U+0085 is a
+        // control character and not an ECMAScript LineTerminator, so no parser
+        // in this model ends a comment there and the lexer must not either.
+        // Widening the set is invisible to every safety test — the bare rule is
+        // already the strictest — so the four members are pinned from both
+        // sides and anyone adding a fifth has to edit this.
+        let comma = mapped_to(&[("a,b", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&comma);
+        assert!(
+            buffer.push("// note\u{85}{\"x\":\"[PERSON_1]\"}").is_err(),
+            "U+0085 ended a comment that no parser here ends"
+        );
     }
 
     #[test]
@@ -2586,6 +2597,71 @@ mod buffer_tests {
         let mut out = buffer.push(carrier).unwrap();
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, "{\"note\":\"Kunde\u{2028}x,admin:true,pad:1}");
+    }
+
+    #[test]
+    fn a_comment_the_lexer_never_leaves_loses_the_container() {
+        // The bare rule makes a stale comment state strict rather than loose,
+        // so this is the injection that survives it: while the lexer believes it
+        // is in a comment it ignores `{`, and when the comment finally ends the
+        // depth is 0. Depth 0 outside a string is prose, and prose refuses
+        // nothing — so a token at a bare position inside a real object is judged
+        // as though there were no object.
+        //
+        // `// note\r{"a":1,\n admin:[PERSON_1]}` admitted `1,"admin":true` before
+        // the carriage return was a terminator. That is why the set has to be
+        // right and not merely conservative.
+        let payload = mapped_to(&[(r#"1,"admin":true"#, "PERSON")]);
+        for carrier in [
+            "{\"a\":1,\n admin:[PERSON_1]}",
+            "// note\r{\"a\":1,\n admin:[PERSON_1]}",
+            "// note\u{2028}{\"a\":1,\n admin:[PERSON_1]}",
+            "// note\n{\"a\":1,\n admin:[PERSON_1]}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&payload);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "the object was lost while the lexer sat in a comment: {carrier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_the_carrier_never_opened_is_judged_strictly() {
+        // Three injections that needed no comment to exist. A comment rule of
+        // its own permits exactly the characters a string rule refuses, so
+        // *entering a comment spuriously* was worth more to an attacker than
+        // any value could be — and `//` and `/*` occur in ordinary prose.
+        let payload = mapped_to(&[(r#"x","admin":true,"pad":"y"#, "PERSON")]);
+        for carrier in [
+            // the `//` of a URL, opening a line comment that never closes
+            "Siehe https://acme.example {\"name\":\"[PERSON_1]\"}",
+            // prose quoting a C comment, which then runs across newlines
+            "Beispiel: /* Kommentar\n\n{\"name\":\"[PERSON_1]\"}",
+            // and an ordinary sentence with a double slash in it
+            "Beispiel: // Kommentar dann {\"name\":\"[PERSON_1]\"}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&payload);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a place the parser is not in was judged by its own looser rule: {carrier:?}"
+            );
+        }
+
+        // The price, so it is a fixture rather than a surprise: a value in a
+        // genuine comment must be word-like now.
+        let plain = mapped_to(&[("Weber", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&plain);
+        let mut out = buffer.push("{/* kunde [PERSON_1] */ a:1}").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "{/* kunde Weber */ a:1}");
+
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&irish);
+        assert!(
+            buffer.push("{/* kunde [PERSON_1] */ a:1}").is_err(),
+            "the apostrophe is the price of judging a comment strictly"
+        );
     }
 
     #[test]
