@@ -1709,11 +1709,14 @@ mod buffer_tests {
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, r#"Weber" and " wrote {"a":1} and "#);
 
-        // And once it has been opened it stays opened, in the same run: a
-        // second token after the brace is refused.
+        // And while it is *open* it encloses what follows, in the same run.
+        // This used to use `{"b":1}` — closed — and asserted a refusal, which
+        // was the flag never coming down rather than the property it names. A
+        // closed container returns to prose now, and the container here stays
+        // open so the assertion is about enclosure again.
         let mut buffer = RestoreBuffer::new(&mapping);
         let error = buffer
-            .push(r#"a {"b":1} then [PERSON_1]"#)
+            .push(r#"a {"b":1, "c": [PERSON_1]"#)
             .expect_err("a container opened earlier in the same run still encloses this token");
         assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
     }
@@ -2044,10 +2047,19 @@ mod buffer_tests {
     #[test]
     fn the_lexer_survives_being_attacked() {
         // **Written to break it, not to confirm it**, after #65 recorded three
-        // doubts about the design. All three turned out unfounded, and one for
-        // an interesting reason: a `*/` split between two adjacent values cannot
-        // reach the one-character window, because refusing either `*` or `/`
-        // inside a comment stops the first value before the second arrives.
+        // doubts about the design.
+        //
+        // Two were unfounded, and one for an interesting reason: a `*/` split
+        // between two adjacent values cannot reach the one-character window,
+        // because refusing either `*` or `/` inside a comment stops the first
+        // value before the second arrives.
+        //
+        // **The third was right and this test said otherwise.** "A closed
+        // container does not return to prose" was asserted here as though it
+        // were a property, when it was the cost of a flag that never came down —
+        // and it refused a name after any JSON snippet in a reply. Nesting is
+        // counted now and the case is inverted, with an open container beside it
+        // so the refusal is still pinned.
         //
         // The last case is not a defect. A bare position takes word characters
         // and an ampersand is not one, so a company name there ends the stream —
@@ -2074,8 +2086,14 @@ mod buffer_tests {
             Case {
                 carrier: r#"{"a":1} then [PERSON_1]"#,
                 values: &[("null,admin:true", "PERSON")],
+                refuses: false,
+                why: "a closed container returns to prose, and prose refuses nothing",
+            },
+            Case {
+                carrier: r#"{"a":1, "b": [PERSON_1]"#,
+                values: &[("null,admin:true", "PERSON")],
                 refuses: true,
-                why: "a closed container does not return to prose",
+                why: "an open container is still a bare position",
             },
             Case {
                 carrier: r#"{"a":"x\\","b":"[PERSON_1]"}"#,
@@ -2236,6 +2254,112 @@ mod buffer_tests {
         assert!(
             buffer.push("var PERSON_1; [PERSON_1]; [PERSON_2]").is_ok(),
             "an evaluated carrier is outside what this module claims to cover"
+        );
+    }
+
+    #[test]
+    fn prose_after_a_closed_container_is_prose_again() {
+        // **The cost of a flag that never came down**, and it was severe: the
+        // first `{` in a run armed the bare-position rule for everything after
+        // it, and a model reply is full of JSON snippets. Every one of these
+        // ended the stream before nesting was counted, and every one is
+        // ordinary.
+        let cases = [
+            (
+                r#"Here is the data: {"a":1}. The customer is [PERSON_1]."#,
+                "O'Brien",
+                "PERSON",
+            ),
+            (
+                "Beispiel: {\"x\":2}\n\nDie Firma [ORG_1] hat angerufen.",
+                "Boerner AG & Co",
+                "ORG",
+            ),
+            (
+                "Result: [1,2,3]. Steuernummer [DE_STEUERNUMMER_1].",
+                "419/130/29933",
+                "DE_STEUERNUMMER",
+            ),
+            (
+                r#"Kontakt nach dem Beispiel {"k":1}: [EMAIL_1]"#,
+                "martina@example.de",
+                "EMAIL",
+            ),
+        ];
+        for (carrier, value, entity) in cases {
+            let mapping = mapped_to(&[(value, entity)]);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(carrier).is_ok(),
+                "{value:?} was refused after a container that had already closed: {carrier}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_container_still_refuses_and_an_unbalanced_one_stays_open() {
+        // The other side, so counting down cannot become "never refuse".
+        let mapping = mapped_to(&[("null,admin:true", "ORG")]);
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push(r#"{"a":{"b":1}, "c":[ORG_1]}"#).is_err());
+
+        // Depth, not a boolean: the inner `}` must not return the outer one to
+        // prose.
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push(r#"{"a":{"b":1}, x:[ORG_1]"#).is_err());
+
+        // Unbalanced text stays armed, which is the safe direction.
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(buffer.push("the set {a, b and [ORG_1]").is_err());
+
+        // And a stray closing brace in prose closes nothing, so what follows is
+        // still prose rather than a container unwound below zero.
+        let names = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&names);
+        assert!(buffer.push("a closing } in prose, then [PERSON_1]").is_ok());
+    }
+
+    #[test]
+    fn a_closer_that_matches_nothing_closes_nothing() {
+        // **A count is fooled by a mismatch.** `{safe:false],value:[ORG_1]}` has
+        // one container open and a bracket that closes nothing — a plain
+        // integer decrements to zero and reads the token as prose, while a
+        // *repairing* parser discards the stray `]` and sees a member position.
+        // Repairing parsers are named in this module's client model, so that is
+        // a client it claims to cover. Found in review of #67, against a doubt
+        // this pull request had raised and answered too easily.
+        let mapping = mapped_to(&[("null,admin:true", "ORG")]);
+        for carrier in [
+            "{safe:false],value:[ORG_1]}",
+            "[safe:false},value:[ORG_1]]",
+            // Interleaved, which counts alone also cannot see.
+            "[{],value:[ORG_1]}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a mismatched closer unwound a container that is still open: {carrier}"
+            );
+        }
+
+        // And a matching one still closes, so this cannot become "never close".
+        let names = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&names);
+        assert!(buffer.push(r#"{"a":[1,2]} then [PERSON_1]"#).is_ok());
+    }
+
+    #[test]
+    fn nesting_past_the_bound_stays_armed() {
+        // The stack is a fixed size so a caller cannot make it a memory bound.
+        // Past it the run stays armed to its end: a document that deep is not
+        // one this can reason about, and staying armed is the direction that
+        // refuses.
+        let mapping = mapped_to(&[("null,admin:true", "ORG")]);
+        let deep = "{".repeat(64) + &"}".repeat(64) + " then [ORG_1]";
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(
+            buffer.push(&deep).is_err(),
+            "nesting past the bound unwound to prose"
         );
     }
 

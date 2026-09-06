@@ -219,6 +219,10 @@ pub const REDACTED_TYPE: &str = "REDACTED";
 /// quotes something is not JSON, and this will treat the inside of that
 /// quotation as a string. That direction is safe — it refuses — and it is why
 /// the refusal only fires for a *value* that could act in the place it lands.
+/// How deep a run may nest before this stops trying to follow it. Deeper than
+/// any document a model emits, and shallow enough that the state stays small.
+const MAX_NESTING: usize = 32;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Place {
     /// No structure seen. Prose, until something says otherwise.
@@ -240,12 +244,49 @@ enum Place {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamStructure {
     place: Place,
-    /// A `{` or `[` has gone past. **Kept apart from `place` because closing a
-    /// string does not put you in a container.** A first version returned to
-    /// `Bare` whenever a string ended, so `she said "hello" to [PERSON_1]` —
-    /// prose — was treated as a bare member position and refused a name with an
-    /// apostrophe in it. What a closing quote returns you to is where you were.
-    container: bool,
+    /// How many containers are open. **Depth rather than a flag, and the
+    /// difference is most of what this rule costs.**
+    ///
+    /// A flag never came down, so the first `{` in a run armed the bare-position
+    /// rule for everything after it — and a model reply is full of JSON
+    /// snippets. Measured against the flag version, every one of these ended the
+    /// stream:
+    ///
+    /// ```text
+    /// Here is the data: {"a":1}. The customer is [PERSON_1].   O'Brien
+    /// Beispiel: {"x":2}  Die Firma [ORG_1] hat angerufen.      Boerner AG & Co
+    /// Result: [1,2,3]. Steuernummer [DE_STEUERNUMMER_1].       419/130/29933
+    /// Kontakt nach dem Beispiel {"k":1}: [EMAIL_1]             martina@…
+    /// ```
+    ///
+    /// All four are prose with a closed container behind them, and all four are
+    /// ordinary. Counting down returns them to prose, where nothing is refused.
+    ///
+    /// **Kept apart from `place` because closing a string does not put you in a
+    /// container.** A first version returned to `Bare` whenever a string ended,
+    /// so `she said "hello" to [PERSON_1]` — prose — was treated as a bare
+    /// member position. What a closing delimiter returns you to is where you
+    /// were, which is what `outside` answers.
+    ///
+    /// Unbalanced text stays armed, which is the safe direction: `the set {a, b`
+    /// never closes, and a stray `}` in prose closes nothing rather than
+    /// unwinding a container nobody opened.
+    ///
+    /// **The openers themselves, not a count, because a count is fooled by a
+    /// mismatch.** `{safe:false],value:[ORG_1]}` has one container open and a
+    /// bracket that closes nothing — a plain integer decrements to zero and
+    /// reads the token as prose, while a *repairing* parser discards the stray
+    /// `]` and sees a member position. Repairing parsers are named in this
+    /// module's client model, so that is a client it claims to cover. Found in
+    /// review of #67, against a doubt the pull request had raised and answered
+    /// too easily.
+    open: [char; MAX_NESTING],
+    depth: usize,
+    /// Nesting past `MAX_NESTING`, which stops the stack being a memory bound a
+    /// caller controls. Once poisoned the run stays armed to its end: a document
+    /// that deep is not one this can reason about, and staying armed is the
+    /// direction that refuses.
+    poisoned: bool,
     /// A backslash ended the last fragment. **Carried, because a fragment
     /// boundary is not a token boundary**: a push ending `"foo\` followed by one
     /// beginning `"` has an escaped quote, and recreating this per run read it
@@ -260,7 +301,7 @@ impl StreamStructure {
     /// Where a closing delimiter returns to: a container if one was opened,
     /// and otherwise the prose it interrupted.
     fn outside(&self) -> Place {
-        if self.container {
+        if self.depth > 0 || self.poisoned {
             Place::Bare
         } else {
             Place::Prose
@@ -344,9 +385,27 @@ impl StreamStructure {
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
                 '{' | '[' if structural => {
-                    self.container = true;
+                    if self.depth < MAX_NESTING {
+                        self.open[self.depth] = character;
+                        self.depth += 1;
+                    } else {
+                        self.poisoned = true;
+                    }
                     self.place = Place::Bare;
                 }
+                '}' | ']' if structural => {
+                    // **Only a matching closer closes.** A `]` against an open
+                    // `{` closes nothing — a repairing parser discards it and
+                    // carries on inside the object — and a closer in prose
+                    // closes nothing either. Both leave the state where it was,
+                    // which is the direction that refuses.
+                    let wanted = if character == '}' { '{' } else { '[' };
+                    if self.depth > 0 && self.open[self.depth - 1] == wanted {
+                        self.depth -= 1;
+                        self.place = self.outside();
+                    }
+                }
+
                 _ => {}
             },
         }
