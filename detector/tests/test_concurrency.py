@@ -29,8 +29,15 @@ import time
 
 import pytest
 
-from tessera_detector.deterministic import DeterministicDetector
-from tessera_detector.pipeline import Detector, build_detector
+# The serve group is optional, so the API half of this file must skip rather
+# than fail collection under a bare `uv run pytest`.
+fastapi = pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from tessera_detector.api import create_app  # noqa: E402
+from tessera_detector.deterministic import DeterministicDetector  # noqa: E402
+from tessera_detector.pipeline import Detector, build_detector  # noqa: E402
+from tessera_detector.spans import Span  # noqa: E402
 
 # Why each shared attribute is safe to share. One sentence, and it has to be an
 # argument rather than a restatement of the name.
@@ -165,3 +172,164 @@ def test_the_deterministic_layer_agrees_with_itself_across_threads() -> None:
         thread.join(timeout=30)
 
     assert not wrong, wrong[0]
+
+
+TEXTS = [
+    "Contact: anna.keller@example.ch about IBAN CH93 0076 2011 6238 5295 7",
+    "Steuernummer 419/130/29933, Rechnung vom 14.03.",
+    "Le NIR 2 84 11 20 102 728 71 figure au dossier de Fischer.",
+    "Bitte an m.wolf@example.de senden, Kundennummer 88213.",
+    # A shape the service *refuses*, kept in the run on purpose. An
+    # input-validation path that consults shared state is as much a sharing bug
+    # as a detection path that does, and it is the one a 200-hammer never
+    # visits.
+    "",
+]
+
+
+def hammer(detector: object, rounds: int = 16) -> list[str]:
+    """Ask the service the same questions alone and then all at once, and return
+    the texts whose answer changed.
+
+    **It compares answers rather than status codes**, which is the whole design.
+    A hammer checking for 200s catches a shared object that *raises* — which is
+    what the tokenizer did, by luck of PyO3 panicking rather than returning
+    nonsense. A shared object that quietly hands one request another's state
+    gives 200s all day. The sequential answers are taken first, so the
+    comparison is against a known value rather than against whatever the threads
+    agreed on among themselves.
+    """
+    app = create_app(detector)
+    with TestClient(app) as sequential:
+        alone = {}
+        for text in TEXTS:
+            response = sequential.post("/detect", json={"text": text})
+            alone[text] = (response.status_code, response.json())
+
+    changed: list[str] = []
+    lock = threading.Lock()
+
+    def ask(text: str) -> None:
+        # A client each, so the concurrency is in the service rather than in one
+        # client's connection pool.
+        with TestClient(app) as one:
+            response = one.post("/detect", json={"text": text})
+        with lock:
+            if (response.status_code, response.json()) != alone[text]:
+                changed.append(text)
+
+    threads = [
+        threading.Thread(target=ask, args=(TEXTS[i % len(TEXTS)],))
+        for i in range(rounds * len(TEXTS))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return changed
+
+
+class SharesItsState:
+    """A detector with the defect this whole file exists for, kept so the hammer
+    above has something it is known to catch.
+
+    #60 asks for a concurrency test and then says why the obvious one is not
+    enough: **a 24-request load test passed against the build that was failing
+    17% of requests by hand.** A hammer nobody has ever seen fail is a hammer
+    tuned to nothing. This is the known-unsafe build the issue says has to be
+    kept around, and it is three lines rather than a git revert.
+
+    The shape is the one that actually happened: per-call state parked on an
+    object that outlives the call.
+    """
+
+    ner_available = False
+    ner_off_reason = "no weights in this fixture"
+    model_id = "unsafe-fixture@0"
+    catalog_text = "unsafe-fixture"
+
+    def __init__(self) -> None:
+        self._text = ""
+
+    def _detect(self, text: str) -> list[Span]:
+        self._text = text
+        # Long enough that another thread lands between the write and the read,
+        # which is what makes this deterministic rather than a coin toss.
+        time.sleep(0.01)
+        return [
+            Span(
+                entity_type="EMAIL",
+                start=0,
+                end=len(self._text),
+                confidence=0.9,
+                recognizer="catalog:email",
+                tier=2,
+            )
+        ]
+
+    def detect(self, text: str) -> list[Span]:
+        return self._detect(text)
+
+    def deterministic_only(self, text: str) -> list[Span]:
+        return self._detect(text)
+
+
+def test_the_hammer_catches_a_detector_that_shares_its_state() -> None:
+    """The gate on the gate. Without this, the tests below have never failed and
+    nobody knows what it would take.
+
+    **What it proves is that the comparison is right, not that the hammer is
+    sensitive.** `SharesItsState` is caught because it holds the window open for
+    10ms; take the sleep out and this test fails against a detector that is still
+    genuinely broken. That is the honest shape of every concurrency test and it
+    is why #59's real race needed 64 calls to show itself.
+
+    So: a defect that corrupts an answer will be *reported correctly* rather than
+    passed over as a 200. Whether a given defect is hit at all remains luck, and
+    no arrangement of N and M changes that.
+    """
+    changed = hammer(SharesItsState(), rounds=4)
+    assert changed, "the hammer did not notice a detector parking per-call state on itself"
+
+
+def test_the_api_answers_the_same_under_concurrency_as_alone() -> None:
+    """**The gap this file's own docstring left open**: nothing sent the service
+    two requests at once.
+
+    The tests above enumerate what a request shares and exercise the
+    *deterministic layer* across threads. Neither goes through `api.detect`,
+    which is where the sharing actually happens — `def`, not `async def`, so
+    Starlette runs it in a threadpool over one `Detector` built at startup.
+
+    **This does not prove thread safety and no hammer does.** #59's race needed
+    64 calls at eight concurrent, and a 24-call load test passed against the
+    unfixed build. What it closes is the "nothing exercises the endpoint
+    concurrently at all" gap.
+
+    Unmarked, so it runs in the job that has no weights: there it is the
+    deterministic path, and it costs 0.8s. The NER path gets
+    `test_the_api_answers_the_same_under_concurrency_with_ner` below, because a
+    test that changes which code it covers depending on what is in a cache is
+    not one anybody can reason about from CI.
+    """
+    detector = build_detector()
+    if detector.ner_available:
+        pytest.skip("weights are present, so the marked test below is the one that applies")
+    assert hammer(detector) == []
+
+
+@pytest.mark.ner
+def test_the_api_answers_the_same_under_concurrency_with_ner() -> None:
+    """The same hammer over the layer that actually broke.
+
+    #59's race was in the recognizer's tokenizer, not in the catalog, so the
+    deterministic run above would not have caught it whatever N and M were. This
+    is the half #60 priced at 55s and declined — it is a few seconds now,
+    because the hammer reuses one application rather than building a detector
+    per request, and because it asks a question it can answer cheaply rather
+    than trying to reproduce a race by volume.
+    """
+    detector = build_detector()
+    if detector.recognizer is None:
+        pytest.skip(f"NER is not provisioned ({detector.ner_off_reason})")
+    assert hammer(detector, rounds=8) == []
