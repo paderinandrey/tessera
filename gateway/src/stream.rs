@@ -2144,8 +2144,44 @@ mod buffer_tests {
             Case {
                 carrier: "{org:[ORG_1]}",
                 values: &[("Boerner AG & Co", "ORG")],
+                refuses: false,
+                why: "an ampersand has no role in a JSON-family bare position",
+            },
+            Case {
+                carrier: "{tax:[DE_STEUERNUMMER_1]}",
+                values: &[("419/130/29933", "DE_STEUERNUMMER")],
+                refuses: false,
+                why: "a solidus between digits opens no comment",
+            },
+            Case {
+                carrier: "{mail:[EMAIL_1]}",
+                values: &[("uschihiller@example.org", "EMAIL")],
+                refuses: false,
+                why: "an at sign has no role in any parser in the model",
+            },
+            Case {
+                carrier: "{path:[ORG_1]}",
+                values: &[("acme//note", "ORG")],
                 refuses: true,
-                why: "a bare position takes only word characters — the cost, not a bug",
+                why: "a doubled solidus opens a comment that eats the closing brace",
+            },
+            Case {
+                carrier: "{path:[ORG_1]}",
+                values: &[("acme/", "ORG")],
+                refuses: true,
+                why: "a trailing solidus pairs with whatever the carrier puts next",
+            },
+            Case {
+                carrier: "``[ORG_1]``",
+                values: &[("Boerner AG & Co", "ORG")],
+                refuses: true,
+                why: "a region says nothing about what will read it, and `&` is a YAML anchor",
+            },
+            Case {
+                carrier: "{/* [ORG_1] */ a:1}",
+                values: &[("uschihiller@example.org", "EMAIL")],
+                refuses: true,
+                why: "a comment the lexer is in may be one the parser is not",
             },
         ];
         for case in cases {
@@ -2664,31 +2700,37 @@ mod buffer_tests {
         );
     }
 
-    /// What the bare rule costs, measured against the corpus rather than
+    /// What the strict rules cost, measured against the corpus rather than
     /// argued from an example.
     ///
-    /// The rule is the strictest thing in the restoration path and #70 widened
-    /// what it governs — a bare position, a backtick region, and now every
-    /// comment. So the question "which values can it never carry" stopped being
-    /// about one anecdote and became a property worth watching.
+    /// **Two places, two rules, and this measures both.** A bare position inside
+    /// a container is a place whose language is known, so it takes the
+    /// JSON-family rule; a backtick region says nothing about what will read it,
+    /// so it takes word characters only. Pricing them together is the point —
+    /// the split exists because one number was hiding two.
     ///
-    /// **This drives the real predicate through the real seam.** A copy of the
-    /// rule in a test is a copy that drifts; a carrier that puts the token in a
-    /// bare position and asks the buffer cannot.
+    /// **This drives the real predicates through the real seam.** A copy of a
+    /// rule in a test is a copy that drifts; a carrier that puts the token where
+    /// the rule applies and asks the buffer cannot.
     ///
     /// **The members are named, not counted.** A count passes while the set
     /// changes underneath it — the joined-recall gate in this repository was
     /// wrong four times that way. Adding an entity type whose format cannot pass
-    /// this rule is a decision, and this is where it gets made rather than
+    /// either rule is a decision, and this is where it gets made rather than
     /// discovered.
     #[test]
-    fn the_bare_rule_refuses_two_formats_outright() {
+    fn the_strict_rules_cost_nothing_in_a_container_and_three_formats_in_a_region() {
         let corpus = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../evaluation/corpus/public.jsonl"
         ));
 
-        let mut refused: Vec<(String, String)> = Vec::new();
+        // `{value:[KIND_1]}` is a bare position inside a container; ``` ``…`` ```
+        // is a region. Same values, same seam, different rule.
+        let mut refused: std::collections::BTreeMap<&str, Vec<(String, String)>> =
+            [("container", vec![]), ("region", vec![])]
+                .into_iter()
+                .collect();
         let mut totals: std::collections::BTreeMap<String, usize> = Default::default();
         for line in corpus.lines() {
             let document: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -2700,49 +2742,68 @@ mod buffer_tests {
                 let value: String = text[start..end].iter().collect();
                 *totals.entry(kind.clone()).or_default() += 1;
 
-                // `{value:[KIND_1]}` — the brace opens a container, so the token
-                // is judged at a bare position by the rule under test.
-                let mapping = mapped_to(&[(&value, &kind)]);
-                let mut buffer = RestoreBuffer::new(&mapping);
-                match buffer.push(&format!("{{value:[{kind}_1]}}")) {
-                    Err(_) => refused.push((kind, value)),
-                    // **A value the buffer did not recognise would count as
-                    // admitted**, and a whole entity type could leave this
-                    // measurement by having its placeholder spelled differently.
-                    // So each streaming case is checked to have actually
-                    // restored, which is the difference between "not refused"
-                    // and "not looked at".
-                    Ok(out) => {
-                        let out = out + &buffer.finish().unwrap();
-                        assert_eq!(
-                            out,
-                            format!("{{value:{value}}}"),
-                            "{kind} was never substituted, so it was never judged"
-                        );
+                for (place, carrier, restored) in [
+                    (
+                        "container",
+                        format!("{{value:[{kind}_1]}}"),
+                        format!("{{value:{value}}}"),
+                    ),
+                    ("region", format!("``[{kind}_1]``"), format!("``{value}``")),
+                ] {
+                    let mapping = mapped_to(&[(&value, &kind)]);
+                    let mut buffer = RestoreBuffer::new(&mapping);
+                    match buffer.push(&carrier) {
+                        Err(_) => refused
+                            .get_mut(place)
+                            .unwrap()
+                            .push((kind.clone(), value.clone())),
+                        // **A value the buffer did not recognise would count as
+                        // admitted**, and a whole entity type could leave this
+                        // measurement by having its placeholder spelled
+                        // differently. So each streaming case is checked to have
+                        // actually restored, which is the difference between
+                        // "not refused" and "not looked at".
+                        Ok(out) => {
+                            let out = out + &buffer.finish().unwrap();
+                            assert_eq!(
+                                out, restored,
+                                "{kind} was never substituted at a {place}, so it was never judged"
+                            );
+                        }
                     }
                 }
             }
         }
 
+        // **Inside a container the corpus costs nothing at all.** It used to cost
+        // 14 of 196 — every EMAIL on the `@`, both DE_STEUERNUMMER on the `/`,
+        // and four German company forms on the `&`. Two entity types were
+        // refused outright, which is not a hard case within a format, it is the
+        // format.
+        assert_eq!(
+            refused["container"],
+            Vec::new(),
+            "a format that cannot be restored at a bare position is a decision, not a discovery"
+        );
+
+        // **In a region the price is the full 14**, and it stays there on
+        // purpose: a backtick region does not say what will read it, `&` is a
+        // YAML anchor and `@` a reserved indicator, so the rule that may lean on
+        // "no parser in the model gives this a role" does not apply where the
+        // parser is unknown.
         let kinds: std::collections::BTreeSet<&str> =
-            refused.iter().map(|(k, _)| k.as_str()).collect();
+            refused["region"].iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             kinds,
             ["DE_STEUERNUMMER", "EMAIL", "ORG"].into_iter().collect(),
-            "the set of formats the bare rule cannot carry changed: {refused:#?}"
+            "the set of formats a region cannot carry changed: {:#?}",
+            refused["region"]
         );
-
-        // **Two of them are refused outright — every value of the type, not a
-        // hard case in it.** An `@` is not optional in an e-mail address and a
-        // German tax number is written `419/130/29933`. This is the number that
-        // makes the rule's cost a fact rather than an anecdote, and it is
-        // asserted with `==` because a bound that only tightens cannot notice a
-        // format going from partly to wholly unrepresentable.
         for kind in ["EMAIL", "DE_STEUERNUMMER"] {
-            let hit = refused.iter().filter(|(k, _)| k == kind).count();
+            let hit = refused["region"].iter().filter(|(k, _)| k == kind).count();
             assert_eq!(
                 hit, totals[kind],
-                "{kind}: {hit} of {} refused, and it used to be all of them",
+                "{kind}: {hit} of {} refused in a region",
                 totals[kind]
             );
         }
@@ -2752,9 +2813,9 @@ mod buffer_tests {
         // matter and not its count. **This was a count in the first version of
         // this test**, which is the aggregation this repository has been wrong
         // by four times: four ORG values refused stays four while a different
-        // four are refused, and the difference is exactly what a reader of this
-        // test would want to know.
-        let orgs: std::collections::BTreeSet<&str> = refused
+        // four are refused, and the difference is exactly what a reader would
+        // want to know.
+        let orgs: std::collections::BTreeSet<&str> = refused["region"]
             .iter()
             .filter(|(k, _)| k == "ORG")
             .map(|(_, v)| v.as_str())
@@ -2769,17 +2830,105 @@ mod buffer_tests {
             ]
             .into_iter()
             .collect(),
-            "the German company forms are what the ampersand costs"
+            "the German company forms are what the ampersand costs in a region"
         );
 
         // And the apostrophe, which is what #69 was opened about, costs nothing
-        // here — the corpus is synthetic and has no name carrying one. Recorded
-        // so the absence is read as "unmeasured" rather than "measured zero".
+        // in either place — the corpus is synthetic and has no name carrying
+        // one. Recorded so the absence is read as "unmeasured" rather than
+        // "measured zero".
         assert!(
-            !refused
+            !refused["region"]
                 .iter()
                 .any(|(_, v)| v.contains('\'') || v.contains('\u{2019}')),
             "the corpus grew an apostrophe name; #69's premise is measurable now"
+        );
+    }
+
+    #[test]
+    fn the_container_rule_still_refuses_what_acts_at_a_bare_position() {
+        // Widening an allowlist is the change that has to prove it kept the
+        // thing it was for. A bare position needs no hazardous character —
+        // `{safe:false,value:[ORG_1]}` with `null,admin:true,pad:null` is valid
+        // JSON5 and adds two members out of punctuation — so every character
+        // that does that is still out.
+        for value in [
+            "null,admin:true,pad:null",
+            r#"x","admin":true"#,
+            "x'}, {'admin':true",
+            "a\nadmin:true",
+            "a[0]",
+            "a{b}",
+        ] {
+            let mapping = mapped_to(&[(value, "ORG")]);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push("{safe:false,value:[ORG_1]}").is_err(),
+                "a bare position admitted {value:?}"
+            );
+        }
+
+        // `/` is the one that is inert alone and structural in a pair, and a
+        // comment at a bare position deletes the rest of the line — including
+        // the brace that closes the object.
+        for value in [
+            "acme//note", // opens a line comment
+            "acme/*note", // opens a block comment
+            "/acme",      // pairs with a `/` the carrier may have left
+            "acme/",      // pairs with whatever is substituted next
+        ] {
+            let mapping = mapped_to(&[(value, "ORG")]);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push("{value:[ORG_1]}").is_err(),
+                "a bare position admitted {value:?}"
+            );
+        }
+
+        // And what the widening is *for*, in the three formats the corpus
+        // showed cannot otherwise be written.
+        for (value, kind) in [
+            ("uschihiller@example.org", "EMAIL"),
+            ("419/130/29933", "DE_STEUERNUMMER"),
+            ("Börner AG & Co. KGaA", "ORG"),
+        ] {
+            let mapping = mapped_to(&[(value, kind)]);
+            let mut buffer = RestoreBuffer::new(&mapping);
+            let mut out = buffer.push(&format!("{{value:[{kind}_1]}}")).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(out, format!("{{value:{value}}}"));
+        }
+    }
+
+    #[test]
+    fn only_a_container_earns_the_wider_rule() {
+        // The rule leans on "no parser in the model gives this character a
+        // role", and that sentence needs a parser. Reaching `Place::Bare`
+        // unpoisoned means a `{` was counted, so a JSON-family reader is
+        // reading. A region, a comment and a poisoned state say nothing about
+        // what will read them and keep the word-only rule.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        for carrier in [
+            "``[EMAIL_1]``",         // a backtick region
+            "{/* [EMAIL_1] */ a:1}", // a comment, which may be spurious
+        ] {
+            let mut buffer = RestoreBuffer::new(&mail);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a place of unknown kind took the container's rule: {carrier:?}"
+            );
+        }
+
+        // Poisoned: nesting past what the state can track is an unknown place
+        // too, and it must not inherit the container's rule just because the
+        // depth counter says a container was opened.
+        // Past the 32 slots the state tracks; the exact number is
+        // `mapping::MAX_NESTING` and this only has to exceed it.
+        let deep = "[".repeat(64);
+        let mut buffer = RestoreBuffer::new(&mail);
+        assert!(
+            buffer.push(&format!("{deep}[EMAIL_1]")).is_err(),
+            "a poisoned state took the container's rule"
         );
     }
 
