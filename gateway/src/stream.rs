@@ -2145,7 +2145,7 @@ mod buffer_tests {
                 carrier: "{org:[ORG_1]}",
                 values: &[("Boerner AG & Co", "ORG")],
                 refuses: true,
-                why: "an ampersand anchors a node for a reader this cannot rule out",
+                why: "a bare position takes word characters",
             },
             Case {
                 carrier: "{org: *[ORG_1]}",
@@ -2156,26 +2156,14 @@ mod buffer_tests {
             Case {
                 carrier: "{tax:[DE_STEUERNUMMER_1]}",
                 values: &[("419/130/29933", "DE_STEUERNUMMER")],
-                refuses: false,
-                why: "a solidus between digits opens no comment",
+                refuses: true,
+                why: "a bare position takes word characters, and a tax number is not one",
             },
             Case {
                 carrier: "{mail:[EMAIL_1]}",
                 values: &[("uschihiller@example.org", "EMAIL")],
-                refuses: false,
-                why: "an at sign has no role in any parser in the model",
-            },
-            Case {
-                carrier: "{path:[ORG_1]}",
-                values: &[("acme//note", "ORG")],
                 refuses: true,
-                why: "a doubled solidus opens a comment that eats the closing brace",
-            },
-            Case {
-                carrier: "{path:[ORG_1]}",
-                values: &[("acme/", "ORG")],
-                refuses: true,
-                why: "a trailing solidus pairs with whatever the carrier puts next",
+                why: "the same, and it is the cost #69 is open about",
             },
             Case {
                 carrier: "``[ORG_1]``",
@@ -2706,7 +2694,7 @@ mod buffer_tests {
         );
     }
 
-    /// What the strict rules cost, measured against the corpus rather than
+    /// What the strict rule costs, measured against the corpus rather than
     /// argued from an example.
     ///
     /// **Two places, two rules, and this measures both.** A bare position inside
@@ -2725,7 +2713,7 @@ mod buffer_tests {
     /// either rule is a decision, and this is where it gets made rather than
     /// discovered.
     #[test]
-    fn the_strict_rules_cost_the_ampersand_in_a_container_and_three_formats_in_a_region() {
+    fn the_strict_rule_costs_three_formats_in_every_place_it_applies() {
         let corpus = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../evaluation/corpus/public.jsonl"
@@ -2781,37 +2769,27 @@ mod buffer_tests {
             }
         }
 
-        // **Inside a container the corpus costs the ampersand and nothing
-        // else.** It used to cost 14 of 196 — every EMAIL on the `@`, both
-        // DE_STEUERNUMMER on the `/`, and four German company forms on the `&`.
-        // The first two are recovered; the third is paid, because a consumer
-        // reading the content as YAML turns a leading `&` into an anchor and
-        // the narrowing that would have kept these was killed in review of #79.
+        // **Both places cost the same, because there is one rule again.** #72
+        // gave a bare position inside a container a wider rule than a backtick
+        // region, on the argument that a container's language is known. Review
+        // of #79 took that back in four steps — the last of them a custom tag
+        // completed by the carrier rather than the value — and the argument it
+        // rested on was answering a narrower question than the module asks.
         //
-        // Named rather than counted, so that recovering them later is a change
-        // somebody makes on purpose.
-        let containers: std::collections::BTreeSet<&str> = refused["container"]
-            .iter()
-            .map(|(_, v)| v.as_str())
-            .collect();
+        // So 14 of 196 again, in both places: every EMAIL on the `@`, both
+        // DE_STEUERNUMMER on the `/`, four German company forms on the `&`.
+        // Two entity types refused outright, which is a format and not a hard
+        // case within one. #69 is open about it.
         assert_eq!(
-            containers,
-            [
-                "Beckmann AG & Co. KG",
-                "Börner AG & Co. KGaA",
-                "Patberg GmbH & Co. OHG",
-                "Römer Stiftung & Co. KG",
-            ]
-            .into_iter()
-            .collect(),
-            "the ampersand is the whole of what a bare position still costs"
+            refused["container"].len(),
+            refused["region"].len(),
+            "the two places have one rule again; a difference means one was widened"
         );
 
-        // **In a region the price is the full 14**, and it stays there on
-        // purpose: a backtick region does not say what will read it, `&` is a
-        // YAML anchor and `@` a reserved indicator, so the rule that may lean on
-        // "no parser in the model gives this a role" does not apply where the
-        // parser is unknown.
+        // **The price is the full 14**, and it is paid everywhere the rule
+        // applies: a place does not say what will read it, `&` is a YAML anchor
+        // and `@` a reserved indicator, and "no parser in the model gives this
+        // a role" turned out to mean "no parser I listed".
         let kinds: std::collections::BTreeSet<&str> =
             refused["region"].iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
@@ -2867,23 +2845,34 @@ mod buffer_tests {
     }
 
     #[test]
-    fn the_container_rule_still_refuses_what_acts_at_a_bare_position() {
-        // Widening an allowlist is the change that has to prove it kept the
-        // thing it was for. A bare position needs no hazardous character —
-        // `{safe:false,value:[ORG_1]}` with `null,admin:true,pad:null` is valid
-        // JSON5 and adds two members out of punctuation — so every character
-        // that does that is still out.
-        // **Every shape below was confirmed to inject against a real parser**,
-        // not reasoned about: `{safe:false,value:V}` was fed to json5 2.2.3 and
-        // to jsonrepair 3.15.0, and each of these comes back as an object with
-        // an `admin` key the carrier never had. The two disagree about which —
-        // `+1,…` injects only in json5, while `a\nadmin:true` and the quoted
-        // form inject only after repair — which is the argument for the model
-        // naming both rather than picking one.
+    fn a_bare_position_takes_word_characters_and_that_is_the_whole_rule() {
+        // **#72 widened this and #79's review took it back, in four steps.**
+        // The widening admitted `@`, `&` and a non-pairing `/` on the argument
+        // that no parser in the *stated* model gives them a token role. The
+        // model says it covers "a client that parses the text as data", and a
+        // client reading the content as YAML does exactly that — so the
+        // argument was answering a narrower question than the one the module
+        // asks. Each patch was defeated by the next construct:
         //
-        // The differential run itself cannot live here: it needs node and two
-        // packages this repository does not depend on. Its *result* can, and
-        // this is it.
+        //   `&victim secret`                    an anchor
+        //   `- &victim secret`                  an anchor after a block entry,
+        //                                       so `&` need not come first
+        //   `other: *[ORG_1]` with `victim`     the *carrier* wrote the
+        //                                       indicator; no rule over the
+        //                                       value can see it
+        //   `![EMAIL_1]`, `!<[ORG_1]>`          a custom tag, and a verbatim
+        //                                       tag that defeats a
+        //                                       one-character lookback
+        //
+        // That is the argument `Place::Bare` already recorded for JSON5 and
+        // never applied to a second grammar: **a bare position needs no
+        // hazardous character.** An allowlist of characters inert in one
+        // grammar is not inert in another, and the gateway does not choose the
+        // grammar.
+        //
+        // So the rule is word characters, a space, a hyphen and a full stop,
+        // as it was before #72. What that costs is measured in
+        // `the_bare_rule_refuses_two_formats_outright` and is not small.
         for value in [
             "null,admin:true,pad:null",
             r#"x","admin":true"#,
@@ -2891,9 +2880,6 @@ mod buffer_tests {
             "a\nadmin:true",
             "a[0]",
             "a{b}",
-            // a value that begins with a JSON5 literal or number: the comma is
-            // what carries the injection, and the prefix is what makes the
-            // document parse rather than throw
             "1,admin:true",
             "true,admin:true",
             "null,admin:true",
@@ -2901,6 +2887,11 @@ mod buffer_tests {
             "Infinity,admin:true",
             ".5,admin:true",
             "+1,admin:true",
+            // and the four the widening had admitted
+            "uschihiller@example.org",
+            "419/130/29933",
+            "Börner AG & Co. KGaA",
+            "&victim secret",
         ] {
             let mapping = mapped_to(&[(value, "ORG")]);
             let mut buffer = RestoreBuffer::new(&mapping);
@@ -2910,67 +2901,56 @@ mod buffer_tests {
             );
         }
 
-        // `/` is the one that is inert alone and structural in a pair, and a
-        // comment at a bare position deletes the rest of the line — including
-        // the brace that closes the object.
-        for value in [
-            "acme//note", // opens a line comment
-            "acme/*note", // opens a block comment
-            "/acme",      // pairs with a `/` the carrier may have left
-            "acme/",      // pairs with whatever is substituted next
-        ] {
-            let mapping = mapped_to(&[(value, "ORG")]);
-            let mut buffer = RestoreBuffer::new(&mapping);
-            assert!(
-                buffer.push("{value:[ORG_1]}").is_err(),
-                "a bare position admitted {value:?}"
-            );
-        }
-
-        // And what the widening is *for*, in the three formats the corpus
-        // showed cannot otherwise be written.
-        for (value, kind) in [
-            ("uschihiller@example.org", "EMAIL"),
-            ("419/130/29933", "DE_STEUERNUMMER"),
-        ] {
-            let mapping = mapped_to(&[(value, kind)]);
-            let mut buffer = RestoreBuffer::new(&mapping);
-            let mut out = buffer.push(&format!("{{value:[{kind}_1]}}")).unwrap();
-            out.push_str(&buffer.finish().unwrap());
-            assert_eq!(out, format!("{{value:{value}}}"));
-        }
+        // Inside a string every one of them is data, which is where an e-mail
+        // address actually sits in ordinary traffic — so the revert costs the
+        // unusual shape rather than the common one.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        let mut buffer = RestoreBuffer::new(&mail);
+        let mut out = buffer.push(r#"{"mail":"[EMAIL_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"mail":"uschihiller@example.org"}"#);
     }
 
     #[test]
-    fn only_a_container_earns_the_wider_rule() {
-        // The rule leans on "no parser in the model gives this character a
-        // role", and that sentence needs a parser. Reaching `Place::Bare`
-        // unpoisoned means a `{` was counted, so a JSON-family reader is
-        // reading. A region, a comment and a poisoned state say nothing about
-        // what will read them and keep the word-only rule.
+    fn nesting_past_what_the_state_tracks_is_still_refused() {
+        // **This test used to be `only_a_container_earns_the_wider_rule`**, and
+        // there is no wider rule now — #72 gave a container one and review of
+        // #79 took it back. What survives is the part that was never about the
+        // widening: a place the state has lost track of is judged like every
+        // other place, which is strictly.
+        //
+        // Kept rather than deleted because `poisoned` has no other test. The
+        // depth counter says a container was opened, and past 32 slots the
+        // matched-closer array cannot say which — so the state stops claiming
+        // to know anything, and that has to be a refusal rather than a
+        // fallback to prose.
         let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
         for carrier in [
             "``[EMAIL_1]``",         // a backtick region
             "{/* [EMAIL_1] */ a:1}", // a comment, which may be spurious
+            "{mail:[EMAIL_1]}",      // and a bare position, which is the same rule
         ] {
             let mut buffer = RestoreBuffer::new(&mail);
             assert!(
                 buffer.push(carrier).is_err(),
-                "a place of unknown kind took the container's rule: {carrier:?}"
+                "a strict place admitted an at sign: {carrier:?}"
             );
         }
 
-        // Poisoned: nesting past what the state can track is an unknown place
-        // too, and it must not inherit the container's rule just because the
-        // depth counter says a container was opened.
         // Past the 32 slots the state tracks; the exact number is
         // `mapping::MAX_NESTING` and this only has to exceed it.
         let deep = "[".repeat(64);
         let mut buffer = RestoreBuffer::new(&mail);
         assert!(
             buffer.push(&format!("{deep}[EMAIL_1]")).is_err(),
-            "a poisoned state took the container's rule"
+            "a poisoned state stopped refusing"
         );
+
+        // And a word-like value still streams there, so `poisoned` is a
+        // stricter judgement rather than a dead stream.
+        let plain = mapped_to(&[("Weber", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&plain);
+        assert!(buffer.push(&format!("{deep}[PERSON_1]")).is_ok());
     }
 
     #[test]
