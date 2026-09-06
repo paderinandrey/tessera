@@ -2320,6 +2320,50 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_closer_that_matches_nothing_closes_nothing() {
+        // **A count is fooled by a mismatch.** `{safe:false],value:[ORG_1]}` has
+        // one container open and a bracket that closes nothing — a plain
+        // integer decrements to zero and reads the token as prose, while a
+        // *repairing* parser discards the stray `]` and sees a member position.
+        // Repairing parsers are named in this module's client model, so that is
+        // a client it claims to cover. Found in review of #67, against a doubt
+        // this pull request had raised and answered too easily.
+        let mapping = mapped_to(&[("null,admin:true", "ORG")]);
+        for carrier in [
+            "{safe:false],value:[ORG_1]}",
+            "[safe:false},value:[ORG_1]]",
+            // Interleaved, which counts alone also cannot see.
+            "[{],value:[ORG_1]}",
+        ] {
+            let mut buffer = RestoreBuffer::new(&mapping);
+            assert!(
+                buffer.push(carrier).is_err(),
+                "a mismatched closer unwound a container that is still open: {carrier}"
+            );
+        }
+
+        // And a matching one still closes, so this cannot become "never close".
+        let names = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::new(&names);
+        assert!(buffer.push(r#"{"a":[1,2]} then [PERSON_1]"#).is_ok());
+    }
+
+    #[test]
+    fn nesting_past_the_bound_stays_armed() {
+        // The stack is a fixed size so a caller cannot make it a memory bound.
+        // Past it the run stays armed to its end: a document that deep is not
+        // one this can reason about, and staying armed is the direction that
+        // refuses.
+        let mapping = mapped_to(&[("null,admin:true", "ORG")]);
+        let deep = "{".repeat(64) + &"}".repeat(64) + " then [ORG_1]";
+        let mut buffer = RestoreBuffer::new(&mapping);
+        assert!(
+            buffer.push(&deep).is_err(),
+            "nesting past the bound unwound to prose"
+        );
+    }
+
+    #[test]
     fn one_run_s_structure_does_not_bind_another() {
         // The flag is per `RestoreBuffer`, and `stream::handle` keys one per
         // text run — the granularity at which the buffered path restores a
