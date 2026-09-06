@@ -247,7 +247,14 @@ enum Place {
     /// act structurally can act. It closes on the next backtick, which bounds
     /// the cost to the region rather than the rest of the run. Found across two
     /// rounds of review on #68.
-    Ticked,
+    ///
+    /// **It carries the length of the run that opened it**, because markdown
+    /// closes a fence only with a run at least as long. A lone backtick is
+    /// ordinary content inside a ```json fence — and closing on it put the
+    /// lexer back in prose having ignored the braces and quotes of the object
+    /// it was inside, which admitted a payload. Found in the third round on
+    /// this one character.
+    Ticked(usize),
     /// Inside `/* … */`.
     Block,
     /// Inside `// …`, until a newline.
@@ -297,6 +304,9 @@ pub struct StreamStructure {
     /// module's client model, so that is a client it claims to cover. Found in
     /// review of #67, against a doubt the pull request had raised and answered
     /// too easily.
+    /// Consecutive backticks seen but not yet resolved: a run is only a fence
+    /// once something that is not a backtick follows it.
+    ticks: usize,
     open: [char; MAX_NESTING],
     depth: usize,
     /// Nesting past `MAX_NESTING`, which stops the stack being a memory bound a
@@ -373,11 +383,40 @@ impl StreamStructure {
         }
     }
 
+    /// Resolve a finished run of backticks.
+    ///
+    /// A run opens a region, or closes one it is at least as long as, and does
+    /// neither until something that is not a backtick follows it. Called both
+    /// when that character arrives and before judging a value, since a token can
+    /// sit immediately after the run that opened its region.
+    fn settle(&mut self) {
+        if self.ticks == 0 {
+            return;
+        }
+        match self.place {
+            Place::Ticked(opened_with) if self.ticks >= opened_with => {
+                self.place = self.outside();
+            }
+            Place::Prose | Place::Bare => self.place = Place::Ticked(self.ticks),
+            _ => {}
+        }
+        self.ticks = 0;
+    }
+
     fn step(&mut self, character: char, structural: bool) {
         let previous = self.last.replace(character);
         if self.escaped {
             self.escaped = false;
             return;
+        }
+        // Backticks are punctuation only outside a string or comment; inside
+        // one they are ordinary content.
+        if matches!(self.place, Place::Prose | Place::Bare | Place::Ticked(_)) {
+            if character == '`' {
+                self.ticks += 1;
+                return;
+            }
+            self.settle();
         }
         match self.place {
             Place::Text(delimiter) => match character {
@@ -385,11 +424,9 @@ impl StreamStructure {
                 c if c == delimiter => self.place = self.outside(),
                 _ => {}
             },
-            Place::Ticked => {
-                if character == '`' {
-                    self.place = self.outside();
-                }
-            }
+            // Content inside the region: only a long enough run leaves it, and
+            // `settle` is what decides that.
+            Place::Ticked(_) => {}
             Place::Block => {
                 if character == '/' && previous == Some('*') {
                     self.place = self.outside();
@@ -404,8 +441,6 @@ impl StreamStructure {
             }
             Place::Prose | Place::Bare => match character {
                 '"' | '\'' => self.place = Place::Text(character),
-                // Neither a string nor ordinary text — see `Place::Ticked`.
-                '`' => self.place = Place::Ticked,
 
                 '*' if previous == Some('/') => self.place = Place::Block,
                 '/' if previous == Some('/') => self.place = Place::Line,
@@ -442,7 +477,10 @@ impl StreamStructure {
     /// characters cannot be right without knowing where the characters land:
     /// `,` and `:` are inert inside a string and structural in a bare position,
     /// and `/` is inert everywhere except inside a comment.
-    fn refuses(&self, value: &str) -> Option<&'static str> {
+    fn refuses(&mut self, value: &str) -> Option<&'static str> {
+        // A token can sit immediately after the run that opened its region.
+        self.settle();
+
         match self.place {
             // Nothing structural has been seen. A value cannot close what was
             // never opened, and this is the case that keeps streamed prose —
@@ -461,15 +499,18 @@ impl StreamStructure {
                 {
                     return Some("a value that could close a string, inside a streamed structure");
                 }
-                // `${` executes in a JavaScript template literal without
-                // carrying its delimiter. That is the evaluation threat this
-                // module declines, so it is **defence in depth rather than a
-                // claim** — kept because a detected value containing `${` is
-                // vanishingly rare, so it costs nothing, and dropped the moment
-                // it costs something.
-                if value.contains("${") {
-                    return Some("a value that could open an interpolation, inside a stream");
-                }
+                // **No interpolation check here, and it was deleted rather than
+                // kept.** `${` executes in a JavaScript template literal, which
+                // routes through `Place::Ticked` now — so this arm is only ever
+                // a `"` or `'` string, where `${` is inert for every parser in
+                // the stated model. The check had stopped protecting anything
+                // and still refused `Account ${name}` inside `{"label":"…"}`.
+                //
+                // It survived a round because its own test passed without it:
+                // the backtick carrier is refused by the bare rule now, so the
+                // test proved the region rather than the check. Keeping a hazard
+                // that does nothing is how a rule accumulates cost it cannot
+                // account for. Found in the third round on #68.
                 None
             }
             // The only way out of a comment is its delimiter, and either half of
@@ -493,7 +534,7 @@ impl StreamStructure {
             // A backtick region is judged like a bare position, for the reason
             // `Place::Ticked` gives: whichever of the two readings is right, a
             // value that can act structurally can act.
-            Place::Bare | Place::Ticked => {
+            Place::Bare | Place::Ticked(_) => {
                 if value
                     .chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.'))
