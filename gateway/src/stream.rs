@@ -3517,6 +3517,33 @@ mod buffer_tests {
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, "Hier ist die Antwort für O'Brien:");
 
+        // **A broken top-level string is a broken document, not prose.** #79
+        // excluded depth 0 from the string-break rule because prose that quotes
+        // something is likelier there than a top-level JSON string. Under a
+        // declaration that reasoning has nothing left to rest on, and a reader
+        // that ends the string at the break and supplies the missing brace is
+        // at a bare position while the lexer is still in `Text`. Review of #85,
+        // one round after the arm above — the same exclusion, one place over.
+        for carrier in [
+            "\"Kunde\nname: [PERSON_1]}",
+            "\"Kunde\tname: [PERSON_1]}",
+            "\"Kunde\u{2028}name: [PERSON_1]}",
+        ] {
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::JsonFamily);
+            assert!(
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a declared top-level string kept the looser string rule: {carrier:?}"
+            );
+
+            // Undeclared it is still a sentence with a quote in it, which is
+            // what #79's exclusion is for.
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Unknown);
+            assert!(buffer.push(carrier).is_ok(), "prose stopped being prose");
+        }
+
         // The ordinary declared shape is untouched: a value inside a string is
         // judged by the string rule, which is where an e-mail address sits.
         let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);

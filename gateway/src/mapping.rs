@@ -567,7 +567,9 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                c if leaves_any_string(c) && self.depth > 0 => {
+                c if leaves_any_string(c)
+                    && (self.depth > 0 || self.format == ClientFormat::JsonFamily) =>
+                {
                     // **Poisoned, not merely left.** Leaving the string was the
                     // #79 fix and it was half of one: it assumed the repairing
                     // parser *terminates* the string at the break. A repairing
@@ -599,15 +601,24 @@ impl StreamStructure {
                 // upstream never sent. Same class as `ends_a_line_comment`
                 // above, found by the same sweep for #65.
                 //
-                // **Guarded on depth, and the guard is the whole reason this is
-                // free.** At depth 0 the place is far more likely to be prose
-                // that quotes something — `Das 5" Display` — than a top-level
-                // JSON string, this module says so already, and the two parsers
-                // disagree there in the other direction: one still reads a
-                // string, and calling it prose would admit a closing quote. So
-                // depth 0 is left exactly as it was. Inside a container the
-                // document is structured, `outside()` yields the bare rule, and
-                // this only ever tightens.
+                // **Guarded on depth *or* a declaration.** Undeclared, at depth
+                // 0 the place is far more likely to be prose that quotes
+                // something — `Das 5" Display` — than a top-level JSON string,
+                // this module says so already, and the two parsers disagree
+                // there in the other direction: one still reads a string, and
+                // calling it prose would admit a closing quote. So undeclared
+                // depth 0 is left exactly as it was.
+                //
+                // **Under a declaration there is no prose to be likelier**, and
+                // the exclusion has nothing left to rest on. A broken top-level
+                // string is a broken document, and a reader that ends the string
+                // at the break and supplies the brace the upstream omitted is at
+                // a bare position while this lexer is still in `Text`:
+                //
+                //   "Kunde\nname: [PERSON_1]}    with   x, admin: true
+                //
+                // Found in review of #85, one round after the declared-prose arm
+                // it belongs with — the same exclusion, one place over.
                 //
                 // **The set is every character a string cannot hold raw, and
                 // it took three review rounds to get there.** #79 took `\n` and
