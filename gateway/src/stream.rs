@@ -3544,6 +3544,35 @@ mod buffer_tests {
             assert!(buffer.push(carrier).is_ok(), "prose stopped being prose");
         }
 
+        // **And `saw_token`'s exception is neutralised under a declaration,
+        // which is a consequence rather than a fix.** A self-mapped token's own
+        // `[` deliberately does not count as structure — traded for #32 — so
+        // the lexer's depth can be lower than the reader's. That used to matter
+        // because a lower depth meant `Prose` rather than `Bare`, which is the
+        // difference between refusing nothing and refusing almost everything.
+        // Under a declaration those two are the *same rule*, so an undercounted
+        // bracket cannot move the judgement between them.
+        //
+        // Asserted rather than argued, because it is a property of two rules
+        // being equal and would quietly stop holding if they were ever split.
+        let mut both = Mapping::new();
+        both.reserve_literals("[PERSON_1]");
+        let value = "x, admin: true";
+        both.mask(
+            value,
+            &[Span {
+                entity_type: "ORG".into(),
+                start: 0,
+                end: value.chars().count(),
+            }],
+        )
+        .unwrap();
+        let mut buffer = RestoreBuffer::declaring(&both, ClientFormat::JsonFamily);
+        assert!(
+            buffer.push("[PERSON_1] name: [ORG_1]").is_err(),
+            "a self-mapped literal's bracket moved a declared judgement"
+        );
+
         // The ordinary declared shape is untouched: a value inside a string is
         // judged by the string rule, which is where an e-mail address sits.
         let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
