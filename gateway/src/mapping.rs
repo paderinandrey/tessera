@@ -246,20 +246,27 @@ pub enum ClientFormat {
     /// it, which is what #79 left the rule at.
     #[default]
     Unknown,
-    /// The caller parses the content with **strict JSON**. A bare position is
+    /// The caller parses the content with JSON's string production —
+    /// `json` or `jsonc`. A bare position is
     /// then a JSON bare position, and `json_bare_inert` says what is inert
     /// *there* — the sentence #72 could not justify and a declaration can.
     ///
-    /// Separate from `JsonFamily` for one reason: **U+2028 and U+2029 are valid
+    /// Separate from `Json5` for one reason: **U+2028 and U+2029 are valid
     /// unescaped inside a JSON string**, and are line terminators to a JSON5
-    /// reader. Collapsing the two threw away a distinction the caller had
+    /// reader. Collapsing the names threw away a distinction the caller had
     /// already made and cost a declaring caller a valid document — raised in
     /// review of #85.
+    ///
+    /// **JSONC is here and not below.** It adds comments to JSON and leaves
+    /// JSON's string production untouched, so its strings hold the separators
+    /// as JSON's do. Grouping it with JSON5 by the shape of the name rather
+    /// than by the grammar was the same mistake a second time, in the same
+    /// review.
     Json,
-    /// The caller parses the content with JSON5 or JSONC. Everything `Json`
-    /// says, and a string additionally ends at U+2028 or U+2029, because those
-    /// are line terminators to such a reader.
-    JsonFamily,
+    /// The caller parses the content with JSON5. Everything `Json` says, and a
+    /// string additionally ends at U+2028 or U+2029, because those are line
+    /// terminators to such a reader.
+    Json5,
 }
 
 impl ClientFormat {
@@ -295,9 +302,10 @@ impl ClientFormat {
     /// Whether a string, for the declared reader, ends at a Unicode line
     /// separator as well as at a control character.
     ///
-    /// Strict JSON says no — U+2028 and U+2029 are ordinary characters there.
-    /// JSON5 and JSONC say yes. Undeclared says yes, because a reader that has
-    /// not been named could be either and the strict answer is the safe one.
+    /// JSON and JSONC say no — U+2028 and U+2029 are ordinary characters in
+    /// their strings. JSON5 says yes. Undeclared says yes, because a reader
+    /// that has not been named could be either and the strict answer is the
+    /// safe one.
     pub fn separators_end_a_string(self) -> bool {
         !matches!(self, Self::Json)
     }
@@ -308,8 +316,8 @@ impl ClientFormat {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("json") => Self::Json,
-            Some("json5" | "jsonc") => Self::JsonFamily,
+            Some("json" | "jsonc") => Self::Json,
+            Some("json5") => Self::Json5,
             _ => Self::Unknown,
         }
     }
@@ -578,10 +586,18 @@ impl StreamStructure {
     /// forbidden raw in every grammar here, so a reader meeting one is
     /// repairing rather than parsing.
     fn breaks_a_string(&self, character: char) -> bool {
-        if !self.format.separators_end_a_string() && matches!(character, '\u{2028}' | '\u{2029}') {
-            return false;
+        // **C0 only, not `char::is_control`.** JSON forbids U+0000–U+001F
+        // unescaped and nothing else; U+007F and the C1 range are ordinary
+        // characters in a JSON string and no reader here ends one at them. The
+        // first version delegated to `leaves_any_string`, which uses
+        // `is_control` — right for the question that predicate asks, which is
+        // what a **value** must not contain, and wrong for this one, which is
+        // whether the reader has already left. `"Kunde\u{85}[EMAIL_1]"` is
+        // valid and was refused. Raised in review of #85.
+        if character <= '\u{1f}' {
+            return true;
         }
-        leaves_any_string(character)
+        self.format.separators_end_a_string() && matches!(character, '\u{2028}' | '\u{2029}')
     }
 
     fn settle(&mut self) {

@@ -201,12 +201,15 @@ Declaring one of them says a JSON-family parser reads the content, where `@`,
 `&` and `/` cannot act, and those values are restored. It changes nothing in a
 markdown code fence or a comment, whose language nobody has spoken for.
 
-**Inside a string it changes one thing, and only for `json5` and `jsonc`.** A
-string ends at a raw control character for every reader here; for a JSON5 or
-JSONC reader it also ends at U+2028 or U+2029, which strict JSON treats as
-ordinary characters. So `json` keeps a valid document with a separator in it
-working, and `json5` does not — which is the difference the three names are for,
-and the reason they are not one setting.
+**Inside a string it changes one thing, and only for `json5`.** A string ends
+at a raw C0 control for every reader here — JSON forbids U+0000–U+001F
+unescaped and nothing else — and for a JSON5 reader it also ends at U+2028 or
+U+2029, which JSON and JSONC treat as ordinary characters. So `json` and
+`jsonc` keep a valid document with a separator in it working and `json5` does
+not, which is why the three names are three settings and not one.
+
+JSONC is grouped with JSON here because it adds comments and leaves JSON'''s
+string production alone.
 
 **It tightens as well as widens, and the tightening is the part to read
 twice.** Declaring `json` says the content *is* a document — so text outside
