@@ -3206,6 +3206,15 @@ mod buffer_tests {
             r#"{"k":"[ORG_1]"}"#,
             crate::mapping::ClientFormat::Unknown,
         ),
+        // Declared prose sits here because it takes the same rule as a declared
+        // bare position: the caller said the content is a document, so there is
+        // no prose in it to be lenient about. Both are in the chain so they
+        // cannot drift apart — review of #85 asked for exactly that.
+        (
+            "prose, declared json",
+            "name: [ORG_1]",
+            crate::mapping::ClientFormat::JsonFamily,
+        ),
         (
             "bare, declared json",
             "{k:[ORG_1]}",
@@ -3250,6 +3259,15 @@ mod buffer_tests {
             "single-quoted string",
             "{k:'[ORG_1]'}",
             crate::mapping::ClientFormat::Unknown,
+        ),
+        // Declared prose sits here because it takes the same rule as a declared
+        // bare position: the caller said the content is a document, so there is
+        // no prose in it to be lenient about. Both are in the chain so they
+        // cannot drift apart — review of #85 asked for exactly that.
+        (
+            "prose, declared json",
+            "name: [ORG_1]",
+            crate::mapping::ClientFormat::JsonFamily,
         ),
         (
             "bare, declared json",
@@ -3357,6 +3375,27 @@ mod buffer_tests {
                     }
                 }
             }
+
+            // **Declared prose and a declared bare position share a rule, and
+            // the chain cannot say so.** Monotonicity only forbids a *later*
+            // place being looser, so putting declared prose before declared
+            // bare permits exactly the drift review asked me to catch — a
+            // mutation letting declared prose admit a comma passed the chain.
+            // Equality is the statement; a chain is the wrong shape for it.
+            let judged = |carrier: &str| {
+                let mut buffer =
+                    RestoreBuffer::declaring(&mapping, crate::mapping::ClientFormat::JsonFamily);
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err()
+            };
+            assert_eq!(
+                judged("name: [ORG_1]"),
+                judged("{k:[ORG_1]}"),
+                "{value:?} is judged differently at a declared top level than at a \
+                 declared bare position, and the declaration says they are the same place"
+            );
         }
     }
 

@@ -298,13 +298,16 @@ impl ClientFormat {
 /// Ordered by strictness, the rules are: bare (word characters only) ⊃
 /// JSON-family bare (`@`, `&`, a non-pairing `/`, and only under a declaration)
 /// ⊃ string (no delimiter, no backslash, no line separator, no control) ⊃ prose
-/// (nothing). Checking every variant against that:
+/// (nothing). **Two variants take a different rule under a declaration**, which
+/// is why the table has five rows for six variants. Checking each against
+/// that:
 ///
 /// | the lexer says | rule | where the parser could be instead | holds? |
 /// |---|---|---|---|
 /// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
 /// | `Bare`, under `ClientFormat::JsonFamily` | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
 /// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
+/// | `Prose`, under `ClientFormat::JsonFamily` | JSON-family bare | at the top level of the document the operator said this is, including one a repairing reader gave a brace the upstream omitted | yes — the declaration says there is no prose here to be lenient about |
 /// | `Prose` | nothing | nowhere, unless a `{` or a quote went uncounted | yes, with one recorded exception |
 ///
 /// **The second row is the one that has been wrong three times, and it is worth
