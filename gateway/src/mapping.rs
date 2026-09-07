@@ -723,6 +723,33 @@ impl StreamStructure {
             // Nothing structural has been seen. A value cannot close what was
             // never opened, and this is the case that keeps streamed prose —
             // most of what streams — working.
+            // **A caller that declared JSON has no prose in its content.**
+            // `Prose` means "no structure seen", and for an undeclared caller
+            // that is the common case — a chat reply — where there is nothing
+            // to break and the rule is rightly nothing. For a caller that said
+            // the content is a JSON document, depth 0 outside a string is not
+            // prose; it is the top level of that document, and a repairing
+            // reader that supplies a brace the upstream omitted puts the token
+            // at a bare position:
+            //
+            //   name: [PERSON_1]      with   x, admin: true
+            //
+            // The lexer counts no `{`, so it says prose and refuses nothing,
+            // while the reader the caller described is inside an object. Found
+            // pulling on #65's `Prose` row, which is the one review called
+            // cheapest to answer and nobody had.
+            //
+            // The declaration is what makes this sound, and it is the same
+            // declaration that widens a bare position — so a caller who asks
+            // for the widening gets this tightening with it, which is the
+            // honest shape of the trade.
+            Place::Prose if self.format == ClientFormat::JsonFamily && !self.poisoned => {
+                if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
+                    None
+                } else {
+                    Some("a value that could change the structure it was substituted into")
+                }
+            }
             Place::Prose => None,
             // **Only the delimiter that opened it closes it**, which is a
             // precision the earlier versions could not have: they knew a string

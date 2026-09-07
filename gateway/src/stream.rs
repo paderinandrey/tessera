@@ -3432,6 +3432,62 @@ mod buffer_tests {
     }
 
     #[test]
+    fn a_declared_document_has_no_prose_in_it() {
+        // **#65's `Prose` row, which review called the cheapest of its four
+        // questions and which nobody had answered.**
+        //
+        // `Prose` means "no structure seen", and it refuses nothing — right for
+        // an undeclared caller, where the content is a chat reply and there is
+        // nothing to break. For a caller that declared the content is a JSON
+        // document, depth 0 outside a string is not prose; it is that
+        // document's top level, and a repairing reader that supplies a brace
+        // the upstream omitted puts the token at a bare position.
+        use crate::mapping::ClientFormat;
+        let structural = mapped_to(&[("x, admin: true", "PERSON")]);
+        for carrier in ["name: [PERSON_1]", "\"a\":1, name: [PERSON_1]}"] {
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::JsonFamily);
+            assert!(
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a declared document treated a missing brace as prose: {carrier:?}"
+            );
+
+            // And undeclared it still streams, because there the content really
+            // may be a chat reply and prose has nothing to break.
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Unknown);
+            assert!(buffer.push(carrier).is_ok(), "prose stopped being prose");
+        }
+
+        // **The price, and it falls on the caller who asked for the widening.**
+        // A declared caller whose content is not in fact a document — a model
+        // that writes a sentence before its JSON — gets the bare rule in that
+        // sentence, where an apostrophe is not a word character.
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::declaring(&irish, ClientFormat::JsonFamily);
+        assert!(
+            buffer.push("Hier ist die Antwort für [PERSON_1]:").is_err(),
+            "the price of the declaration is not being paid, so it is not being measured"
+        );
+
+        // Undeclared, that sentence is prose and the name streams — which is
+        // what makes the price the declaration's rather than the rule's.
+        let mut buffer = RestoreBuffer::declaring(&irish, ClientFormat::Unknown);
+        let mut out = buffer.push("Hier ist die Antwort für [PERSON_1]:").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "Hier ist die Antwort für O'Brien:");
+
+        // The ordinary declared shape is untouched: a value inside a string is
+        // judged by the string rule, which is where an e-mail address sits.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::JsonFamily);
+        let mut out = buffer.push(r#"{"mail":"[EMAIL_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"mail":"uschihiller@example.org"}"#);
+    }
+
+    #[test]
     fn a_lone_backtick_does_not_close_a_fence() {
         // **Markdown closes a fence only with a run at least as long.** A lone
         // backtick is ordinary content inside a triple-backtick block — and
