@@ -246,10 +246,27 @@ pub enum ClientFormat {
     /// it, which is what #79 left the rule at.
     #[default]
     Unknown,
-    /// The caller parses the content with a JSON-family reader. A bare position
-    /// is then a JSON bare position, and `json_bare_inert` says what is inert
+    /// The caller parses the content with JSON's string production —
+    /// `json` or `jsonc`. A bare position is
+    /// then a JSON bare position, and `json_bare_inert` says what is inert
     /// *there* — the sentence #72 could not justify and a declaration can.
-    JsonFamily,
+    ///
+    /// Separate from `Json5` for one reason: **U+2028 and U+2029 are valid
+    /// unescaped inside a JSON string**, and are line terminators to a JSON5
+    /// reader. Collapsing the names threw away a distinction the caller had
+    /// already made and cost a declaring caller a valid document — raised in
+    /// review of #85.
+    ///
+    /// **JSONC is here and not below.** It adds comments to JSON and leaves
+    /// JSON's string production untouched, so its strings hold the separators
+    /// as JSON's do. Grouping it with JSON5 by the shape of the name rather
+    /// than by the grammar was the same mistake a second time, in the same
+    /// review.
+    Json,
+    /// The caller parses the content with JSON5. Everything `Json` says, and a
+    /// string additionally ends at U+2028 or U+2029, because those are line
+    /// terminators to such a reader.
+    Json5,
 }
 
 impl ClientFormat {
@@ -273,13 +290,34 @@ impl ClientFormat {
     /// `json5x`. An operator who misspells it gets the strict rule and refused
     /// streams they can debug, rather than a widened rule they did not ask for
     /// — the failure direction has to cost a restoration, not a guarantee.
+    /// Whether the caller declared a grammar at all.
+    ///
+    /// Every rule that widens or tightens on a declaration asks this. Only the
+    /// string-break set asks *which* grammar, because that is the one place the
+    /// two differ.
+    pub fn is_declared(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// Whether a string, for the declared reader, ends at a Unicode line
+    /// separator as well as at a control character.
+    ///
+    /// JSON and JSONC say no — U+2028 and U+2029 are ordinary characters in
+    /// their strings. JSON5 says yes. Undeclared says yes, because a reader
+    /// that has not been named could be either and the strict answer is the
+    /// safe one.
+    pub fn separators_end_a_string(self) -> bool {
+        !matches!(self, Self::Json)
+    }
+
     pub fn configured(declared: Option<&str>) -> Self {
         match declared
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("json" | "json5" | "jsonc") => Self::JsonFamily,
+            Some("json" | "jsonc") => Self::Json,
+            Some("json5") => Self::Json5,
             _ => Self::Unknown,
         }
     }
@@ -298,13 +336,16 @@ impl ClientFormat {
 /// Ordered by strictness, the rules are: bare (word characters only) ⊃
 /// JSON-family bare (`@`, `&`, a non-pairing `/`, and only under a declaration)
 /// ⊃ string (no delimiter, no backslash, no line separator, no control) ⊃ prose
-/// (nothing). Checking every variant against that:
+/// (nothing). **Two variants take a different rule under a declaration**, which
+/// is why the table has five rows for six variants. Checking each against
+/// that:
 ///
 /// | the lexer says | rule | where the parser could be instead | holds? |
 /// |---|---|---|---|
 /// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
-/// | `Bare`, under `ClientFormat::JsonFamily` | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
+/// | `Bare`, under a declaration | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
 /// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
+/// | `Prose`, under a declaration | JSON-family bare | at the top level of the document the operator said this is, including one a repairing reader gave a brace the upstream omitted | yes — the declaration says there is no prose here to be lenient about |
 /// | `Prose` | nothing | nowhere, unless a `{` or a quote went uncounted | yes, with one recorded exception |
 ///
 /// **The second row is the one that has been wrong three times, and it is worth
@@ -321,6 +362,12 @@ impl ClientFormat {
 ///   is outside the request, so nothing in the traffic moves the row. That is
 ///   the difference, and it is the whole of the difference: the rule is the
 ///   same three characters that review took apart twice.
+///
+/// The declaration also names *which* JSON grammar, and that is not decoration:
+/// U+2028 and U+2029 end a string for a JSON5 reader and are ordinary
+/// characters to a strict JSON one. Collapsing the three names into one
+/// variant cost a declaring caller a valid document, which is what
+/// `ClientFormat::Json` exists to avoid.
 ///
 /// So the row holds exactly as far as the configuration is true. A deployment
 /// that declares `json` and pipes the content to a YAML reader has moved the
@@ -531,6 +578,28 @@ impl StreamStructure {
     /// neither until something that is not a backtick follows it. Called both
     /// when that character arrives and before judging a value, since a token can
     /// sit immediately after the run that opened its region.
+    /// Whether this character means the reader has left a string the lexer
+    /// still thinks it is in.
+    ///
+    /// `leaves_any_string` minus the separators when the caller declared strict
+    /// JSON, where they are valid unescaped. Everything else in that set is
+    /// forbidden raw in every grammar here, so a reader meeting one is
+    /// repairing rather than parsing.
+    fn breaks_a_string(&self, character: char) -> bool {
+        // **C0 only, not `char::is_control`.** JSON forbids U+0000–U+001F
+        // unescaped and nothing else; U+007F and the C1 range are ordinary
+        // characters in a JSON string and no reader here ends one at them. The
+        // first version delegated to `leaves_any_string`, which uses
+        // `is_control` — right for the question that predicate asks, which is
+        // what a **value** must not contain, and wrong for this one, which is
+        // whether the reader has already left. `"Kunde\u{85}[EMAIL_1]"` is
+        // valid and was refused. Raised in review of #85.
+        if character <= '\u{1f}' {
+            return true;
+        }
+        self.format.separators_end_a_string() && matches!(character, '\u{2028}' | '\u{2029}')
+    }
+
     fn settle(&mut self) {
         if self.ticks == 0 {
             return;
@@ -564,7 +633,7 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                c if leaves_any_string(c) && self.depth > 0 => {
+                c if self.breaks_a_string(c) && (self.depth > 0 || self.format.is_declared()) => {
                     // **Poisoned, not merely left.** Leaving the string was the
                     // #79 fix and it was half of one: it assumed the repairing
                     // parser *terminates* the string at the break. A repairing
@@ -596,15 +665,24 @@ impl StreamStructure {
                 // upstream never sent. Same class as `ends_a_line_comment`
                 // above, found by the same sweep for #65.
                 //
-                // **Guarded on depth, and the guard is the whole reason this is
-                // free.** At depth 0 the place is far more likely to be prose
-                // that quotes something — `Das 5" Display` — than a top-level
-                // JSON string, this module says so already, and the two parsers
-                // disagree there in the other direction: one still reads a
-                // string, and calling it prose would admit a closing quote. So
-                // depth 0 is left exactly as it was. Inside a container the
-                // document is structured, `outside()` yields the bare rule, and
-                // this only ever tightens.
+                // **Guarded on depth *or* a declaration.** Undeclared, at depth
+                // 0 the place is far more likely to be prose that quotes
+                // something — `Das 5" Display` — than a top-level JSON string,
+                // this module says so already, and the two parsers disagree
+                // there in the other direction: one still reads a string, and
+                // calling it prose would admit a closing quote. So undeclared
+                // depth 0 is left exactly as it was.
+                //
+                // **Under a declaration there is no prose to be likelier**, and
+                // the exclusion has nothing left to rest on. A broken top-level
+                // string is a broken document, and a reader that ends the string
+                // at the break and supplies the brace the upstream omitted is at
+                // a bare position while this lexer is still in `Text`:
+                //
+                //   "Kunde\nname: [PERSON_1]}    with   x, admin: true
+                //
+                // Found in review of #85, one round after the declared-prose arm
+                // it belongs with — the same exclusion, one place over.
                 //
                 // **The set is every character a string cannot hold raw, and
                 // it took three review rounds to get there.** #79 took `\n` and
@@ -723,6 +801,33 @@ impl StreamStructure {
             // Nothing structural has been seen. A value cannot close what was
             // never opened, and this is the case that keeps streamed prose —
             // most of what streams — working.
+            // **A caller that declared JSON has no prose in its content.**
+            // `Prose` means "no structure seen", and for an undeclared caller
+            // that is the common case — a chat reply — where there is nothing
+            // to break and the rule is rightly nothing. For a caller that said
+            // the content is a JSON document, depth 0 outside a string is not
+            // prose; it is the top level of that document, and a repairing
+            // reader that supplies a brace the upstream omitted puts the token
+            // at a bare position:
+            //
+            //   name: [PERSON_1]      with   x, admin: true
+            //
+            // The lexer counts no `{`, so it says prose and refuses nothing,
+            // while the reader the caller described is inside an object. Found
+            // pulling on #65's `Prose` row, which is the one review called
+            // cheapest to answer and nobody had.
+            //
+            // The declaration is what makes this sound, and it is the same
+            // declaration that widens a bare position — so a caller who asks
+            // for the widening gets this tightening with it, which is the
+            // honest shape of the trade.
+            Place::Prose if self.format.is_declared() && !self.poisoned => {
+                if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
+                    None
+                } else {
+                    Some("a value that could change the structure it was substituted into")
+                }
+            }
             Place::Prose => None,
             // **Only the delimiter that opened it closes it**, which is a
             // precision the earlier versions could not have: they knew a string
@@ -808,7 +913,7 @@ impl StreamStructure {
             // poisoned state stay strict even under a declaration: the caller
             // said how it reads the *content*, not that every region inside it
             // is that format, and a comment may be one the parser is not in.
-            Place::Bare if self.format == ClientFormat::JsonFamily && !self.poisoned => {
+            Place::Bare if self.format.is_declared() && !self.poisoned => {
                 if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
                     None
                 } else {

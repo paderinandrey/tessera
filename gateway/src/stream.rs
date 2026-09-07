@@ -2663,14 +2663,14 @@ mod buffer_tests {
         // carries no quote for the string rule to catch. Raised in review of
         // #84.
         // **Every character a string cannot hold raw, not the line terminators
-        // alone.** Three review rounds narrowed this set from `\n` and `\r`:
-        // the separators were added, then every control, because
-        // `leaves_any_string` classifies them all the same way and a repairing
-        // reader may end a string at a tab. The predicate is shared with that
-        // one now, minus the backslash — the single character in both sets that
-        // is legal raw, being an escape the lexer already tracks.
+        // alone — and not everything `char::is_control` accepts either.** Four
+        // review rounds moved this set: `\n` and `\r`, then the separators, then
+        // every control, then back to **C0 and the separators**, because JSON
+        // forbids U+0000–U+001F unescaped and nothing else. U+007F and the C1
+        // range are ordinary characters in a valid string, and they are
+        // asserted to stream below.
         for terminator in [
-            '\u{2028}', '\u{2029}', '\t', '\u{b}', '\u{c}', '\u{0}', '\u{1b}', '\u{7f}', '\u{85}',
+            '\u{2028}', '\u{2029}', '\t', '\u{b}', '\u{c}', '\u{0}', '\u{1b}',
         ] {
             let mut buffer = RestoreBuffer::new(&structural);
             let carrier = format!("{{\"note\":\"Kunde{terminator}[PERSON_1]}}");
@@ -2681,6 +2681,17 @@ mod buffer_tests {
                     .is_err(),
                 "{terminator:?} left the lexer in a string a repairing parser had ended"
             );
+        }
+
+        // The two the review took out, in a container: a valid string holding
+        // one keeps streaming.
+        let plainer = mapped_to(&[("Weber", "PERSON")]);
+        for ordinary in ['\u{7f}', '\u{85}', '\u{9f}'] {
+            let mut buffer = RestoreBuffer::new(&plainer);
+            let carrier = format!("{{\"note\":\"Kunde{ordinary}\",\"who\":\"[PERSON_1]\"}}");
+            let mut out = buffer.push(&carrier).unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(out, carrier.replace("[PERSON_1]", "Weber"));
         }
 
         // A backslash is legal raw and must not poison, or every escaped string
@@ -3122,7 +3133,7 @@ mod buffer_tests {
             ("Boerner AG & Co. KGaA", "ORG"),
         ] {
             let map = mapped_to(&[(value, kind)]);
-            let mut buffer = RestoreBuffer::declaring(&map, ClientFormat::JsonFamily);
+            let mut buffer = RestoreBuffer::declaring(&map, ClientFormat::Json5);
             let mut out = buffer.push(&format!("{{v:[{kind}_1]}}")).unwrap();
             out.push_str(&buffer.finish().unwrap());
             assert_eq!(out, format!("{{v:{value}}}"));
@@ -3133,7 +3144,7 @@ mod buffer_tests {
         // that format — a fence's language is still unknown and a comment may
         // be one the parser is not in.
         for carrier in ["``[EMAIL_1]``", "{/* [EMAIL_1] */ a:1}"] {
-            let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::JsonFamily);
+            let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::Json5);
             assert!(
                 buffer.push(carrier).is_err(),
                 "a declaration widened a place the caller said nothing about: {carrier}"
@@ -3143,7 +3154,7 @@ mod buffer_tests {
         // And what a declaration must never buy: the injection the bare rule
         // exists for is refused whatever the caller says.
         let payload = mapped_to(&[("null,admin:true,pad:null", "ORG")]);
-        let mut buffer = RestoreBuffer::declaring(&payload, ClientFormat::JsonFamily);
+        let mut buffer = RestoreBuffer::declaring(&payload, ClientFormat::Json5);
         assert!(buffer.push("{safe:false,value:[ORG_1]}").is_err());
     }
 
@@ -3156,13 +3167,40 @@ mod buffer_tests {
         // the declaration while the application bears the risk — a party that
         // might be attacking, selecting the policy that protects someone else,
         // which is #78's defect in different clothes.
-        for value in ["json", "JSON", " json5 ", "jsonc"] {
+        // **`json` and `json5` are different declarations**, and collapsing
+        // them cost a declaring caller a valid document: U+2028 and U+2029 are
+        // valid unescaped inside a JSON string and are line terminators to a
+        // JSON5 reader. Raised in review of #85.
+        for value in ["json", "JSON", " json "] {
             assert_eq!(
                 ClientFormat::configured(Some(value)),
-                ClientFormat::JsonFamily,
+                ClientFormat::Json,
                 "{value:?}"
             );
         }
+        // **JSONC keeps JSON's string production** — it adds comments and
+        // nothing else — so it belongs with `json` and not with `json5`.
+        // Grouping it by the shape of the name was the same mistake twice in
+        // one review.
+        for value in ["jsonc", "JSONC", " jsonc "] {
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::Json,
+                "{value:?}"
+            );
+        }
+        for value in ["json5", " json5 ", "JSON5"] {
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::Json5,
+                "{value:?}"
+            );
+        }
+        assert!(ClientFormat::Json.is_declared() && ClientFormat::Json5.is_declared());
+        assert!(!ClientFormat::Unknown.is_declared());
+        assert!(!ClientFormat::Json.separators_end_a_string());
+        assert!(ClientFormat::Json5.separators_end_a_string());
+        assert!(ClientFormat::Unknown.separators_end_a_string());
 
         // Every unrecognised value is `Unknown`, including a near miss. An
         // operator who misspells it gets refused streams they can debug rather
@@ -3206,10 +3244,19 @@ mod buffer_tests {
             r#"{"k":"[ORG_1]"}"#,
             crate::mapping::ClientFormat::Unknown,
         ),
+        // Declared prose sits here because it takes the same rule as a declared
+        // bare position: the caller said the content is a document, so there is
+        // no prose in it to be lenient about. Both are in the chain so they
+        // cannot drift apart — review of #85 asked for exactly that.
+        (
+            "prose, declared json",
+            "name: [ORG_1]",
+            crate::mapping::ClientFormat::Json5,
+        ),
         (
             "bare, declared json",
             "{k:[ORG_1]}",
-            crate::mapping::ClientFormat::JsonFamily,
+            crate::mapping::ClientFormat::Json5,
         ),
         ("bare", "{k:[ORG_1]}", crate::mapping::ClientFormat::Unknown),
         (
@@ -3251,10 +3298,19 @@ mod buffer_tests {
             "{k:'[ORG_1]'}",
             crate::mapping::ClientFormat::Unknown,
         ),
+        // Declared prose sits here because it takes the same rule as a declared
+        // bare position: the caller said the content is a document, so there is
+        // no prose in it to be lenient about. Both are in the chain so they
+        // cannot drift apart — review of #85 asked for exactly that.
+        (
+            "prose, declared json",
+            "name: [ORG_1]",
+            crate::mapping::ClientFormat::Json5,
+        ),
         (
             "bare, declared json",
             "{k:[ORG_1]}",
-            crate::mapping::ClientFormat::JsonFamily,
+            crate::mapping::ClientFormat::Json5,
         ),
         ("bare", "{k:[ORG_1]}", crate::mapping::ClientFormat::Unknown),
     ];
@@ -3357,6 +3413,27 @@ mod buffer_tests {
                     }
                 }
             }
+
+            // **Declared prose and a declared bare position share a rule, and
+            // the chain cannot say so.** Monotonicity only forbids a *later*
+            // place being looser, so putting declared prose before declared
+            // bare permits exactly the drift review asked me to catch — a
+            // mutation letting declared prose admit a comma passed the chain.
+            // Equality is the statement; a chain is the wrong shape for it.
+            let judged = |carrier: &str| {
+                let mut buffer =
+                    RestoreBuffer::declaring(&mapping, crate::mapping::ClientFormat::Json5);
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err()
+            };
+            assert_eq!(
+                judged("name: [ORG_1]"),
+                judged("{k:[ORG_1]}"),
+                "{value:?} is judged differently at a declared top level than at a \
+                 declared bare position, and the declaration says they are the same place"
+            );
         }
     }
 
@@ -3429,6 +3506,166 @@ mod buffer_tests {
         let mut out = buffer.push("Das 5\" Display\nund dann [PERSON_1]").unwrap();
         out.push_str(&buffer.finish().unwrap());
         assert_eq!(out, "Das 5\" Display\nund dann O'Brien");
+    }
+
+    #[test]
+    fn a_declared_document_has_no_prose_in_it() {
+        // **#65's `Prose` row, which review called the cheapest of its four
+        // questions and which nobody had answered.**
+        //
+        // `Prose` means "no structure seen", and it refuses nothing — right for
+        // an undeclared caller, where the content is a chat reply and there is
+        // nothing to break. For a caller that declared the content is a JSON
+        // document, depth 0 outside a string is not prose; it is that
+        // document's top level, and a repairing reader that supplies a brace
+        // the upstream omitted puts the token at a bare position.
+        use crate::mapping::ClientFormat;
+        let structural = mapped_to(&[("x, admin: true", "PERSON")]);
+        for carrier in ["name: [PERSON_1]", "\"a\":1, name: [PERSON_1]}"] {
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Json5);
+            assert!(
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a declared document treated a missing brace as prose: {carrier:?}"
+            );
+
+            // And undeclared it still streams, because there the content really
+            // may be a chat reply and prose has nothing to break.
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Unknown);
+            assert!(buffer.push(carrier).is_ok(), "prose stopped being prose");
+        }
+
+        // **The price, and it falls on the caller who asked for the widening.**
+        // A declared caller whose content is not in fact a document — a model
+        // that writes a sentence before its JSON — gets the bare rule in that
+        // sentence, where an apostrophe is not a word character.
+        let irish = mapped_to(&[("O'Brien", "PERSON")]);
+        let mut buffer = RestoreBuffer::declaring(&irish, ClientFormat::Json5);
+        assert!(
+            buffer.push("Hier ist die Antwort für [PERSON_1]:").is_err(),
+            "the price of the declaration is not being paid, so it is not being measured"
+        );
+
+        // Undeclared, that sentence is prose and the name streams — which is
+        // what makes the price the declaration's rather than the rule's.
+        let mut buffer = RestoreBuffer::declaring(&irish, ClientFormat::Unknown);
+        let mut out = buffer.push("Hier ist die Antwort für [PERSON_1]:").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "Hier ist die Antwort für O'Brien:");
+
+        // **A broken top-level string is a broken document, not prose.** #79
+        // excluded depth 0 from the string-break rule because prose that quotes
+        // something is likelier there than a top-level JSON string. Under a
+        // declaration that reasoning has nothing left to rest on, and a reader
+        // that ends the string at the break and supplies the missing brace is
+        // at a bare position while the lexer is still in `Text`. Review of #85,
+        // one round after the arm above — the same exclusion, one place over.
+        for carrier in [
+            "\"Kunde\nname: [PERSON_1]}",
+            "\"Kunde\tname: [PERSON_1]}",
+            "\"Kunde\u{2028}name: [PERSON_1]}",
+        ] {
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Json5);
+            assert!(
+                buffer
+                    .push(carrier)
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a declared top-level string kept the looser string rule: {carrier:?}"
+            );
+
+            // Undeclared it is still a sentence with a quote in it, which is
+            // what #79's exclusion is for.
+            let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Unknown);
+            assert!(buffer.push(carrier).is_ok(), "prose stopped being prose");
+        }
+
+        // **And `saw_token`'s exception is neutralised under a declaration,
+        // which is a consequence rather than a fix.** A self-mapped token's own
+        // `[` deliberately does not count as structure — traded for #32 — so
+        // the lexer's depth can be lower than the reader's. That used to matter
+        // because a lower depth meant `Prose` rather than `Bare`, which is the
+        // difference between refusing nothing and refusing almost everything.
+        // Under a declaration those two are the *same rule*, so an undercounted
+        // bracket cannot move the judgement between them.
+        //
+        // Asserted rather than argued, because it is a property of two rules
+        // being equal and would quietly stop holding if they were ever split.
+        let mut both = Mapping::new();
+        both.reserve_literals("[PERSON_1]");
+        let value = "x, admin: true";
+        both.mask(
+            value,
+            &[Span {
+                entity_type: "ORG".into(),
+                start: 0,
+                end: value.chars().count(),
+            }],
+        )
+        .unwrap();
+        let mut buffer = RestoreBuffer::declaring(&both, ClientFormat::Json5);
+        assert!(
+            buffer.push("[PERSON_1] name: [ORG_1]").is_err(),
+            "a self-mapped literal's bracket moved a declared judgement"
+        );
+
+        // **U+2028 is valid unescaped in a JSON string, and a caller who
+        // declared `json` gets to keep it.** The broadened guard poisoned on
+        // the whole of `leaves_any_string`, which includes the two separators
+        // because they are line terminators *to a JSON5 reader* — so a valid
+        // JSON document with a separator in a top-level string started
+        // refusing an e-mail address that had always restored. Collapsing
+        // `json`, `json5` and `jsonc` into one declaration is what threw the
+        // distinction away; the caller had already made it. Review of #85.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::Json);
+        let mut out = buffer.push("\"Kunde\u{2028}[EMAIL_1]\"").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "\"Kunde\u{2028}uschihiller@example.org\"");
+
+        // Declaring json5, or declaring nothing, keeps the poison — there the
+        // separator really may end the string.
+        for format in [ClientFormat::Json5, ClientFormat::Unknown] {
+            let mut buffer = RestoreBuffer::declaring(&structural, format);
+            assert!(
+                buffer
+                    .push("{\"a\":\"Kunde\u{2028}[PERSON_1]}")
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a separator stopped ending a string for a reader that ends one there"
+            );
+        }
+
+        // **A C1 control is not forbidden raw and must not poison.** JSON
+        // forbids U+0000–U+001F unescaped and nothing else, so `"Kunde\u{85}…"`
+        // is a valid document — and `char::is_control` accepts U+007F and the
+        // whole C1 range, which is why delegating to `leaves_any_string` here
+        // refused one. Raised in review of #85.
+        for format in [
+            ClientFormat::Json,
+            ClientFormat::Json5,
+            ClientFormat::Unknown,
+        ] {
+            let mut buffer = RestoreBuffer::declaring(&mail, format);
+            let mut out = buffer.push("\"Kunde\u{85}[EMAIL_1]\"").unwrap();
+            out.push_str(&buffer.finish().unwrap());
+            assert_eq!(out, "\"Kunde\u{85}uschihiller@example.org\"");
+        }
+
+        // A C0 control is forbidden raw in every grammar here, so every
+        // declaration poisons on it — the split is about the separators alone.
+        let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Json);
+        assert!(buffer.push("\"Kunde\tname: [PERSON_1]}").is_err());
+
+        // The ordinary declared shape is untouched: a value inside a string is
+        // judged by the string rule, which is where an e-mail address sits.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::Json5);
+        let mut out = buffer.push(r#"{"mail":"[EMAIL_1]"}"#).unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, r#"{"mail":"uschihiller@example.org"}"#);
     }
 
     #[test]
