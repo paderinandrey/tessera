@@ -385,10 +385,7 @@ mod tests {
             &declared,
             std::sync::Arc::new(crate::audit::failing_audit_for_tests()),
         );
-        assert_eq!(
-            state.response_format,
-            crate::mapping::ClientFormat::JsonFamily
-        );
+        assert_eq!(state.response_format, crate::mapping::ClientFormat::Json);
 
         // Absent is the strict rule, which is the default a deployment gets by
         // saying nothing.

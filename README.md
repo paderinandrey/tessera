@@ -197,11 +197,16 @@ and a full stop. **An e-mail address does not pass that**, nor does a German tax
 number like `419/130/29933`, nor `Beckmann AG & Co. KG` — and a value that
 cannot be restored means the response is refused rather than served corrupted.
 
-Declaring `json` says a JSON-family parser reads the content, where `@`, `&` and
-`/` cannot act, and those values are restored. It changes nothing inside a
-string, which is where such values ordinarily sit and where they were always
-restored. It changes nothing in a markdown code fence or a comment either, whose
-language nobody has spoken for.
+Declaring one of them says a JSON-family parser reads the content, where `@`,
+`&` and `/` cannot act, and those values are restored. It changes nothing in a
+markdown code fence or a comment, whose language nobody has spoken for.
+
+**Inside a string it changes one thing, and only for `json5` and `jsonc`.** A
+string ends at a raw control character for every reader here; for a JSON5 or
+JSONC reader it also ends at U+2028 or U+2029, which strict JSON treats as
+ordinary characters. So `json` keeps a valid document with a separator in it
+working, and `json5` does not — which is the difference the three names are for,
+and the reason they are not one setting.
 
 **It tightens as well as widens, and the tightening is the part to read
 twice.** Declaring `json` says the content *is* a document — so text outside

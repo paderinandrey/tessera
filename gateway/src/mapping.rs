@@ -246,9 +246,19 @@ pub enum ClientFormat {
     /// it, which is what #79 left the rule at.
     #[default]
     Unknown,
-    /// The caller parses the content with a JSON-family reader. A bare position
-    /// is then a JSON bare position, and `json_bare_inert` says what is inert
+    /// The caller parses the content with **strict JSON**. A bare position is
+    /// then a JSON bare position, and `json_bare_inert` says what is inert
     /// *there* — the sentence #72 could not justify and a declaration can.
+    ///
+    /// Separate from `JsonFamily` for one reason: **U+2028 and U+2029 are valid
+    /// unescaped inside a JSON string**, and are line terminators to a JSON5
+    /// reader. Collapsing the two threw away a distinction the caller had
+    /// already made and cost a declaring caller a valid document — raised in
+    /// review of #85.
+    Json,
+    /// The caller parses the content with JSON5 or JSONC. Everything `Json`
+    /// says, and a string additionally ends at U+2028 or U+2029, because those
+    /// are line terminators to such a reader.
     JsonFamily,
 }
 
@@ -273,13 +283,33 @@ impl ClientFormat {
     /// `json5x`. An operator who misspells it gets the strict rule and refused
     /// streams they can debug, rather than a widened rule they did not ask for
     /// — the failure direction has to cost a restoration, not a guarantee.
+    /// Whether the caller declared a grammar at all.
+    ///
+    /// Every rule that widens or tightens on a declaration asks this. Only the
+    /// string-break set asks *which* grammar, because that is the one place the
+    /// two differ.
+    pub fn is_declared(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    /// Whether a string, for the declared reader, ends at a Unicode line
+    /// separator as well as at a control character.
+    ///
+    /// Strict JSON says no — U+2028 and U+2029 are ordinary characters there.
+    /// JSON5 and JSONC say yes. Undeclared says yes, because a reader that has
+    /// not been named could be either and the strict answer is the safe one.
+    pub fn separators_end_a_string(self) -> bool {
+        !matches!(self, Self::Json)
+    }
+
     pub fn configured(declared: Option<&str>) -> Self {
         match declared
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("json" | "json5" | "jsonc") => Self::JsonFamily,
+            Some("json") => Self::Json,
+            Some("json5" | "jsonc") => Self::JsonFamily,
             _ => Self::Unknown,
         }
     }
@@ -305,9 +335,9 @@ impl ClientFormat {
 /// | the lexer says | rule | where the parser could be instead | holds? |
 /// |---|---|---|---|
 /// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
-/// | `Bare`, under `ClientFormat::JsonFamily` | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
+/// | `Bare`, under a declaration | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
 /// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
-/// | `Prose`, under `ClientFormat::JsonFamily` | JSON-family bare | at the top level of the document the operator said this is, including one a repairing reader gave a brace the upstream omitted | yes — the declaration says there is no prose here to be lenient about |
+/// | `Prose`, under a declaration | JSON-family bare | at the top level of the document the operator said this is, including one a repairing reader gave a brace the upstream omitted | yes — the declaration says there is no prose here to be lenient about |
 /// | `Prose` | nothing | nowhere, unless a `{` or a quote went uncounted | yes, with one recorded exception |
 ///
 /// **The second row is the one that has been wrong three times, and it is worth
@@ -324,6 +354,12 @@ impl ClientFormat {
 ///   is outside the request, so nothing in the traffic moves the row. That is
 ///   the difference, and it is the whole of the difference: the rule is the
 ///   same three characters that review took apart twice.
+///
+/// The declaration also names *which* JSON grammar, and that is not decoration:
+/// U+2028 and U+2029 end a string for a JSON5 reader and are ordinary
+/// characters to a strict JSON one. Collapsing the three names into one
+/// variant cost a declaring caller a valid document, which is what
+/// `ClientFormat::Json` exists to avoid.
 ///
 /// So the row holds exactly as far as the configuration is true. A deployment
 /// that declares `json` and pipes the content to a YAML reader has moved the
@@ -534,6 +570,20 @@ impl StreamStructure {
     /// neither until something that is not a backtick follows it. Called both
     /// when that character arrives and before judging a value, since a token can
     /// sit immediately after the run that opened its region.
+    /// Whether this character means the reader has left a string the lexer
+    /// still thinks it is in.
+    ///
+    /// `leaves_any_string` minus the separators when the caller declared strict
+    /// JSON, where they are valid unescaped. Everything else in that set is
+    /// forbidden raw in every grammar here, so a reader meeting one is
+    /// repairing rather than parsing.
+    fn breaks_a_string(&self, character: char) -> bool {
+        if !self.format.separators_end_a_string() && matches!(character, '\u{2028}' | '\u{2029}') {
+            return false;
+        }
+        leaves_any_string(character)
+    }
+
     fn settle(&mut self) {
         if self.ticks == 0 {
             return;
@@ -567,9 +617,7 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                c if leaves_any_string(c)
-                    && (self.depth > 0 || self.format == ClientFormat::JsonFamily) =>
-                {
+                c if self.breaks_a_string(c) && (self.depth > 0 || self.format.is_declared()) => {
                     // **Poisoned, not merely left.** Leaving the string was the
                     // #79 fix and it was half of one: it assumed the repairing
                     // parser *terminates* the string at the break. A repairing
@@ -757,7 +805,7 @@ impl StreamStructure {
             // declaration that widens a bare position — so a caller who asks
             // for the widening gets this tightening with it, which is the
             // honest shape of the trade.
-            Place::Prose if self.format == ClientFormat::JsonFamily && !self.poisoned => {
+            Place::Prose if self.format.is_declared() && !self.poisoned => {
                 if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
                     None
                 } else {
@@ -849,7 +897,7 @@ impl StreamStructure {
             // poisoned state stay strict even under a declaration: the caller
             // said how it reads the *content*, not that every region inside it
             // is that format, and a comment may be one the parser is not in.
-            Place::Bare if self.format == ClientFormat::JsonFamily && !self.poisoned => {
+            Place::Bare if self.format.is_declared() && !self.poisoned => {
                 if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
                     None
                 } else {

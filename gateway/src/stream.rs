@@ -3156,13 +3156,29 @@ mod buffer_tests {
         // the declaration while the application bears the risk — a party that
         // might be attacking, selecting the policy that protects someone else,
         // which is #78's defect in different clothes.
-        for value in ["json", "JSON", " json5 ", "jsonc"] {
+        // **`json` and `json5` are different declarations**, and collapsing
+        // them cost a declaring caller a valid document: U+2028 and U+2029 are
+        // valid unescaped inside a JSON string and are line terminators to a
+        // JSON5 reader. Raised in review of #85.
+        for value in ["json", "JSON", " json "] {
+            assert_eq!(
+                ClientFormat::configured(Some(value)),
+                ClientFormat::Json,
+                "{value:?}"
+            );
+        }
+        for value in ["json5", " json5 ", "jsonc", "JSONC"] {
             assert_eq!(
                 ClientFormat::configured(Some(value)),
                 ClientFormat::JsonFamily,
                 "{value:?}"
             );
         }
+        assert!(ClientFormat::Json.is_declared() && ClientFormat::JsonFamily.is_declared());
+        assert!(!ClientFormat::Unknown.is_declared());
+        assert!(!ClientFormat::Json.separators_end_a_string());
+        assert!(ClientFormat::JsonFamily.separators_end_a_string());
+        assert!(ClientFormat::Unknown.separators_end_a_string());
 
         // Every unrecognised value is `Unknown`, including a near miss. An
         // operator who misspells it gets refused streams they can debug rather
@@ -3572,6 +3588,38 @@ mod buffer_tests {
             buffer.push("[PERSON_1] name: [ORG_1]").is_err(),
             "a self-mapped literal's bracket moved a declared judgement"
         );
+
+        // **U+2028 is valid unescaped in a JSON string, and a caller who
+        // declared `json` gets to keep it.** The broadened guard poisoned on
+        // the whole of `leaves_any_string`, which includes the two separators
+        // because they are line terminators *to a JSON5 reader* — so a valid
+        // JSON document with a separator in a top-level string started
+        // refusing an e-mail address that had always restored. Collapsing
+        // `json`, `json5` and `jsonc` into one declaration is what threw the
+        // distinction away; the caller had already made it. Review of #85.
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+        let mut buffer = RestoreBuffer::declaring(&mail, ClientFormat::Json);
+        let mut out = buffer.push("\"Kunde\u{2028}[EMAIL_1]\"").unwrap();
+        out.push_str(&buffer.finish().unwrap());
+        assert_eq!(out, "\"Kunde\u{2028}uschihiller@example.org\"");
+
+        // Declaring json5 or jsonc keeps the poison, because there the
+        // separator really does end the string.
+        for format in [ClientFormat::JsonFamily, ClientFormat::Unknown] {
+            let mut buffer = RestoreBuffer::declaring(&structural, format);
+            assert!(
+                buffer
+                    .push("{\"a\":\"Kunde\u{2028}[PERSON_1]}")
+                    .and_then(|out| buffer.finish().map(|tail| out + &tail))
+                    .is_err(),
+                "a separator stopped ending a string for a reader that ends one there"
+            );
+        }
+
+        // A control is forbidden raw in every grammar here, so `json` poisons
+        // on it like the others — the split is about the separators alone.
+        let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Json);
+        assert!(buffer.push("\"Kunde\tname: [PERSON_1]}").is_err());
 
         // The ordinary declared shape is untouched: a value inside a string is
         // judged by the string rule, which is where an e-mail address sits.
