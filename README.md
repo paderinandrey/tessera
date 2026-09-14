@@ -197,11 +197,33 @@ and a full stop. **An e-mail address does not pass that**, nor does a German tax
 number like `419/130/29933`, nor `Beckmann AG & Co. KG` — and a value that
 cannot be restored means the response is refused rather than served corrupted.
 
-Declaring `json` says a JSON-family parser reads the content, where `@`, `&` and
-`/` cannot act, and those values are restored. It changes nothing inside a
-string, which is where such values ordinarily sit and where they were always
-restored. It changes nothing in a markdown code fence or a comment either, whose
-language nobody has spoken for.
+Declaring one of them says a JSON-family parser reads the content, where `@`,
+`&` and `/` cannot act, and those values are restored. It changes nothing in a
+markdown code fence or a comment, whose language nobody has spoken for.
+
+**Inside a string it changes one thing, and only for `json5`.** A string ends
+at a raw C0 control for every reader here — JSON forbids U+0000–U+001F
+unescaped and nothing else — and for a JSON5 reader it also ends at U+2028 or
+U+2029, which JSON and JSONC treat as ordinary characters. So `json` and
+`jsonc` keep a valid document with a separator in it working and `json5` does
+not, which is why the three names are three settings and not one.
+
+JSONC is grouped with JSON here because it adds comments and leaves JSON'''s
+string production alone.
+
+**It tightens as well as widens, and the tightening is the part to read
+twice.** Declaring `json` says the content *is* a document — so text outside
+any string is that document's top level rather than prose, and it takes the
+same rule. Undeclared, such text is a chat reply with nothing to break and
+nothing is refused there; declared, a repairing reader that supplies a brace
+the model omitted would be inside an object, so `name: [PERSON_1]` is judged as
+a bare position.
+
+The price falls on a caller whose content is not in fact a document. A model
+that writes a sentence before its JSON puts names in that sentence, and
+`O'Brien` does not pass the bare rule — declared, that sentence is refused where
+undeclared it streams. **If your responses mix prose and JSON, do not declare
+the format.**
 
 **It is configuration and not a request header, on purpose.** A header would be
 sent by whoever calls the gateway — and behind an application proxy that
