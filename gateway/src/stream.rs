@@ -2694,6 +2694,36 @@ mod buffer_tests {
             assert_eq!(out, carrier.replace("[PERSON_1]", "Weber"));
         }
 
+        use crate::mapping::ClientFormat;
+        let mail = mapped_to(&[("uschihiller@example.org", "EMAIL")]);
+
+        // **A line continuation escapes CRLF as one sequence.** JSON5's
+        // continuation is `\` followed by a LineTerminatorSequence, and CRLF is
+        // one of those — so consuming only the carriage return left the line
+        // feed to be read as a raw break, poisoning a valid document. Raised in
+        // review of #85, and it only showed under a declaration because
+        // undeclared depth 0 does not poison at all.
+        for continuation in ["\\\n", "\\\r\n", "\\\r"] {
+            for format in [
+                ClientFormat::Json5,
+                ClientFormat::Json,
+                ClientFormat::Unknown,
+            ] {
+                let mut buffer = RestoreBuffer::declaring(&mail, format);
+                let carrier = format!("\"Kunde{continuation}[EMAIL_1]\"");
+                let mut out = buffer
+                    .push(&carrier)
+                    .unwrap_or_else(|e| panic!("{continuation:?} under {format:?}: {e}"));
+                out.push_str(&buffer.finish().unwrap());
+                assert_eq!(out, carrier.replace("[EMAIL_1]", "uschihiller@example.org"));
+            }
+        }
+
+        // And an unescaped CRLF still breaks the string, so the fix is about
+        // the escape and not about the pair.
+        let mut buffer = RestoreBuffer::declaring(&structural, ClientFormat::Json5);
+        assert!(buffer.push("\"Kunde\r\nname: [PERSON_1]}").is_err());
+
         // A backslash is legal raw and must not poison, or every escaped string
         // in every response is refused.
         let plain = mapped_to(&[("Weber", "PERSON")]);

@@ -500,6 +500,9 @@ pub struct StreamStructure {
     /// construction, and never from anything the upstream sends.
     format: ClientFormat,
     escaped: bool,
+    /// The escape just consumed a carriage return, so a line feed after it
+    /// belongs to the same sequence — see `step`.
+    escaped_cr: bool,
     /// The last character emitted, so a `*` at the end of a value and a `/` at
     /// the start of the next run are seen as the `*/` they become.
     last: Option<char>,
@@ -618,8 +621,21 @@ impl StreamStructure {
         let previous = self.last.replace(character);
         if self.escaped {
             self.escaped = false;
+            // **CRLF is one line-terminator sequence, not two characters.** A
+            // JSON5 line continuation is `\` followed by a LineTerminatorSequence
+            // and CRLF is one of them, so the escape covers both — consuming
+            // only the carriage return leaves the line feed to be read as a raw
+            // break, which poisons a valid document. Raised in review of #85.
+            self.escaped_cr = character == '\r';
             return;
         }
+        if self.escaped_cr {
+            self.escaped_cr = false;
+            if character == '\n' {
+                return;
+            }
+        }
+
         // Backticks are punctuation only outside a string or comment; inside
         // one they are ordinary content.
         if matches!(self.place, Place::Prose | Place::Bare | Place::Ticked(_)) {
