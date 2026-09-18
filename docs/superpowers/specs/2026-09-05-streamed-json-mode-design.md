@@ -38,6 +38,14 @@ document the caller's own agent reads.
 traffic, so a described `arguments` — the case the escaping work was written for
 — never streams. This is the other half.
 
+> **No longer true of Anthropic, as of #87 (2026-09-18).** A tool block there is
+> accumulated and restored when `content_block_stop` closes it, which reaches
+> `restore_in_string_strictly` for every leaf — the same door this spec is
+> about, so the escaping holds; what changed is that the traffic arrives rather
+> than being refused. OpenAI still refuses, its deltas closing no block. The
+> guard this section leans on is now provider-dependent, and the sentence is
+> left standing because it is what was true when #36 was decided.
+
 ## The change
 
 **Refuse `stream: true` beside any `response_format` that is not `text`**, in

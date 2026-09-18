@@ -190,9 +190,16 @@ has cost so far.
 ## What it does not do yet
 
 Early development. The detector, the gateway — sessions, streaming, the audit journal, tool
-traffic on the buffered path — and the two-container stack all work end to end. **Not ready
-for production use:** the gateway authenticates no caller, and nothing here has been run in
-anger.
+traffic — and the two-container stack all work end to end.
+
+**Streaming and tool calls together work on Anthropic only.** The same request to OpenAI is
+refused before the upstream call, where it costs no tokens: its `tool_calls` deltas close no
+block of their own, so the accumulator that makes this safe has no boundary to key on. An
+agent harness pointed at `/v1/messages` is served; one pointed at `/v1/chat/completions` has
+to turn streaming off.
+
+**Not ready for production use:** the gateway authenticates no caller, and nothing here has
+been run in anger.
 
 ## Documentation
 
