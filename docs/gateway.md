@@ -170,9 +170,11 @@ provider as the client sent it. And **the body and the message levels are not al
 all** — see below, because that is the other half of the closed-allowlist claim.
 
 Tool traffic is masked now, so what it still refuses is worth stating on its own.
-**Streamed tool calls**, which the buffered path's masking does not reach: a document
-arriving a delta at a time is not well formed until its block closes, so masking it means
-buffering the block first, which the streamed path does not do yet. A
+**Streamed tool calls on OpenAI**: a document arriving a delta at a time is not well formed
+until its block closes, so restoring it means accumulating the block first — and OpenAI's
+`tool_calls` deltas close no block, the end arriving as `finish_reason` in a later chunk.
+Anthropic's do, so there the block is accumulated and restored structurally and the request
+is served; see [the streamed path](streaming.md). A
 **tool-field shape the gateway has no rule for** — and the rule is a *closed allowlist*, so
 an unrecognized content-block type, or a field beside the ones each tool structure is
 described by, is refused rather than forwarded. That is deliberately the expensive

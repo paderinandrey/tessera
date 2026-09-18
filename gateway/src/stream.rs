@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::mapping::{Mapping, MappingError};
-use crate::provider::{read_pointer, write_pointer, Provider, ShapeError, Terminates};
+use crate::provider::{read_pointer, write_pointer, Provider, Run, ShapeError, Terminates};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -39,6 +39,11 @@ pub enum StreamError {
     Stalled,
     #[error("upstream opened more runs of text than this gateway will hold; the stream ends")]
     TooManyRuns,
+    #[error(
+        "upstream sent a tool-argument document larger than this gateway will \
+         accumulate; the stream ends"
+    )]
+    ToolDocumentTooLarge,
     #[error(
         "upstream sent an event this gateway cannot parse; the stream ends rather \
          than forwarding text it could not restore"
@@ -102,6 +107,7 @@ impl StreamError {
             StreamError::Oversized => "stream_oversized",
             StreamError::Stalled => "stream_stalled",
             StreamError::TooManyRuns => "stream_too_many_runs",
+            StreamError::ToolDocumentTooLarge => "stream_tool_document_too_large",
             StreamError::Malformed => "stream_malformed",
         }
     }
@@ -131,6 +137,23 @@ pub const MAX_ACTIVE_RUNS: usize = 64;
 /// `mapping::MAX_ENTITY_TYPE`, so releasing a bracket here can never orphan a
 /// real token.
 pub const MAX_HELD: usize = 64;
+
+/// How much of one tool-argument document to accumulate before giving up on it.
+///
+/// A tool block is held whole rather than streamed: half a document is not a
+/// document, so there is no safe prefix to release and the usual hold-back
+/// buffer does not apply. That makes it the one run here with no natural
+/// ceiling — `MAX_EVENT_BYTES` bounds a single event and `MAX_QUEUED_BYTES`
+/// bounds what waits behind one, and a document spread thinly across many
+/// events is neither.
+///
+/// 256 KiB is above what a model can emit in one block: it is roughly 64k
+/// tokens, which is the output ceiling of the models this gateway is pointed
+/// at. **Worst case is this times `MAX_ACTIVE_RUNS`** — 16 MiB of accumulator
+/// for one response that opens every run it is allowed and closes none. That is
+/// the price of holding documents whole, and it is bounded, which streaming
+/// them is not.
+pub const MAX_TOOL_DOCUMENT_BYTES: usize = 256 << 10;
 
 /// Restores placeholders in text arriving piece by piece. A placeholder
 /// matching `[TYPE_N]` contains no `[`, so only the text from the last `[` with
@@ -492,10 +515,31 @@ pub struct StreamRestorer<'a> {
     format: crate::mapping::ClientFormat,
 }
 
-/// A run of text in progress, and where its event wrote it last.
-struct Held<'a> {
-    buffer: RestoreBuffer<'a>,
-    pointer: String,
+/// A run in progress, and where its event wrote it last.
+///
+/// The two kinds differ in what can safely be served before the run ends. A
+/// `Text` run has a safe prefix — everything before the last unclosed `[` — and
+/// streams it. A `Document` run has none: half a JSON document is not a
+/// document, so nothing of it goes out until its block closes and it can be
+/// parsed and restored structurally.
+enum Held<'a> {
+    Text {
+        buffer: RestoreBuffer<'a>,
+        pointer: String,
+    },
+    Document {
+        /// The fragments as the upstream sent them, unrestored. A placeholder
+        /// may be split across two of them, which is half the reason this path
+        /// could not substitute as it went.
+        raw: String,
+        pointer: String,
+        /// The most recent event of this run, envelope already restored and its
+        /// fragment blanked. The whole document is written into it when the
+        /// block closes, so the client receives one event carrying the lot
+        /// rather than a synthesized one this module would have to invent a
+        /// shape for.
+        carrier: SseEvent,
+    },
 }
 
 /// The text-bearing event waiting one behind, and which runs it carries. A
@@ -563,7 +607,9 @@ impl<'a> StreamRestorer<'a> {
     /// What was already safe to serve when a failure stopped the stream: events
     /// rendered before the failing one, and whatever the one-event delay was
     /// still holding. The hold-back buffers are dropped untouched — they may
-    /// contain the very token that could not be restored.
+    /// contain the very token that could not be restored — and so are the
+    /// document accumulators, which hold fragments that were never restored at
+    /// all and would carry placeholders out verbatim.
     pub fn salvage(&mut self) -> String {
         let mut out = std::mem::take(&mut self.salvage);
         self.buffers.clear();
@@ -632,6 +678,63 @@ impl<'a> StreamRestorer<'a> {
         }
 
         let mapping = self.mapping;
+        let provider = self.provider.name();
+
+        // **A fragment of a tool-argument document, which is not restored
+        // here.** A delta is not a document, so there is nothing to parse at
+        // the moment of substitution and nothing of it is safe to serve; it is
+        // accumulated and restored whole when `content_block_stop` closes this
+        // index. The envelope is restored now, because it is this event's own
+        // and the accumulator has no use for it.
+        if let Some(slot) = slots.iter().find(|slot| slot.run == Run::Document) {
+            // One event, one run. Two would mean one of them belongs to another
+            // block, and writing a document into the wrong carrier is the
+            // failure `place` guards against on the text path.
+            if slots.len() != 1 {
+                return Err(ShapeError::Response(provider).into());
+            }
+            let fragment = read_pointer(&parsed, &slot.pointer)?;
+            let mut scrubbed = parsed.clone();
+            write_pointer(&mut scrubbed, &slot.pointer, "")?;
+            let mut carrier = event;
+            carrier.data = Some(mapping.restore_value(&scrubbed)?.to_string());
+
+            match self.buffers.get_mut(&slot.key) {
+                Some(Held::Document {
+                    raw,
+                    pointer,
+                    carrier: held,
+                }) => {
+                    if raw.len() + fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
+                        return Err(StreamError::ToolDocumentTooLarge);
+                    }
+                    raw.push_str(&fragment);
+                    pointer.clone_from(&slot.pointer);
+                    *held = carrier;
+                }
+                // One key, two kinds. The upstream changed what a run is
+                // mid-flight, and neither reading of the fragments is right.
+                Some(Held::Text { .. }) => return Err(ShapeError::Response(provider).into()),
+                None => {
+                    if self.buffers.len() >= MAX_ACTIVE_RUNS {
+                        return Err(StreamError::TooManyRuns);
+                    }
+                    if fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
+                        return Err(StreamError::ToolDocumentTooLarge);
+                    }
+                    self.buffers.insert(
+                        slot.key.clone(),
+                        Held::Document {
+                            raw: fragment,
+                            pointer: slot.pointer.clone(),
+                            carrier,
+                        },
+                    );
+                }
+            }
+            return Ok(String::new());
+        }
+
         // Everything in the event that is not the streamed text is restored
         // whole, exactly as a pointer-less event is. The slot path rewrites the
         // deltas and nothing else, so any other string a provider puts here —
@@ -656,12 +759,16 @@ impl<'a> StreamRestorer<'a> {
             let held = self
                 .buffers
                 .entry(slot.key.clone())
-                .or_insert_with(|| Held {
+                .or_insert_with(|| Held::Text {
                     buffer: RestoreBuffer::declaring(mapping, format),
                     pointer: slot.pointer.clone(),
                 });
-            held.pointer = slot.pointer.clone();
-            let safe = held.buffer.push(&text)?;
+            let Held::Text { buffer, pointer } = held else {
+                // See the same arm above: one key cannot be both kinds of run.
+                return Err(ShapeError::Response(provider).into());
+            };
+            pointer.clone_from(&slot.pointer);
+            let safe = buffer.push(&text)?;
             write_pointer(&mut rewritten, &slot.pointer, &safe)?;
             carried.insert(slot.key.clone(), slot.pointer.clone());
         }
@@ -709,14 +816,61 @@ impl<'a> StreamRestorer<'a> {
             Terminates::Runs(keys) => keys.contains(key),
             Terminates::Nothing => false,
         };
+        let mapping = self.mapping;
+        let provider = self.provider.name();
         let mut remainders: Vec<(String, String)> = Vec::new();
+        // Documents that closed with this event, rendered whole. They go out
+        // behind whatever was already waiting and in front of the event that
+        // ended them, which is the order the upstream sent their fragments in.
+        let mut documents = String::new();
         for (key, held) in self.buffers.iter_mut() {
             if !ends(key) {
                 continue;
             }
-            let rest = held.buffer.finish()?;
-            if !rest.is_empty() {
-                remainders.push((key.clone(), rest));
+            match held {
+                Held::Text { buffer, .. } => {
+                    let rest = buffer.finish()?;
+                    if !rest.is_empty() {
+                        remainders.push((key.clone(), rest));
+                    }
+                }
+                // **The structural route, and the whole reason this path may
+                // admit tool traffic at all.** The fragments are a document
+                // now, so the value goes into a leaf and serialization escapes
+                // it — a name carrying a `"` cannot close the string it lands
+                // in, which textual substitution into a fragment could not
+                // promise.
+                Held::Document {
+                    raw,
+                    pointer,
+                    carrier,
+                } => {
+                    // **What says a document is complete is its block closing,
+                    // not its text parsing.** A run still held when the message
+                    // ends never saw its own `content_block_stop`, and
+                    // `Terminates::All` — `message_stop`, `[DONE]`, or an
+                    // `error` the upstream sent mid-generation — is not that
+                    // signal for any of them. Truncation usually leaves JSON
+                    // that will not parse and the refusal below would catch it,
+                    // but *usually* is the whole objection: the one truncation
+                    // that happens to parse would be served as a finished tool
+                    // call, and a tool call is an action the client's agent
+                    // takes rather than text it displays. So the test is the
+                    // signal itself.
+                    if matches!(terminates, Terminates::All) {
+                        return Err(ShapeError::MalformedDocument(provider, pointer.clone()).into());
+                    }
+                    let document: Value = serde_json::from_str(raw)
+                        .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
+                    let restored = mapping.restore_value(&document)?;
+                    let mut data: Value =
+                        serde_json::from_str(carrier.data.as_deref().unwrap_or(""))
+                            .map_err(|_| StreamError::Malformed)?;
+                    write_pointer(&mut data, pointer, &restored.to_string())?;
+                    let mut event = carrier.clone();
+                    event.data = Some(data.to_string());
+                    documents.push_str(&event.render());
+                }
             }
         }
         self.buffers.retain(|key, _| !ends(key));
@@ -726,19 +880,27 @@ impl<'a> StreamRestorer<'a> {
             if let Some((key, _)) = remainders.first() {
                 return Err(StreamError::Unplaceable(key.clone()));
             }
-            return Ok(String::new());
+            return Ok(documents);
         };
         if remainders.is_empty() {
-            return Ok(pending.event.render());
+            let mut out = pending.event.render();
+            out.push_str(&documents);
+            return Ok(out);
         }
         // The event as it stands is already rewritten and correct. If a
         // remainder cannot be placed the stream ends, but that event was safe
-        // before the remainder existed and is safe still.
+        // before the remainder existed and is safe still — and so is any
+        // document that closed alongside it.
         let without_remainders = pending.event.render();
         match place(&mut pending, remainders) {
-            Ok(()) => Ok(pending.event.render()),
+            Ok(()) => {
+                let mut out = pending.event.render();
+                out.push_str(&documents);
+                Ok(out)
+            }
             Err(error) => {
                 self.salvage.push_str(&without_remainders);
+                self.salvage.push_str(&documents);
                 Err(error)
             }
         }
@@ -904,6 +1066,7 @@ mod audit_class_tests {
             StreamError::Oversized.audit_class(),
             StreamError::Stalled.audit_class(),
             StreamError::TooManyRuns.audit_class(),
+            StreamError::ToolDocumentTooLarge.audit_class(),
             StreamError::Malformed.audit_class(),
         ];
         let mut seen: Vec<&str> = classes.to_vec();
@@ -928,6 +1091,7 @@ mod restorer_tests {
     use super::*;
     use crate::mapping::Span;
     use crate::provider::OpenAi;
+    use serde_json::json;
 
     fn mapped() -> Mapping {
         let mut mapping = Mapping::new();
@@ -1180,6 +1344,337 @@ mod restorer_tests {
         let mut rendered = restorer.push(body.as_bytes()).unwrap();
         rendered.push_str(&restorer.finish().unwrap());
         assert_eq!(anthropic_text(&rendered), "held Weber");
+    }
+
+    /// One SSE event, named and carrying `data`.
+    fn sse(event: &str, data: &str) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    /// The tool document the client reassembles for one block: every
+    /// `partial_json` fragment it was sent, in order, concatenated.
+    fn anthropic_tool_json(rendered: &str, index: u64) -> String {
+        let mut out = String::new();
+        for line in rendered.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if value.get("index").and_then(Value::as_u64) != Some(index) {
+                continue;
+            }
+            if let Some(fragment) = value.pointer("/delta/partial_json").and_then(Value::as_str) {
+                out.push_str(fragment);
+            }
+        }
+        out
+    }
+
+    /// A mapping whose one value carries a `"`. Substituted as text into a tool
+    /// document it would close the string it lands in; restored structurally it
+    /// is escaped on the way out.
+    fn mapped_quoting() -> Mapping {
+        let mut mapping = Mapping::new();
+        mapping
+            .mask(
+                "Weber \"Bo\" AG",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 13,
+                }],
+            )
+            .unwrap();
+        mapping
+    }
+
+    /// The events of one tool block, with its argument document cut into the
+    /// given fragments.
+    fn tool_block(index: u64, fragments: &[&str]) -> String {
+        let mut body = sse(
+            "content_block_start",
+            &format!(
+                "{{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":\
+                 {{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"send_mail\",\
+                 \"input\":{{}}}}}}"
+            ),
+        );
+        for fragment in fragments {
+            let escaped = Value::String((*fragment).to_owned()).to_string();
+            body.push_str(&sse(
+                "content_block_delta",
+                &format!(
+                    "{{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":\
+                     {{\"type\":\"input_json_delta\",\"partial_json\":{escaped}}}}}"
+                ),
+            ));
+        }
+        body
+    }
+
+    fn block_stop(index: u64) -> String {
+        sse(
+            "content_block_stop",
+            &format!("{{\"type\":\"content_block_stop\",\"index\":{index}}}"),
+        )
+    }
+
+    #[test]
+    fn a_tool_document_split_across_deltas_is_restored_whole() {
+        // The reason the streamed path refused tool traffic at all: a
+        // placeholder is split across two `input_json_delta`s *and* lands
+        // inside a half-written JSON value at the same time, so there is
+        // nothing to parse at the moment of substitution. Accumulating the
+        // block and restoring it when it closes answers both at once.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"note\":\"[PER", "SON_1]\"}"]) + &block_stop(0);
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        let document: Value = serde_json::from_str(&anthropic_tool_json(&rendered, 0))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"note": "Weber"}));
+        assert!(
+            !rendered.contains("[PERSON_1]") && !rendered.contains("[PER\\\""),
+            "a fragment of the token reached the client: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_restored_value_that_could_close_a_string_is_escaped_into_the_tool_document() {
+        // What restoring a document buys over substituting into a fragment, and
+        // the whole reason this path refused rather than substituted. `Weber
+        // "Bo" AG` written as text into `{"note":"[PERSON_1]"}` closes `note`
+        // and puts `Bo` where the client's agent reads a member.
+        //
+        // **The escaping is `restore_in_string_strictly`'s, not
+        // serialization's** — `restore_value` reaches it for every string leaf,
+        // and it carries the rule precisely because a leaf can itself be a
+        // serialized document. Measured by mutation: making this an
+        // `input_json_delta` a `Run::Text` instead sends the fragments through
+        // `RestoreBuffer`, which substitutes leniently, and this assertion is
+        // the one that fails. Flattening the document and restoring *that*
+        // string does not fail it, because it is the same rule one level up.
+        use crate::provider::Anthropic;
+        let mapping = mapped_quoting();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"note\":\"[PERSON_1]\"}"]) + &block_stop(0);
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        let document: Value = serde_json::from_str(&anthropic_tool_json(&rendered, 0))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"note": "Weber \"Bo\" AG"}));
+        assert_eq!(
+            document.as_object().expect("an object").len(),
+            1,
+            "the value added a member: {document}"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_tool_block_releases_nothing() {
+        // The accumulator is not a hold-back buffer with a safe prefix: half a
+        // document is not a document, and no prefix of it is safe to serve. A
+        // block the upstream never closes ends the stream with none of it
+        // written.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"note\":\"[PERSON_1]"]);
+        let rendered = restorer.push(body.as_bytes()).unwrap();
+        assert_eq!(
+            anthropic_tool_json(&rendered, 0),
+            "",
+            "a fragment was served before the block closed: {rendered}"
+        );
+        let finished = restorer.finish();
+        assert!(
+            matches!(
+                finished,
+                Err(StreamError::Shape(ShapeError::MalformedDocument(
+                    "anthropic",
+                    _
+                )))
+            ),
+            "an unclosed tool document was not refused as one: {finished:?}"
+        );
+    }
+
+    #[test]
+    fn one_block_index_cannot_be_both_kinds_of_run() {
+        // Both arms of the `Held` mismatch, which nothing else reaches. A
+        // `content_block_start` of type `text` opens a run that streams; an
+        // `input_json_delta` at the same index then claims that run is a
+        // document. Whichever the upstream meant, one of the two readings is
+        // wrong about every fragment already handled — the text run has served
+        // its safe prefix, and a document has none — so there is no reading to
+        // continue with.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+
+        let mut text_first = StreamRestorer::new(&Anthropic, &mapping);
+        let outcome = text_first.push(
+            (sse(
+                "content_block_delta",
+                "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+                 {\"type\":\"text_delta\",\"text\":\"Hallo\"}}",
+            ) + &tool_block(0, &["{\"note\":\"x\"}"]))
+                .as_bytes(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::Response("anthropic")))
+            ),
+            "a document claimed a text run: {outcome:?}"
+        );
+
+        let mut document_first = StreamRestorer::new(&Anthropic, &mapping);
+        let outcome = document_first.push(
+            (tool_block(0, &["{\"note\":"])
+                + &sse(
+                    "content_block_delta",
+                    "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+                     {\"type\":\"text_delta\",\"text\":\"Hallo\"}}",
+                ))
+                .as_bytes(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::Response("anthropic")))
+            ),
+            "a text run claimed a document: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_block_the_message_ended_without_closing_is_not_served() {
+        // The sharper half of `an_unclosed_tool_block_releases_nothing`, and
+        // the case that one passes without testing. There the truncation left
+        // JSON that will not parse, so the refusal could come from the parse
+        // and the guard would never be exercised. Here the fragments stop at a
+        // point where they *do* parse — `{"note":"x"}` is a whole document —
+        // and `message_stop` arrives with the block still open.
+        //
+        // Serving it would hand the client's agent a finished tool call the
+        // model never finished writing. What says a document is complete is
+        // `content_block_stop` at its own index; JSON validity is a different
+        // question that happens to agree most of the time.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"note\":\"x\"}"])
+            + &sse("message_stop", "{\"type\":\"message_stop\"}");
+        let outcome = restorer.push(body.as_bytes());
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::MalformedDocument(
+                    "anthropic",
+                    _
+                )))
+            ),
+            "a tool call the message never closed was served: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_document_that_does_not_parse_ends_the_stream() {
+        // Serving it unrestored would hand the client `[PERSON_1]`, and
+        // restoring it as text is the substitution this whole path exists to
+        // avoid. Neither is served.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"note\": \"[PERSON_1]\" ,,}"]) + &block_stop(0);
+        let outcome = restorer.push(body.as_bytes());
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::MalformedDocument(
+                    "anthropic",
+                    _
+                )))
+            ),
+            "an unparseable tool document was not refused as one: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_document_past_the_bound_ends_the_stream() {
+        // An accumulator is unbounded by nature: the per-event cap does not
+        // cover a document spread across many events, and `MAX_QUEUED_BYTES`
+        // does not either, because these deltas are suppressed rather than
+        // queued.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let filler = "x".repeat(MAX_TOOL_DOCUMENT_BYTES + 1);
+        let body = tool_block(0, &[&format!("{{\"note\":\"{filler}\"}}")]);
+        let outcome = restorer.push(body.as_bytes());
+        assert!(
+            matches!(outcome, Err(StreamError::ToolDocumentTooLarge)),
+            "an unbounded tool document was accumulated"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_in_a_tool_document_key_ends_the_stream() {
+        // `restore_value`'s rule, on the path that had not reached it. Keys are
+        // never masked going up, so a placeholder in key position is the model
+        // writing one it saw in the text; restoring it renames the property the
+        // client's tool reads its argument from, and leaving it hands our own
+        // token over. Both change dispatch.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"[PERSON_1]\":\"x\"}"]) + &block_stop(0);
+        let outcome = restorer.push(body.as_bytes());
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Mapping(MappingError::PlaceholderKey(_)))
+            ),
+            "a placeholder in key position was not refused as one: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_text_block_and_a_tool_block_are_restored_independently() {
+        // One message carries both, and they are separate runs: the text block
+        // streams as it always did while the tool block accumulates, and
+        // neither drains the other. `content_block_stop` ends its own index —
+        // the rule `stopping_one_block_leaves_another_block_held` already
+        // pinned, now with a run of each kind in flight.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let mut body = sse(
+            "content_block_delta",
+            "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+             {\"type\":\"text_delta\",\"text\":\"Hallo [PER\"}}",
+        );
+        body.push_str(&tool_block(1, &["{\"note\":\"[PERSON_1]\"}"]));
+        body.push_str(&block_stop(1));
+        body.push_str(&sse(
+            "content_block_delta",
+            "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+             {\"type\":\"text_delta\",\"text\":\"SON_1]!\"}}",
+        ));
+        body.push_str(&block_stop(0));
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        assert_eq!(anthropic_text(&rendered), "Hallo Weber!");
+        let document: Value = serde_json::from_str(&anthropic_tool_json(&rendered, 1))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"note": "Weber"}));
     }
 
     #[test]

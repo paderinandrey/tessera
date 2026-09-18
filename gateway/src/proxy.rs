@@ -1195,14 +1195,23 @@ async fn handle(
             // an arbitrary prefix with no relation to a document boundary. See
             // `RestoreBuffer`, which says the same from the other side.
             //
-            // **Both halves are closed there by refusing a request shape, not
-            // by restoring differently.** `reject_streamed_tools` refuses
-            // `stream: true` on any request carrying tool traffic, so a
-            // described `arguments` — the case the whole recursion was written
-            // for — never streams at all; and `reject_streamed_json_mode`
-            // refuses it beside a `response_format` of `json_object` or
-            // `json_schema`, so a `content` the caller has declared will be a
-            // document does not stream either (#36).
+            // **Both halves were closed there by refusing a request shape
+            // rather than by restoring differently, and one of them is no
+            // longer closed that way.** `reject_streamed_json_mode` still
+            // refuses `stream: true` beside a `response_format` of
+            // `json_object` or `json_schema`, so a `content` the caller has
+            // declared will be a document does not stream (#36).
+            //
+            // The tool half has moved. `reject_streamed_tools` still refuses
+            // OpenAI, whose `tool_calls` deltas close no block of their own, so
+            // a described `arguments` never streams there. **On Anthropic it
+            // does stream now** (#87): a tool block is accumulated whole and
+            // restored when `content_block_stop` closes it, which reaches this
+            // very door — `restore_value`, and so `restore_in_string_strictly`
+            // for every leaf. So the exception the paragraph above describes is
+            // about a *fragment*, and a document held until it is one is not a
+            // fragment. `Held::Document` in `stream.rs` is the other side of
+            // this sentence.
             //
             // **And the undeclared case is answered by the stream itself.**
             // `RestoreBuffer` restores through `Mapping::restore_in_stream`,
@@ -2929,6 +2938,90 @@ mod tests {
             "the citation the slot path does not address was not restored: {served}"
         );
         assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_reaches_the_client_as_a_restored_document() {
+        // #87, end to end through the real handler rather than the restorer
+        // alone. A request that streams *and* carries tools is the shape every
+        // agent harness sends, and it was a 400 before the upstream call: the
+        // gateway could not be put in front of one at all. Both halves are
+        // asserted here — the request is admitted, and the tool argument the
+        // client's agent will act on carries the real value inside a document
+        // that still parses.
+        //
+        // The token is split across two `input_json_delta`s *and* sits inside a
+        // half-written JSON value, which is the pair of problems that made
+        // substituting as it streams impossible. The block is accumulated and
+        // restored when `content_block_stop` closes it.
+        //
+        // `detector_finding_weber` rather than `detector_returning`: the tool
+        // definitions are their own detection call, and a fixed span of 0..5
+        // answered for that text too — landing past the end of a one-character
+        // description, and taking the first placeholder the response then
+        // expects to be the prompt's.
+        let detector = detector_finding_weber().await;
+        let upstream = MockServer::start().await;
+        let fragment = |partial: &str| {
+            format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "input_json_delta", "partial_json": partial}})
+            )
+        };
+        let body = format!(
+            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n{}{}\
+             event: content_block_stop\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+            json!({"type": "message_start"}),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "tool_use", "id": "toolu_1",
+                                     "name": "send_mail", "input": {}}}),
+            fragment("{\"to\":\"[PER"),
+            fragment("SON_1]\"}"),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_stop"}),
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
+            )
+            .mount(&upstream)
+            .await;
+        let (status, served) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "stream": true,
+                   "tools": [{"name": "send_mail", "description": "d", "input_schema": {}}],
+                   "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a streamed request carrying tools was refused: {served}"
+        );
+        assert!(!served.contains("PERSON_1"), "placeholder served: {served}");
+
+        // Not `served.contains(SECRET)`: that passes on a fragment of a broken
+        // document as readily as on a whole one, and a document the client's
+        // agent cannot parse is among the failures this path exists to prevent.
+        // Reassemble it the way the client would.
+        let mut reassembled = String::new();
+        for line in served.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(piece) = event.pointer("/delta/partial_json").and_then(Value::as_str) {
+                reassembled.push_str(piece);
+            }
+        }
+        let document: Value = serde_json::from_str(&reassembled)
+            .unwrap_or_else(|error| panic!("the tool document did not parse: {error}: {served}"));
+        assert_eq!(document, json!({"to": SECRET}));
     }
 
     /// A detector that finds `Weber` inside `Martina Weber` at the offsets it

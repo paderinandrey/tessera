@@ -74,15 +74,36 @@ headers and fields like `id:` reach the client as the provider sent them.
 
 If a token turns out to have no mapping, bytes have already gone out and the request cannot
 be refused. The stream ends instead, with an `error` event naming the failure — the client
-gets a truncated answer, never a placeholder in place of a name. Streamed tool calls
-(`tool_calls`, `input_json_delta`) end the stream, and no longer for the reason they once
-did — the buffered path masks tool arguments now. What it cannot do in fragments is read
-them: a document arriving a delta at a time is not well formed until its block closes, and
-a placeholder can be split across two deltas *and* land inside a half-written JSON value
-at the same time, so masking one means buffering the whole block first — which is exactly
-what the streamed path does not do yet. A request carrying tool traffic together with
-`stream: true` is therefore refused before the upstream call, where it costs no tokens,
-and a tool block the model produces inside a stream that was allowed ends that stream.
+gets a truncated answer, never a placeholder in place of a name. **Streamed tool calls are served on Anthropic and refused on OpenAI, and the difference is
+the protocol rather than the risk.** A document arriving a delta at a time is not well
+formed until its block closes, and a placeholder can be split across two deltas *and* land
+inside a half-written JSON value at the same time — so there is nothing to parse at the
+moment of substitution, and nothing of it is safe to serve. The answer is to stop
+substituting: the fragments are accumulated, and when the block closes they are a document,
+restored through the same door the buffered path uses. A value carrying a `"` then lands in
+a leaf and is escaped on the way out instead of closing the string it was written into.
+
+Anthropic says where a block ends — `content_block_start` with `type: "tool_use"`, then
+`input_json_delta`, then `content_block_stop` at that index — so the accumulator has a
+boundary to key on. OpenAI's `tool_calls` deltas have none: the end arrives as
+`finish_reason` in a later chunk, several calls interleave in one chunk under their own
+indices, and `id` and `name` come in the first fragment while `arguments` dribble after. So
+a request carrying tool traffic together with `stream: true` is still refused there, before
+the upstream call, where it costs no tokens.
+
+**A document is served when its block closes, and on no other signal.** A run still held
+when `message_stop` arrives — or `[DONE]`, or an `error` the upstream sent mid-generation —
+never saw its own `content_block_stop`, and the stream ends rather than serving it. Truncation
+usually leaves JSON that will not parse, so refusing on the parse would catch it nearly
+always; *nearly* is the objection. The one truncation that happens to parse would go out as a
+finished tool call, and a tool call is an action the client's agent takes rather than text it
+displays.
+
+**What the trade costs.** A refusal spent nothing; an accumulator spends the caller's tokens
+and can still end the stream mid-flight, on a document past
+`MAX_TOOL_DOCUMENT_BYTES`, one that does not parse, or one whose block never closed. The client also
+sees nothing for the duration of a tool call and then the whole document at once, because
+half a document is not a document and has no safe prefix to release.
 Extended thinking is refused before
 the upstream call rather than at its first streamed block, so the refusal costs no tokens.
 

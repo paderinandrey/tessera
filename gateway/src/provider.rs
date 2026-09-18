@@ -55,6 +55,25 @@ pub trait Provider: Send + Sync {
 pub struct TextSlot {
     pub pointer: String,
     pub key: String,
+    pub run: Run,
+}
+
+/// What kind of run a slot belongs to, which decides how its fragments may be
+/// restored.
+///
+/// The distinction is not cosmetic. `Text` is restored as it streams, against a
+/// hold-back buffer and the lexer that judges where a value would land;
+/// `Document` cannot be, because a fragment of a JSON document is not a
+/// document and there is nothing to parse at the moment of substitution. A
+/// `Document` run is accumulated whole and restored structurally when its block
+/// closes — the buffered path's route, which puts a value in a leaf and escapes
+/// it on the way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Run {
+    /// Model text. Streams.
+    Text,
+    /// A tool-argument document arriving a fragment at a time. Accumulates.
+    Document,
 }
 
 /// What an event without text of its own does to the runs in progress.
@@ -334,11 +353,17 @@ fn reject_tool_fields(
 }
 
 /// `proxy.rs` calls `request_pointers` before it looks at `stream`, so relaxing
-/// the tool refusal admits streamed tool requests as readily as buffered ones —
-/// and `stream_slots`, which this slice does not touch, would then reject the
-/// tool events *after* the upstream call, spending the caller's tokens to
-/// return a broken stream. The streaming slice deletes this function; nothing
-/// else should.
+/// this refusal admits streamed tool requests as readily as buffered ones — and
+/// a provider whose `stream_slots` still rejects tool events would then do it
+/// *after* the upstream call, spending the caller's tokens to return a broken
+/// stream. So the two move together, per provider, and never apart.
+///
+/// **Anthropic no longer calls this.** Its `stream_slots` accumulates a tool
+/// block and restores the document when `content_block_stop` closes it, so
+/// there is nothing left here for it to protect. OpenAI still calls it: its
+/// `tool_calls` deltas have no terminating event of their own — the end is
+/// `finish_reason` in a later chunk — so the accumulator it would need is a
+/// state machine this slice did not write.
 fn reject_streamed_tools(
     body: &Value,
     slots: &[Slot],
@@ -1754,6 +1779,7 @@ impl Provider for OpenAi {
                     Some(Value::String(_)) => slots.push(TextSlot {
                         pointer: format!("/choices/{position}/delta/{field}"),
                         key: format!("choice/{index}/{field}"),
+                        run: Run::Text,
                     }),
                     // Recognized, unreadable: refused rather than forwarded.
                     Some(_) => return Err(ShapeError::Response("openai")),
@@ -1882,17 +1908,19 @@ impl Provider for Anthropic {
                 )?;
             }
         }
-        // Last, because the slots are the answer. A definition, a call's
-        // arguments and a result are all tool traffic, and each of them already
-        // says so — so asking the slots cannot miss a location the way asking
-        // for a top-level `tools` did, and a location added later is covered
-        // the day it is described.
-        reject_streamed_tools(body, &pointers, "anthropic")?;
-        // Called for both providers though only one has the field today. The
-        // Messages API asks for structured output through tools, which
-        // `reject_streamed_tools` already refuses — so this is inert here, and
-        // it is the day Anthropic grows a `response_format` that the omission
-        // would cost, silently, in the half nobody was looking at.
+        // **`reject_streamed_tools` is not called here any more.** A streamed
+        // tool block is accumulated by `stream_slots` and restored structurally
+        // when its `content_block_stop` arrives, which is the thing the refusal
+        // stood in for. It still guards OpenAI, whose deltas close no block.
+        //
+        // Called for both providers though only one has the field today, and
+        // the reason it is inert here has changed. It used to be that the
+        // Messages API asks for structured output through tools and
+        // `reject_streamed_tools` refused those outright; now they are served,
+        // and what makes this inert is only that Anthropic has no
+        // `response_format` field to read. That is a weaker reason, and it is
+        // why the call stays: the day Anthropic grows one, the omission would
+        // cost silently in the half nobody was looking at.
         reject_streamed_json_mode(body, "anthropic")?;
         Ok(pointers)
     }
@@ -1996,14 +2024,25 @@ impl Provider for Anthropic {
                         Some(Value::String(_)) => Ok(vec![TextSlot {
                             pointer: "/delta/text".to_owned(),
                             key,
+                            run: Run::Text,
                         }]),
                         _ => Err(ShapeError::Response("anthropic")),
                     },
-                    // `input_json_delta` streams tool arguments, which this
-                    // gateway does not mask yet.
-                    Some("input_json_delta") => {
-                        Err(ShapeError::Unsupported("anthropic", "tool_use"))
-                    }
+                    // A tool argument arrives as fragments of a JSON document,
+                    // so it opens a `Document` run: the restorer accumulates
+                    // them and restores the whole document when
+                    // `content_block_stop` closes this index. Substituting into
+                    // a fragment is what this branch used to refuse, and the
+                    // refusal is now the accumulator's job rather than a
+                    // blanket no.
+                    Some("input_json_delta") => match delta.get("partial_json") {
+                        Some(Value::String(_)) => Ok(vec![TextSlot {
+                            pointer: "/delta/partial_json".to_owned(),
+                            key,
+                            run: Run::Document,
+                        }]),
+                        _ => Err(ShapeError::Response("anthropic")),
+                    },
                     _ => Err(ShapeError::Response("anthropic")),
                 }
             }
@@ -2014,10 +2053,18 @@ impl Provider for Anthropic {
                         Some(Value::String(_)) => Ok(vec![TextSlot {
                             pointer: "/content_block/text".to_owned(),
                             key,
+                            run: Run::Text,
                         }]),
                         _ => Err(ShapeError::Response("anthropic")),
                     },
-                    Some("tool_use") => Err(ShapeError::Unsupported("anthropic", "tool_use")),
+                    // It opens a tool block but carries no fragment of the
+                    // argument document — `input` is `{}` here, and the
+                    // document arrives in the `input_json_delta`s after it. So
+                    // it declares no slot and passes through as an envelope,
+                    // restored like any other, which is what carries the tool's
+                    // `name` if a placeholder ever reached one. The accumulator
+                    // is opened by the first fragment, not by this event.
+                    Some("tool_use") => Ok(Vec::new()),
                     _ => Err(ShapeError::Response("anthropic")),
                 }
             }
@@ -3409,20 +3456,36 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_refuses_tool_traffic_on_a_streamed_request() {
+    fn anthropic_admits_tool_traffic_on_a_streamed_request() {
+        // The refusal this replaces is what stopped an agent harness reaching
+        // this gateway at all: a harness streams and calls tools in the same
+        // request. What made it safe to lift is on the response side — a tool
+        // block is accumulated and restored structurally when it closes — and
+        // what makes it safe *here* is that the definitions are masked exactly
+        // as they are on the buffered path, which is what the slots below say.
         let body = json!({
             "model": "claude",
             "stream": true,
             "tools": [{"name": "read_file", "description": "d", "input_schema": {}}],
             "messages": [{"role": "user", "content": "hello"}]
         });
-        assert!(matches!(
-            Anthropic.request_pointers(&body),
-            Err(ShapeError::Unsupported(
-                "anthropic",
-                "streamed tool traffic"
-            ))
-        ));
+        let slots = Anthropic
+            .request_pointers(&body)
+            .expect("streamed tool traffic is served");
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Text { pointer, tool: true, .. } if pointer == "/tools/0/description"
+            )),
+            "the tool description went unmasked: {slots:?}"
+        );
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Text { pointer, .. } if pointer == "/messages/0/content"
+            )),
+            "the prompt went unmasked: {slots:?}"
+        );
     }
 
     #[test]
@@ -3455,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_streamed_continuation_is_refused_for_its_tool_history_not_its_definitions() {
+    fn an_openai_streamed_continuation_is_refused_for_its_tool_history_not_its_definitions() {
         // The refusal keyed on top-level `tools`, so a continuation carrying an
         // earlier call and its result — but no repeated definitions — passed,
         // and `stream_slots` would refuse the tool events afterwards, once the
@@ -3467,48 +3530,45 @@ mod tests {
         // `mcp_servers` grants tools without `tools` at all — so "no
         // definitions means no tool events" is not something to rest a refusal
         // on. What this gateway can mask is its own business to decide.
+        //
+        // **Retargeted from Anthropic, which no longer has this guard.** The
+        // lesson is about what the refusal keys on, and it is OpenAI that still
+        // refuses, so that is where it is pinned. Anthropic's side of it is now
+        // `anthropic_admits_tool_traffic_on_a_streamed_request`.
         let continuation = json!({
-            "model": "claude",
+            "model": "gpt",
             "stream": true,
             "messages": [
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"path": "x"}}]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "Weber"}]}
+                {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"path\":\"x\"}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": "Weber"}
             ]
         });
         assert!(matches!(
-            Anthropic.request_pointers(&continuation),
-            Err(ShapeError::Unsupported(
-                "anthropic",
-                "streamed tool traffic"
-            ))
+            OpenAi.request_pointers(&continuation),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
         ));
 
         // A result alone is enough — it is tool traffic and `stream_slots` does
         // not know how to mask what comes back for it either.
         let result_only = json!({
-            "model": "claude",
+            "model": "gpt",
             "stream": true,
-            "messages": [{"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t1", "content": "Weber"}]}]
+            "messages": [{"role": "tool", "tool_call_id": "t1", "content": "Weber"}]
         });
         assert!(matches!(
-            Anthropic.request_pointers(&result_only),
-            Err(ShapeError::Unsupported(
-                "anthropic",
-                "streamed tool traffic"
-            ))
+            OpenAi.request_pointers(&result_only),
+            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
         ));
 
         // And an ordinary streamed conversation is untouched by any of this.
         let plain = json!({
-            "model": "claude",
+            "model": "gpt",
             "stream": true,
             "messages": [{"role": "user", "content": "hallo"}]
         });
         assert_eq!(
-            Anthropic.request_pointers(&plain).unwrap(),
+            OpenAi.request_pointers(&plain).unwrap(),
             vec![text("/messages/0/content")]
         );
     }
@@ -4935,21 +4995,48 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_refuses_a_streamed_tool_block() {
+    fn a_streamed_tool_block_opens_no_run_of_its_own() {
+        // It carries no fragment of the argument document — `input` is `{}`
+        // and the document arrives in the deltas after it — so it declares no
+        // slot and passes through as an envelope. Both of these refused the
+        // whole stream until the accumulator existed.
         let event = json!({
             "type": "content_block_start",
             "index": 0,
-            "content_block": {"type": "tool_use", "input": {}}
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
         });
-        assert!(Anthropic.stream_slots(&event).is_err());
+        assert!(Anthropic.stream_slots(&event).unwrap().is_empty());
     }
 
     #[test]
-    fn anthropic_refuses_an_input_json_delta() {
+    fn an_input_json_delta_opens_a_document_run() {
+        // Named, not counted: the pointer and the key say where the fragment is
+        // and which block it joins, and `Run::Document` is what stops it being
+        // substituted into as it streams.
+        let event = json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": "{"}
+        });
+        assert_eq!(
+            Anthropic.stream_slots(&event).unwrap(),
+            vec![TextSlot {
+                pointer: "/delta/partial_json".to_owned(),
+                key: "block/2".to_owned(),
+                run: Run::Document,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_input_json_delta_without_a_fragment_is_refused() {
+        // Recognized, unreadable — the rule the text branch beside it follows.
+        // Taking `partial_json`'s absence for an empty fragment would accumulate
+        // a document the upstream never sent.
         let event = json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": {"type": "input_json_delta", "partial_json": "{"}
+            "delta": {"type": "input_json_delta", "partial_json": 7}
         });
         assert!(Anthropic.stream_slots(&event).is_err());
     }
