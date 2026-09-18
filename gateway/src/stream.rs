@@ -1506,6 +1506,54 @@ mod restorer_tests {
     }
 
     #[test]
+    fn one_block_index_cannot_be_both_kinds_of_run() {
+        // Both arms of the `Held` mismatch, which nothing else reaches. A
+        // `content_block_start` of type `text` opens a run that streams; an
+        // `input_json_delta` at the same index then claims that run is a
+        // document. Whichever the upstream meant, one of the two readings is
+        // wrong about every fragment already handled — the text run has served
+        // its safe prefix, and a document has none — so there is no reading to
+        // continue with.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+
+        let mut text_first = StreamRestorer::new(&Anthropic, &mapping);
+        let outcome = text_first.push(
+            (sse(
+                "content_block_delta",
+                "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+                 {\"type\":\"text_delta\",\"text\":\"Hallo\"}}",
+            ) + &tool_block(0, &["{\"note\":\"x\"}"]))
+                .as_bytes(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::Response("anthropic")))
+            ),
+            "a document claimed a text run: {outcome:?}"
+        );
+
+        let mut document_first = StreamRestorer::new(&Anthropic, &mapping);
+        let outcome = document_first.push(
+            (tool_block(0, &["{\"note\":"])
+                + &sse(
+                    "content_block_delta",
+                    "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+                     {\"type\":\"text_delta\",\"text\":\"Hallo\"}}",
+                ))
+                .as_bytes(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::Response("anthropic")))
+            ),
+            "a text run claimed a document: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn a_tool_block_the_message_ended_without_closing_is_not_served() {
         // The sharper half of `an_unclosed_tool_block_releases_nothing`, and
         // the case that one passes without testing. There the truncation left
