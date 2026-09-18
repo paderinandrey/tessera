@@ -735,7 +735,7 @@ impl Drop for Inner {
         // this line no status was ever observed, and the alternative — leaving
         // the field out, or carrying the 200 an open stream had already sent —
         // either breaks the schema every other line has or claims an outcome
-        // nobody saw. `README.md` says so where it describes `aborted`, because
+        // nobody saw. `docs/audit.md` says so where it describes `aborted`, because
         // a reader parsing `status` as a code is the one person this would
         // mislead.
         let (result, status, error) = state.outcome.unwrap_or(("aborted", 0, None));

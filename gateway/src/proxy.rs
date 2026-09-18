@@ -138,7 +138,7 @@ impl ProxyError {
     /// pointed at the provider for a bug that is here. Two of those four sites
     /// arrived with this slice (`c230fb8`), and tool slots are where the gateway
     /// builds the most pointers of its own, so the population grew at the same
-    /// time. `README.md` names which classes mean a defect here rather than
+    /// time. `docs/audit.md` names which classes mean a defect here rather than
     /// there, because the prefix cannot: `shape_request` is the caller's body,
     /// `shape_response` the provider's, and `shape_pointer` neither.
     ///
@@ -384,11 +384,15 @@ async fn mask_all(
     // from the detection cache without a call, so two identical messages are
     // `texts: 2` against one request at the detector's door — measured, and
     // pinned by `two_texts_the_cache_answers_once_are_two_detections_asked_for`.
-    // The README says "detections asked for" for this reason, and it was
-    // corrected to say it. Three sentences written in the same commit were not:
-    // this comment and the two field docs in `audit::Detected` all said "one
-    // detector call", and so did the README's own paragraph two sentences
+    // `docs/audit.md` says "asked for" for this reason, and it was corrected
+    // to say it. Three sentences written in the same commit were not: this
+    // comment and the two field docs in `audit::Detected` all said "one
+    // detector call", and so did the prose's own paragraph two sentences
     // earlier. The cache that falsified one falsified all four.
+    //
+    // The pointer said `README.md` until the homepage was cut down, and it had
+    // been stale before that — the sentence it quoted was reworded upstream and
+    // nothing here noticed, because a comment naming a file cannot be checked.
     let mut texts = 0usize;
     let mut documents = 0usize;
     // **Every literal in the request, reserved before the first allocation.**
@@ -6874,15 +6878,34 @@ mod tests {
             "and it names the class, so a refusal is legible without the body"
         );
 
-        let text = std::fs::read_to_string(&path).expect("readable");
+        // **Everything the machine generated is dropped before the search,
+        // and this used to search the raw file.** The record carries an RFC3339
+        // timestamp with six fractional digits and three 32-character hex
+        // digests over a per-journal random salt — each of which contains
+        // `4111` now and then, and one of them did on CI. A gate that fails
+        // roughly one run in six hundred teaches people to re-run it, which
+        // costs more than the gate is worth.
+        //
+        // Dropping the generated keys rather than lengthening the needle keeps
+        // the four-digit sensitivity, and a field added later that quotes the
+        // caller is searched rather than exempted — the exemption list is the
+        // machine's fields, not the interesting ones.
+        let generated = ["ts", "request", "tenant", "session", "ms", "status"];
+        let quoted: String = lines[0]
+            .as_object()
+            .expect("a JSON object per line")
+            .iter()
+            .filter(|(key, _)| !generated.contains(&key.as_str()))
+            .map(|(key, value)| format!("{key}={value} "))
+            .collect();
         assert!(
-            !text.contains("4111"),
+            !quoted.contains("4111"),
             "the value the request was refused over is the last thing that \
-             belongs in the record of refusing it: {text}"
+             belongs in the record of refusing it: {quoted}"
         );
         assert!(
-            !text.contains("cardholder_pan"),
-            "nor the key naming it: {text}"
+            !quoted.contains("cardholder_pan"),
+            "nor the key naming it: {quoted}"
         );
     }
 
@@ -7717,8 +7740,9 @@ mod tests {
             .iter()
             .filter(|line| line["event"] == "masked")
             .collect();
-        // Every field but the two that are supposed to differ. `README.md`
-        // says two turns carrying identical traffic write identical lines, and
+        // Every field but the two that are supposed to differ.
+        // `docs/audit.md` says two turns carrying identical traffic write
+        // identical lines, and
         // a comparison of one field would have missed the next count to be
         // read off the mapping instead of off the request.
         let strip = |line: &Value| {
@@ -8426,18 +8450,21 @@ mod tests {
         // `shape_pointer` is a defect in this gateway and `shape_response` is
         // the provider's, and the prefix they share says neither — which is how
         // the wildcard managed to blame the provider for our own pointer for as
-        // long as it did. `README.md` names the four groups, and a paragraph
+        // long as it did. `docs/audit.md` names the four groups, and a paragraph
         // nobody checks is how this branch has been wrong seven times, so this
         // is the check.
-        let readme = include_str!("../../README.md");
-        let (_, audit_section) = readme.split_once("### Audit").expect("the audit section");
-        let audit_section = audit_section
-            .split_once("\n## ")
-            .map_or(audit_section, |(section, _)| section);
+        //
+        // **The prose moved and this moved with it.** It read `README.md`'s
+        // `### Audit` section until the homepage was cut down and the journal's
+        // documentation went to its own file. The old form would have failed
+        // loudly rather than drifted — `split_once` returns `None` and the
+        // `expect` panics — which is the gate working, and is why this points
+        // at the new location rather than being deleted.
+        let documentation = include_str!("../../docs/audit.md");
         for class in every_audit_class() {
             assert!(
-                audit_section.contains(&format!("`{class}`")),
-                "the journal can write `{class}` and the README does not say whose fault it is"
+                documentation.contains(&format!("`{class}`")),
+                "the journal can write `{class}` and docs/audit.md does not say whose fault it is"
             );
         }
     }
