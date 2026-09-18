@@ -8426,18 +8426,21 @@ mod tests {
         // `shape_pointer` is a defect in this gateway and `shape_response` is
         // the provider's, and the prefix they share says neither — which is how
         // the wildcard managed to blame the provider for our own pointer for as
-        // long as it did. `README.md` names the four groups, and a paragraph
+        // long as it did. `docs/audit.md` names the four groups, and a paragraph
         // nobody checks is how this branch has been wrong seven times, so this
         // is the check.
-        let readme = include_str!("../../README.md");
-        let (_, audit_section) = readme.split_once("### Audit").expect("the audit section");
-        let audit_section = audit_section
-            .split_once("\n## ")
-            .map_or(audit_section, |(section, _)| section);
+        //
+        // **The prose moved and this moved with it.** It read `README.md`'s
+        // `### Audit` section until the homepage was cut down and the journal's
+        // documentation went to its own file. The old form would have failed
+        // loudly rather than drifted — `split_once` returns `None` and the
+        // `expect` panics — which is the gate working, and is why this points
+        // at the new location rather than being deleted.
+        let documentation = include_str!("../../docs/audit.md");
         for class in every_audit_class() {
             assert!(
-                audit_section.contains(&format!("`{class}`")),
-                "the journal can write `{class}` and the README does not say whose fault it is"
+                documentation.contains(&format!("`{class}`")),
+                "the journal can write `{class}` and docs/audit.md does not say whose fault it is"
             );
         }
     }
