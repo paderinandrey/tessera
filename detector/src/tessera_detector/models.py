@@ -31,7 +31,12 @@ HF_REVISION = "6ddaeb9413b0e71ad8457da1aab378a165b24058"
 # referenced by both the loader (`ner.py`) and `weights_digest` below, so the
 # two cannot drift apart the way `REQUIRED_ARTIFACTS` and "what the loader
 # reads" already have once. The mirror ships two other quantizations
-# (fp16, int8) alongside this one; neither is ever opened.
+# (fp16, int8) alongside this one; neither is ever opened, and both have now
+# been measured rather than left as an open question. fp16 is *slower* than
+# fp32 on a CPU execution provider, which has no native fp16 kernels; int8 is
+# about twice as fast and fails `evaluate.py --require-ner` outright, taking
+# PERSON recall to 0.013 and every Article 9 category to zero. See
+# docs/latency.md.
 ONNX_MODEL_FILE = "onnx/model.onnx"
 # What GlinerRecognizer needs to load, in the narrow sense of "did the
 # download finish": snapshot_download creates the directory before it
