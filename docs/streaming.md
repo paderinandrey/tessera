@@ -31,7 +31,7 @@ U+2029, which JSON and JSONC treat as ordinary characters. So `json` and
 `jsonc` keep a valid document with a separator in it working and `json5` does
 not, which is why the three names are three settings and not one.
 
-JSONC is grouped with JSON here because it adds comments and leaves JSON'''s
+JSONC is grouped with JSON here because it adds comments and leaves JSON's
 string production alone.
 
 **It tightens as well as widens, and the tightening is the part to read
@@ -162,7 +162,7 @@ moment earlier, and the failure does not change that; what stays behind is the h
 buffer, which may hold the token that failed.
 
 On a cache miss the gateway asks the detector for every layer it has, so that request
-costs what the [latency](#latency) section reports; a hit costs a lookup instead.
+costs what [latency](latency.md) reports; a hit costs a lookup instead.
 `detector_timeout_secs` defaults to 30 seconds because a tight timeout would turn
 protection into a denial of service. Configuration is
 TOML and rejects unknown keys — a typo in a security control should fail loudly rather
