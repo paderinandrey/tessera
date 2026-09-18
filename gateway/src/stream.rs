@@ -845,6 +845,21 @@ impl<'a> StreamRestorer<'a> {
                     pointer,
                     carrier,
                 } => {
+                    // **What says a document is complete is its block closing,
+                    // not its text parsing.** A run still held when the message
+                    // ends never saw its own `content_block_stop`, and
+                    // `Terminates::All` — `message_stop`, `[DONE]`, or an
+                    // `error` the upstream sent mid-generation — is not that
+                    // signal for any of them. Truncation usually leaves JSON
+                    // that will not parse and the refusal below would catch it,
+                    // but *usually* is the whole objection: the one truncation
+                    // that happens to parse would be served as a finished tool
+                    // call, and a tool call is an action the client's agent
+                    // takes rather than text it displays. So the test is the
+                    // signal itself.
+                    if matches!(terminates, Terminates::All) {
+                        return Err(ShapeError::MalformedDocument(provider, pointer.clone()).into());
+                    }
                     let document: Value = serde_json::from_str(raw)
                         .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
                     let restored = mapping.restore_value(&document)?;
@@ -1487,6 +1502,37 @@ mod restorer_tests {
                 )))
             ),
             "an unclosed tool document was not refused as one: {finished:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_block_the_message_ended_without_closing_is_not_served() {
+        // The sharper half of `an_unclosed_tool_block_releases_nothing`, and
+        // the case that one passes without testing. There the truncation left
+        // JSON that will not parse, so the refusal could come from the parse
+        // and the guard would never be exercised. Here the fragments stop at a
+        // point where they *do* parse — `{"note":"x"}` is a whole document —
+        // and `message_stop` arrives with the block still open.
+        //
+        // Serving it would hand the client's agent a finished tool call the
+        // model never finished writing. What says a document is complete is
+        // `content_block_stop` at its own index; JSON validity is a different
+        // question that happens to agree most of the time.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"note\":\"x\"}"])
+            + &sse("message_stop", "{\"type\":\"message_stop\"}");
+        let outcome = restorer.push(body.as_bytes());
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Shape(ShapeError::MalformedDocument(
+                    "anthropic",
+                    _
+                )))
+            ),
+            "a tool call the message never closed was served: {outcome:?}"
         );
     }
 
