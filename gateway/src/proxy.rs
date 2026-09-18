@@ -6874,15 +6874,34 @@ mod tests {
             "and it names the class, so a refusal is legible without the body"
         );
 
-        let text = std::fs::read_to_string(&path).expect("readable");
+        // **Everything the machine generated is dropped before the search,
+        // and this used to search the raw file.** The record carries an RFC3339
+        // timestamp with six fractional digits and three 32-character hex
+        // digests over a per-journal random salt — each of which contains
+        // `4111` now and then, and one of them did on CI. A gate that fails
+        // roughly one run in six hundred teaches people to re-run it, which
+        // costs more than the gate is worth.
+        //
+        // Dropping the generated keys rather than lengthening the needle keeps
+        // the four-digit sensitivity, and a field added later that quotes the
+        // caller is searched rather than exempted — the exemption list is the
+        // machine's fields, not the interesting ones.
+        let generated = ["ts", "request", "tenant", "session", "ms", "status"];
+        let quoted: String = lines[0]
+            .as_object()
+            .expect("a JSON object per line")
+            .iter()
+            .filter(|(key, _)| !generated.contains(&key.as_str()))
+            .map(|(key, value)| format!("{key}={value} "))
+            .collect();
         assert!(
-            !text.contains("4111"),
+            !quoted.contains("4111"),
             "the value the request was refused over is the last thing that \
-             belongs in the record of refusing it: {text}"
+             belongs in the record of refusing it: {quoted}"
         );
         assert!(
-            !text.contains("cardholder_pan"),
-            "nor the key naming it: {text}"
+            !quoted.contains("cardholder_pan"),
+            "nor the key naming it: {quoted}"
         );
     }
 
