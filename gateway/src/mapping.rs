@@ -371,8 +371,9 @@ impl ClientFormat {
 ///
 /// So the row holds exactly as far as the configuration is true. A deployment
 /// that declares `json` and pipes the content to a YAML reader has moved the
-/// "could" back where it was, and the invariant with it — which is why the
-/// README says declaring it is a promise about your own parser.
+/// "could" back where it was, and the invariant with it — which is why
+/// `docs/streaming.md` tells an operator not to declare the format when their
+/// responses mix prose and JSON.
 ///
 /// A first version of #81 put the declaration in a request header. Review
 /// pointed out that behind an application proxy the *end user* sends it while

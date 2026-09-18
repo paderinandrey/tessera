@@ -59,7 +59,7 @@ license a reader to require the old outcome.
 What survives of the goal is narrower and worth keeping: **nothing that refuses
 today stops refusing**, and every new refusal is a response that was previously
 served altered. The costs are enumerated with the loss handling and priced
-again in `README.md`.
+again in `docs/gateway.md`.
 
 ### Why that order, and why the obvious order is wrong twice
 
@@ -583,7 +583,7 @@ wrongly.
 the promise is stated" — was false at the moment it was written**, since this
 paragraph listed only the collision exception while claiming the synchronisation
 it was breaking. A claim about other files is not evidence about them. The
-promise has seven live sites: `README.md`, `docs/frontend-handoff.md`,
+promise has seven live sites: `docs/gateway.md`, `docs/frontend-handoff.md`,
 `restore_sweep`'s doc, `restore_in_string_with`'s doc, `proxy::handle`'s comment
 above the sweep, `a_streamed_block_restores_the_fields_no_slot_addresses`, and
 this paragraph. (The step list in `docs/superpowers/plans/` is an eighth
@@ -594,6 +594,15 @@ own words — first the streamed-path comment, then the handoff paragraph, then
 this one. So: when the clause changes, enumerate the sites and search on the
 *unchanging* half of the promise. Sweeping for the wording you are replacing
 finds only the sites that already agree with you.
+
+**A fourth round proved the paragraph again, in a way it did not anticipate.**
+The first site was `README.md` until the homepage was cut down and the gateway's
+prose moved to `docs/gateway.md`. The move copied the promise faithfully and
+left this enumeration naming a file that no longer holds it — so a contributor
+following this contract would have corrected the short summary and left the
+authoritative text stale. Nothing catches that: the file is untouched, every
+link in it still resolves, and a list of filenames has no test. Raised in review
+of the redesign, not by anyone reading this.
 
 The fourth site moved and the enumeration above is corrected rather than
 appended to: the exception clause was stated on `restore_in_string`, and the

@@ -138,7 +138,7 @@ impl ProxyError {
     /// pointed at the provider for a bug that is here. Two of those four sites
     /// arrived with this slice (`c230fb8`), and tool slots are where the gateway
     /// builds the most pointers of its own, so the population grew at the same
-    /// time. `README.md` names which classes mean a defect here rather than
+    /// time. `docs/audit.md` names which classes mean a defect here rather than
     /// there, because the prefix cannot: `shape_request` is the caller's body,
     /// `shape_response` the provider's, and `shape_pointer` neither.
     ///
@@ -384,11 +384,15 @@ async fn mask_all(
     // from the detection cache without a call, so two identical messages are
     // `texts: 2` against one request at the detector's door — measured, and
     // pinned by `two_texts_the_cache_answers_once_are_two_detections_asked_for`.
-    // The README says "detections asked for" for this reason, and it was
-    // corrected to say it. Three sentences written in the same commit were not:
-    // this comment and the two field docs in `audit::Detected` all said "one
-    // detector call", and so did the README's own paragraph two sentences
+    // `docs/audit.md` says "asked for" for this reason, and it was corrected
+    // to say it. Three sentences written in the same commit were not: this
+    // comment and the two field docs in `audit::Detected` all said "one
+    // detector call", and so did the prose's own paragraph two sentences
     // earlier. The cache that falsified one falsified all four.
+    //
+    // The pointer said `README.md` until the homepage was cut down, and it had
+    // been stale before that — the sentence it quoted was reworded upstream and
+    // nothing here noticed, because a comment naming a file cannot be checked.
     let mut texts = 0usize;
     let mut documents = 0usize;
     // **Every literal in the request, reserved before the first allocation.**
@@ -7736,8 +7740,9 @@ mod tests {
             .iter()
             .filter(|line| line["event"] == "masked")
             .collect();
-        // Every field but the two that are supposed to differ. `README.md`
-        // says two turns carrying identical traffic write identical lines, and
+        // Every field but the two that are supposed to differ.
+        // `docs/audit.md` says two turns carrying identical traffic write
+        // identical lines, and
         // a comparison of one field would have missed the next count to be
         // read off the mapping instead of off the request.
         let strip = |line: &Value| {
