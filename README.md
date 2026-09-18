@@ -63,13 +63,23 @@ nothing less.
        alt="Your application, the Tessera gateway, the detector, the mapping table and the audit journal all run inside your perimeter. What crosses to the LLM provider is masked — a detected name goes out as a placeholder such as [PERSON_1] — and values are restored on the way back.">
 </p>
 
-One documented exception, because a diagram cannot carry it. Where the **model** finds a
-name, a place, an organisation or an Article 9 category on a **numeric** leaf of a tool
-document, those digits go to the provider unchanged: a placeholder there would turn a
-number into a string. A **catalog** type in the same position — an IBAN, a tax number, a
-card — refuses the request instead, as does any type this gateway does not declare at all.
-The journal counts what went out verbatim as `forwarded`, so a record whose `forwarded` is
-zero says every detection it names went up masked.
+**What the diagram does not show: the gateway masks what it scans, and it does not scan
+everything.** If you are deciding whether to point an agent at a customer folder — the
+prompt, the tool definitions, the tool arguments and the tool results are covered, and the
+request envelope around them is not.
+
+- **Image and audio parts are forwarded untouched.** Nothing here reads pixels, so a
+  photograph of an identity document reaches the provider as your client sent it.
+- **A body or message field this gateway describes no slot for travels exactly as
+  written** — `metadata`, `stop`, `prediction.content`, a JSON Schema in `response_format`,
+  Anthropic's `stop_sequences`, or a field a client invents.
+- **Digits on a numeric leaf of a tool document go unchanged** where the *model* found a
+  name, a place, an organisation or an Article 9 category there, because a placeholder
+  would turn a number into a string. A *catalog* type in that position — an IBAN, a tax
+  number, a card — refuses the request instead, as does a type this gateway does not
+  declare. The journal counts what went out verbatim as `forwarded`.
+
+[The gateway](docs/gateway.md) enumerates each of these where the code makes the decision.
 
 - **Detection quality first.** The moat is high-quality PII detection in **French and
   German** (with code-switching), Swiss and EU identifiers with checksum validation, GDPR
