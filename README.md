@@ -60,8 +60,15 @@ nothing less.
 
 <p align="center">
   <img src="./assets/readme/flow.svg" width="100%"
-       alt="Your application, the Tessera gateway, the detector, the mapping table and the audit journal all run inside your perimeter. Only placeholders cross to the LLM provider; values are restored on the way back.">
+       alt="Your application, the Tessera gateway, the detector, the mapping table and the audit journal all run inside your perimeter. What crosses to the LLM provider is masked — a detected name goes out as a placeholder such as [PERSON_1] — and values are restored on the way back.">
 </p>
+
+One documented exception, because a diagram cannot carry it. Where the model finds a name,
+a place, an organisation or an Article 9 category on a **numeric** leaf of a tool document,
+those digits go to the provider unchanged: a placeholder there would turn a number into a
+string. A checksum-backed identifier in the same position refuses the request instead. The
+journal counts what went out verbatim as `forwarded`, so a record whose `forwarded` is zero
+says every detection it names went up masked.
 
 - **Detection quality first.** The moat is high-quality PII detection in **French and
   German** (with code-switching), Swiss and EU identifiers with checksum validation, GDPR

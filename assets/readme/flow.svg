@@ -3,8 +3,9 @@
      role="img" aria-labelledby="flow-title flow-desc">
   <title id="flow-title">What stays inside your perimeter, and what crosses it</title>
   <desc id="flow-desc">Your application, the Tessera gateway, the detector, the mapping
-  table and the audit journal all run inside your perimeter. Only placeholders cross to
-  the LLM provider; values are restored on the way back.</desc>
+  table and the audit journal all run inside your perimeter. What crosses to the LLM
+  provider is masked — a detected name goes out as a placeholder such as [PERSON_1] — and
+  values are restored on the way back.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
@@ -44,7 +45,7 @@
   <line x1="596" y1="134" x2="952" y2="134" stroke="#D6A94C" stroke-width="2" marker-end="url(#arrow-token)"/>
   <text x="848" y="118" text-anchor="end"
         font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
-        font-size="19" fill="#D6A94C">placeholders only</text>
+        font-size="19" fill="#D6A94C">[PERSON_1]</text>
 
   <line x1="952" y1="176" x2="596" y2="176" stroke="#868C95" stroke-width="2" marker-end="url(#arrow)"/>
   <text x="848" y="202" text-anchor="end"
