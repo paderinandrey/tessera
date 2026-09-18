@@ -110,9 +110,12 @@ them to a running stack needs `docker compose restart detector`; skipping that r
 the one way to end up with a successful 2 GB download, a gateway that looks installed, and
 names still reaching the provider unmasked.
 
-The gateway binds to loopback and authenticates no caller — it forwards whatever credential
-arrives. Reaching it from beyond the host is a deliberate act (`TESSERA_BIND=0.0.0.0`), and
-you should put an authenticating proxy in front of it first.
+The gateway binds to loopback, and it serves anyone who can reach it until you list who it
+serves. Set `accepted_credentials` to the SHA-256 digests of the keys your callers already
+send and everything else is refused before the body is walked; leave it unset and the
+gateway forwards whatever credential arrives, which is what it did before the key existed.
+Reaching it from beyond the host is a deliberate act (`TESSERA_BIND=0.0.0.0`) and one to
+pair with that list.
 [Operating it](docs/operating.md) explains why the download is separate, what the gateway
 publishes and to whom, and which volumes must be backed up together.
 
@@ -198,8 +201,9 @@ block of their own, so the accumulator that makes this safe has no boundary to k
 agent harness pointed at `/v1/messages` is served; one pointed at `/v1/chat/completions` has
 to turn streaming off.
 
-**Not ready for production use:** the gateway authenticates no caller, and nothing here has
-been run in anger.
+**Not ready for production use:** nothing here has been run in anger, and a caller who is
+served can still be handed a value they did not send ([#32](https://github.com/paderinandrey/tessera/issues/32)),
+which authentication narrows without closing.
 
 ## Documentation
 

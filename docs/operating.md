@@ -26,17 +26,30 @@ Only the gateway is published, and on `${TESSERA_PORT:-8080}` rather than a
 fixed `8080` — a variable, because a host that already has something bound to
 8080 should not have to edit a file to try Tessera; set `TESSERA_PORT` before
 `up` to use another port instead. The host address is a variable too, and
-defaults to loopback: the gateway authenticates no caller, it forwards
-whatever credential arrives, so reaching it from beyond this host is a
-deliberate act — `TESSERA_BIND=0.0.0.0` — and never a side effect of the
-default. It holds no key of its own, so what you publish is not your provider
-credit but an unauthenticated relay out through your egress and into a journal
-whose worth is that it records your traffic and not a stranger's: strangers can
-fill the session table until legitimate callers are refused with a 503, and
-anyone who already holds one of your callers' keys can guess a session id — they
-are chosen by the client and need not be secret — and read that conversation's
-real values back out of its table, which going to the provider directly would
-never have given them. Put an authenticating proxy in front of it before you do.
+defaults to loopback: until `accepted_credentials` is set the gateway serves
+anyone who can reach it, forwarding whatever credential arrives, so reaching it
+from beyond this host is a deliberate act — `TESSERA_BIND=0.0.0.0` — and never a
+side effect of the default. It holds no key of its own, so what you would be
+publishing is not your provider credit but a relay out through your egress and
+into a journal whose worth is that it records your traffic and not a stranger's:
+strangers can fill the session table until legitimate callers are refused with a
+503, and anyone who already holds one of your callers' keys can guess a session
+id — they are chosen by the client and need not be secret — and read that
+conversation's real values back out of its table, which going to the provider
+directly would never have given them.
+
+**So list who you serve before you publish it.** `accepted_credentials` takes
+the SHA-256 digest of each credential your callers already send — `printf '%s'
+"$KEY" | shasum -a 256` — and a request whose credential is not on the list is
+refused with 401 before the body is walked, before the detector is called and
+before anything goes upstream, so it costs neither detector time nor anybody's
+tokens. The refusal is attributed in the journal under `caller_not_served`, so a
+run of them tells you whether one client has the wrong key or somebody is trying
+keys. It narrows who can reach the mapping table; it does not make the table
+safe to reach, because a caller who *is* served can still be handed a value they
+did not send — see [the session table](sessions.md) and issue #32. An
+authenticating proxy in front remains worthwhile where you want a credential of
+your own rather than the provider's.
 The detector answers on the compose network and nowhere else: `POST /detect`
 takes arbitrary text and authenticates nobody, so exposing it would be a way to
 run text through the model outside the gateway, and therefore outside the audit
