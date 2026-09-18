@@ -6,7 +6,9 @@ Configuring the streamed path is in [streaming.md](streaming.md); per-conversati
 
 ## What it accepts
 
-Point a client's base URL at the gateway and personal data stops leaving the process:
+Point a client's base URL at the gateway and the personal data it scans stops leaving the
+process. **What it does not scan is below**, under "What it refuses" and the two paragraphs
+before it — read those before relying on the short version of this sentence:
 
 ```
 cd gateway && cargo run -- tessera.example.toml     # 127.0.0.1:8080

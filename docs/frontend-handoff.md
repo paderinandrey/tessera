@@ -39,9 +39,10 @@ refuse the response with a 502, because bytes left alone there are bytes with th
 placeholder still in them.
 None of that is your surface — you are building against the detector, for the
 reasons below — but it is the sentence a buyer will quote back, so do not
-restore the short version of it, and do not drop a clause from it. `README.md`
-states both directions with their qualifications and is the place to correct if
-they change.
+restore the short version of it, and do not drop a clause from it.
+`docs/gateway.md` states both directions with their qualifications and is the
+place to correct if they change; the README carries the short form and the list
+of what the gateway does not scan.
 
 ## Which service you talk to, and why not the other one
 

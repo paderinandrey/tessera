@@ -9,9 +9,12 @@
 </p>
 
 **Tessera** sits as a transparent reverse proxy between your application and an LLM
-provider (OpenAI- or Anthropic-compatible). Personal data is replaced with placeholders on
-the way to the model and restored in the response. Your application changes one thing —
-the base URL.
+provider (OpenAI- or Anthropic-compatible). Personal data in the prompt and in tool traffic
+is replaced with placeholders on the way to the model and restored in the response. Your
+application changes one thing — the base URL.
+
+It does not scan everything it forwards, and [what it does not scan](#how-it-works) is
+listed rather than implied.
 
 > In ancient Rome, a *tessera* was a token that stood in for an identity.
 > Tessera replaces identities with controlled tokens — and puts them back.
