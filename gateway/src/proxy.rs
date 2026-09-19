@@ -1864,6 +1864,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_credential_checked_is_the_one_forwarded() {
+        // **The property that makes a duplicated header harmless, pinned
+        // because nothing else pins it.** `credential_of`, `SessionKey::new`
+        // and the forwarding loop all reach for the header through
+        // `HeaderMap::get`, which yields the *first* value — so the value this
+        // gateway authenticated, the value it namespaced the session by and the
+        // value the provider sees are one value.
+        //
+        // Change any of the three to `get_all` and they stop agreeing: the
+        // gateway would admit a caller on the first credential while the
+        // provider acted on a second one it never checked. That is a plain
+        // header-smuggling shape, and today it is prevented by which method was
+        // reached for rather than by anything that would fail if it changed.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_accepting(&detector, &upstream, &["sk-served"]);
+        let (status, body) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+            &[
+                ("authorization", "sk-served"),
+                ("authorization", "sk-smuggled"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let sent: Vec<_> = received
+            .headers
+            .get_all("authorization")
+            .iter()
+            .map(|value| value.to_str().expect("ascii").to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            vec!["sk-served".to_owned()],
+            "the upstream saw a credential this gateway did not authenticate"
+        );
+    }
+
+    #[tokio::test]
     async fn a_gateway_with_no_list_serves_what_it_always_did() {
         // Backward compatibility, asserted rather than assumed: every
         // deployment written before #91 has no `accepted_credentials`, and a
