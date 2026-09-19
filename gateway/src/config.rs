@@ -18,6 +18,23 @@ pub enum ConfigError {
     ZeroToolChars,
     #[error("max_tool_calls must be greater than zero")]
     ZeroToolCalls,
+    #[error(
+        "accepted_credentials is present but empty, which would refuse every caller; \
+         omit the key to serve anyone"
+    )]
+    NoAcceptedCredentials,
+    /// **The entry is not echoed, and that is the whole point of the variant.**
+    /// The likeliest way to get here is pasting the credential itself instead
+    /// of its digest, so the offending value may be a working provider key —
+    /// and this message goes to a terminal, a log and quite possibly a bug
+    /// report. The position is enough to find it. Same rule as
+    /// `ProxyError::NumericPersonalData`: name the failure, never the value.
+    #[error(
+        "entry {0} of accepted_credentials is not a 64-character lowercase hex SHA-256 \
+         digest; it is not repeated here because a mistyped entry may be the credential \
+         itself"
+    )]
+    NotADigest(usize),
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +268,24 @@ pub struct Config {
     /// the quantity that costs nothing after the first turn.
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: usize,
+
+    /// Which callers this gateway serves, as lowercase hex SHA-256 digests of
+    /// the credential they already send — `authorization` for OpenAI,
+    /// `x-api-key` for Anthropic.
+    ///
+    /// **Absent means the gateway serves anyone, which is what it did before
+    /// this key existed.** Every configuration written until now keeps working,
+    /// and a deployment that has not thought about the control is not given a
+    /// half of one. Present but empty is an error rather than either reading:
+    /// it could mean "refuse everybody" or "I meant to fill this in", and a
+    /// typo that silently disables a security control is what `deny_unknown_fields`
+    /// on this struct exists to prevent one line up.
+    ///
+    /// Digests rather than the keys, because a file holding working provider
+    /// credentials is one whose leak costs money; and unsalted, because a salt
+    /// defends low-entropy secrets and would only stop the operator computing
+    /// the value. `printf '%s' "$KEY" | shasum -a 256` produces it.
+    pub accepted_credentials: Option<Vec<String>>,
 }
 
 fn default_bind() -> String {
@@ -357,6 +392,19 @@ impl Config {
         }
         if config.max_tool_calls == 0 {
             return Err(ConfigError::ZeroToolCalls);
+        }
+        // Checked at load rather than at the first request, so an operator who
+        // pasted a raw key learns it from a process that will not start instead
+        // of from every caller getting a 401.
+        if let Some(accepted) = &config.accepted_credentials {
+            if accepted.is_empty() {
+                return Err(ConfigError::NoAcceptedCredentials);
+            }
+            for (position, entry) in accepted.iter().enumerate() {
+                if !crate::auth::is_digest(entry) {
+                    return Err(ConfigError::NotADigest(position));
+                }
+            }
         }
         Ok(config)
     }
@@ -544,6 +592,71 @@ mod tests {
         ))
         .expect("a disabled cache does not care what its dead setting says");
         assert_eq!(config.max_spans_per_entry, 0);
+    }
+
+    #[test]
+    fn a_gateway_serves_anyone_until_a_list_is_configured() {
+        // Backward compatibility is the default, and it is the default on
+        // purpose: a deployment written before this key existed keeps working,
+        // and one that has not thought about the control is not given a half of
+        // one it might mistake for the whole.
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert!(config.accepted_credentials.is_none());
+    }
+
+    #[test]
+    fn an_empty_list_of_accepted_credentials_is_rejected() {
+        // It could mean "refuse everybody" or "I meant to fill this in", and
+        // the second is far likelier. Reading it either way silently is the
+        // failure `deny_unknown_fields` exists to prevent one line up.
+        let error = Config::from_toml(&with_audit("accepted_credentials = []")).unwrap_err();
+        assert!(
+            error.to_string().contains("accepted_credentials"),
+            "unhelpful: {error}"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_digest_is_rejected_without_being_repeated() {
+        // The likeliest mistake here is pasting the credential rather than its
+        // digest — so the offending entry may be a working provider key, and
+        // this message goes to a terminal, a log, and possibly a bug report.
+        // Position, never value.
+        let raw = "sk-ant-api03-thisisnotadigest";
+        let error = Config::from_toml(&with_audit(&format!("accepted_credentials = [\"{raw}\"]")))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(raw) && !message.contains("sk-ant"),
+            "the error repeated the entry: {message}"
+        );
+        assert!(message.contains('0'), "the position is missing: {message}");
+    }
+
+    #[test]
+    fn the_position_named_is_the_offending_one() {
+        // Naming a position instead of the value is only useful if it is the
+        // right position. With one good entry ahead of it, an off-by-one here
+        // sends the operator to the line that is fine.
+        let good = crate::auth::digest_of(b"sk-served");
+        let error = Config::from_toml(&with_audit(&format!(
+            "accepted_credentials = [\"{good}\", \"nope\"]"
+        )))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains('1'), "wrong position named: {message}");
+        assert!(!message.contains(&good), "a digest was repeated: {message}");
+    }
+
+    #[test]
+    fn a_list_of_digests_is_accepted() {
+        let one = crate::auth::digest_of(b"sk-one");
+        let two = crate::auth::digest_of(b"sk-two");
+        let config = Config::from_toml(&with_audit(&format!(
+            "accepted_credentials = [\"{one}\", \"{two}\"]"
+        )))
+        .expect("two digests are a configuration");
+        assert_eq!(config.accepted_credentials, Some(vec![one, two]));
     }
 
     #[test]

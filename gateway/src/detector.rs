@@ -65,10 +65,19 @@ impl DetectorClient {
 
     /// Every layer the detector has: the gateway does not narrow detection.
     ///
-    /// The credential is not used to authenticate anything — the gateway
-    /// authenticates nobody — only to keep one tenant's cached results from
-    /// answering another's request, which would report through response time
-    /// that the two sent the same text.
+    /// **The credential is not used to authenticate anything here**, and the
+    /// distinction outlived the sentence that used to make it: this said "the
+    /// gateway authenticates nobody", which stopped being true with #91. It
+    /// still does not authenticate *here*. A request that reaches this call has
+    /// already been admitted or refused in `proxy::handle`, before detection,
+    /// and what the credential does at this point is keep one tenant's cached
+    /// results from answering another's request — which would report through
+    /// response time that the two sent the same text.
+    ///
+    /// So the separation is a side-channel defence and it is not weakened by
+    /// the admission check, nor does it stand in for one: a gateway with no
+    /// `accepted_credentials` serves anyone, and their texts still get their
+    /// own bucket.
     /// Whether `detect` would answer this text without a call.
     ///
     /// **The admission bounds ask this, and they ask it of the same cache the

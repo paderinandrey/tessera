@@ -58,6 +58,11 @@ pub enum ProxyError {
          refused rather than forwarded with the value still in it"
     )]
     NumericPersonalData,
+    /// The message says nothing about which part was wrong — whether a
+    /// credential was sent, whether one was recognised, whether the list is
+    /// long. A caller who is not served learns that they are not served.
+    #[error("this gateway does not serve this caller")]
+    Unauthenticated,
 }
 
 impl ProxyError {
@@ -80,6 +85,12 @@ impl ProxyError {
             | ProxyError::ToolTooLarge
             | ProxyError::TooManyToolCalls
             | ProxyError::NumericPersonalData => StatusCode::BAD_REQUEST,
+            // 401 and not 403: the caller may have a credential this gateway
+            // would serve, which is what 401 means and what 403 denies. No
+            // `WWW-Authenticate` — there is no challenge to offer, because the
+            // credential is the provider's own header and this gateway issues
+            // nothing the caller could go and get.
+            ProxyError::Unauthenticated => StatusCode::UNAUTHORIZED,
             // Saturation is this gateway's own capacity rather than anything
             // the caller got wrong, and the same request may well succeed a
             // moment later. No `Retry-After`: the wait is another request's
@@ -180,6 +191,7 @@ impl ProxyError {
             ProxyError::ToolTooLarge => "tool_too_large",
             ProxyError::TooManyToolCalls => "tool_too_many_calls",
             ProxyError::NumericPersonalData => "tool_numeric_personal_data",
+            ProxyError::Unauthenticated => "caller_not_served",
         }
     }
 }
@@ -238,6 +250,9 @@ pub struct AppState {
     /// detected in a single call. Bounds *calls* where `max_tool_chars` bounds
     /// *size*.
     pub max_tool_calls: usize,
+    /// Which callers this gateway serves. `Callers::Anyone` unless the operator
+    /// configured a list, which is what every deployment before #91 was.
+    pub callers: crate::auth::Callers,
 }
 
 impl AppState {
@@ -263,6 +278,12 @@ impl AppState {
             audit,
             max_tool_chars: config.max_tool_chars,
             max_tool_calls: config.max_tool_calls,
+            callers: match &config.accepted_credentials {
+                None => crate::auth::Callers::Anyone,
+                Some(accepted) => {
+                    crate::auth::Callers::Accepted(accepted.iter().cloned().collect())
+                }
+            },
         }
     }
 
@@ -790,6 +811,26 @@ async fn handle(
     let credential = crate::session::credential_of(&headers, provider);
     if let Some(credential) = credential {
         record.attribute(state.audit.digest(&[credential]), None);
+    }
+
+    // **Whether this gateway serves this caller, asked here and nowhere else.**
+    //
+    // After attribution, because a refused request should still say whose it
+    // was and this is the one line such a request leaves. Before
+    // `request_pointers`, because `session::key_from` already states the rule
+    // this follows: every refusal on the way in happens before detection, so a
+    // credential this gateway does not serve costs a string comparison rather
+    // than a second per 1 200 characters — and, with nothing forwarded, none of
+    // the caller's tokens.
+    //
+    // The check is on the same header the provider authenticates with, so the
+    // client sends nothing new. What it stops is a stranger reaching the
+    // mapping table at all: a session id is the client's own choice rather than
+    // a secret this gateway issues, so without this a guessed id and a stolen
+    // key read a conversation's real values back out (#91, and #32 for the read
+    // it narrows without closing).
+    if !state.callers.admits(credential) {
+        return Err(ProxyError::Unauthenticated);
     }
 
     // Where is the text? A shape we do not recognize is refused, not forwarded.
@@ -1567,6 +1608,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         });
         (state, dir, path)
     }
@@ -1594,6 +1636,7 @@ mod tests {
             audit,
             max_tool_chars,
             max_tool_calls,
+            callers: crate::auth::Callers::Anyone,
         });
         (state, dir, path)
     }
@@ -1687,6 +1730,205 @@ mod tests {
 
     fn state(detector: &MockServer, upstream: &MockServer) -> Arc<AppState> {
         state_with(detector, upstream, test_limits()).0
+    }
+
+    /// A gateway that serves only the given credentials, with its journal.
+    fn state_accepting(
+        detector: &MockServer,
+        upstream: &MockServer,
+        accepted: &[&str],
+    ) -> (Arc<AppState>, tempfile::TempDir, std::path::PathBuf) {
+        let (state, dir, path) = state_with(detector, upstream, test_limits());
+        let Ok(mut state) = Arc::try_unwrap(state) else {
+            panic!("state_with handed back a shared Arc");
+        };
+        state.callers = crate::auth::Callers::Accepted(
+            accepted
+                .iter()
+                .map(|key| crate::auth::digest_of(key.as_bytes()))
+                .collect(),
+        );
+        (Arc::new(state), dir, path)
+    }
+
+    #[tokio::test]
+    async fn a_credential_this_gateway_does_not_serve_is_refused_before_anything_is_spent() {
+        // #91. The property is not only the 401 — it is *where* the 401 comes
+        // from. A refusal after the detector call costs a second per 1 200
+        // characters of somebody else's text; one after the upstream call
+        // spends a caller's tokens to hand back an error. Both mocks are
+        // mounted with `expect(0)` and verified on drop, so either would fail
+        // this rather than pass it quietly.
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"spans": [], "layers_run": []})),
+            )
+            .expect(0)
+            .mount(&detector)
+            .await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let (state, _dir, journal_path) = state_accepting(&detector, &upstream, &["sk-served"]);
+        let (status, body) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+            &[("authorization", "sk-stranger")],
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "served a stranger: {body}"
+        );
+        // The body says nothing about which part was wrong, and nothing about
+        // the credential it was given.
+        assert!(
+            !body.contains("sk-stranger") && !body.contains("sk-served"),
+            "the refusal echoed a credential: {body}"
+        );
+
+        // It is still attributed: the one line a refused request leaves has to
+        // say whose it was, which is why the check sits after `record.attribute`
+        // and not before it.
+        let lines = journal(&journal_path);
+        assert_eq!(lines.len(), 1, "expected one line: {lines:?}");
+        assert_eq!(lines[0]["error"], "caller_not_served");
+        assert_eq!(lines[0]["result"], "refused");
+        assert_eq!(lines[0]["status"], 401);
+        assert!(
+            lines[0]["tenant"].as_str().is_some_and(|t| !t.is_empty()),
+            "a refused caller was left unattributed: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].to_string().contains("sk-stranger"),
+            "the journal quoted the credential: {}",
+            lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_on_the_list_is_served_exactly_as_before() {
+        // The other half, and the one that fails if the digest is computed or
+        // compared differently at the two ends.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_accepting(&detector, &upstream, &["sk-served"]);
+        let (status, body) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+            &[("authorization", "sk-served")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "refused a served caller: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_credential_is_refused_once_a_list_exists() {
+        // Absent is not on the list. Worth its own test because the credential
+        // is an `Option` all the way through — `credential_of` filters an empty
+        // header value to `None` — so "no credential" reaches `admits` as the
+        // same shape a missing header does, and a `None` treated as "nothing to
+        // check" would serve everyone while looking configured.
+        let detector = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        let (state, _dir, _path) = state_accepting(&detector, &upstream, &["sk-served"]);
+        for headers in [vec![], vec![("authorization", "")]] {
+            let (status, body) = call_with_headers(
+                state.clone(),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+                &headers,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "served a caller with no credential ({headers:?}): {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_credential_checked_is_the_one_forwarded() {
+        // **The property that makes a duplicated header harmless, pinned
+        // because nothing else pins it.** `credential_of`, `SessionKey::new`
+        // and the forwarding loop all reach for the header through
+        // `HeaderMap::get`, which yields the *first* value — so the value this
+        // gateway authenticated, the value it namespaced the session by and the
+        // value the provider sees are one value.
+        //
+        // Change any of the three to `get_all` and they stop agreeing: the
+        // gateway would admit a caller on the first credential while the
+        // provider acted on a second one it never checked. That is a plain
+        // header-smuggling shape, and today it is prevented by which method was
+        // reached for rather than by anything that would fail if it changed.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_accepting(&detector, &upstream, &["sk-served"]);
+        let (status, body) = call_with_headers(
+            state,
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+            &[
+                ("authorization", "sk-served"),
+                ("authorization", "sk-smuggled"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let received = &upstream.received_requests().await.unwrap()[0];
+        let sent: Vec<_> = received
+            .headers
+            .get_all("authorization")
+            .iter()
+            .map(|value| value.to_str().expect("ascii").to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            vec!["sk-served".to_owned()],
+            "the upstream saw a credential this gateway did not authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_with_no_list_serves_what_it_always_did() {
+        // Backward compatibility, asserted rather than assumed: every
+        // deployment written before #91 has no `accepted_credentials`, and a
+        // credential-less request is what the gateway's own tests have always
+        // sent.
+        let detector = detector_returning(person_span()).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": SECRET}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "an open gateway refused: {body}");
     }
 
     async fn call(state: Arc<AppState>, route: &str, body: Value) -> (StatusCode, String) {
@@ -5091,6 +5333,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         })
     }
 
@@ -6102,6 +6345,7 @@ mod tests {
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         });
 
         let (status, _) = call_with_headers(
@@ -6506,6 +6750,7 @@ mod tests {
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         });
 
         let (status, body) = call(
@@ -6565,6 +6810,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         });
         call(
             state,
@@ -6604,6 +6850,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         });
         (state, dir, path)
     }
@@ -7206,6 +7453,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            callers: crate::auth::Callers::Anyone,
         });
 
         let response = streamed_response(state).await;
@@ -8508,6 +8756,7 @@ mod tests {
             ProxyError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
             ProxyError::Upstream("reset".to_owned()).audit_class(),
+            ProxyError::Unauthenticated.audit_class(),
             ProxyError::Session(SessionError::BadId).audit_class(),
             ProxyError::Session(SessionError::Disabled).audit_class(),
             ProxyError::Session(SessionError::NoCredential("authorization")).audit_class(),

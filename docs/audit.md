@@ -98,7 +98,11 @@ without changing something else in it — a member dropped, a key renamed, a
 number rounded — refused rather than served changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
 `mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
 `tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
-`session_disabled` and `session_no_credential` are the caller's;
+`session_disabled`, `session_no_credential` and `caller_not_served` are the
+caller's — the last meaning the credential is not one this deployment accepts,
+which is only ever written where an operator configured `accepted_credentials`;
+a run of them is either a client with the wrong key or somebody trying keys, and
+the `tenant` digest on the line is what tells those apart;
 `detector_transport`, `detector_status`, `session_saturated` and
 `audit_write_failed` are this deployment's own machinery rather than anybody's
 mistake. A run of the first group is worth a page; a run of the second is worth
