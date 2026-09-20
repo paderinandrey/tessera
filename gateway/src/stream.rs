@@ -85,6 +85,13 @@ impl StreamError {
             StreamError::Mapping(MappingError::BadSpan(_)) => "stream_bad_span",
             StreamError::Mapping(MappingError::TooDeep) => "stream_too_deep",
             StreamError::Mapping(MappingError::TooLarge) => "stream_too_large",
+            // Unreachable on this path — nothing masks on the way back — but
+            // matched rather than wildcarded, which is the rule this function
+            // states about itself and the reason it caught a probe variant
+            // silently before.
+            StreamError::Mapping(MappingError::LiteralAlreadyIssued(_)) => {
+                "stream_literal_already_issued"
+            }
             StreamError::Mapping(MappingError::MaskCountMismatch(_)) => "stream_mask_mismatch",
             StreamError::Mapping(MappingError::PlaceholderKey(_)) => "stream_placeholder_key",
             // Not `stream_unrestorable_document`, though the variant is
@@ -1051,6 +1058,8 @@ mod audit_class_tests {
             StreamError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
             StreamError::Mapping(MappingError::TooDeep).audit_class(),
             StreamError::Mapping(MappingError::TooLarge).audit_class(),
+            StreamError::Mapping(MappingError::LiteralAlreadyIssued("[PERSON_1]".to_owned()))
+                .audit_class(),
             StreamError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
             StreamError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
                 .audit_class(),
@@ -2742,7 +2751,9 @@ mod buffer_tests {
         // attacking the lexer rather than by review, which is the only finding
         // in this file that arrived that way.
         let mut mapping = Mapping::new();
-        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .reserve_literals("[PERSON_1]")
+            .expect("a literal no allocation holds reserves");
         mapping
             .mask(
                 "O'Brien",
@@ -2780,7 +2791,9 @@ mod buffer_tests {
         // added a member. Found in review of #66, against the exception that
         // pull request introduced two commits earlier.
         let mut mapping = Mapping::new();
-        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .reserve_literals("[PERSON_1]")
+            .expect("a literal no allocation holds reserves");
         mapping
             .mask(
                 "null,admin:true",
@@ -2815,7 +2828,9 @@ mod buffer_tests {
         // false positive on the prose `reserve_literals` exists for. Raised in
         // review of #66.
         let mut mapping = Mapping::new();
-        mapping.reserve_literals("[PERSON_1]");
+        mapping
+            .reserve_literals("[PERSON_1]")
+            .expect("a literal no allocation holds reserves");
         mapping
             .mask(
                 "null,globalThis.admin=true",
@@ -4119,7 +4134,8 @@ mod buffer_tests {
         // Asserted rather than argued, because it is a property of two rules
         // being equal and would quietly stop holding if they were ever split.
         let mut both = Mapping::new();
-        both.reserve_literals("[PERSON_1]");
+        both.reserve_literals("[PERSON_1]")
+            .expect("a literal no allocation holds reserves");
         let value = "x, admin: true";
         both.mask(
             value,

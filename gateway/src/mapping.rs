@@ -31,6 +31,23 @@ pub enum MappingError {
              rather than served with it"
     )]
     Unknown(String),
+    /// A placeholder the caller writes literally that this session has already
+    /// issued to a value, on an earlier turn.
+    ///
+    /// Carries the placeholder for tests and logs and **deliberately not for
+    /// the message**, which is the rule `Unknown` and `PlaceholderKey` above
+    /// already follow — and here it has a second reason of its own. A message
+    /// naming the token would confirm that *this* token is bound to a value in
+    /// *this* session, so a caller could learn which numbers a session has
+    /// issued by sending literals and reading the refusals. That is the
+    /// restoration oracle the session namespace exists to deny, rebuilt out of
+    /// error messages.
+    #[error(
+        "a placeholder this request writes literally was already issued to a value \
+             earlier in this session; the request is refused rather than served with \
+             that value substituted for the text you sent"
+    )]
+    LiteralAlreadyIssued(String),
     #[error(
         "detector reported an unusable span ({0}); the request is refused rather than \
              forwarded with the value still in it"
@@ -1075,7 +1092,7 @@ impl Mapping {
         // request this call finds its own literals already reserved. It stays
         // because `mask` is called on its own too, and a caller masking one
         // text must not have to know about the wider pass to be correct.
-        self.reserve_literals(text);
+        self.reserve_literals(text)?;
 
         let mut result = String::with_capacity(text.len());
         let mut cursor = 0usize;
@@ -1118,21 +1135,47 @@ impl Mapping {
     /// Map every placeholder-shaped token already present to itself, so it is
     /// never issued for a detected value and an echo restores unchanged.
     ///
-    /// `or_insert` is deliberate, and it is also the limit of what this can
-    /// do: it yields to whoever holds the key already. A literal that reaches
-    /// this *after* its number was issued for a detected value is therefore
-    /// not reserved, and the provider's echo of the caller's own text restores
-    /// to that value. Reserving ahead of every allocation is the caller's job,
-    /// and `proxy::mask_all` does it for a whole request. Across turns nothing
-    /// can do it: the allocation happened before the literal existed.
-    pub fn reserve_literals(&mut self, text: &str) {
+    /// Reserving ahead of every allocation closes this inside one request, and
+    /// `proxy::mask_all` does it for a whole request. **Across turns nothing
+    /// can**: the allocation happened before the literal existed, so no
+    /// ordering reaches it (#32).
+    ///
+    /// What is left is a choice between two wrong answers and a third. Yielding
+    /// to the holder — the `or_insert` this used to be — restores the caller's
+    /// own literal to somebody's name, in a tool argument their agent may
+    /// execute. Taking the key instead would unbind a token the session issued,
+    /// so the *next* echo of it restores to nothing and the response is refused
+    /// anyway, having corrupted this request first. **So it refuses**, which is
+    /// the same direction every other guard here points: an omission has to
+    /// cost a restoration rather than an injection.
+    ///
+    /// This does not close #32, it makes it loud. The design change there —
+    /// giving an issued token a component the caller cannot predict — lets both
+    /// the literal and the token through, which is what a templating client
+    /// actually wants; until then it gets a 400 where it used to get somebody
+    /// else's name.
+    pub fn reserve_literals(&mut self, text: &str) -> Result<(), MappingError> {
         for piece in pieces(text) {
-            if let Piece::Placeholder(candidate) = piece {
-                self.by_placeholder
-                    .entry(candidate.to_owned())
-                    .or_insert_with(|| candidate.to_owned());
+            let Piece::Placeholder(candidate) = piece else {
+                continue;
+            };
+            match self.by_placeholder.get(candidate) {
+                // Already reserved, by this request's own pass or an earlier
+                // call. A self-map is the literal's own reservation and says
+                // nothing about a value.
+                Some(existing) if existing == candidate => {}
+                // Held by an allocation: this token names a real value, and the
+                // caller has written it as text. Only reachable across turns,
+                // because `mask_all` reserves every literal in a request before
+                // it allocates anything.
+                Some(_) => return Err(MappingError::LiteralAlreadyIssued(candidate.to_owned())),
+                None => {
+                    self.by_placeholder
+                        .insert(candidate.to_owned(), candidate.to_owned());
+                }
             }
         }
+        Ok(())
     }
 
     fn placeholder_for(
@@ -4615,6 +4658,88 @@ mod tests {
     }
 
     #[test]
+    fn reserving_a_literal_distinguishes_three_states_of_one_key() {
+        // The whole predicate, named rather than counted. `by_placeholder` can
+        // hold a key in exactly three ways, and only one of them is a hazard.
+        let mut mapping = Mapping::new();
+
+        // Free: nothing holds it, so it is reserved as its own value and a
+        // later allocation cannot take it.
+        mapping
+            .reserve_literals("the caller wrote [ORG_5]")
+            .expect("a free key reserves");
+        assert_eq!(
+            mapping.by_placeholder.get("[ORG_5]"),
+            Some(&"[ORG_5]".to_owned())
+        );
+
+        // Self-mapped: reserved already, by this pass or an earlier call.
+        // Idempotent, because `proxy::mask_all` reserves a request's slots and
+        // then `mask` reserves each string again as it masks it.
+        mapping
+            .reserve_literals("[ORG_5] again")
+            .expect("a self-map reserves idempotently");
+
+        // Held by an allocation: this token names a real value. Reachable only
+        // across turns, because the request-wide pass runs before anything is
+        // allocated — so within a request the literal is already self-mapped by
+        // the time any value could claim its number.
+        let mut carried = Mapping::new();
+        let masked = carried
+            .mask(
+                "Weber",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 5,
+                }],
+            )
+            .unwrap();
+        assert_eq!(masked, "[PERSON_1]");
+        let outcome = carried.reserve_literals("a later turn writes [PERSON_1] itself");
+        assert!(
+            matches!(outcome, Err(MappingError::LiteralAlreadyIssued(ref token)) if token == "[PERSON_1]"),
+            "an issued token was quietly yielded to a literal: {outcome:?}"
+        );
+
+        // And the refusal leaves the table as it found it: the token still
+        // names the value, so an echo of it in *this* response still restores.
+        // Taking the key instead would have unbound it and refused the next
+        // response too, having corrupted this one first.
+        assert_eq!(
+            carried.by_placeholder.get("[PERSON_1]"),
+            Some(&"Weber".to_owned()),
+            "the refusal unbound the token it refused over"
+        );
+    }
+
+    #[test]
+    fn a_literal_and_a_value_in_one_request_still_both_work() {
+        // The #29 fix, which this must not undo: within a request the literal
+        // is reserved before anything is allocated, so the value gets the next
+        // number and neither is refused. Only the cross-turn case is a refusal,
+        // and this is the test that fails if the new arm is reached too eagerly.
+        let mut mapping = Mapping::new();
+        mapping
+            .reserve_literals("{\"z\": \"[PERSON_1]\"}")
+            .expect("the request-wide pass reserves first");
+        let masked = mapping
+            .mask(
+                "Weber",
+                &[Span {
+                    entity_type: "PERSON".into(),
+                    start: 0,
+                    end: 5,
+                }],
+            )
+            .expect("a detected value is masked beside the caller's literal");
+        assert_eq!(
+            masked, "[PERSON_2]",
+            "the value took the number the caller had already written"
+        );
+    }
+
+    #[test]
     fn a_mapping_records_the_tokens_this_request_issued_and_forgets_the_last_ones() {
         let mut mapping = Mapping::default();
         mapping.begin_request();
@@ -4625,7 +4750,9 @@ mod tests {
 
         // A literal the caller wrote is not issued. `reserve_literals` sees it;
         // `placeholder_for` never does, which is what makes the set unforgeable.
-        mapping.reserve_literals("the caller wrote [ORG_5] here");
+        mapping
+            .reserve_literals("the caller wrote [ORG_5] here")
+            .expect("a literal no allocation holds reserves");
         assert_eq!(mapping.issued(), HashSet::from([masked.clone()]));
 
         // A second turn re-masking the same value still issues it: the token is
