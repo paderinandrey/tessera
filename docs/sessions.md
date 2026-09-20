@@ -11,7 +11,14 @@ The id does not select a session on its own. A session table is a restoration or
 a real name on the way back. So the store keys on a salted fingerprint of the caller's own
 credential as well as the id, and a guessed id lands in an empty namespace. The boundary
 is the credential, not the id: callers who share one API key share one namespace, and
-within it any id is reachable by anyone holding that key. The raw id
+within it any id is reachable by anyone holding that key.
+
+**Inside a namespace the probe no longer restores — it refuses.** A literal that the
+session has already issued is a 400 (`mapping_literal_already_issued`) rather than a value
+substituted into text the caller wrote. That closes the read and leaves a thinner oracle in
+its place: an issued token refuses where an unissued one is served, so one literal per
+request still tells a caller holding the credential which numbers a session has allocated.
+Closing that needs an issued token the caller cannot predict, which is #32. The raw id
 never reaches a log either — a client may well name its session after the person in it.
 
 The table holds real values in memory between requests. It is the only place in the
