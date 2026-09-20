@@ -38,13 +38,21 @@ document the caller's own agent reads.
 traffic, so a described `arguments` — the case the escaping work was written for
 — never streams. This is the other half.
 
-> **No longer true of Anthropic, as of #87 (2026-09-18).** A tool block there is
-> accumulated and restored when `content_block_stop` closes it, which reaches
-> `restore_in_string_strictly` for every leaf — the same door this spec is
-> about, so the escaping holds; what changed is that the traffic arrives rather
-> than being refused. OpenAI still refuses, its deltas closing no block. The
-> guard this section leans on is now provider-dependent, and the sentence is
-> left standing because it is what was true when #36 was decided.
+> **No longer true of either provider, and `reject_streamed_tools` no longer
+> exists (#87, 2026-09-20).** A tool call's fragments are accumulated and the
+> document restored when its run closes — `content_block_stop` on Anthropic,
+> `finish_reason` on OpenAI — which reaches `restore_in_string_strictly` for
+> every leaf, the same door this spec is about. So the escaping this spec
+> argues for still holds; what changed is that the traffic arrives rather than
+> being refused, and the function this section leaned on is deleted.
+>
+> **What that does to this spec's other half.** `reject_streamed_json_mode`
+> stays and is now the only guard of the two. On Anthropic it was inert because
+> the Messages API asks for structured output through tools and the tool
+> refusal caught those; it is now inert only because Anthropic has no
+> `response_format` field to read, which is a weaker reason for the same
+> silence. The sentence above is left standing because it is what was true when
+> #36 was decided.
 
 ## The change
 

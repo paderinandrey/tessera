@@ -524,6 +524,10 @@ pub struct StreamRestorer<'a> {
     /// Threaded to every buffer this restorer opens. Set once from the request
     /// and never from anything the response says.
     format: crate::mapping::ClientFormat,
+    /// Hands out `Held::Document::group`. One value per event that opens
+    /// document runs, so the runs one chunk opened share a carrier and are
+    /// rendered together.
+    groups: u64,
 }
 
 /// A run in progress, and where its event wrote it last.
@@ -544,6 +548,16 @@ enum Held<'a> {
         /// could not substitute as it went.
         raw: String,
         pointer: String,
+        /// Which runs share this carrier, because one event opened them all.
+        ///
+        /// OpenAI opens parallel calls in a single chunk, so that chunk — and
+        /// so the carrier — describes every one of them: their `id`, `type` and
+        /// `function.name` together. Rendering a carrier per run replays each
+        /// call's identity once per sibling, and a client that concatenates a
+        /// call's string fields across chunks reads the name `firstfirst` and
+        /// dispatches to nothing. So the group is rendered once, with every
+        /// member's document written into it.
+        group: u64,
         /// The most recent event of this run, envelope already restored and its
         /// fragment blanked. The whole document is written into it when the
         /// block closes, so the client receives one event carrying the lot
@@ -586,6 +600,7 @@ impl<'a> StreamRestorer<'a> {
             queued_bytes: 0,
             salvage: String::new(),
             format,
+            groups: 0,
         }
     }
 
@@ -721,6 +736,13 @@ impl<'a> StreamRestorer<'a> {
             let mut carrier = event;
             carrier.data = Some(mapping.restore_value(&scrubbed)?.to_string());
 
+            // One group for every run this event opens. A run it merely
+            // continues keeps the group it was opened with, so a chunk opening
+            // one call beside an older one does not drag the older one into
+            // this event's carrier.
+            let group = self.groups;
+            let mut opened = false;
+
             for slot in &slots {
                 let fragment = read_pointer(&parsed, &slot.pointer)?;
                 let carrier = carrier.clone();
@@ -758,16 +780,21 @@ impl<'a> StreamRestorer<'a> {
                         if fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
                             return Err(StreamError::ToolDocumentTooLarge);
                         }
+                        opened = true;
                         self.buffers.insert(
                             slot.key.clone(),
                             Held::Document {
                                 raw: fragment,
                                 pointer: slot.pointer.clone(),
+                                group,
                                 carrier,
                             },
                         );
                     }
                 }
+            }
+            if opened {
+                self.groups += 1;
             }
             return Ok(String::new());
         }
@@ -865,50 +892,96 @@ impl<'a> StreamRestorer<'a> {
             if !ends(key) {
                 continue;
             }
-            match held {
-                Held::Text { buffer, .. } => {
-                    let rest = buffer.finish()?;
-                    if !rest.is_empty() {
-                        remainders.push((key.clone(), rest));
-                    }
+            if let Held::Text { buffer, .. } = held {
+                let rest = buffer.finish()?;
+                if !rest.is_empty() {
+                    remainders.push((key.clone(), rest));
                 }
-                // **The structural route, and the whole reason this path may
-                // admit tool traffic at all.** The fragments are a document
-                // now, so the value goes into a leaf and serialization escapes
-                // it — a name carrying a `"` cannot close the string it lands
-                // in, which textual substitution into a fragment could not
-                // promise.
-                Held::Document {
+            }
+        }
+
+        // **Documents are drained by group, not by run.** One OpenAI chunk
+        // opens every parallel call at once, so those runs share a carrier that
+        // describes all of them — their `id`, `type` and `function.name`
+        // together. A carrier rendered per run replays each call's identity
+        // once per sibling, and a client that concatenates a call's string
+        // fields across chunks reads the name `firstfirst` and dispatches to
+        // nothing. So a group is rendered once, with every member's document
+        // written into it at its own pointer.
+        let mut groups: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        let mut group_of: BTreeMap<String, u64> = BTreeMap::new();
+        for (key, held) in self.buffers.iter() {
+            if let Held::Document { group, .. } = held {
+                group_of.insert(key.clone(), *group);
+                if ends(key) {
+                    groups.entry(*group).or_default().push(key.clone());
+                }
+            }
+        }
+        for (group, members) in &groups {
+            // **A group ends whole or the stream ends.** Rendering the carrier
+            // for some members now and the rest later would replay the
+            // identities this grouping exists to send once.
+            //
+            // **Unreachable with both protocols as they stand, and untested for
+            // that reason** — Anthropic opens one document slot per event, so
+            // its groups are single runs, and OpenAI's `finish_reason` ends
+            // every run under its choice in one flush. It is here because the
+            // grouping is what makes it unreachable: a provider added later
+            // that closes calls one at a time would meet this instead of
+            // silently replaying a name, and the direction of that failure is
+            // the one this module takes everywhere else.
+            let whole = group_of
+                .iter()
+                .filter(|(_, g)| *g == group)
+                .all(|(key, _)| members.contains(key));
+            if !whole {
+                return Err(StreamError::Unplaceable(members[0].clone()));
+            }
+            let mut data: Option<Value> = None;
+            let mut event: Option<SseEvent> = None;
+            for key in members {
+                let Some(Held::Document {
                     raw,
                     pointer,
                     carrier,
-                } => {
-                    // **What says a document is complete is its block closing,
-                    // not its text parsing.** A run still held when the message
-                    // ends never saw its own `content_block_stop`, and
-                    // `Terminates::All` — `message_stop`, `[DONE]`, or an
-                    // `error` the upstream sent mid-generation — is not that
-                    // signal for any of them. Truncation usually leaves JSON
-                    // that will not parse and the refusal below would catch it,
-                    // but *usually* is the whole objection: the one truncation
-                    // that happens to parse would be served as a finished tool
-                    // call, and a tool call is an action the client's agent
-                    // takes rather than text it displays. So the test is the
-                    // signal itself.
-                    if matches!(terminates, Terminates::All) {
-                        return Err(ShapeError::MalformedDocument(provider, pointer.clone()).into());
-                    }
-                    let document: Value = serde_json::from_str(raw)
-                        .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
-                    let restored = mapping.restore_value(&document)?;
-                    let mut data: Value =
-                        serde_json::from_str(carrier.data.as_deref().unwrap_or(""))
-                            .map_err(|_| StreamError::Malformed)?;
-                    write_pointer(&mut data, pointer, &restored.to_string())?;
-                    let mut event = carrier.clone();
-                    event.data = Some(data.to_string());
-                    documents.push_str(&event.render());
+                    ..
+                }) = self.buffers.get(key)
+                else {
+                    continue;
+                };
+                // **What says a document is complete is its own run closing,
+                // not its text parsing.** A run still held when the message
+                // ends never saw the event that closes it, and
+                // `Terminates::All` — `message_stop`, `[DONE]`, or an `error`
+                // the upstream sent mid-generation — is not that signal for any
+                // of them. Truncation usually leaves JSON that will not parse
+                // and the refusal below would catch it, but *usually* is the
+                // whole objection: the one truncation that happens to parse
+                // would be served as a finished tool call, and a tool call is
+                // an action the client's agent takes rather than text it
+                // displays. So the test is the signal itself.
+                if matches!(terminates, Terminates::All) {
+                    return Err(ShapeError::MalformedDocument(provider, pointer.clone()).into());
                 }
+                let document: Value = serde_json::from_str(raw)
+                    .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
+                let restored = mapping.restore_value(&document)?;
+                let into = match &mut data {
+                    Some(value) => value,
+                    None => {
+                        event = Some(carrier.clone());
+                        data.insert(
+                            serde_json::from_str(carrier.data.as_deref().unwrap_or(""))
+                                .map_err(|_| StreamError::Malformed)?,
+                        )
+                    }
+                };
+                write_pointer(into, pointer, &restored.to_string())?;
+            }
+            if let (Some(mut event), Some(data)) = (event, data) {
+                event.data = Some(data.to_string());
+                documents.push_str(&event.render());
             }
         }
         self.buffers.retain(|key, _| !ends(key));
@@ -2063,6 +2136,28 @@ mod restorer_tests {
             .expect("the second call's document must parse");
         assert_eq!(first, json!({"to": "Weber"}));
         assert_eq!(second, json!({"cc": "Weber"}));
+
+        // **And each call's identity reaches the client exactly once.** A
+        // client concatenates every string field of a call across chunks, so a
+        // name delivered twice is `firstfirst` and dispatches to nothing. Each
+        // run keeping its own clone of a carrier that describes *both* calls
+        // replays the other's `id` and `name` when it closes — which the
+        // argument assertions above cannot see, because they only read
+        // `arguments`.
+        for name in ["first", "second"] {
+            assert_eq!(
+                rendered.matches(&format!("\"{name}\"")).count(),
+                1,
+                "the call name {name} reached the client more than once: {rendered}"
+            );
+        }
+        for id in ["\"a\"", "\"b\""] {
+            assert_eq!(
+                rendered.matches(id).count(),
+                1,
+                "the call id {id} reached the client more than once: {rendered}"
+            );
+        }
     }
 
     #[test]
