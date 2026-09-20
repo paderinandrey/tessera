@@ -180,14 +180,18 @@ pub const MAX_TOOL_DOCUMENT_BYTES: usize = 256 << 10;
 /// nothing about the document it will become at the client.
 ///
 /// **So the two paths differ here, and neither one of them decides it.** Both
-/// halves are answered before the upstream call, by refusing a request shape:
+/// halves are answered before this buffer sees them, and no longer by the same
+/// means:
 ///
-/// - the `arguments` case — the one the recursion was written for — cannot
-///   reach this buffer at all, because `reject_streamed_tools` refuses
-///   `stream: true` on a request carrying tool traffic;
-/// - a `content` the caller has declared will be a document cannot either,
-///   because `reject_streamed_json_mode` refuses `stream: true` beside a
-///   `response_format` of `json_object` or `json_schema` (#36).
+/// - the `arguments` case — the one the recursion was written for — never
+///   reaches this buffer, because tool arguments open a `Held::Document` run
+///   instead. They are accumulated whole and restored structurally when the
+///   run closes, which is the same door the buffered path uses (#87). It used
+///   to be `reject_streamed_tools` refusing the request outright, and that
+///   function no longer exists;
+/// - a `content` the caller has declared will be a document cannot reach it
+///   either, because `reject_streamed_json_mode` refuses `stream: true` beside
+///   a `response_format` of `json_object` or `json_schema` (#36).
 ///
 /// Buffering a whole run before emitting any of it is the thing streaming
 /// exists not to do, and teaching this buffer to track JSON structure across
@@ -693,50 +697,76 @@ impl<'a> StreamRestorer<'a> {
         // accumulated and restored whole when `content_block_stop` closes this
         // index. The envelope is restored now, because it is this event's own
         // and the accumulator has no use for it.
-        if let Some(slot) = slots.iter().find(|slot| slot.run == Run::Document) {
-            // One event, one run. Two would mean one of them belongs to another
-            // block, and writing a document into the wrong carrier is the
-            // failure `place` guards against on the text path.
-            if slots.len() != 1 {
+        if slots.iter().any(|slot| slot.run == Run::Document) {
+            // **One event may carry several documents and must not mix kinds.**
+            // OpenAI streams parallel tool calls as one `tool_calls` array, so
+            // two fragments of two different documents arrive together and both
+            // have to accumulate. Text in the same event is the shape that
+            // cannot be served: it would have to stream now while the documents
+            // are held back, and then the event that finally carries a document
+            // would carry that text a second time. Neither provider produces
+            // it — a delta holds content or tool calls, not both — so it is
+            // refused rather than guessed at.
+            if slots.iter().any(|slot| slot.run == Run::Text) {
                 return Err(ShapeError::Response(provider).into());
             }
-            let fragment = read_pointer(&parsed, &slot.pointer)?;
+            // Blanked once, for **every** document in the event rather than the
+            // one being handled: each run keeps this as its carrier, and a
+            // carrier still holding a sibling's fragment would emit that
+            // fragment again when this run closes.
             let mut scrubbed = parsed.clone();
-            write_pointer(&mut scrubbed, &slot.pointer, "")?;
+            for slot in &slots {
+                write_pointer(&mut scrubbed, &slot.pointer, "")?;
+            }
             let mut carrier = event;
             carrier.data = Some(mapping.restore_value(&scrubbed)?.to_string());
 
-            match self.buffers.get_mut(&slot.key) {
-                Some(Held::Document {
-                    raw,
-                    pointer,
-                    carrier: held,
-                }) => {
-                    if raw.len() + fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
-                        return Err(StreamError::ToolDocumentTooLarge);
+            for slot in &slots {
+                let fragment = read_pointer(&parsed, &slot.pointer)?;
+                let carrier = carrier.clone();
+
+                match self.buffers.get_mut(&slot.key) {
+                    Some(Held::Document { raw, .. }) => {
+                        if raw.len() + fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
+                            return Err(StreamError::ToolDocumentTooLarge);
+                        }
+                        raw.push_str(&fragment);
+                        // **The carrier and its pointer are the run's first
+                        // event, and they are not replaced.** On OpenAI a
+                        // call's identity — `id`, `type` and `function.name` —
+                        // arrives in the same chunk as its first `arguments`
+                        // fragment and never again, so a run that kept its
+                        // latest event handed the client a tool call with no
+                        // name to dispatch on. Measured: the document restored
+                        // correctly and the call was unusable.
+                        //
+                        // Nothing in a later fragment is lost by this. OpenAI's
+                        // carry `index` and `arguments` alone; Anthropic's
+                        // carry an envelope identical to the first. The pointer
+                        // stays with the carrier because it addresses *that*
+                        // event — a call's array position can differ between
+                        // chunks, so the latest pointer need not resolve in the
+                        // first event.
                     }
-                    raw.push_str(&fragment);
-                    pointer.clone_from(&slot.pointer);
-                    *held = carrier;
-                }
-                // One key, two kinds. The upstream changed what a run is
-                // mid-flight, and neither reading of the fragments is right.
-                Some(Held::Text { .. }) => return Err(ShapeError::Response(provider).into()),
-                None => {
-                    if self.buffers.len() >= MAX_ACTIVE_RUNS {
-                        return Err(StreamError::TooManyRuns);
+                    // One key, two kinds. The upstream changed what a run is
+                    // mid-flight, and neither reading of the fragments is right.
+                    Some(Held::Text { .. }) => return Err(ShapeError::Response(provider).into()),
+                    None => {
+                        if self.buffers.len() >= MAX_ACTIVE_RUNS {
+                            return Err(StreamError::TooManyRuns);
+                        }
+                        if fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
+                            return Err(StreamError::ToolDocumentTooLarge);
+                        }
+                        self.buffers.insert(
+                            slot.key.clone(),
+                            Held::Document {
+                                raw: fragment,
+                                pointer: slot.pointer.clone(),
+                                carrier,
+                            },
+                        );
                     }
-                    if fragment.len() > MAX_TOOL_DOCUMENT_BYTES {
-                        return Err(StreamError::ToolDocumentTooLarge);
-                    }
-                    self.buffers.insert(
-                        slot.key.clone(),
-                        Held::Document {
-                            raw: fragment,
-                            pointer: slot.pointer.clone(),
-                            carrier,
-                        },
-                    );
                 }
             }
             return Ok(String::new());
@@ -821,6 +851,7 @@ impl<'a> StreamRestorer<'a> {
         let ends = |key: &String| match terminates {
             Terminates::All => true,
             Terminates::Runs(keys) => keys.contains(key),
+            Terminates::Under(prefixes) => prefixes.iter().any(|p| key.starts_with(p)),
             Terminates::Nothing => false,
         };
         let mapping = self.mapping;
@@ -1967,13 +1998,150 @@ mod restorer_tests {
     }
 
     #[test]
-    fn a_streamed_tool_call_ends_the_stream() {
+    fn a_streamed_tool_call_is_restored_when_its_choice_finishes() {
+        // What #87's OpenAI half is for. The token is split across two
+        // `arguments` fragments *and* sits inside a half-written JSON value, so
+        // there is nothing to parse at the moment of substitution — and unlike
+        // Anthropic there is no event that closes the call. `finish_reason` in
+        // a later chunk is the only close there is, and it names no tool.
         let mapping = mapped();
         let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
-        let error = restorer
-            .push(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n")
-            .unwrap_err();
-        assert!(matches!(error, StreamError::Shape(_)));
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"send\",\
+             \"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"arguments\":\"{\\\"to\\\":\\\"[PER\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"arguments\":\"SON_1]\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        let document: Value = serde_json::from_str(&openai_tool_json(&rendered, 0))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"to": "Weber"}));
+        assert!(
+            !rendered.contains("[PERSON_1]") && !rendered.contains("[PER"),
+            "a fragment of the token reached the client: {rendered}"
+        );
+        assert!(
+            rendered.contains("call_1") && rendered.contains("\"send\""),
+            "the call's identity did not reach the client: {rendered}"
+        );
+    }
+
+    #[test]
+    fn two_tool_calls_in_one_chunk_do_not_splice() {
+        // OpenAI streams parallel calls as one `tool_calls` array, so two
+        // fragments of two different documents arrive in the same event and
+        // both accumulate. The carrier each run keeps has **every** document
+        // blanked, not just its own — a carrier still holding a sibling's
+        // fragment would emit that fragment again when this run closed, and the
+        // client would reassemble one call's argument into the other.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[\
+             {\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"first\",\
+             \"arguments\":\"{\\\"to\\\":\\\"[PER\"}},\
+             {\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"second\",\
+             \"arguments\":\"{\\\"cc\\\":\\\"[PER\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[\
+             {\"index\":0,\"function\":{\"arguments\":\"SON_1]\\\"}\"}},\
+             {\"index\":1,\"function\":{\"arguments\":\"SON_1]\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        let first: Value = serde_json::from_str(&openai_tool_json(&rendered, 0))
+            .expect("the first call's document must parse");
+        let second: Value = serde_json::from_str(&openai_tool_json(&rendered, 1))
+            .expect("the second call's document must parse");
+        assert_eq!(first, json!({"to": "Weber"}));
+        assert_eq!(second, json!({"cc": "Weber"}));
+    }
+
+    #[test]
+    fn a_choice_that_finishes_does_not_end_another_choices_tool_call() {
+        // The prefix has a separator for a reason. `choice/1/` must not reach
+        // `choice/10/tool/0`, and this is the end-to-end half of the assertion
+        // the provider test makes on `Terminates` alone.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let open = |choice: u64, fragment: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices": [{"index": choice, "delta": {"tool_calls": [
+                    {"index": 0, "id": "x", "function": {"name": "f", "arguments": fragment}}]}}]})
+            )
+        };
+        // Choice 1's document is whole, so finishing it must serve it. Choice
+        // 10's is a fragment, so if the prefix reached it the flush would fail
+        // here instead of later — which is the other half of what this checks.
+        let mut body = open(1, "{\"to\":\"[PERSON_1]\"}");
+        body.push_str(&open(10, "{\"to\":\"[PER"));
+        // Choice 1 finishes; choice 10 has not, and its run must survive.
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 1, "delta": {}, "finish_reason": "tool_calls"}]})
+        ));
+        let rendered = restorer.push(body.as_bytes()).unwrap();
+        assert!(
+            rendered.contains("Weber"),
+            "choice 1's call was not restored when it finished: {rendered}"
+        );
+        // Choice 10's document never closed, so finishing the stream refuses it
+        // rather than serving half a document — which is also the proof that it
+        // was still open rather than drained by choice 1's prefix.
+        let finished = restorer.finish();
+        assert!(
+            matches!(
+                finished,
+                Err(StreamError::Shape(ShapeError::MalformedDocument(
+                    "openai",
+                    _
+                )))
+            ),
+            "choice 10's run was ended by choice 1's finish_reason: {finished:?}"
+        );
+    }
+
+    /// The tool document the client reassembles for one call index.
+    fn openai_tool_json(rendered: &str, tool: u64) -> String {
+        let mut out = String::new();
+        for line in rendered.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+                continue;
+            };
+            for choice in choices {
+                let Some(calls) = choice
+                    .pointer("/delta/tool_calls")
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                for call in calls {
+                    if call.get("index").and_then(Value::as_u64) != Some(tool) {
+                        continue;
+                    }
+                    if let Some(piece) = call.pointer("/function/arguments").and_then(Value::as_str)
+                    {
+                        out.push_str(piece);
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]

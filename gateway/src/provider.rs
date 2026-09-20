@@ -82,6 +82,20 @@ pub enum Terminates {
     /// A keepalive, a comment, an event type added after this was written.
     Nothing,
     Runs(Vec<String>),
+    /// Every run whose key begins with one of these prefixes.
+    ///
+    /// **It exists because OpenAI cannot name the runs it is ending.** A chunk
+    /// carrying `finish_reason` holds no `tool_calls` array, so there is nothing
+    /// in it to enumerate: the runs being closed were opened by earlier chunks
+    /// and the terminating one has forgotten them. Anthropic never needs this —
+    /// `content_block_stop` names its own index — and `Runs` stays the exact
+    /// answer wherever an exact answer exists.
+    ///
+    /// A prefix is not a wildcard. `choice/0/` ends `choice/0/content` and
+    /// `choice/0/tool/1` and cannot reach `choice/10/content`, because the
+    /// trailing separator is part of the prefix. Keys are built here, in one
+    /// place, so that stays true.
+    Under(Vec<String>),
     All,
 }
 
@@ -348,37 +362,6 @@ fn reject_tool_fields(
         if body.get(field).is_some_and(|value| !value.is_null()) {
             return Err(ShapeError::Unsupported(provider, field));
         }
-    }
-    Ok(())
-}
-
-/// `proxy.rs` calls `request_pointers` before it looks at `stream`, so relaxing
-/// this refusal admits streamed tool requests as readily as buffered ones — and
-/// a provider whose `stream_slots` still rejects tool events would then do it
-/// *after* the upstream call, spending the caller's tokens to return a broken
-/// stream. So the two move together, per provider, and never apart.
-///
-/// **Anthropic no longer calls this.** Its `stream_slots` accumulates a tool
-/// block and restores the document when `content_block_stop` closes it, so
-/// there is nothing left here for it to protect. OpenAI still calls it: its
-/// `tool_calls` deltas have no terminating event of their own — the end is
-/// `finish_reason` in a later chunk — so the accumulator it would need is a
-/// state machine this slice did not write.
-fn reject_streamed_tools(
-    body: &Value,
-    slots: &[Slot],
-    provider: &'static str,
-) -> Result<(), ShapeError> {
-    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    // Every `Json` slot is tool traffic, and a `Text` slot says whether it is.
-    // Reading the slots rather than a field name is what makes this cover a
-    // continuation that carries an earlier call and its result without
-    // repeating the definitions.
-    let carries_tools = slots
-        .iter()
-        .any(|slot| matches!(slot, Slot::Json { .. } | Slot::Text { tool: true, .. }));
-    if streaming && carries_tools {
-        return Err(ShapeError::Unsupported(provider, "streamed tool traffic"));
     }
     Ok(())
 }
@@ -1676,7 +1659,6 @@ impl Provider for OpenAi {
         // arguments and a result each say they are tool traffic, so a
         // continuation carrying only history is covered without asking for a
         // top-level `tools` that a continuation need not repeat.
-        reject_streamed_tools(body, &pointers, "openai")?;
         // Reads the request rather than the slots: `response_format` describes
         // the *response*, which has no slots yet, and it is the caller's
         // declaration rather than anything masking found.
@@ -1756,12 +1738,16 @@ impl Provider for OpenAi {
             if delta.get("audio").is_some_and(|value| !value.is_null()) {
                 return Err(ShapeError::Unsupported("openai", "audio"));
             }
-            // Tool arguments stream as their own field, past the masker.
-            // Masking them is a later slice; until then they are refused.
-            for field in ["tool_calls", "function_call"] {
-                if delta.get(field).is_some_and(|value| !value.is_null()) {
-                    return Err(ShapeError::Unsupported("openai", "tool_calls"));
-                }
+            // `function_call` is the single-call form this API deprecated, and
+            // it is still refused: it is shaped differently from `tool_calls`,
+            // nothing in this gateway describes it on the way up, and admitting
+            // it would mean a second accumulator for a field no current client
+            // sends.
+            if delta
+                .get("function_call")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(ShapeError::Unsupported("openai", "function_call"));
             }
             // `index` says which completion this chunk belongs to; the array
             // position only says where it sits in this chunk. With `n > 1` they
@@ -1785,6 +1771,42 @@ impl Provider for OpenAi {
                     Some(_) => return Err(ShapeError::Response("openai")),
                 }
             }
+
+            // **Tool arguments, which arrive as fragments of a JSON document
+            // and so open `Document` runs.** A chunk's `tool_calls` is an
+            // array, several calls can be in flight at once, and each element
+            // carries its own `index` — which is the call's identity across
+            // chunks, exactly as `choice.index` is the completion's. The array
+            // position is where it sits in *this* chunk and is not the same
+            // number.
+            //
+            // The first fragment of a call also carries `id`, `type` and
+            // `function.name`; none of those is a slot, so they are restored as
+            // part of the envelope like any other field the upstream sends.
+            match delta.get("tool_calls") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(calls)) => {
+                    for (at, call) in calls.iter().enumerate() {
+                        let tool = call
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(at as u64);
+                        match call.pointer("/function/arguments") {
+                            None | Some(Value::Null) => {}
+                            Some(Value::String(_)) => slots.push(TextSlot {
+                                pointer: format!(
+                                    "/choices/{position}/delta/tool_calls/{at}/function/arguments"
+                                ),
+                                key: format!("choice/{index}/tool/{tool}"),
+                                run: Run::Document,
+                            }),
+                            // Recognized, unreadable, as above.
+                            Some(_) => return Err(ShapeError::Response("openai")),
+                        }
+                    }
+                }
+                Some(_) => return Err(ShapeError::Response("openai")),
+            }
         }
         Ok(slots)
     }
@@ -1803,14 +1825,19 @@ impl Provider for OpenAi {
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or(position as u64);
-                keys.push(format!("choice/{index}/content"));
-                keys.push(format!("choice/{index}/refusal"));
+                // A prefix rather than the two names it used to push. A
+                // chunk carrying `finish_reason` holds no `tool_calls` array,
+                // so the tool runs this choice opened cannot be enumerated
+                // from it — they were opened by earlier chunks and this one
+                // has forgotten them. The trailing separator is what keeps
+                // `choice/1/` away from `choice/10/content`.
+                keys.push(format!("choice/{index}/"));
             }
         }
         if keys.is_empty() {
             Terminates::Nothing
         } else {
-            Terminates::Runs(keys)
+            Terminates::Under(keys)
         }
     }
 
@@ -1908,19 +1935,16 @@ impl Provider for Anthropic {
                 )?;
             }
         }
-        // **`reject_streamed_tools` is not called here any more.** A streamed
-        // tool block is accumulated by `stream_slots` and restored structurally
-        // when its `content_block_stop` arrives, which is the thing the refusal
-        // stood in for. It still guards OpenAI, whose deltas close no block.
-        //
         // Called for both providers though only one has the field today, and
-        // the reason it is inert here has changed. It used to be that the
-        // Messages API asks for structured output through tools and
-        // `reject_streamed_tools` refused those outright; now they are served,
-        // and what makes this inert is only that Anthropic has no
-        // `response_format` field to read. That is a weaker reason, and it is
-        // why the call stays: the day Anthropic grows one, the omission would
-        // cost silently in the half nobody was looking at.
+        // the reason it is inert here has changed twice. It was that the
+        // Messages API asks for structured output through tools and a blanket
+        // refusal of streamed tool traffic caught those outright. That refusal
+        // is gone — the fragments are accumulated and restored structurally
+        // now (#87) — so what makes this inert is only that Anthropic has no
+        // `response_format` field to read. That is a weaker reason than the one
+        // it replaced, and it is why the call stays: the day Anthropic grows
+        // one, the omission would cost silently in the half nobody was looking
+        // at.
         reject_streamed_json_mode(body, "anthropic")?;
         Ok(pointers)
     }
@@ -3518,62 +3542,6 @@ mod tests {
     }
 
     #[test]
-    fn an_openai_streamed_continuation_is_refused_for_its_tool_history_not_its_definitions() {
-        // The refusal keyed on top-level `tools`, so a continuation carrying an
-        // earlier call and its result — but no repeated definitions — passed,
-        // and `stream_slots` would refuse the tool events afterwards, once the
-        // caller had already paid for them.
-        //
-        // Whether Anthropic itself accepts such a request is not the question.
-        // Anthropic's tool-use documentation passes `tools` on every
-        // continuation in every example but nowhere states it is required, and
-        // `mcp_servers` grants tools without `tools` at all — so "no
-        // definitions means no tool events" is not something to rest a refusal
-        // on. What this gateway can mask is its own business to decide.
-        //
-        // **Retargeted from Anthropic, which no longer has this guard.** The
-        // lesson is about what the refusal keys on, and it is OpenAI that still
-        // refuses, so that is where it is pinned. Anthropic's side of it is now
-        // `anthropic_admits_tool_traffic_on_a_streamed_request`.
-        let continuation = json!({
-            "model": "gpt",
-            "stream": true,
-            "messages": [
-                {"role": "assistant", "tool_calls": [{"id": "t1", "type": "function",
-                    "function": {"name": "f", "arguments": "{\"path\":\"x\"}"}}]},
-                {"role": "tool", "tool_call_id": "t1", "content": "Weber"}
-            ]
-        });
-        assert!(matches!(
-            OpenAi.request_pointers(&continuation),
-            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
-        ));
-
-        // A result alone is enough — it is tool traffic and `stream_slots` does
-        // not know how to mask what comes back for it either.
-        let result_only = json!({
-            "model": "gpt",
-            "stream": true,
-            "messages": [{"role": "tool", "tool_call_id": "t1", "content": "Weber"}]
-        });
-        assert!(matches!(
-            OpenAi.request_pointers(&result_only),
-            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
-        ));
-
-        // And an ordinary streamed conversation is untouched by any of this.
-        let plain = json!({
-            "model": "gpt",
-            "stream": true,
-            "messages": [{"role": "user", "content": "hallo"}]
-        });
-        assert_eq!(
-            OpenAi.request_pointers(&plain).unwrap(),
-            vec![text("/messages/0/content")]
-        );
-    }
-
-    #[test]
     fn an_mcp_server_grants_tools_this_gateway_cannot_see_and_is_refused() {
         // `mcp_servers` gives the model tools without `tools`, so its calls and
         // results would arrive shaped by a server this gateway never described.
@@ -4643,9 +4611,10 @@ mod tests {
     #[test]
     fn anthropic_is_asked_the_same_question_though_it_has_no_field_today() {
         // Inert on the Messages API, which asks for structured output through
-        // tools — already refused by `reject_streamed_tools`. It is here so the
-        // day Anthropic grows the field is not the day the half nobody watched
-        // silently admits it.
+        // tools — and those are served now rather than refused (#87), so the
+        // only thing making this inert is that Anthropic has no
+        // `response_format` field. It is here so the day Anthropic grows one is
+        // not the day the half nobody watched silently admits it.
         let declared = json!({
             "model": "claude", "stream": true, "max_tokens": 16,
             "response_format": {"type": "json_object"},
@@ -4661,22 +4630,33 @@ mod tests {
     }
 
     #[test]
-    fn openai_refuses_tool_traffic_on_a_streamed_request() {
-        // `stream_slots` refuses tool events, and it does so *after* the
-        // upstream call. Refusing here costs the caller nothing; refusing there
-        // costs them the tokens and hands back a broken stream.
+    fn openai_serves_tool_traffic_on_a_streamed_request_and_masks_all_of_it() {
+        // This used to assert a refusal, and the refusal existed only because
+        // `stream_slots` could not restore the tool events that would come
+        // back. It can now (#87), so the request is served — and the property
+        // the refusal was keyed on is still the one that matters here: tool
+        // traffic is found by asking the **slots**, never by looking for a
+        // `tools` field. A continuation carrying an earlier call and its result
+        // repeats no definitions, and every one of these has to be masked.
         let with_definitions = json!({
             "model": "gpt", "stream": true,
             "tools": [{"type": "function", "function": {"name": "f", "description": "d"}}],
             "messages": [{"role": "user", "content": "hello"}]
         });
-        assert!(matches!(
-            OpenAi.request_pointers(&with_definitions),
-            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
-        ));
+        let slots = OpenAi
+            .request_pointers(&with_definitions)
+            .expect("streamed tool traffic is served");
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Text { pointer, tool: true, .. }
+                    if pointer == "/tools/0/function/description"
+            )),
+            "the definition went unmasked: {slots:?}"
+        );
 
-        // A continuation carrying only history is tool traffic too — the
-        // predicate reads the slots, not a field name.
+        // A continuation carrying only history: no `tools` key anywhere, and
+        // both the arguments document and the result have to be described.
         let continuation = json!({
             "model": "gpt", "stream": true,
             "messages": [
@@ -4686,21 +4666,42 @@ mod tests {
                 {"role": "tool", "tool_call_id": "t1", "content": "Weber"}
             ]
         });
-        assert!(matches!(
-            OpenAi.request_pointers(&continuation),
-            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
-        ));
+        let slots = OpenAi
+            .request_pointers(&continuation)
+            .expect("a streamed continuation is served");
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Json { pointer, .. }
+                    if pointer == "/messages/0/tool_calls/0/function/arguments"
+            )),
+            "the call's arguments went unmasked: {slots:?}"
+        );
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Text { pointer, tool: true, .. } if pointer == "/messages/1/content"
+            )),
+            "the result went unmasked: {slots:?}"
+        );
 
-        // A result alone is enough, which is only true because a tool message's
-        // content is marked as tool traffic.
+        // A result alone is tool traffic too, which is only true because a tool
+        // message's content is marked as such rather than inferred from a
+        // sibling field.
         let result_only = json!({
             "model": "gpt", "stream": true,
             "messages": [{"role": "tool", "tool_call_id": "t1", "content": "Weber"}]
         });
-        assert!(matches!(
-            OpenAi.request_pointers(&result_only),
-            Err(ShapeError::Unsupported("openai", "streamed tool traffic"))
-        ));
+        let slots = OpenAi
+            .request_pointers(&result_only)
+            .expect("a streamed result is served");
+        assert!(
+            slots.iter().any(|slot| matches!(
+                slot,
+                Slot::Text { pointer, tool: true, .. } if pointer == "/messages/0/content"
+            )),
+            "a lone result went unmasked: {slots:?}"
+        );
 
         // And an ordinary streamed conversation is untouched by any of this.
         let plain = json!({"model": "gpt", "stream": true,
@@ -4966,9 +4967,69 @@ mod tests {
     }
 
     #[test]
-    fn openai_refuses_a_streamed_tool_call() {
+    fn a_streamed_tool_call_without_arguments_opens_no_run() {
+        // The first fragment of a call carries `id`, `type` and
+        // `function.name` and often no `arguments` at all. Nothing to
+        // accumulate, so no slot — and the envelope carries those fields
+        // through like any other. This used to refuse the whole stream.
         let event = json!({"choices": [{"delta": {"tool_calls": [{"index": 0}]}}]});
-        assert!(OpenAi.stream_slots(&event).is_err());
+        assert!(OpenAi.stream_slots(&event).unwrap().is_empty());
+    }
+
+    #[test]
+    fn streamed_tool_arguments_open_a_document_run_keyed_on_the_calls_own_index() {
+        // Two calls in one chunk, and the second sits at array position 1 while
+        // its own `index` says 4. The key has to follow the call rather than
+        // the position, for the reason the choice key already does: the
+        // position says where it is in *this* chunk and says nothing about
+        // which run its next fragment belongs to.
+        let event = json!({"choices": [{"index": 2, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"a\":"}},
+            {"index": 4, "function": {"arguments": "{\"b\":"}}
+        ]}}]});
+        assert_eq!(
+            OpenAi.stream_slots(&event).unwrap(),
+            vec![
+                TextSlot {
+                    pointer: "/choices/0/delta/tool_calls/0/function/arguments".to_owned(),
+                    key: "choice/2/tool/0".to_owned(),
+                    run: Run::Document,
+                },
+                TextSlot {
+                    pointer: "/choices/0/delta/tool_calls/1/function/arguments".to_owned(),
+                    key: "choice/2/tool/4".to_owned(),
+                    run: Run::Document,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_finish_reason_ends_every_run_of_its_choice_and_no_others() {
+        // The terminating chunk carries no `tool_calls`, so the runs it closes
+        // cannot be named from it — hence a prefix. The separator is what stops
+        // `choice/1/` reaching `choice/10/content`, and this is the assertion
+        // that fails if it is ever dropped.
+        let event = json!({"choices": [{"index": 1, "delta": {}, "finish_reason": "tool_calls"}]});
+        let Terminates::Under(prefixes) = OpenAi.stream_terminates(&event) else {
+            panic!("a finish_reason must end this choice's runs");
+        };
+        assert_eq!(prefixes, vec!["choice/1/".to_owned()]);
+        assert!(!"choice/10/content".starts_with(&prefixes[0]));
+        for key in ["choice/1/content", "choice/1/refusal", "choice/1/tool/3"] {
+            assert!(key.starts_with(&prefixes[0]), "{key} was left open");
+        }
+    }
+
+    #[test]
+    fn the_deprecated_function_call_field_is_still_refused() {
+        // A different shape, described by nothing on the way up, and sent by no
+        // current client. Admitting it would mean a second accumulator for it.
+        let event = json!({"choices": [{"delta": {"function_call": {"arguments": "{"}}}]});
+        assert!(matches!(
+            OpenAi.stream_slots(&event),
+            Err(ShapeError::Unsupported("openai", "function_call"))
+        ));
     }
 
     #[test]
