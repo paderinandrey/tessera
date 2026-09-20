@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{FromRequestParts, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -813,25 +813,11 @@ async fn handle(
         record.attribute(state.audit.digest(&[credential]), None);
     }
 
-    // **Whether this gateway serves this caller, asked here and nowhere else.**
-    //
-    // After attribution, because a refused request should still say whose it
-    // was and this is the one line such a request leaves. Before
-    // `request_pointers`, because `session::key_from` already states the rule
-    // this follows: every refusal on the way in happens before detection, so a
-    // credential this gateway does not serve costs a string comparison rather
-    // than a second per 1 200 characters — and, with nothing forwarded, none of
-    // the caller's tokens.
-    //
-    // The check is on the same header the provider authenticates with, so the
-    // client sends nothing new. What it stops is a stranger reaching the
-    // mapping table at all: a session id is the client's own choice rather than
-    // a secret this gateway issues, so without this a guessed id and a stolen
-    // key read a conversation's real values back out (#91, and #32 for the read
-    // it narrows without closing).
-    if !state.callers.admits(credential) {
-        return Err(ProxyError::Unauthenticated);
-    }
+    // The admission check is **not** here. It runs in the `Admitted` extractor,
+    // before `Json<Value>` reads the body — see there for why, and for the
+    // journal line it writes. `handle` is private and both of its callers take
+    // that extractor, so a copy here would be unreachable, and an unreachable
+    // guard is one nothing can prove still works.
 
     // Where is the text? A shape we do not recognize is refused, not forwarded.
     let slots = provider.request_pointers(&body)?;
@@ -1360,8 +1346,71 @@ async fn handle(
     ))
 }
 
+/// Which provider a route belongs to, derived from the providers themselves
+/// rather than repeated. Both serve the path their upstream uses, which is what
+/// makes a client's only change its `base_url`.
+fn provider_for(path: &str) -> Option<&'static dyn Provider> {
+    if path == OpenAi.upstream_path() {
+        Some(&OpenAi)
+    } else if path == Anthropic.upstream_path() {
+        Some(&Anthropic)
+    } else {
+        None
+    }
+}
+
+/// Proof that this caller is served, produced **before the body is read**.
+///
+/// An extractor rather than a line in `handle`, and the difference is what a
+/// caller who is not served costs. `Json<Value>` consumes and parses the whole
+/// body, up to axum's default limit, before any handler runs — so a check
+/// inside `handle` let a stranger make this process parse megabytes of JSON per
+/// request, which is the work an admission check exists to refuse. This runs on
+/// the request *parts*, so a refusal costs one digest and one set lookup.
+///
+/// **It writes its own journal line**, because nothing downstream will: the
+/// `Record` is created in `serve`, which a rejected request never reaches. A
+/// refusal that left no evidence would be the one outcome this gateway cannot
+/// account for.
+struct Admitted;
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<AppState>> for Admitted {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // A path with no provider is not this extractor's business; the router
+        // will not have matched it to a proxy route.
+        let Some(provider) = provider_for(parts.uri.path()) else {
+            return Ok(Admitted);
+        };
+        let credential = crate::session::credential_of(&parts.headers, provider);
+        if state.callers.admits(credential) {
+            return Ok(Admitted);
+        }
+        // `upstream_path` is the route: both are served at the path their
+        // provider uses, which is the whole reason a client changes only its
+        // `base_url`.
+        let record = Record::new(
+            Arc::clone(&state.audit),
+            provider.name(),
+            provider.upstream_path(),
+        );
+        if let Some(credential) = credential {
+            record.attribute(state.audit.digest(&[credential]), None);
+        }
+        let error = ProxyError::Unauthenticated;
+        record.refused(error.status().as_u16(), error.audit_class());
+        Err(error.into_response())
+    }
+}
+
 async fn openai(
     State(state): State<Arc<AppState>>,
+    _admitted: Admitted,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -1370,6 +1419,7 @@ async fn openai(
 
 async fn anthropic(
     State(state): State<Arc<AppState>>,
+    _admitted: Admitted,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -1814,6 +1864,52 @@ mod tests {
             "the journal quoted the credential: {}",
             lines[0]
         );
+    }
+
+    #[tokio::test]
+    async fn a_stranger_is_refused_before_their_body_is_parsed() {
+        // **The test that tells the two checks apart**, which the others cannot:
+        // they assert a 401 and a journal line, and either check produces both.
+        // What only the extractor produces is a 401 for a body that would not
+        // have parsed — because it is refused before anything reads it.
+        //
+        // The property matters on its own. `Json<Value>` consumes and parses up
+        // to axum's default body limit before a handler runs, so a check inside
+        // `handle` let a stranger make this process parse megabytes per request
+        // — the work an admission check exists to refuse. It also left the
+        // refusal unrecorded: a malformed body is rejected by axum before
+        // `serve` creates a `Record`, so the one line such a request should
+        // leave was never written.
+        let detector = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        let (state, _dir, journal_path) = state_accepting(&detector, &upstream, &["sk-served"]);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "sk-stranger")
+                    .body(Body::from("{ this is not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the body was parsed before the caller was checked: {body}"
+        );
+        let lines = journal(&journal_path);
+        assert_eq!(lines.len(), 1, "the refusal left no evidence: {lines:?}");
+        assert_eq!(lines[0]["error"], "caller_not_served");
     }
 
     #[tokio::test]

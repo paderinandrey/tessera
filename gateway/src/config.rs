@@ -2,8 +2,27 @@ use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("invalid configuration: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// **Built from the error's span and message, never from its `Display`.**
+    ///
+    /// `toml::de::Error` renders with the offending source line quoted under a
+    /// caret. That is excellent diagnostics and it is also a credential
+    /// disclosure: an operator who mistypes a quote in `accepted_credentials`
+    /// gets their provider key printed to stderr, into the service log, and
+    /// quite possibly into a bug report — one character away from the
+    /// `NotADigest` care below, and around it.
+    ///
+    /// **Redacted unconditionally rather than when a credential is present.** A
+    /// rule that asked "does this file hold secrets" would answer wrongly the
+    /// day a second sensitive key is added, and it would have to answer before
+    /// parsing, which is the thing that failed. Line and column and the
+    /// parser's own message are enough to find it in a file the operator is
+    /// already looking at.
+    #[error("invalid configuration at line {line}, column {column}: {message}")]
+    Parse {
+        line: usize,
+        column: usize,
+        message: String,
+    },
     #[error("detector_timeout_secs must be greater than zero")]
     ZeroTimeout,
     #[error("max_sessions must be greater than zero unless session_idle_secs is zero")]
@@ -370,9 +389,27 @@ pub fn default_max_tool_calls() -> usize {
     40
 }
 
+/// A parse failure reduced to a position and the parser's own message.
+///
+/// The span is a byte offset into the source, which is counted here rather than
+/// taken from the rendered error — the rendering is the thing being avoided.
+fn redact(error: &toml::de::Error, text: &str) -> ConfigError {
+    let at = error
+        .span()
+        .map(|span| span.start)
+        .unwrap_or(0)
+        .min(text.len());
+    let before = &text[..at];
+    ConfigError::Parse {
+        line: before.matches('\n').count() + 1,
+        column: before.rsplit('\n').next().map(str::len).unwrap_or(0) + 1,
+        message: error.message().to_owned(),
+    }
+}
+
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text)?;
+        let config: Config = toml::from_str(text).map_err(|error| redact(&error, text))?;
         if config.detector_timeout_secs == 0 {
             return Err(ConfigError::ZeroTimeout);
         }
@@ -613,6 +650,45 @@ mod tests {
         assert!(
             error.to_string().contains("accepted_credentials"),
             "unhelpful: {error}"
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_beside_a_credential_does_not_quote_the_line() {
+        // The hole the `NotADigest` care below left open, one character wide.
+        // A missing closing quote fails in `toml::from_str` *before* any
+        // validation runs, and that error renders with the offending source
+        // line under a caret — so a real provider key reaches stderr, the
+        // service log and any bug report pasted from it.
+        //
+        // Position and the parser's own message survive; the text does not.
+        let key = "sk-ant-api03-NOT-A-REAL-KEY-BUT-SHAPED-LIKE-ONE";
+        let broken = format!("audit_path = \"a.jsonl\"\naccepted_credentials = [\"{key}\n");
+        let error = Config::from_toml(&broken).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(key) && !message.contains("sk-ant"),
+            "the parse error quoted the credential: {message}"
+        );
+        assert!(
+            message.contains("line 2"),
+            "the position is missing, which is all that is left: {message}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_syntax_error_still_says_where_and_why() {
+        // Redaction is unconditional, so this is what every operator gets. It
+        // has to remain usable or the rule will be argued away the first time
+        // somebody debugs a config.
+        let error =
+            Config::from_toml("audit_path = \"a\"\nmax_sessions = notanumber\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("line 2"), "no line: {message}");
+        assert!(message.contains("column"), "no column: {message}");
+        assert!(
+            message.len() > 30,
+            "the message lost the parser's own reason: {message}"
         );
     }
 

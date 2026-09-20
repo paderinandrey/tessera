@@ -1,17 +1,30 @@
 //! Which callers this gateway serves.
 //!
-//! The gateway authenticated nobody until this existed, and the cost was not
-//! the obvious one. A stranger holding one of your callers' provider keys could
-//! reach the mapping table, and a session id is chosen by the client rather than
-//! issued — so a guessed id plus a stolen key reads real values back out of a
-//! conversation, which going to the provider directly would never have given
-//! them. See #91, and #32 for the read itself, which this narrows rather than
-//! closes.
+//! **What this buys, stated precisely, because an earlier version of this
+//! comment overclaimed.** It refuses a caller whose credential is not on the
+//! list. That is everyone who can reach the port and is not one of yours: no
+//! detector time, no session table entry, no relay out through your egress, and
+//! a journal that records your traffic rather than a stranger's.
+//!
+//! **It does not defend against a stolen key that is on the list.** If an
+//! attacker holds one of your callers' provider keys, its digest is necessarily
+//! accepted, `admits` succeeds, and `session::key_from` namespaces the mapping
+//! table by that same key plus a session id the client chooses — so the
+//! restoration oracle is exactly as reachable as it was before. The population
+//! who can attempt it narrows from "anyone who can reach this port" to "your
+//! own callers, and whoever holds one of their keys". That is worth having and
+//! it is not the same claim.
+//!
+//! Closing the stolen-key case needs a credential this gateway issues, separate
+//! from the provider's — and then `SessionKey` has to choose which of the two it
+//! namespaces by, which is #32's question. See #91 for why that is deliberately
+//! not here.
 //!
 //! **The credential is the provider's own header**, already sent by every
 //! client because the provider requires it. This adds a fourth role to a value
 //! that already carries three — session namespace, audit tenant, detection-cache
 //! bucket — rather than a second identity.
+//!
 
 use std::collections::BTreeSet;
 
@@ -32,11 +45,25 @@ pub enum Callers {
     /// working provider keys is one whose leak costs money and buys inference
     /// elsewhere; one holding their digests costs nothing.
     ///
-    /// **Unsalted, deliberately.** A salt defends a dictionary of low-entropy
-    /// secrets from being recognised; a provider API key is not one, and a salt
-    /// here would only mean the operator could not compute the value to put in
-    /// the file. The audit journal's own `digest` is salted with a
-    /// per-deployment secret for a different purpose and is unusable for this.
+    /// **Unsalted, and that rests on an assumption worth naming.** A salt and a
+    /// slow hash defend a *guessable* secret; a key issued by OpenAI or
+    /// Anthropic is not one, and a salt here would only mean the operator could
+    /// not compute the value with `shasum`. The audit journal's own `digest` is
+    /// salted with a per-deployment secret for a different purpose and is
+    /// unusable for this.
+    ///
+    /// **The assumption does not hold everywhere this gateway can point.** The
+    /// upstream bases are configuration, so a deployment in front of a
+    /// self-hosted or OpenAI-compatible model may authenticate with a token the
+    /// operator chose — and `secret` or `team-key-2026` falls to a dictionary
+    /// in moments if this file leaks. Nothing here can tell the two apart: the
+    /// gateway sees a digest at startup and a credential at request time, and
+    /// neither says how it was generated.
+    ///
+    /// So the requirement is on the operator and it is written where they set
+    /// the key: if you choose the credential rather than receive it, generate
+    /// it randomly. A per-entry salted slow verifier would remove the
+    /// requirement at the cost of the `shasum` property; that is #95.
     Accepted(BTreeSet<String>),
 }
 

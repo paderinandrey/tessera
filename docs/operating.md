@@ -41,15 +41,25 @@ directly would never have given them.
 **So list who you serve before you publish it.** `accepted_credentials` takes
 the SHA-256 digest of each credential your callers already send — `printf '%s'
 "$KEY" | shasum -a 256` — and a request whose credential is not on the list is
-refused with 401 before the body is walked, before the detector is called and
-before anything goes upstream, so it costs neither detector time nor anybody's
-tokens. The refusal is attributed in the journal under `caller_not_served`, so a
-run of them tells you whether one client has the wrong key or somebody is trying
-keys. It narrows who can reach the mapping table; it does not make the table
-safe to reach, because a caller who *is* served can still be handed a value they
-did not send — see [the session table](sessions.md) and issue #32. An
-authenticating proxy in front remains worthwhile where you want a credential of
-your own rather than the provider's.
+refused with 401 **before its body is read**, so it costs neither a JSON parse
+nor detector time nor anybody's tokens. The refusal is attributed in the journal
+under `caller_not_served`, so a run of them tells you whether one client has the
+wrong key or somebody is trying keys.
+
+**Be precise about what that fixes.** It refuses everyone who is not one of your
+callers. It does not refuse a stolen key that belongs to one of them: that
+digest is on the list, so the request is served, and the mapping table is
+namespaced by that same key plus a session id the client chooses — the paragraph
+above still describes what such a caller can read. What narrows is the
+population: from anyone who can reach the port, to your own callers and whoever
+holds one of their keys. An authenticating proxy in front is what closes the
+rest, because it gives you a credential of your own rather than the provider's.
+
+**And the credential has to be unguessable.** The digest is a fast unsalted
+hash, right for a key issued by a provider and wrong for one you chose. If you
+point this gateway at a self-hosted or OpenAI-compatible model and pick the
+token yourself, generate it randomly — `openssl rand -hex 32`. The gateway
+cannot check this for you.
 The detector answers on the compose network and nowhere else: `POST /detect`
 takes arbitrary text and authenticates nobody, so exposing it would be a way to
 run text through the model outside the gateway, and therefore outside the audit

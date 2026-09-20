@@ -112,10 +112,10 @@ names still reaching the provider unmasked.
 
 The gateway binds to loopback, and it serves anyone who can reach it until you list who it
 serves. Set `accepted_credentials` to the SHA-256 digests of the keys your callers already
-send and everything else is refused before the body is walked; leave it unset and the
-gateway forwards whatever credential arrives, which is what it did before the key existed.
-Reaching it from beyond the host is a deliberate act (`TESSERA_BIND=0.0.0.0`) and one to
-pair with that list.
+send, and every other caller is refused before their body is read. It narrows who can reach
+the mapping table, not what a listed caller can read out of it — a stolen key that is on the
+list is still accepted. Reaching the gateway from beyond the host is a deliberate act
+(`TESSERA_BIND=0.0.0.0`) and one to pair with that list.
 [Operating it](docs/operating.md) explains why the download is separate, what the gateway
 publishes and to whom, and which volumes must be backed up together.
 

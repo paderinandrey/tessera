@@ -193,13 +193,28 @@ max_spans_per_entry = 250
 # anything is sent upstream -- so it costs a string comparison rather than a
 # second per 1 200 characters, and none of anybody's tokens.
 #
-# WHY IT MATTERS MORE HERE THAN IN FRONT OF THE PROVIDER. A stolen provider key
-# used against the provider buys inference. Used against this gateway it buys
-# data the provider never had: a session id is chosen by the client rather than
-# issued as a secret, so a guessed id and a stolen key read a conversation's real
-# values back out of its mapping table. Leaving this unset adds a leak surface
-# that does not exist without this gateway. See issue #91, and #32 for the read
-# itself, which this narrows rather than closes.
+# WHAT IT BUYS, AND WHAT IT DOES NOT. It refuses every caller whose credential
+# is not listed -- everyone who can reach the port and is not yours. They get no
+# detector time, no entry in the session table, no relay out through your egress,
+# and no line in your journal beyond the refusal.
+#
+# It does NOT defend against a stolen key that IS listed. If somebody takes one
+# of your callers' provider keys, its digest is accepted, and the mapping table
+# is namespaced by that same key plus a session id the client chooses -- so a
+# guessed id reads that conversation's real values back out, exactly as it would
+# have without this key set. What narrows is who can try: from anyone who can
+# reach the port, to your own callers and whoever holds one of their keys.
+# Closing the rest needs a credential this gateway issues rather than the
+# provider's. See issue #91, and #32 for the read itself.
+#
+# THE CREDENTIAL MUST BE UNGUESSABLE. The digest is a fast unsalted hash, which
+# is right for a key issued by OpenAI or Anthropic and wrong for one you chose
+# yourself. If you point this gateway at a self-hosted or OpenAI-compatible
+# model and pick the token, generate it randomly -- `openssl rand -hex 32` --
+# because a memorable one falls to a dictionary in moments if this file leaks.
+# The gateway cannot check this for you: it sees a digest here and a credential
+# on the wire, and neither says how it was made. Issue #95 is the change that
+# would remove the requirement.
 #
 # THE VALUES ARE DIGESTS, NOT THE CREDENTIALS. A file holding working provider
 # keys is a file whose leak costs money and grants inference elsewhere; a file
