@@ -463,20 +463,29 @@ async fn mask_all(
     // reachable from here in any order — the allocation happened before the
     // literal existed — and it restores to that turn's value. Measured, not
     // fixed, and recorded rather than papered over.
-    for slot in slots {
-        match slot {
-            Slot::Text { pointer, .. } => {
-                mapping.reserve_literals(&read_pointer(body, pointer)?)?;
-            }
-            Slot::Json {
-                pointer,
-                embedded,
-                shape: _,
-            } => {
-                let document = read_document(body, pointer, *embedded, provider)?;
-                mapping.reserve_literals(&document.to_string())?;
-            }
-        }
+    // **Over the whole body, not over the slots.** A slot-only pass misses every
+    // position this gateway forwards verbatim — a property name, a dispatch
+    // field such as `function.name`, any envelope field no slot describes — and
+    // a literal there collides with a session's allocation exactly as one in a
+    // masked string does. It is not academic: the provider echoes a tool's name
+    // into `content`, the slot loop restores `content` strictly out of the
+    // table, and `lookup_[PERSON_1]` reaches the client as
+    // `lookup_Martina Weber`.
+    //
+    // `placeholder_literals` is the same function `Provenance` is built from a
+    // few dozen lines below. That is the point of using it rather than a second
+    // walk: the sweep already treats these positions as the caller's, and a
+    // check that disagreed with the sweep about which tokens those are is the
+    // defect this is fixing.
+    //
+    // Sorted so that a body with two colliding literals refuses over the same
+    // one every time. Nothing downstream can see which — the message names no
+    // token — but a test that could fail one run in two would be worse than
+    // none.
+    let mut literals: Vec<String> = mapping::placeholder_literals(body).into_iter().collect();
+    literals.sort();
+    for literal in &literals {
+        mapping.reserve_literal(literal)?;
     }
     for slot in slots {
         match slot {
@@ -6105,6 +6114,65 @@ mod tests {
             !second.contains("PERSON_1"),
             "the refusal named the token, which would say which numbers this \
              session has issued: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_in_a_dispatch_field_collides_like_any_other() {
+        // The half a slot-only reservation pass missed. `function.name` is
+        // dispatch: no slot describes it, nothing masks it, and it reaches the
+        // provider exactly as the caller wrote it. So a literal there was never
+        // reserved — and when the provider echoed the name into `content`, the
+        // slot loop restored `content` strictly out of the session table and
+        // handed back `lookup_Weber` for a name the caller had written
+        // `lookup_[PERSON_1]`.
+        //
+        // The pass now reads `placeholder_literals` over the whole body, which
+        // is the same function `Provenance` is built from — so the check and
+        // the sweep agree about which tokens are the caller's.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "calling lookup_[PERSON_1] now"
+            }}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        // Turn one puts `Weber` in the session under `[PERSON_1]`.
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        // Turn two writes the literal only where nothing masks it.
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "lookup_[PERSON_1]", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": "nothing here"}
+            ]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a literal outside every slot was served: {second}"
+        );
+        assert!(
+            !second.contains(SECRET),
+            "the response carried the value it refused over: {second}"
         );
     }
 

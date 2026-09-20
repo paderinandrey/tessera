@@ -36,12 +36,25 @@ pub enum MappingError {
     ///
     /// Carries the placeholder for tests and logs and **deliberately not for
     /// the message**, which is the rule `Unknown` and `PlaceholderKey` above
-    /// already follow — and here it has a second reason of its own. A message
-    /// naming the token would confirm that *this* token is bound to a value in
-    /// *this* session, so a caller could learn which numbers a session has
-    /// issued by sending literals and reading the refusals. That is the
-    /// restoration oracle the session namespace exists to deny, rebuilt out of
-    /// error messages.
+    /// already follow: a client is never supposed to see a placeholder, and an
+    /// error body is the one path that could hand one over.
+    ///
+    /// **It does not close the oracle, and an earlier draft of this comment
+    /// claimed it did.** The caller chose the candidate, so they learn nothing
+    /// from being told it back — what tells them is the *behaviour*: a token
+    /// this session has issued refuses here and deterministically never reaches
+    /// the provider, while one it has not is reserved and the request is served
+    /// normally. One literal per request enumerates a session's allocations
+    /// either way. Redacting the message is still right — it keeps the token
+    /// out of a body and a log, which is the rule above — but the two states
+    /// are distinguishable by whether the request succeeds, and nothing short
+    /// of an issued token the caller cannot predict makes them not be. That is
+    /// #32, and this variant is what makes its absence loud rather than
+    /// corrupting.
+    ///
+    /// The oracle needs an accepted credential *and* the session id, because a
+    /// session is namespaced by both. It reads one bit per request where the
+    /// behaviour it replaces read the value itself.
     #[error(
         "a placeholder this request writes literally was already issued to a value \
              earlier in this session; the request is refused rather than served with \
@@ -1156,9 +1169,23 @@ impl Mapping {
     /// else's name.
     pub fn reserve_literals(&mut self, text: &str) -> Result<(), MappingError> {
         for piece in pieces(text) {
-            let Piece::Placeholder(candidate) = piece else {
-                continue;
-            };
+            if let Piece::Placeholder(candidate) = piece {
+                self.reserve_literal(candidate)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One candidate, already recognised as placeholder-shaped.
+    ///
+    /// Separate from `reserve_literals` because the request-wide pass does not
+    /// have text to scan: it reads `placeholder_literals` over the whole body,
+    /// which reaches property names and every field no slot describes — and
+    /// those are exactly the positions a slot-only pass misses. The two must
+    /// see the same set, because `Provenance` is built from that same function
+    /// and the sweep and this check disagreeing is the defect being fixed.
+    pub fn reserve_literal(&mut self, candidate: &str) -> Result<(), MappingError> {
+        {
             match self.by_placeholder.get(candidate) {
                 // Already reserved, by this request's own pass or an earlier
                 // call. A self-map is the literal's own reservation and says
