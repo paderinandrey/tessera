@@ -454,6 +454,13 @@ fn elide_quoted(message: &str) -> String {
     }
     let mut out = String::with_capacity(message.len());
     let mut delimiter: Option<char> = None;
+    // **A backslash inside a run escapes what follows, including the closing
+    // delimiter.** Serde renders a value the way Rust prints one, so a
+    // credential holding a quote arrives as `"\"sk-secret"` — and a scanner
+    // that took the escaped quote for the end of the run emitted `sk-secret`
+    // into the very diagnostic it was redacting. Measured against the pinned
+    // `toml`, not reasoned about.
+    let mut escaped = false;
     for character in message.chars() {
         match delimiter {
             None if character == '"' || character == '`' => {
@@ -462,6 +469,8 @@ fn elide_quoted(message: &str) -> String {
                 out.push('…');
             }
             None => out.push(character),
+            Some(_) if escaped => escaped = false,
+            Some(_) if character == '\\' => escaped = true,
             Some(open) if character == open => {
                 delimiter = None;
                 out.push(character);
@@ -742,6 +751,23 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_holding_a_quote_is_not_half_quoted_back() {
+        // End to end through `from_toml`, because the unit test above proves
+        // the elider and this proves the thing an operator would actually type.
+        // The value is a quote followed by the key, which serde renders with
+        // the inner quote escaped — and a scanner that took that for the end of
+        // the run emitted the rest of it.
+        let secret = "sk-ant-api03-NOT-REAL-BUT-SHAPED-LIKE-ONE";
+        let broken = with_audit(&format!("accepted_credentials = \"\\\"{secret}\""));
+        let error = Config::from_toml(&broken).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(secret) && !message.contains("sk-ant"),
+            "an escaped quote let the credential out: {message}"
+        );
+    }
+
+    #[test]
     fn a_credential_of_the_wrong_type_is_not_quoted_back() {
         // The second place the input reaches a diagnostic, and the one the
         // first version of this redaction missed. Valid TOML, wrong shape: a
@@ -794,6 +820,18 @@ mod tests {
         // An unterminated run elides to the end rather than emitting its tail,
         // which is the half that would be the value.
         assert_eq!(elide_quoted("stopped at \"sk-secret"), "stopped at \"…");
+        // **An escaped delimiter does not end the run.** A credential holding a
+        // quote is rendered `"\\"sk-secret"`, and a scanner that stopped at the
+        // inner quote emitted the rest of the value verbatim.
+        assert_eq!(
+            elide_quoted("invalid type: string \"\\\"sk-secret\", expected a sequence"),
+            "invalid type: string \"…\", expected a sequence"
+        );
+        // A trailing escaped backslash is the other half of the same rule.
+        assert_eq!(
+            elide_quoted("invalid type: string \"sk\\\\\", expected a sequence"),
+            "invalid type: string \"…\", expected a sequence"
+        );
     }
 
     #[test]
