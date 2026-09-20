@@ -14,9 +14,15 @@ pub enum ConfigError {
     /// **Redacted unconditionally rather than when a credential is present.** A
     /// rule that asked "does this file hold secrets" would answer wrongly the
     /// day a second sensitive key is added, and it would have to answer before
-    /// parsing, which is the thing that failed. Line and column and the
-    /// parser's own message are enough to find it in a file the operator is
-    /// already looking at.
+    /// parsing, which is the thing that failed.
+    ///
+    /// **The source line is one of two places the input appears**, and the
+    /// first version of this caught only that one. The parser's message carries
+    /// it too — a value of the wrong type produces `invalid type: string
+    /// "sk-ant-…", expected a sequence` — so `elide_quoted` takes every quoted
+    /// and backticked run out of the message as well. Line, column and a
+    /// message with no value in it are enough to find the fault in a file the
+    /// operator already has open.
     #[error("invalid configuration at line {line}, column {column}: {message}")]
     Parse {
         line: usize,
@@ -403,8 +409,67 @@ fn redact(error: &toml::de::Error, text: &str) -> ConfigError {
     ConfigError::Parse {
         line: before.matches('\n').count() + 1,
         column: before.rsplit('\n').next().map(str::len).unwrap_or(0) + 1,
-        message: error.message().to_owned(),
+        message: elide_quoted(error.message()),
     }
+}
+
+/// Replace every `"…"` and `` `…` `` run in a parser message with an ellipsis.
+///
+/// **The message carries the input too, and the first version of this redactor
+/// caught only the source line.** A value of the wrong type produces `invalid
+/// type: string "sk-ant-…", expected a sequence`, so copying the message put
+/// the credential straight back into the diagnostic the source line had just
+/// been removed from.
+///
+/// The rule is the class rather than the case: no quoted or backticked run
+/// survives, whichever key it came from and whatever the parser embeds next.
+/// Serde spells values both ways — `"…"` for strings, `` `…` `` for numbers —
+/// and a message with no value in it, such as `invalid basic string`, passes
+/// through unchanged.
+///
+/// An unterminated run elides to the end, which is the safe direction: the
+/// alternative is emitting the tail of a message that opened a quote and never
+/// closed it, and that tail is the value.
+///
+/// Two message shapes are passed through whole, because their backticks hold a
+/// key name rather than a value: `missing field` and `unknown field`. They are
+/// an allowlist of what is safe rather than a list of what is not, so a wording
+/// serde grows later is elided rather than trusted.
+fn elide_quoted(message: &str) -> String {
+    // **An allowlist of shapes whose backticks hold a key name, not a value.**
+    // Serde spells a field name the same way it spells a value, so the choice
+    // is which way to be wrong when a message is not recognised. Listing the
+    // *hazardous* forms admits whatever wording serde grows next; listing the
+    // safe ones elides it. This fails toward an unhelpful message rather than a
+    // disclosed credential, which is the direction every guard here takes.
+    //
+    // Both of these are worth keeping. `unknown field` names a typo the
+    // operator has to see, and `missing field` has no position to fall back on
+    // at all — a missing key is nowhere, so the span is the start of the file
+    // and the name is the entire diagnostic.
+    for safe in ["missing field", "unknown field"] {
+        if message.starts_with(safe) {
+            return message.to_owned();
+        }
+    }
+    let mut out = String::with_capacity(message.len());
+    let mut delimiter: Option<char> = None;
+    for character in message.chars() {
+        match delimiter {
+            None if character == '"' || character == '`' => {
+                delimiter = Some(character);
+                out.push(character);
+                out.push('…');
+            }
+            None => out.push(character),
+            Some(open) if character == open => {
+                delimiter = None;
+                out.push(character);
+            }
+            Some(_) => {}
+        }
+    }
+    out
 }
 
 impl Config {
@@ -674,6 +739,61 @@ mod tests {
             message.contains("line 2"),
             "the position is missing, which is all that is left: {message}"
         );
+    }
+
+    #[test]
+    fn a_credential_of_the_wrong_type_is_not_quoted_back() {
+        // The second place the input reaches a diagnostic, and the one the
+        // first version of this redaction missed. Valid TOML, wrong shape: a
+        // bare string where a list belongs. The source line is gone by now, but
+        // serde's own message is `invalid type: string "sk-ant-…", expected a
+        // sequence` — the value, put back into the diagnostic it had just been
+        // taken out of.
+        let key = "sk-ant-api03-NOT-A-REAL-KEY-BUT-SHAPED-LIKE-ONE";
+        let error = Config::from_toml(&with_audit(&format!("accepted_credentials = \"{key}\"")))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(key) && !message.contains("sk-ant"),
+            "the parser's message quoted the credential: {message}"
+        );
+        assert!(
+            message.contains("expected a sequence"),
+            "eliding the value took the reason with it: {message}"
+        );
+    }
+
+    #[test]
+    fn elision_takes_the_value_and_leaves_the_sentence() {
+        // The rule is the class: every quoted or backticked run goes, whichever
+        // key it came from and whatever the parser embeds next. A message with
+        // no value in it is untouched.
+        assert_eq!(
+            elide_quoted("invalid type: string \"sk-secret\", expected a sequence"),
+            "invalid type: string \"…\", expected a sequence"
+        );
+        assert_eq!(
+            elide_quoted("invalid type: integer `12345`, expected a sequence"),
+            "invalid type: integer `…`, expected a sequence"
+        );
+        assert_eq!(elide_quoted("invalid basic string"), "invalid basic string");
+        // Two shapes pass through whole, because their backticks hold a key
+        // name. They are an allowlist: an unrecognised message is elided.
+        assert_eq!(
+            elide_quoted("missing field `audit_path`"),
+            "missing field `audit_path`"
+        );
+        assert_eq!(
+            elide_quoted("unknown field `detector_timeoutt_secs`, expected one of `bind`"),
+            "unknown field `detector_timeoutt_secs`, expected one of `bind`"
+        );
+        assert_eq!(
+            elide_quoted("some wording serde grows later: `sk-secret`"),
+            "some wording serde grows later: `…`"
+        );
+        // An unterminated run elides to the end rather than emitting its tail,
+        // which is the half that would be the value.
+        assert_eq!(elide_quoted("stopped at \"sk-secret"), "stopped at \"…");
     }
 
     #[test]
