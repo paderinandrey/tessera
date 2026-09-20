@@ -103,6 +103,14 @@ always; *nearly* is the objection. The one truncation that happens to parse woul
 finished tool call, and a tool call is an action the client's agent takes rather than text it
 displays.
 
+**A document with nothing to restore is never parsed, and one whose parse would change it is
+refused.** Restoring means re-serializing, and re-serializing collapses two members of the
+same name into one and respells a number the parse does not reproduce — which would hand the
+client's agent a well-formed tool call carrying arguments the model did not write. So a
+document holding no placeholder of ours goes back byte for byte, whatever its numbers look
+like, and one that holds a placeholder *and* would not survive the round trip ends the stream
+instead. Both are the rules the buffered path already followed at `write_document`.
+
 **What the trade costs.** A refusal spent nothing; an accumulator spends the caller's tokens
 and can still end the stream mid-flight, on a document past
 `MAX_TOOL_DOCUMENT_BYTES`, one that does not parse, or one whose block never closed. The client also

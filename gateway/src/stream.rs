@@ -964,9 +964,37 @@ impl<'a> StreamRestorer<'a> {
                 if matches!(terminates, Terminates::All) {
                     return Err(ShapeError::MalformedDocument(provider, pointer.clone()).into());
                 }
-                let document: Value = serde_json::from_str(raw)
-                    .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
-                let restored = mapping.restore_value(&document)?;
+                // **The parse is a round trip, and a round trip can lose.** The
+                // buffered path learned this: re-serializing a document
+                // collapses two members of the same name into one and respells
+                // a number the parse does not reproduce, and the result is a
+                // tool call the client's agent executes with arguments the
+                // model did not write. It answers with the same two rules, and
+                // so does this.
+                //
+                // **Nothing to restore, so nothing to re-serialize.** Most
+                // arguments carry no token of ours at all, and those go back
+                // byte for byte however their numbers are spelled — no parse,
+                // no round trip, no question.
+                let served = if crate::mapping::carries_a_placeholder(raw) {
+                    // There is a token to put back, so this document *will* be
+                    // re-serialized — and a round trip that loses is refused
+                    // rather than served changed, exactly as `write_document`'s
+                    // caller refuses it on the buffered path.
+                    // Parsed first, so a document that is not one is refused
+                    // as that rather than as whatever the round-trip scan makes
+                    // of malformed text. The scan reads the *text* — duplicate
+                    // members are invisible once parsed — so it runs on `raw`,
+                    // just not before there is a document to talk about.
+                    let document: Value = serde_json::from_str(raw)
+                        .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
+                    if let Some(cause) = crate::mapping::round_trip_loses(raw) {
+                        return Err(MappingError::Unrestorable(cause).into());
+                    }
+                    mapping.restore_value(&document)?.to_string()
+                } else {
+                    raw.clone()
+                };
                 let into = match &mut data {
                     Some(value) => value,
                     None => {
@@ -977,7 +1005,7 @@ impl<'a> StreamRestorer<'a> {
                         )
                     }
                 };
-                write_pointer(into, pointer, &restored.to_string())?;
+                write_pointer(into, pointer, &served)?;
             }
             if let (Some(mut event), Some(data)) = (event, data) {
                 event.data = Some(data.to_string());
@@ -1716,6 +1744,49 @@ mod restorer_tests {
                 )))
             ),
             "an unparseable tool document was not refused as one: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_document_the_round_trip_would_change_is_refused() {
+        // The rule the buffered path already had, arriving here late. Restoring
+        // means re-serializing, and a re-serialization collapses two members of
+        // the same name into one. The client'"'"'s agent then executes a call whose
+        // arguments the model did not write — silently, because the document it
+        // receives is well formed.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"to\":\"[PERSON_1]\",\"to\":\"second\"}"]) + &block_stop(0);
+        let outcome = restorer.push(body.as_bytes());
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Mapping(MappingError::Unrestorable(_)))
+            ),
+            "a document the round trip changes was served: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_document_with_nothing_to_restore_goes_back_byte_for_byte() {
+        // No token of ours in it, so there is nothing to put back and no reason
+        // to parse it — and a document that is never parsed is never
+        // re-serialized, so its duplicate members and its 20-digit number
+        // survive exactly as the model wrote them. Most tool calls are this
+        // one, which is why refusing on the round trip alone would have been
+        // far too broad.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let awkward = "{\"id\":12345678901234567890,\"to\":\"a\",\"to\":\"b\"}";
+        let body = tool_block(0, &[awkward]) + &block_stop(0);
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        assert_eq!(
+            anthropic_tool_json(&rendered, 0),
+            awkward,
+            "the document was round-tripped though nothing needed restoring"
         );
     }
 
