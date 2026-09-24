@@ -719,9 +719,19 @@ impl<'a> StreamRestorer<'a> {
             // have to accumulate. Text in the same event is the shape that
             // cannot be served: it would have to stream now while the documents
             // are held back, and then the event that finally carries a document
-            // would carry that text a second time. Neither provider produces
-            // it — a delta holds content or tool calls, not both — so it is
-            // refused rather than guessed at.
+            // would carry that text a second time.
+            //
+            // **This is event-wide rather than per choice, and that is the
+            // stricter reading on purpose.** With `n > 1` one could imagine a
+            // chunk whose first choice emits `content` while its second emits
+            // `tool_calls`. It is not a shape this protocol produces — each
+            // chunk carries one choice at array position 0, which
+            // `interleaved_choices_get_distinct_keys_at_the_same_position` and
+            // the key design itself both rest on — so scoping the check per
+            // choice would buy nothing reachable and would cost the simple
+            // rule that an event is emitted once or held once. If OpenAI ever
+            // batches choices, this refuses rather than emitting the text twice
+            // or dropping a document, which is the side to be wrong on.
             if slots.iter().any(|slot| slot.run == Run::Text) {
                 return Err(ShapeError::Response(provider).into());
             }
@@ -926,7 +936,10 @@ impl<'a> StreamRestorer<'a> {
             // **Unreachable with both protocols as they stand, and untested for
             // that reason** — Anthropic opens one document slot per event, so
             // its groups are single runs, and OpenAI's `finish_reason` ends
-            // every run under its choice in one flush. It is here because the
+            // every run under its choice in one flush. A group cannot span two
+            // choices either, for the same reason the check above is event-wide:
+            // one chunk carries one choice, so the runs an event opens are all
+            // that choice's and all end together. It is here because the
             // grouping is what makes it unreachable: a provider added later
             // that closes calls one at a time would meet this instead of
             // silently replaying a name, and the direction of that failure is
@@ -976,18 +989,35 @@ impl<'a> StreamRestorer<'a> {
                 // arguments carry no token of ours at all, and those go back
                 // byte for byte however their numbers are spelled — no parse,
                 // no round trip, no question.
-                let served = if crate::mapping::carries_a_placeholder(raw) {
+                // **Parsed first, and the decision is made on the parse.**
+                // `carries_a_placeholder` over the raw text misses a token the
+                // model escaped: `{"name":"[PERSON_\u0031]"}` holds no literal
+                // `[PERSON_1]` in its bytes, and the client's own parser
+                // reconstructs one — so a gate reading the bytes forwarded our
+                // token instead of restoring it. Measured.
+                //
+                // Parsing is not what the byte-for-byte path avoids;
+                // *re-serializing* is. So the parse decides and the raw bytes
+                // are still what goes out when there is nothing to put back.
+                let document: Value = serde_json::from_str(raw)
+                    .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
+                // **The union of both readings, because each sees a token the
+                // other cannot.** The parse reveals one the model escaped —
+                // `[PERSON_\u0031]` is not in the bytes and is in the value.
+                // The raw text reveals one the parse *discards*: with two
+                // members of the same name serde keeps the last, so a token in
+                // the first is gone from the document while still being in the
+                // document the client would have read. Either sighting means
+                // this is not a document to pass through untouched.
+                let token_in_bytes = crate::mapping::carries_a_placeholder(raw);
+                let token_in_value = !crate::mapping::placeholder_literals(&document).is_empty();
+                let served = if token_in_bytes || token_in_value {
                     // There is a token to put back, so this document *will* be
                     // re-serialized — and a round trip that loses is refused
                     // rather than served changed, exactly as `write_document`'s
                     // caller refuses it on the buffered path.
-                    // Parsed first, so a document that is not one is refused
-                    // as that rather than as whatever the round-trip scan makes
-                    // of malformed text. The scan reads the *text* — duplicate
-                    // members are invisible once parsed — so it runs on `raw`,
-                    // just not before there is a document to talk about.
-                    let document: Value = serde_json::from_str(raw)
-                        .map_err(|_| ShapeError::MalformedDocument(provider, pointer.clone()))?;
+                    // The round-trip scan reads the *text*, because duplicate
+                    // members are invisible once parsed.
                     if let Some(cause) = crate::mapping::round_trip_loses(raw) {
                         return Err(MappingError::Unrestorable(cause).into());
                     }
@@ -1765,6 +1795,30 @@ mod restorer_tests {
                 Err(StreamError::Mapping(MappingError::Unrestorable(_)))
             ),
             "a document the round trip changes was served: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_escaped_placeholder_is_still_restored() {
+        // The hole the byte-for-byte path opened. A model that JSON-escapes any
+        // character of a token — `[PERSON_\u0031]` — leaves bytes that hold no
+        // literal `[PERSON_1]`, while the client's own parser reconstructs one.
+        // A gate reading the bytes therefore forwarded this gateway's token to
+        // the client instead of restoring the value, in a tool argument their
+        // agent dispatches on.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let body = tool_block(0, &["{\"to\":\"[PERSON_\\u0031]\"}"]) + &block_stop(0);
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        let document: Value = serde_json::from_str(&anthropic_tool_json(&rendered, 0))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"to": "Weber"}));
+        assert!(
+            !rendered.contains("PERSON_1") && !rendered.contains("0031"),
+            "the token reached the client, escaped or otherwise: {rendered}"
         );
     }
 
