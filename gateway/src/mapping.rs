@@ -52,9 +52,13 @@ pub enum MappingError {
     /// #32, and this variant is what makes its absence loud rather than
     /// corrupting.
     ///
-    /// The oracle needs an accepted credential *and* the session id, because a
-    /// session is namespaced by both. It reads one bit per request where the
-    /// behaviour it replaces read the value itself.
+    /// The oracle needs the session id *and* the credential **bytes** — not a
+    /// credential the provider still honours. `session::key_from` namespaces on
+    /// whatever non-empty header arrives, and this check answers before the
+    /// upstream is called at all, so a revoked key still tells an issued token
+    /// (local 400) from an unissued one (whatever the upstream says) until the
+    /// session expires. "Accepted" would understate it. It reads one bit per
+    /// request where the behaviour it replaces read the value itself.
     #[error(
         "a placeholder this request writes literally was already issued to a value \
              earlier in this session; the request is refused rather than served with \

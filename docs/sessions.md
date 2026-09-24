@@ -17,7 +17,10 @@ within it any id is reachable by anyone holding that key.
 session has already issued is a 400 (`mapping_literal_already_issued`) rather than a value
 substituted into text the caller wrote. That closes the read and leaves a thinner oracle in
 its place: an issued token refuses where an unissued one is served, so one literal per
-request still tells a caller holding the credential which numbers a session has allocated.
+request still tells which numbers a session has allocated. That needs the id and the
+credential **bytes** rather than a credential the provider still honours — the store keys on
+whatever arrives and the refusal happens before the upstream is called, so a revoked key
+keeps reading that one bit until the session expires.
 Closing that needs an issued token the caller cannot predict, which is #32. The raw id
 never reaches a log either — a client may well name its session after the person in it.
 
