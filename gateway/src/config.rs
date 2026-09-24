@@ -431,10 +431,17 @@ fn redact(error: &toml::de::Error, text: &str) -> ConfigError {
 /// alternative is emitting the tail of a message that opened a quote and never
 /// closed it, and that tail is the value.
 ///
-/// Two message shapes are passed through whole, because their backticks hold a
-/// key name rather than a value: `missing field` and `unknown field`. They are
-/// an allowlist of what is safe rather than a list of what is not, so a wording
-/// serde grows later is elided rather than trusted.
+/// **One shape passes through whole and one is split, and the difference is
+/// where the name came from.** `missing field` names a field this struct
+/// declares, so nothing in it is the file's. `unknown field` names a key the
+/// *file* supplied — and a TOML key may be quoted, so `"sk-ant-…" = true` is a
+/// valid file whose diagnostic is the credential. Its first backticked run is
+/// elided and the rest, which is the list of fields this struct declares, is
+/// kept.
+///
+/// Everything else is elided entirely: this is an allowlist of what is safe
+/// rather than a list of what is not, so a wording serde grows later loses its
+/// quoted runs rather than being trusted.
 fn elide_quoted(message: &str) -> String {
     // **An allowlist of shapes whose backticks hold a key name, not a value.**
     // Serde spells a field name the same way it spells a value, so the choice
@@ -447,9 +454,31 @@ fn elide_quoted(message: &str) -> String {
     // operator has to see, and `missing field` has no position to fall back on
     // at all — a missing key is nowhere, so the span is the start of the file
     // and the name is the entire diagnostic.
-    for safe in ["missing field", "unknown field"] {
-        if message.starts_with(safe) {
-            return message.to_owned();
+    // `missing field `audit_path`` names a field this struct *declares*, so its
+    // backticks hold nothing the file supplied. Passed through whole, and it
+    // has to be: a missing key is nowhere, so the span is the start of the file
+    // and the name is the entire diagnostic.
+    if message.starts_with("missing field") {
+        return message.to_owned();
+    }
+    // **`unknown field` is not the same, and treating it as safe was a leak.**
+    // A TOML key may be quoted, so `"sk-ant-…" = true` is a valid file and
+    // serde reports `unknown field `sk-ant-…`, expected `bind`` — the
+    // credential, verbatim, in the one message shape this had decided to trust.
+    //
+    // The first backticked run is the key the file supplied and is elided; the
+    // rest is the list of fields this struct declares, which is ours and
+    // static. So the operator keeps the category and the list of what was
+    // expected, and loses only the spelling of their own typo — which the
+    // position points at.
+    if let Some(rest) = message.strip_prefix("unknown field ") {
+        let mut elided = String::from("unknown field ");
+        // Not the shape expected means nothing here can say which part came
+        // from the file, so it falls through and every run is elided.
+        if let Some((_, tail)) = rest.strip_prefix('`').and_then(|r| r.split_once('`')) {
+            elided.push_str("`…`");
+            elided.push_str(tail);
+            return elided;
         }
     }
     let mut out = String::with_capacity(message.len());
@@ -598,9 +627,35 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_rejected() {
-        // A typo in a security control's configuration must not be silently ignored.
+        // A typo in a security control's configuration must not be silently
+        // ignored. The message no longer repeats the key: a TOML key may be
+        // quoted, so `"sk-ant-…" = true` is a valid file whose unknown-field
+        // diagnostic would otherwise carry a credential. What is left — the
+        // category, the list of fields this struct declares, and the position —
+        // is what the operator needs, and the position points at the typo.
         let error = Config::from_toml(&with_audit("detector_timeoutt_secs = 5")).unwrap_err();
-        assert!(error.to_string().contains("detector_timeoutt_secs"));
+        let message = error.to_string();
+        assert!(
+            !message.contains("detector_timeoutt_secs"),
+            "the key the file supplied was repeated: {message}"
+        );
+        assert!(message.contains("unknown field"), "no category: {message}");
+        assert!(message.contains("line 2"), "no position: {message}");
+    }
+
+    #[test]
+    fn a_credential_used_as_a_key_is_not_named_back() {
+        // The leak the `unknown field` passthrough left open. TOML keys may be
+        // quoted, so this is a syntactically valid file — and serde reports the
+        // key verbatim.
+        let secret = "sk-ant-api03-NOT-REAL-BUT-SHAPED-LIKE-ONE";
+        let error = Config::from_toml(&with_audit(&format!("\"{secret}\" = true"))).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(secret) && !message.contains("sk-ant"),
+            "a credential used as a key was named back: {message}"
+        );
+        assert!(message.contains("unknown field"), "no category: {message}");
     }
 
     #[test]
@@ -809,9 +864,12 @@ mod tests {
             elide_quoted("missing field `audit_path`"),
             "missing field `audit_path`"
         );
+        // `unknown field` keeps its category and the list of what this struct
+        // declares, and loses the key the *file* supplied — a TOML key may be
+        // quoted, so that key is arbitrary input and could be the credential.
         assert_eq!(
             elide_quoted("unknown field `detector_timeoutt_secs`, expected one of `bind`"),
-            "unknown field `detector_timeoutt_secs`, expected one of `bind`"
+            "unknown field `…`, expected one of `bind`"
         );
         assert_eq!(
             elide_quoted("some wording serde grows later: `sk-secret`"),
