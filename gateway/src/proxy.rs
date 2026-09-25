@@ -79,6 +79,7 @@ impl ProxyError {
             | ProxyError::Shape(ShapeError::MalformedDocument(_, _))
             | ProxyError::Mapping(MappingError::TooDeep)
             | ProxyError::Mapping(MappingError::TooLarge)
+            | ProxyError::Mapping(MappingError::LiteralAlreadyIssued(_))
             | ProxyError::Session(SessionError::BadId)
             | ProxyError::Session(SessionError::Disabled)
             | ProxyError::Session(SessionError::NoCredential(_))
@@ -171,6 +172,9 @@ impl ProxyError {
             ProxyError::Mapping(MappingError::BadSpan(_)) => "mapping_bad_span",
             ProxyError::Mapping(MappingError::TooDeep) => "mapping_too_deep",
             ProxyError::Mapping(MappingError::TooLarge) => "mapping_too_large",
+            ProxyError::Mapping(MappingError::LiteralAlreadyIssued(_)) => {
+                "mapping_literal_already_issued"
+            }
             ProxyError::Mapping(MappingError::MaskCountMismatch(_)) => "mapping_mask_mismatch",
             ProxyError::Mapping(MappingError::PlaceholderKey(_)) => "mapping_placeholder_key",
             // Named for the loss that was about to be taken rather than for
@@ -459,20 +463,29 @@ async fn mask_all(
     // reachable from here in any order — the allocation happened before the
     // literal existed — and it restores to that turn's value. Measured, not
     // fixed, and recorded rather than papered over.
-    for slot in slots {
-        match slot {
-            Slot::Text { pointer, .. } => {
-                mapping.reserve_literals(&read_pointer(body, pointer)?);
-            }
-            Slot::Json {
-                pointer,
-                embedded,
-                shape: _,
-            } => {
-                let document = read_document(body, pointer, *embedded, provider)?;
-                mapping.reserve_literals(&document.to_string());
-            }
-        }
+    // **Over the whole body, not over the slots.** A slot-only pass misses every
+    // position this gateway forwards verbatim — a property name, a dispatch
+    // field such as `function.name`, any envelope field no slot describes — and
+    // a literal there collides with a session's allocation exactly as one in a
+    // masked string does. It is not academic: the provider echoes a tool's name
+    // into `content`, the slot loop restores `content` strictly out of the
+    // table, and `lookup_[PERSON_1]` reaches the client as
+    // `lookup_Martina Weber`.
+    //
+    // `placeholder_literals` is the same function `Provenance` is built from a
+    // few dozen lines below. That is the point of using it rather than a second
+    // walk: the sweep already treats these positions as the caller's, and a
+    // check that disagreed with the sweep about which tokens those are is the
+    // defect this is fixing.
+    //
+    // Sorted so that a body with two colliding literals refuses over the same
+    // one every time. Nothing downstream can see which — the message names no
+    // token — but a test that could fail one run in two would be worse than
+    // none.
+    let mut literals: Vec<String> = mapping::placeholder_literals(body).into_iter().collect();
+    literals.sort();
+    for literal in &literals {
+        mapping.reserve_literal(literal)?;
     }
     for slot in slots {
         match slot {
@@ -6027,26 +6040,34 @@ mod tests {
 
     #[tokio::test]
     async fn a_caller_writing_a_session_owned_literal_gets_its_own_text_back() {
-        // Turn one issues `[PERSON_1]` for `Weber` and the session keeps it.
-        // Turn two's caller writes that literal itself and the provider echoes
-        // it into two fields: `content`, which the slot loop describes, and
-        // `refusal`, which it does not.
+        // **Rewritten: this test used to assert the corruption.** Turn one
+        // issues `[PERSON_1]` for `Weber` and the session keeps it; turn two's
+        // caller writes that literal itself. The two fields the provider echoes
+        // it into used to disagree — `refusal`, reached only by the sweep,
+        // asked `Provenance::restorable` and gave the caller back the bytes it
+        // sent, while `content`, reached by the slot loop, restored strictly
+        // out of the session table and handed back turn one's value. That
+        // difference was recorded here as the behaviour "until #32".
         //
-        // The two answers differ, and the difference is the point. `refusal` is
-        // reached only by the sweep, which asks `Provenance::restorable` —
-        // turn two issued nothing, so the token is not this request's to claim
-        // and the caller gets back the bytes it sent. `content` is reached by
-        // the slot loop, which restores strictly out of the session table and
-        // does not consult provenance at all, so it hands back turn one's
-        // value. #32 is what makes the two agree; until then this is the
-        // behaviour, asserted here rather than left to be discovered.
+        // It is now a refusal. Turn two never reaches the upstream: the
+        // reservation pass finds `[PERSON_1]` held by an allocation rather than
+        // by a self-map, which can only have happened on an earlier turn, and
+        // refuses rather than serving a value the caller did not send in a
+        // field their agent may act on. The two fields agree by not being
+        // served at all.
         //
-        // **This is not the ordering pin**, though an earlier draft of the plan
-        // said it was: measured, it passes with the sweep on either side of the
-        // slot loop. A token inside a value masked from *this* request is
+        // **This still does not close #32.** A templating client that writes
+        // bracket tokens wants both its literal and the session's token to
+        // work, and that needs an issued token the caller cannot predict. What
+        // changed is the direction of the failure, which is the rule the rest
+        // of this gateway follows: an omission costs a restoration, never an
+        // injection.
+        //
+        // **Nor is this the ordering pin**, though an earlier draft of the plan
+        // said it was: measured, that passed with the sweep on either side of
+        // the slot loop. A token inside a value masked from *this* request is
         // necessarily also in this request's `written` set, so `restorable`
-        // excludes it whichever order runs. The hazard needs a value that
-        // entered the table in an earlier turn, and
+        // excludes it whichever order runs.
         // `a_literal_a_stored_value_carries_survives_a_later_turn_reusing_its_number`
         // above is the test that fails when the sweep moves.
         let detector = detector_finding_weber().await;
@@ -6080,17 +6101,78 @@ mod tests {
             &headers,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{second}");
-
-        let served: Value = serde_json::from_str(&second).expect("a JSON body");
-        let message = &served["choices"][0]["message"];
         assert_eq!(
-            message["refusal"], "I cannot help with [PERSON_1]",
-            "the sweep claimed a token this request never issued: {second}"
+            status,
+            StatusCode::BAD_REQUEST,
+            "turn two was served rather than refused: {second}"
         );
+        assert!(
+            !second.contains(SECRET),
+            "the refusal handed over the value it exists to withhold: {second}"
+        );
+        assert!(
+            !second.contains("PERSON_1"),
+            "the refusal named the token, which would say which numbers this \
+             session has issued: {second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_in_a_dispatch_field_collides_like_any_other() {
+        // The half a slot-only reservation pass missed. `function.name` is
+        // dispatch: no slot describes it, nothing masks it, and it reaches the
+        // provider exactly as the caller wrote it. So a literal there was never
+        // reserved — and when the provider echoed the name into `content`, the
+        // slot loop restored `content` strictly out of the session table and
+        // handed back `lookup_Weber` for a name the caller had written
+        // `lookup_[PERSON_1]`.
+        //
+        // The pass now reads `placeholder_literals` over the whole body, which
+        // is the same function `Provenance` is built from — so the check and
+        // the sweep agree about which tokens are the caller's.
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant",
+                "content": "calling lookup_[PERSON_1] now"
+            }}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+
+        // Turn one puts `Weber` in the session under `[PERSON_1]`.
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        // Turn two writes the literal only where nothing masks it.
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "t1", "type": "function",
+                    "function": {"name": "lookup_[PERSON_1]", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "t1", "content": "nothing here"}
+            ]}),
+            &headers,
+        )
+        .await;
         assert_eq!(
-            message["content"], SECRET,
-            "the described field stopped restoring strictly out of the table: {second}"
+            status,
+            StatusCode::BAD_REQUEST,
+            "a literal outside every slot was served: {second}"
+        );
+        assert!(
+            !second.contains(SECRET),
+            "the response carried the value it refused over: {second}"
         );
     }
 
@@ -8846,6 +8928,8 @@ mod tests {
             ProxyError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
             ProxyError::Mapping(MappingError::TooDeep).audit_class(),
             ProxyError::Mapping(MappingError::TooLarge).audit_class(),
+            ProxyError::Mapping(MappingError::LiteralAlreadyIssued("[PERSON_1]".to_owned()))
+                .audit_class(),
             ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
             ProxyError::Mapping(MappingError::PlaceholderKey("[PERSON_1]".to_owned()))
                 .audit_class(),

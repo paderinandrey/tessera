@@ -119,10 +119,23 @@ from a field the gateway describes. Elsewhere everything this request issued and
 not write is restored, except where restoring it would drop something the upstream sent**,
 which is served exactly as it came. Both clauses are load-bearing and neither is decoration.
 The sweep will not claim a token the *caller* wrote itself, because a caller that puts
-`[PERSON_1]` into a later turn of a session and has the model echo it back has to get its own
-text returned rather than turn one's value; a token that is both issued and written is
-ambiguous by construction and is left alone, and #32 is what separates the two and lets the
-first sentence be stated without its qualification.
+`[PERSON_1]` into a request and has the model echo it back has to get its own text returned
+rather than somebody's name.
+
+**Within a session, a literal that an earlier turn already issued is refused rather than
+resolved either way** (400, `mapping_literal_already_issued`). Such a token is ambiguous by
+construction: the gateway cannot tell its own from the caller's by shape, and the allocation
+was made a turn before the literal existed, so no ordering reaches it. It used to be served
+with turn one's value substituted into text the caller wrote — in a tool argument their agent
+may execute — and the refusal is the same direction every other guard here takes.
+
+**Who this breaks.** A client that writes bracket tokens of its own — a templating layer, a
+prompt about placeholders — *and* sends `X-Tessera-Session`, and happens to write a token
+this session has issued. It gets a 400 where it used to get a corrupted answer. Without a
+session id nothing changes: every literal in a request is reserved before anything is
+allocated, so the literal keeps its number and a detected value takes the next one. #32 is
+what lets both work at once, by giving an issued token a component the caller cannot
+predict.
 
 The second clause is one rule and not a list of cases — what cannot be re-serialized
 faithfully is left, never guessed at. An object whose restored keys would collide —

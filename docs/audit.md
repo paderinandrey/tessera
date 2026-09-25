@@ -98,11 +98,20 @@ without changing something else in it — a member dropped, a key renamed, a
 number rounded — refused rather than served changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
 `mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
 `tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
-`session_disabled`, `session_no_credential` and `caller_not_served` are the
-caller's — the last meaning the credential is not one this deployment accepts,
-which is only ever written where an operator configured `accepted_credentials`;
-a run of them is either a client with the wrong key or somebody trying keys, and
-the `tenant` digest on the line is what tells those apart;
+`session_disabled`, `session_no_credential`, `caller_not_served` and
+`mapping_literal_already_issued` are the caller's. `caller_not_served` means the
+credential is not one this deployment accepts, and is only ever written where an
+operator configured `accepted_credentials`; a run of them is either a client
+with the wrong key or somebody trying keys, and the `tenant` digest on the line
+is what tells those apart. `mapping_literal_already_issued` means the request
+wrote a placeholder literally that an earlier turn of the same session had
+already issued to a value, which this gateway cannot tell apart from its own
+token by shape, so it refuses rather than substituting that value into text the
+caller wrote. The line names neither the token nor the value — a client should
+never see a placeholder — though that is not what denies the caller the
+knowledge, since they chose the token: an issued one refuses where an unissued
+one is served, so a run of these from one tenant and session is somebody reading
+that one bit;
 `detector_transport`, `detector_status`, `session_saturated` and
 `audit_write_failed` are this deployment's own machinery rather than anybody's
 mistake. A run of the first group is worth a page; a run of the second is worth
