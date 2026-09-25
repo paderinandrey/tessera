@@ -184,6 +184,61 @@ max_spans_per_entry = 250
 # detector call on its own and never their sum; no cumulative deadline exists
 # anywhere on the request path. Two constraints: the timeout catches a stuck
 # call, this caps how long a caller waits for the whole request.
+# WHICH CALLERS THIS GATEWAY SERVES.
+#
+# Omit this key and the gateway serves anyone who can reach it, which is what it
+# did before the key existed and what every configuration written until now
+# relies on. Set it and a request whose credential is not listed is refused with
+# 401 before the body is walked, before the detector is called and before
+# anything is sent upstream -- so it costs a string comparison rather than a
+# second per 1 200 characters, and none of anybody's tokens.
+#
+# WHAT IT BUYS, AND WHAT IT DOES NOT. It refuses every caller whose credential
+# is not listed -- everyone who can reach the port and is not yours. They get no
+# detector time, no entry in the session table, no relay out through your egress,
+# and no line in your journal beyond the refusal.
+#
+# It does NOT defend against a stolen key that IS listed. If somebody takes one
+# of your callers' provider keys, its digest is accepted, and the mapping table
+# is namespaced by that same key plus a session id the client chooses -- so a
+# guessed id reads that conversation's real values back out, exactly as it would
+# have without this key set. What narrows is who can try: from anyone who can
+# reach the port, to your own callers and whoever holds one of their keys.
+# Closing the rest needs a credential this gateway issues rather than the
+# provider's. See issue #91, and #32 for the read itself.
+#
+# THE CREDENTIAL MUST BE UNGUESSABLE. The digest is a fast unsalted hash, which
+# is right for a key issued by OpenAI or Anthropic and wrong for one you chose
+# yourself. If you point this gateway at a self-hosted or OpenAI-compatible
+# model and pick the token, generate it randomly -- `openssl rand -hex 32` --
+# because a memorable one falls to a dictionary in moments if this file leaks.
+# The gateway cannot check this for you: it sees a digest here and a credential
+# on the wire, and neither says how it was made. Issue #95 is the change that
+# would remove the requirement.
+#
+# THE VALUES ARE DIGESTS, NOT THE CREDENTIALS. A file holding working provider
+# keys is a file whose leak costs money and grants inference elsewhere; a file
+# holding their SHA-256 costs nothing. Produce each one with:
+#
+#   printf '%s' "$YOUR_PROVIDER_KEY" | shasum -a 256
+#
+# Use the value exactly as the client sends it -- for OpenAI that is the whole
+# `authorization` header including the word `Bearer`, for Anthropic the
+# `x-api-key` value on its own.
+#
+# The digest is unsalted, deliberately: a salt defends a dictionary of
+# low-entropy secrets from being recognised, an API key is not one, and a salt
+# would only mean you could not compute this value yourself.
+#
+# Each entry must be 64 lowercase hex characters or the process refuses to start,
+# so pasting a raw key here fails immediately instead of returning 401 to
+# everybody. An empty list is an error too: it could mean "refuse everyone" or
+# "I meant to fill this in", and a typo must not quietly disable a control.
+#
+# accepted_credentials = [
+#   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+# ]
+
 max_tool_chars = 20000
 
 # How many detector round-trips those structures may need.

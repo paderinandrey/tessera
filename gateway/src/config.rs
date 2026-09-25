@@ -2,8 +2,33 @@ use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("invalid configuration: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// **Built from the error's span and message, never from its `Display`.**
+    ///
+    /// `toml::de::Error` renders with the offending source line quoted under a
+    /// caret. That is excellent diagnostics and it is also a credential
+    /// disclosure: an operator who mistypes a quote in `accepted_credentials`
+    /// gets their provider key printed to stderr, into the service log, and
+    /// quite possibly into a bug report — one character away from the
+    /// `NotADigest` care below, and around it.
+    ///
+    /// **Redacted unconditionally rather than when a credential is present.** A
+    /// rule that asked "does this file hold secrets" would answer wrongly the
+    /// day a second sensitive key is added, and it would have to answer before
+    /// parsing, which is the thing that failed.
+    ///
+    /// **The source line is one of two places the input appears**, and the
+    /// first version of this caught only that one. The parser's message carries
+    /// it too — a value of the wrong type produces `invalid type: string
+    /// "sk-ant-…", expected a sequence` — so `elide_quoted` takes every quoted
+    /// and backticked run out of the message as well. Line, column and a
+    /// message with no value in it are enough to find the fault in a file the
+    /// operator already has open.
+    #[error("invalid configuration at line {line}, column {column}: {message}")]
+    Parse {
+        line: usize,
+        column: usize,
+        message: String,
+    },
     #[error("detector_timeout_secs must be greater than zero")]
     ZeroTimeout,
     #[error("max_sessions must be greater than zero unless session_idle_secs is zero")]
@@ -18,6 +43,23 @@ pub enum ConfigError {
     ZeroToolChars,
     #[error("max_tool_calls must be greater than zero")]
     ZeroToolCalls,
+    #[error(
+        "accepted_credentials is present but empty, which would refuse every caller; \
+         omit the key to serve anyone"
+    )]
+    NoAcceptedCredentials,
+    /// **The entry is not echoed, and that is the whole point of the variant.**
+    /// The likeliest way to get here is pasting the credential itself instead
+    /// of its digest, so the offending value may be a working provider key —
+    /// and this message goes to a terminal, a log and quite possibly a bug
+    /// report. The position is enough to find it. Same rule as
+    /// `ProxyError::NumericPersonalData`: name the failure, never the value.
+    #[error(
+        "entry {0} of accepted_credentials is not a 64-character lowercase hex SHA-256 \
+         digest; it is not repeated here because a mistyped entry may be the credential \
+         itself"
+    )]
+    NotADigest(usize),
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +293,24 @@ pub struct Config {
     /// the quantity that costs nothing after the first turn.
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: usize,
+
+    /// Which callers this gateway serves, as lowercase hex SHA-256 digests of
+    /// the credential they already send — `authorization` for OpenAI,
+    /// `x-api-key` for Anthropic.
+    ///
+    /// **Absent means the gateway serves anyone, which is what it did before
+    /// this key existed.** Every configuration written until now keeps working,
+    /// and a deployment that has not thought about the control is not given a
+    /// half of one. Present but empty is an error rather than either reading:
+    /// it could mean "refuse everybody" or "I meant to fill this in", and a
+    /// typo that silently disables a security control is what `deny_unknown_fields`
+    /// on this struct exists to prevent one line up.
+    ///
+    /// Digests rather than the keys, because a file holding working provider
+    /// credentials is one whose leak costs money; and unsalted, because a salt
+    /// defends low-entropy secrets and would only stop the operator computing
+    /// the value. `printf '%s' "$KEY" | shasum -a 256` produces it.
+    pub accepted_credentials: Option<Vec<String>>,
 }
 
 fn default_bind() -> String {
@@ -335,9 +395,124 @@ pub fn default_max_tool_calls() -> usize {
     40
 }
 
+/// A parse failure reduced to a position and the parser's own message.
+///
+/// The span is a byte offset into the source, which is counted here rather than
+/// taken from the rendered error — the rendering is the thing being avoided.
+fn redact(error: &toml::de::Error, text: &str) -> ConfigError {
+    let at = error
+        .span()
+        .map(|span| span.start)
+        .unwrap_or(0)
+        .min(text.len());
+    let before = &text[..at];
+    ConfigError::Parse {
+        line: before.matches('\n').count() + 1,
+        column: before.rsplit('\n').next().map(str::len).unwrap_or(0) + 1,
+        message: elide_quoted(error.message()),
+    }
+}
+
+/// Replace every `"…"` and `` `…` `` run in a parser message with an ellipsis.
+///
+/// **The message carries the input too, and the first version of this redactor
+/// caught only the source line.** A value of the wrong type produces `invalid
+/// type: string "sk-ant-…", expected a sequence`, so copying the message put
+/// the credential straight back into the diagnostic the source line had just
+/// been removed from.
+///
+/// The rule is the class rather than the case: no quoted or backticked run
+/// survives, whichever key it came from and whatever the parser embeds next.
+/// Serde spells values both ways — `"…"` for strings, `` `…` `` for numbers —
+/// and a message with no value in it, such as `invalid basic string`, passes
+/// through unchanged.
+///
+/// An unterminated run elides to the end, which is the safe direction: the
+/// alternative is emitting the tail of a message that opened a quote and never
+/// closed it, and that tail is the value.
+///
+/// **One shape passes through whole and one is split, and the difference is
+/// where the name came from.** `missing field` names a field this struct
+/// declares, so nothing in it is the file's. `unknown field` names a key the
+/// *file* supplied — and a TOML key may be quoted, so `"sk-ant-…" = true` is a
+/// valid file whose diagnostic is the credential. Its first backticked run is
+/// elided and the rest, which is the list of fields this struct declares, is
+/// kept.
+///
+/// Everything else is elided entirely: this is an allowlist of what is safe
+/// rather than a list of what is not, so a wording serde grows later loses its
+/// quoted runs rather than being trusted.
+fn elide_quoted(message: &str) -> String {
+    // **An allowlist of shapes whose backticks hold a key name, not a value.**
+    // Serde spells a field name the same way it spells a value, so the choice
+    // is which way to be wrong when a message is not recognised. Listing the
+    // *hazardous* forms admits whatever wording serde grows next; listing the
+    // safe ones elides it. This fails toward an unhelpful message rather than a
+    // disclosed credential, which is the direction every guard here takes.
+    //
+    // Both of these are worth keeping. `unknown field` names a typo the
+    // operator has to see, and `missing field` has no position to fall back on
+    // at all — a missing key is nowhere, so the span is the start of the file
+    // and the name is the entire diagnostic.
+    // `missing field `audit_path`` names a field this struct *declares*, so its
+    // backticks hold nothing the file supplied. Passed through whole, and it
+    // has to be: a missing key is nowhere, so the span is the start of the file
+    // and the name is the entire diagnostic.
+    if message.starts_with("missing field") {
+        return message.to_owned();
+    }
+    // **`unknown field` is not the same, and treating it as safe was a leak.**
+    // A TOML key may be quoted, so `"sk-ant-…" = true` is a valid file and
+    // serde reports `unknown field `sk-ant-…`, expected `bind`` — the
+    // credential, verbatim, in the one message shape this had decided to trust.
+    //
+    // The first backticked run is the key the file supplied and is elided; the
+    // rest is the list of fields this struct declares, which is ours and
+    // static. So the operator keeps the category and the list of what was
+    // expected, and loses only the spelling of their own typo — which the
+    // position points at.
+    if let Some(rest) = message.strip_prefix("unknown field ") {
+        let mut elided = String::from("unknown field ");
+        // Not the shape expected means nothing here can say which part came
+        // from the file, so it falls through and every run is elided.
+        if let Some((_, tail)) = rest.strip_prefix('`').and_then(|r| r.split_once('`')) {
+            elided.push_str("`…`");
+            elided.push_str(tail);
+            return elided;
+        }
+    }
+    let mut out = String::with_capacity(message.len());
+    let mut delimiter: Option<char> = None;
+    // **A backslash inside a run escapes what follows, including the closing
+    // delimiter.** Serde renders a value the way Rust prints one, so a
+    // credential holding a quote arrives as `"\"sk-secret"` — and a scanner
+    // that took the escaped quote for the end of the run emitted `sk-secret`
+    // into the very diagnostic it was redacting. Measured against the pinned
+    // `toml`, not reasoned about.
+    let mut escaped = false;
+    for character in message.chars() {
+        match delimiter {
+            None if character == '"' || character == '`' => {
+                delimiter = Some(character);
+                out.push(character);
+                out.push('…');
+            }
+            None => out.push(character),
+            Some(_) if escaped => escaped = false,
+            Some(_) if character == '\\' => escaped = true,
+            Some(open) if character == open => {
+                delimiter = None;
+                out.push(character);
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text)?;
+        let config: Config = toml::from_str(text).map_err(|error| redact(&error, text))?;
         if config.detector_timeout_secs == 0 {
             return Err(ConfigError::ZeroTimeout);
         }
@@ -357,6 +532,19 @@ impl Config {
         }
         if config.max_tool_calls == 0 {
             return Err(ConfigError::ZeroToolCalls);
+        }
+        // Checked at load rather than at the first request, so an operator who
+        // pasted a raw key learns it from a process that will not start instead
+        // of from every caller getting a 401.
+        if let Some(accepted) = &config.accepted_credentials {
+            if accepted.is_empty() {
+                return Err(ConfigError::NoAcceptedCredentials);
+            }
+            for (position, entry) in accepted.iter().enumerate() {
+                if !crate::auth::is_digest(entry) {
+                    return Err(ConfigError::NotADigest(position));
+                }
+            }
         }
         Ok(config)
     }
@@ -439,9 +627,35 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_rejected() {
-        // A typo in a security control's configuration must not be silently ignored.
+        // A typo in a security control's configuration must not be silently
+        // ignored. The message no longer repeats the key: a TOML key may be
+        // quoted, so `"sk-ant-…" = true` is a valid file whose unknown-field
+        // diagnostic would otherwise carry a credential. What is left — the
+        // category, the list of fields this struct declares, and the position —
+        // is what the operator needs, and the position points at the typo.
         let error = Config::from_toml(&with_audit("detector_timeoutt_secs = 5")).unwrap_err();
-        assert!(error.to_string().contains("detector_timeoutt_secs"));
+        let message = error.to_string();
+        assert!(
+            !message.contains("detector_timeoutt_secs"),
+            "the key the file supplied was repeated: {message}"
+        );
+        assert!(message.contains("unknown field"), "no category: {message}");
+        assert!(message.contains("line 2"), "no position: {message}");
+    }
+
+    #[test]
+    fn a_credential_used_as_a_key_is_not_named_back() {
+        // The leak the `unknown field` passthrough left open. TOML keys may be
+        // quoted, so this is a syntactically valid file — and serde reports the
+        // key verbatim.
+        let secret = "sk-ant-api03-NOT-REAL-BUT-SHAPED-LIKE-ONE";
+        let error = Config::from_toml(&with_audit(&format!("\"{secret}\" = true"))).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(secret) && !message.contains("sk-ant"),
+            "a credential used as a key was named back: {message}"
+        );
+        assert!(message.contains("unknown field"), "no category: {message}");
     }
 
     #[test]
@@ -544,6 +758,197 @@ mod tests {
         ))
         .expect("a disabled cache does not care what its dead setting says");
         assert_eq!(config.max_spans_per_entry, 0);
+    }
+
+    #[test]
+    fn a_gateway_serves_anyone_until_a_list_is_configured() {
+        // Backward compatibility is the default, and it is the default on
+        // purpose: a deployment written before this key existed keeps working,
+        // and one that has not thought about the control is not given a half of
+        // one it might mistake for the whole.
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert!(config.accepted_credentials.is_none());
+    }
+
+    #[test]
+    fn an_empty_list_of_accepted_credentials_is_rejected() {
+        // It could mean "refuse everybody" or "I meant to fill this in", and
+        // the second is far likelier. Reading it either way silently is the
+        // failure `deny_unknown_fields` exists to prevent one line up.
+        let error = Config::from_toml(&with_audit("accepted_credentials = []")).unwrap_err();
+        assert!(
+            error.to_string().contains("accepted_credentials"),
+            "unhelpful: {error}"
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_beside_a_credential_does_not_quote_the_line() {
+        // The hole the `NotADigest` care below left open, one character wide.
+        // A missing closing quote fails in `toml::from_str` *before* any
+        // validation runs, and that error renders with the offending source
+        // line under a caret — so a real provider key reaches stderr, the
+        // service log and any bug report pasted from it.
+        //
+        // Position and the parser's own message survive; the text does not.
+        let key = "sk-ant-api03-NOT-A-REAL-KEY-BUT-SHAPED-LIKE-ONE";
+        let broken = format!("audit_path = \"a.jsonl\"\naccepted_credentials = [\"{key}\n");
+        let error = Config::from_toml(&broken).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(key) && !message.contains("sk-ant"),
+            "the parse error quoted the credential: {message}"
+        );
+        assert!(
+            message.contains("line 2"),
+            "the position is missing, which is all that is left: {message}"
+        );
+    }
+
+    #[test]
+    fn a_credential_holding_a_quote_is_not_half_quoted_back() {
+        // End to end through `from_toml`, because the unit test above proves
+        // the elider and this proves the thing an operator would actually type.
+        // The value is a quote followed by the key, which serde renders with
+        // the inner quote escaped — and a scanner that took that for the end of
+        // the run emitted the rest of it.
+        let secret = "sk-ant-api03-NOT-REAL-BUT-SHAPED-LIKE-ONE";
+        let broken = with_audit(&format!("accepted_credentials = \"\\\"{secret}\""));
+        let error = Config::from_toml(&broken).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(secret) && !message.contains("sk-ant"),
+            "an escaped quote let the credential out: {message}"
+        );
+    }
+
+    #[test]
+    fn a_credential_of_the_wrong_type_is_not_quoted_back() {
+        // The second place the input reaches a diagnostic, and the one the
+        // first version of this redaction missed. Valid TOML, wrong shape: a
+        // bare string where a list belongs. The source line is gone by now, but
+        // serde's own message is `invalid type: string "sk-ant-…", expected a
+        // sequence` — the value, put back into the diagnostic it had just been
+        // taken out of.
+        let key = "sk-ant-api03-NOT-A-REAL-KEY-BUT-SHAPED-LIKE-ONE";
+        let error = Config::from_toml(&with_audit(&format!("accepted_credentials = \"{key}\"")))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(key) && !message.contains("sk-ant"),
+            "the parser's message quoted the credential: {message}"
+        );
+        assert!(
+            message.contains("expected a sequence"),
+            "eliding the value took the reason with it: {message}"
+        );
+    }
+
+    #[test]
+    fn elision_takes_the_value_and_leaves_the_sentence() {
+        // The rule is the class: every quoted or backticked run goes, whichever
+        // key it came from and whatever the parser embeds next. A message with
+        // no value in it is untouched.
+        assert_eq!(
+            elide_quoted("invalid type: string \"sk-secret\", expected a sequence"),
+            "invalid type: string \"…\", expected a sequence"
+        );
+        assert_eq!(
+            elide_quoted("invalid type: integer `12345`, expected a sequence"),
+            "invalid type: integer `…`, expected a sequence"
+        );
+        assert_eq!(elide_quoted("invalid basic string"), "invalid basic string");
+        // Two shapes pass through whole, because their backticks hold a key
+        // name. They are an allowlist: an unrecognised message is elided.
+        assert_eq!(
+            elide_quoted("missing field `audit_path`"),
+            "missing field `audit_path`"
+        );
+        // `unknown field` keeps its category and the list of what this struct
+        // declares, and loses the key the *file* supplied — a TOML key may be
+        // quoted, so that key is arbitrary input and could be the credential.
+        assert_eq!(
+            elide_quoted("unknown field `detector_timeoutt_secs`, expected one of `bind`"),
+            "unknown field `…`, expected one of `bind`"
+        );
+        assert_eq!(
+            elide_quoted("some wording serde grows later: `sk-secret`"),
+            "some wording serde grows later: `…`"
+        );
+        // An unterminated run elides to the end rather than emitting its tail,
+        // which is the half that would be the value.
+        assert_eq!(elide_quoted("stopped at \"sk-secret"), "stopped at \"…");
+        // **An escaped delimiter does not end the run.** A credential holding a
+        // quote is rendered `"\\"sk-secret"`, and a scanner that stopped at the
+        // inner quote emitted the rest of the value verbatim.
+        assert_eq!(
+            elide_quoted("invalid type: string \"\\\"sk-secret\", expected a sequence"),
+            "invalid type: string \"…\", expected a sequence"
+        );
+        // A trailing escaped backslash is the other half of the same rule.
+        assert_eq!(
+            elide_quoted("invalid type: string \"sk\\\\\", expected a sequence"),
+            "invalid type: string \"…\", expected a sequence"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_syntax_error_still_says_where_and_why() {
+        // Redaction is unconditional, so this is what every operator gets. It
+        // has to remain usable or the rule will be argued away the first time
+        // somebody debugs a config.
+        let error =
+            Config::from_toml("audit_path = \"a\"\nmax_sessions = notanumber\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("line 2"), "no line: {message}");
+        assert!(message.contains("column"), "no column: {message}");
+        assert!(
+            message.len() > 30,
+            "the message lost the parser's own reason: {message}"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_digest_is_rejected_without_being_repeated() {
+        // The likeliest mistake here is pasting the credential rather than its
+        // digest — so the offending entry may be a working provider key, and
+        // this message goes to a terminal, a log, and possibly a bug report.
+        // Position, never value.
+        let raw = "sk-ant-api03-thisisnotadigest";
+        let error = Config::from_toml(&with_audit(&format!("accepted_credentials = [\"{raw}\"]")))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            !message.contains(raw) && !message.contains("sk-ant"),
+            "the error repeated the entry: {message}"
+        );
+        assert!(message.contains('0'), "the position is missing: {message}");
+    }
+
+    #[test]
+    fn the_position_named_is_the_offending_one() {
+        // Naming a position instead of the value is only useful if it is the
+        // right position. With one good entry ahead of it, an off-by-one here
+        // sends the operator to the line that is fine.
+        let good = crate::auth::digest_of(b"sk-served");
+        let error = Config::from_toml(&with_audit(&format!(
+            "accepted_credentials = [\"{good}\", \"nope\"]"
+        )))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains('1'), "wrong position named: {message}");
+        assert!(!message.contains(&good), "a digest was repeated: {message}");
+    }
+
+    #[test]
+    fn a_list_of_digests_is_accepted() {
+        let one = crate::auth::digest_of(b"sk-one");
+        let two = crate::auth::digest_of(b"sk-two");
+        let config = Config::from_toml(&with_audit(&format!(
+            "accepted_credentials = [\"{one}\", \"{two}\"]"
+        )))
+        .expect("two digests are a configuration");
+        assert_eq!(config.accepted_credentials, Some(vec![one, two]));
     }
 
     #[test]
