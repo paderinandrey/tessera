@@ -655,8 +655,9 @@ impl<'a> StreamRestorer<'a> {
             }
         }
         match self.flush(&Terminates::All) {
-            Ok(released) => {
+            Ok((released, documents)) => {
                 out.push_str(&self.release(released));
+                out.push_str(&documents);
                 Ok(out)
             }
             // The final flush can fail on a run it cannot place. What was
@@ -673,8 +674,9 @@ impl<'a> StreamRestorer<'a> {
             return self.hold(event);
         }
         if data == "[DONE]" {
-            let released = self.flush(&Terminates::All)?;
+            let (released, documents) = self.flush(&Terminates::All)?;
             let mut out = self.release(released);
+            out.push_str(&documents);
             out.push_str(&event.render());
             return Ok(out);
         }
@@ -697,8 +699,9 @@ impl<'a> StreamRestorer<'a> {
             if terminates == Terminates::Nothing {
                 return self.hold(event);
             }
-            let released = self.flush(&terminates)?;
+            let (released, documents) = self.flush(&terminates)?;
             let mut out = self.release(released);
+            out.push_str(&documents);
             out.push_str(&event.render());
             return Ok(out);
         }
@@ -806,7 +809,20 @@ impl<'a> StreamRestorer<'a> {
             if opened {
                 self.groups += 1;
             }
-            return Ok(String::new());
+            // **The event may also end the run it just fed.** OpenAI can put a
+            // final `arguments` fragment and `finish_reason` in one chunk, and
+            // returning here without asking left that run open — `[DONE]` then
+            // flushed it under `Terminates::All`, which refuses a run that
+            // never saw its own close. A valid stream destroyed by the guard
+            // meant to protect it.
+            let terminates = self.provider.stream_terminates(&parsed);
+            if terminates == Terminates::Nothing {
+                return Ok(String::new());
+            }
+            let (released, documents) = self.flush(&terminates)?;
+            let mut out = self.release(released);
+            out.push_str(&documents);
+            return Ok(out);
         }
 
         // Everything in the event that is not the streamed text is restored
@@ -884,7 +900,13 @@ impl<'a> StreamRestorer<'a> {
     }
 
     /// The text run has ended: drain every buffer into the waiting event.
-    fn flush(&mut self, terminates: &Terminates) -> Result<String, StreamError> {
+    /// Returns what the one-event delay was holding and, separately, the
+    /// documents that closed — **because they do not go out together.** Events
+    /// queued behind the held one arrived *before* these documents did, so the
+    /// caller releases the queue first and appends the documents after it.
+    /// Returning one string put a tool call's arguments in front of an event
+    /// the upstream had sent before them.
+    fn flush(&mut self, terminates: &Terminates) -> Result<(String, String), StreamError> {
         let ends = |key: &String| match terminates {
             Terminates::All => true,
             Terminates::Runs(keys) => keys.contains(key),
@@ -1049,12 +1071,10 @@ impl<'a> StreamRestorer<'a> {
             if let Some((key, _)) = remainders.first() {
                 return Err(StreamError::Unplaceable(key.clone()));
             }
-            return Ok(documents);
+            return Ok((String::new(), documents));
         };
         if remainders.is_empty() {
-            let mut out = pending.event.render();
-            out.push_str(&documents);
-            return Ok(out);
+            return Ok((pending.event.render(), documents));
         }
         // The event as it stands is already rewritten and correct. If a
         // remainder cannot be placed the stream ends, but that event was safe
@@ -1062,11 +1082,7 @@ impl<'a> StreamRestorer<'a> {
         // document that closed alongside it.
         let without_remainders = pending.event.render();
         match place(&mut pending, remainders) {
-            Ok(()) => {
-                let mut out = pending.event.render();
-                out.push_str(&documents);
-                Ok(out)
-            }
+            Ok(()) => Ok((pending.event.render(), documents)),
             Err(error) => {
                 self.salvage.push_str(&without_remainders);
                 self.salvage.push_str(&documents);
@@ -2228,6 +2244,61 @@ mod restorer_tests {
         assert!(
             rendered.contains("call_1") && rendered.contains("\"send\""),
             "the call's identity did not reach the client: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_finish_reason_sharing_the_event_with_arguments_closes_the_run() {
+        // The document branch used to return without asking whether the event
+        // it had just consumed also ended the run. OpenAI can put a final
+        // `arguments` fragment and `finish_reason` in one chunk — and the run
+        // then stayed open until `[DONE]` flushed it under `Terminates::All`,
+        // which refuses a run that never saw its own close. A valid stream,
+        // destroyed by the guard written to protect it.
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "a", "function": {"name": "f", "arguments": "{\"to\":\"[PER"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "SON_1]\"}"}}]},
+                "finish_reason": "tool_calls"}]}),
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        let document: Value = serde_json::from_str(&openai_tool_json(&rendered, 0))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"to": "Weber"}));
+    }
+
+    #[test]
+    fn an_event_queued_before_a_document_still_goes_out_before_it() {
+        // `flush` hands back the held event and the closed documents
+        // separately because they do not go out together. A keepalive that
+        // arrived while an event was held belongs *behind that event and ahead
+        // of the documents*, which closed later — returning one string put a
+        // tool call's arguments in front of an event the upstream had already
+        // sent.
+        use crate::provider::Anthropic;
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&Anthropic, &mapping);
+        let mut body = sse(
+            "content_block_delta",
+            "{\"type\":\"content_block_delta\",\"index\":9,\"delta\":\
+             {\"type\":\"text_delta\",\"text\":\"held\"}}",
+        );
+        body.push_str(&sse("ping", "{\"type\":\"ping\"}"));
+        body.push_str(&tool_block(0, &["{\"to\":\"[PERSON_1]\"}"]));
+        body.push_str(&block_stop(0));
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        let ping = rendered.find("ping").expect("the keepalive was dropped");
+        let document = rendered.find("Weber").expect("the document was dropped");
+        assert!(
+            ping < document,
+            "a document overtook an event the upstream sent before it: {rendered}"
         );
     }
 
