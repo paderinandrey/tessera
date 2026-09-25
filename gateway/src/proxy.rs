@@ -1242,16 +1242,17 @@ async fn handle(
             // `json_object` or `json_schema`, so a `content` the caller has
             // declared will be a document does not stream (#36).
             //
-            // The tool half has moved. `reject_streamed_tools` still refuses
-            // OpenAI, whose `tool_calls` deltas close no block of their own, so
-            // a described `arguments` never streams there. **On Anthropic it
-            // does stream now** (#87): a tool block is accumulated whole and
-            // restored when `content_block_stop` closes it, which reaches this
-            // very door — `restore_value`, and so `restore_in_string_strictly`
-            // for every leaf. So the exception the paragraph above describes is
-            // about a *fragment*, and a document held until it is one is not a
-            // fragment. `Held::Document` in `stream.rs` is the other side of
-            // this sentence.
+            // **The tool half is no longer refused at all** (#87). A described
+            // `arguments` streams on both providers now: its fragments are
+            // accumulated whole and restored when the run closes —
+            // `content_block_stop` on Anthropic, `finish_reason` on OpenAI —
+            // which reaches this very door, `restore_value`, and so
+            // `restore_in_string_strictly` for every leaf. So the exception the
+            // paragraph above describes is about a *fragment*, and a document
+            // held until it is one is not a fragment. `Held::Document` in
+            // `stream.rs` is the other side of this sentence, and
+            // `reject_streamed_tools` — which used to close this by refusing
+            // the request — is gone.
             //
             // **And the undeclared case is answered by the stream itself.**
             // `RestoreBuffer` restores through `Mapping::restore_in_stream`,
@@ -3253,8 +3254,10 @@ mod tests {
         // through one rule.
         //
         // So there is nothing to refuse here, which is just as well: a stream
-        // cannot refuse after its first bytes have gone out — the position
-        // `reject_streamed_tools` already records.
+        // cannot refuse after its first bytes have gone out. That used to be
+        // the position `reject_streamed_tools` recorded by refusing the request
+        // instead; it is now recorded by the accumulator, which holds a
+        // document until it is one rather than substituting into a fragment.
         let detector = detector_returning(person_span()).await;
         let upstream = MockServer::start().await;
         let body = concat!(
@@ -3764,9 +3767,12 @@ mod tests {
         //
         // **Refused at admission, so the caller pays nothing.** That is the
         // property, and it is the reason the check sits in `request_pointers`
-        // beside `reject_streamed_tools` rather than anywhere the response is
-        // handled: a refusal after the upstream call spends the caller's tokens
-        // to hand back an error.
+        // rather than anywhere the response is handled: a refusal after the
+        // upstream call spends the caller's tokens to hand back an error. It
+        // used to have `reject_streamed_tools` beside it; that one is gone,
+        // because tool arguments are accumulated and restored rather than
+        // refused, and this one stays because a declared `content` has no run
+        // of its own to accumulate into.
         let payload = r#"x","admin":true,"pad":""#;
         let detector = detector_finding_all_of(payload).await;
         let upstream = upstream_returning("/v1/chat/completions", json!({})).await;

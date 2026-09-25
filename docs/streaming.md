@@ -74,8 +74,8 @@ headers and fields like `id:` reach the client as the provider sent them.
 
 If a token turns out to have no mapping, bytes have already gone out and the request cannot
 be refused. The stream ends instead, with an `error` event naming the failure — the client
-gets a truncated answer, never a placeholder in place of a name. **Streamed tool calls are served on Anthropic and refused on OpenAI, and the difference is
-the protocol rather than the risk.** A document arriving a delta at a time is not well
+gets a truncated answer, never a placeholder in place of a name. **Streamed tool calls are served on both providers now, and the way each one says a call has
+ended is the only difference left.** A document arriving a delta at a time is not well
 formed until its block closes, and a placeholder can be split across two deltas *and* land
 inside a half-written JSON value at the same time — so there is nothing to parse at the
 moment of substitution, and nothing of it is safe to serve. The answer is to stop
@@ -83,21 +83,33 @@ substituting: the fragments are accumulated, and when the block closes they are 
 restored through the same door the buffered path uses. A value carrying a `"` then lands in
 a leaf and is escaped on the way out instead of closing the string it was written into.
 
-Anthropic says where a block ends — `content_block_start` with `type: "tool_use"`, then
-`input_json_delta`, then `content_block_stop` at that index — so the accumulator has a
-boundary to key on. OpenAI's `tool_calls` deltas have none: the end arrives as
-`finish_reason` in a later chunk, several calls interleave in one chunk under their own
-indices, and `id` and `name` come in the first fragment while `arguments` dribble after. So
-a request carrying tool traffic together with `stream: true` is still refused there, before
-the upstream call, where it costs no tokens.
+Anthropic says where a block ends: `content_block_start` with `type: "tool_use"`, then
+`input_json_delta`, then `content_block_stop` at that index.
 
-**A document is served when its block closes, and on no other signal.** A run still held
+OpenAI says it only indirectly, and three details follow from that. The end is
+`finish_reason` in a later chunk, which carries no `tool_calls` array — so the runs it closes
+cannot be named from it, and it ends *everything* under that choice by prefix instead.
+Several calls interleave in one chunk as one `tool_calls` array, each element carrying its own
+`index`, which is the call's identity across chunks where the array position is not. And a
+call's `id`, `type` and `name` arrive in the same chunk as its first `arguments` fragment and
+never again — so the event the accumulator keeps is a run's **first**, not its latest, or the
+client receives a finished document belonging to a call it cannot dispatch.
+
+**A document is served when its own run closes, and on no other signal.** A run still held
 when `message_stop` arrives — or `[DONE]`, or an `error` the upstream sent mid-generation —
-never saw its own `content_block_stop`, and the stream ends rather than serving it. Truncation
+never saw the event that closes it, and the stream ends rather than serving it. Truncation
 usually leaves JSON that will not parse, so refusing on the parse would catch it nearly
 always; *nearly* is the objection. The one truncation that happens to parse would go out as a
 finished tool call, and a tool call is an action the client's agent takes rather than text it
 displays.
+
+**A document with nothing to restore is never parsed, and one whose parse would change it is
+refused.** Restoring means re-serializing, and re-serializing collapses two members of the
+same name into one and respells a number the parse does not reproduce — which would hand the
+client's agent a well-formed tool call carrying arguments the model did not write. So a
+document holding no placeholder of ours goes back byte for byte, whatever its numbers look
+like, and one that holds a placeholder *and* would not survive the round trip ends the stream
+instead. Both are the rules the buffered path already followed at `write_document`.
 
 **What the trade costs.** A refusal spent nothing; an accumulator spends the caller's tokens
 and can still end the stream mid-flight, on a document past

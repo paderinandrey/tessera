@@ -195,15 +195,11 @@ has cost so far.
 Early development. The detector, the gateway — sessions, streaming, the audit journal, tool
 traffic — and the two-container stack all work end to end.
 
-**Streaming and tool calls together work on Anthropic only.** The same request to OpenAI is
-refused before the upstream call, where it costs no tokens: its `tool_calls` deltas close no
-block of their own, so the accumulator that makes this safe has no boundary to key on. An
-agent harness pointed at `/v1/messages` is served; one pointed at `/v1/chat/completions` has
-to turn streaming off.
-
 **Not ready for production use:** nothing here has been run in anger, and a caller who is
-served can still be handed a value they did not send ([#32](https://github.com/paderinandrey/tessera/issues/32)),
-which authentication narrows without closing.
+served can still learn which placeholders a session has issued, one request at a
+time ([#32](https://github.com/paderinandrey/tessera/issues/32)) — the value itself is
+refused rather than handed over, and authentication narrows who can ask without closing the
+question.
 
 ## Documentation
 
