@@ -278,7 +278,7 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 # both corpora rather than inferred:
 #
 #   left:  Tröst              — the value an apostrophe surname replaced
-#   added: dell’Orto          — the apostrophe name itself, lost directly
+#   added: dell(U+2019)Orto          — the apostrophe name itself, lost directly
 #          Röhrdanz           — in de-0000, whose text did not change
 #          écologiste         — in fr-0009, whose text did not change
 #
