@@ -272,7 +272,25 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 # The fifth is not new behaviour: it was always there and this is the first
 # predicate that can see it. Raising the number is the measurement improving,
 # not the detector regressing.
-LOST_TO_JOINING = 5
+#
+# **5 -> 7 when the corpus learned to carry an apostrophe** (#97), and the three
+# entities that joined this set say more than the number does. Measured against
+# both corpora rather than inferred:
+#
+#   left:  Tröst              — the value an apostrophe surname replaced
+#   added: dell’Orto          — the apostrophe name itself, lost directly
+#          Röhrdanz           — in de-0000, whose text did not change
+#          écologiste         — in fr-0009, whose text did not change
+#
+# So one of the three is the shape that was added, and two are **neighbours**:
+# joining concatenates several documents, and changing one made detection worse
+# in another the change never touched. That is a fact about joining rather than
+# about an apostrophe, and it is the sharpest thing this gate has said about #44
+# — the loss is a property of the group, not of the entity.
+#
+# Re-recorded rather than relaxed, which is what the assertion below demands. The
+# code did not change; the corpus did, and the number is a property of both.
+LOST_TO_JOINING = 7
 
 
 def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector) -> None:
