@@ -270,7 +270,15 @@ def render(
                 text += value
             elif name in ("person", "city", "org"):
                 value = {
-                    "person": faker.last_name,
+                    # **`faker.last_name()` is called either way, and the pool
+                    # overrides its result rather than replacing the call.**
+                    # Skipping it consumed one fewer draw from the instance and
+                    # shifted every value after it, so the first version of this
+                    # regenerated the whole corpus — and the recall figures then
+                    # moved for reasons that had nothing to do with an
+                    # apostrophe. The selection has its own `Random` for the
+                    # same reason: `rng` drives every other slot in this loop.
+                    "person": lambda: _apostrophe_or(faker.last_name(), value_lang),
                     "city": faker.city,
                     # faker.company() often returns a bare surname, which no
                     # annotator could tell from a PERSON; a suffix makes the
@@ -292,6 +300,47 @@ def render(
         else:
             text += token
     return {"lang": lang, "text": text, "entities": entities}
+
+
+# Surnames carrying an apostrophe, which `faker.last_name` on these locales never
+# produces — measured: of 196 annotated values in the corpus this generated
+# before they were added, **zero** held `\'` or `\u2019`, while the text around
+# them held seventeen French elisions. So the shape the fence rule prices most
+# heavily was the one shape the quality gates could not see (#69).
+#
+# Both spellings on purpose. `O\'Brien` with U+0027 closes a string in YAML,
+# shell, SQL and Python, and is the character the bare rule is strict for.
+# `O\u2019Brien` with U+2019 closes a string in nothing at all and is refused
+# only because the rule is a list of what is known safe — and it is the one a
+# model actually emits in prose. Neither was reachable from this corpus, so
+# neither narrowing in #69 could be argued from a number.
+#
+# Attested in the populations these locales stand for rather than invented: Irish
+# and Italian-origin surnames are ordinary in France, Germany and Switzerland,
+# which is why the issue names these four.
+APOSTROPHE_SURNAMES = {
+    "fr": ["D\'Angelo", "L\u2019H\u00f4pital", "D\'Amico", "O\u2019Brien"],
+    "de": ["O\'Brien", "dell\u2019Orto", "D\'Agostino", "D\u2019Amico"],
+}
+
+# One person in this many is drawn from the pool above. Six leaves roughly a
+# dozen apostrophe-bearing PERSON values across the corpus — enough for a recall
+# figure to move measurably, and far from enough to make the corpus a test of
+# this one shape.
+APOSTROPHE_IN = 6
+
+
+# Its own stream, so choosing a pool name never perturbs the sequence that drives
+# every other slot.
+_apostrophes = random.Random(SEED ^ 0x0027)
+
+
+def _apostrophe_or(drawn: str, lang: str) -> str:
+    """One surname in `APOSTROPHE_IN` comes from the pool instead of `drawn`."""
+    pool = APOSTROPHE_SURNAMES[lang]
+    if _apostrophes.randrange(APOSTROPHE_IN) == 0:
+        return pool[_apostrophes.randrange(len(pool))]
+    return drawn
 
 
 def _tokenize(template: str) -> list[str]:

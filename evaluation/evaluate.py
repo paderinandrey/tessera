@@ -94,6 +94,40 @@ KNOWN_UNMASKED: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         frozenset({"eine"}),
         "the gold includes the article; the mention is masked as HEALTH",
     ),
+    # **Five real defects of one kind, added with the corpus that can show
+    # them.** Until the generator drew apostrophe-bearing surnames this corpus
+    # held none, so the gates could not see the shape at all — measured: zero of
+    # 196 annotated values carried `\'` or `\u2019`. With eleven of them the
+    # detector finds none: it splits at the apostrophe and **both halves reach
+    # the provider**, which is egress rather than an annotation convention.
+    #
+    # Tracked so the gate measures "no *new* leak" as it already does for
+    # `Tessier SA`, not so the leak reads as acceptable. It is not: these are
+    # ordinary surnames in the populations this product is sold into. Issue #97.
+    #
+    # The two spellings behave identically, which is itself the finding — U+2019
+    # is not a tokenizer problem the model handles better, so #69's cheap
+    # narrowing would recover nothing here.
+    ("PERSON", "O'Brien"): (
+        frozenset({"O", "Brien"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "O\u2019Brien"): (
+        frozenset({"O", "Brien"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "D'Angelo"): (
+        frozenset({"D", "Angelo"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "L\u2019H\u00f4pital"): (
+        frozenset({"L", "H\u00f4pital"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "dell\u2019Orto"): (
+        frozenset({"dell", "Orto"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
     ("ORG", "Tessier SA"): (
         frozenset({"Tessier", "SA"}),
         "organization 0.697 against ORG's bar of 0.75 — a near miss on its own label",
