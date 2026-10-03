@@ -247,7 +247,11 @@ TYPES = {
 
 
 def render(
-    template: str, fakers: dict[str, Faker], lang: str, rng: random.Random
+    template: str,
+    fakers: dict[str, Faker],
+    lang: str,
+    rng: random.Random,
+    apostrophes: random.Random,
 ) -> dict[str, object]:
     value_lang = lang if lang != "mixed" else rng.choice(["fr", "de"])
     faker = fakers[value_lang]
@@ -278,7 +282,7 @@ def render(
                     # moved for reasons that had nothing to do with an
                     # apostrophe. The selection has its own `Random` for the
                     # same reason: `rng` drives every other slot in this loop.
-                    "person": lambda: _apostrophe_or(faker.last_name(), value_lang),
+                    "person": lambda: _apostrophe_or(faker.last_name(), value_lang, apostrophes),
                     "city": faker.city,
                     # faker.company() often returns a bare surname, which no
                     # annotator could tell from a PERSON; a suffix makes the
@@ -330,16 +334,11 @@ APOSTROPHE_SURNAMES = {
 APOSTROPHE_IN = 6
 
 
-# Its own stream, so choosing a pool name never perturbs the sequence that drives
-# every other slot.
-_apostrophes = random.Random(SEED ^ 0x0027)
-
-
-def _apostrophe_or(drawn: str, lang: str) -> str:
+def _apostrophe_or(drawn: str, lang: str, apostrophes: random.Random) -> str:
     """One surname in `APOSTROPHE_IN` comes from the pool instead of `drawn`."""
     pool = APOSTROPHE_SURNAMES[lang]
-    if _apostrophes.randrange(APOSTROPHE_IN) == 0:
-        return pool[_apostrophes.randrange(len(pool))]
+    if apostrophes.randrange(APOSTROPHE_IN) == 0:
+        return pool[apostrophes.randrange(len(pool))]
     return drawn
 
 
@@ -349,6 +348,11 @@ def _tokenize(template: str) -> list[str]:
 
 def main() -> None:
     rng = random.Random(SEED)
+    # Its own stream, so choosing a pool name never perturbs the sequence that
+    # drives every other slot. Built here rather than at module scope so that
+    # calling `main()` twice in one process reseeds it alongside `rng` and the
+    # `Faker` instances, and the second corpus is byte-identical to the first.
+    apostrophes = random.Random(SEED ^ 0x0027)
     fakers = {"fr": Faker("fr_FR"), "de": Faker("de_DE")}
     for f in fakers.values():
         f.seed_instance(SEED)
@@ -356,7 +360,7 @@ def main() -> None:
     pools = [("fr", FR_TEMPLATES, 30), ("de", DE_TEMPLATES, 30), ("mixed", MIXED_TEMPLATES, 20)]
     for lang, templates, count in pools:
         for i in range(count):
-            doc = render(templates[i % len(templates)], fakers, lang, rng)
+            doc = render(templates[i % len(templates)], fakers, lang, rng, apostrophes)
             doc["id"] = f"{lang}-{i:04d}"
             documents.append(doc)
     for i, template in enumerate(CLEAN_TEMPLATES * 5):
