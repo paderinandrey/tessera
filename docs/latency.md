@@ -45,6 +45,12 @@ gateway loads. Both were run end to end — `benchmark.py --runs 8 --warmup 2` a
 `evaluate.py --require-ner` — against an fp32 baseline taken in the same session, so the three
 columns are comparable to each other even where they differ from the table above.
 
+That session predates the apostrophe-bearing surnames the corpus now carries, so every
+quality figure below is against the earlier corpus and none of them matches the README's
+table any more. The fp32 column is what the comparison rests on and all three were measured
+on the same documents, so the verdicts stand; re-measuring fp16 and int8 on the current
+corpus would move all three columns together and change neither.
+
 | size | fp32 | fp16 | int8 | fp16 vs fp32 | int8 vs fp32 |
 |---|---|---|---|---|---|
 | sentence (80 chars) | 115.4 ms | 159.0 ms | 41.1 ms | 0.73x | **2.81x** |

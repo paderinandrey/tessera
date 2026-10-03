@@ -142,9 +142,9 @@ are published rather than trimmed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| PERSON | 1.000 | 0.855 | 0.922 |
-| LOCATION | 0.667 | 1.000 | 0.800 |
-| ORG | 0.154 | 0.333 | 0.211 |
+| PERSON | 0.968 | 0.803 | 0.878 |
+| LOCATION | 0.727 | 1.000 | 0.842 |
+| ORG | 0.148 | 0.333 | 0.205 |
 
 Article 9 special categories are detected by the same layer at a lower threshold, and
 **Article 9 coverage is 0.9783 (45 of 46)**:
@@ -156,17 +156,17 @@ Article 9 special categories are detected by the same layer at a lower threshold
 | GENETIC | 1.000 | 0.750 | 0.857 |
 | HEALTH | 0.667 | 1.000 | 0.800 |
 | PHILOSOPHICAL_BELIEF | 0.000 | 0.000 | 0.000 |
-| POLITICAL_AFFILIATION | 0.800 | 1.000 | 0.889 |
+| POLITICAL_AFFILIATION | 1.000 | 1.000 | 1.000 |
 | POLITICAL_OPINION | 0.000 | 0.000 | 0.000 |
 | RELIGION | 0.500 | 1.000 | 0.667 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
 | SEX_LIFE | 0.000 | 0.000 | 0.000 |
-| TRADE_UNION | 0.296 | 1.000 | 0.457 |
+| TRADE_UNION | 0.286 | 1.000 | 0.444 |
 
 The gate that matters is not a per-type score: **every annotated entity with a word
 reaching the provider is named individually**, and `make evaluate` fails on any that is not
 already written down. [Evaluation](docs/evaluation.md) explains what each gate checks and
-what the three remaining misses are.
+what the eight remaining misses are.
 
 ## How fast it is
 

@@ -9,7 +9,7 @@ with the wrong bounds, or not found at all — three different rows in three dif
 none of which says "these characters went out". `make evaluate` asks by position and by
 content, and fails on anything not already written down.
 
-Three are real, and all three are threshold misses:
+Eight are real. Three are threshold misses:
 
 ```
 GENETIC  'test génétique'   its own label at 0.288, bar 0.30
@@ -21,7 +21,23 @@ Two are near misses by 0.012 and 0.053. The third is [#46][i46]: a quasi-identif
 argmax and then fails a bar the loser would have cleared — asked alone, `person` scores
 `Texier` at 0.704.
 
-The other five are an annotation convention. The gold span includes a leading article the
+The other five are one defect, [#97][i97]: the detector splits a surname at its apostrophe
+and finds neither half, so both reach the provider.
+
+```
+PERSON   "D'Angelo"         reaches the provider as 'D', 'Angelo'
+PERSON   'L’Hôpital'        reaches the provider as 'L', 'Hôpital'
+PERSON   "O'Brien"          reaches the provider as 'O', 'Brien'
+PERSON   'O’Brien'          reaches the provider as 'O', 'Brien'
+PERSON   'dell’Orto'        reaches the provider as 'dell', 'Orto'
+```
+
+Both spellings behave identically — U+2019 is not a form the model handles better than
+U+0027 — and these are the first family of real misses here that is not a threshold: no bar
+is close, because no candidate span covers the whole surname. They are tracked so the gate
+measures "no *new* leak", which is bookkeeping rather than acceptance.
+
+The remaining five are an annotation convention. The gold span includes a leading article the
 detector does not predict — `un diabète de type 2` masked as `diabète de type 2` — and `un`
 is not personal data, the same argument the `PERSON` trimming rule makes for `Der Kunde`.
 
@@ -38,6 +54,7 @@ protects by name in the trimming rule. Forgiving a convention is a decision some
 down about a specific entity, not a spelling rule.
 
 [i46]: https://github.com/paderinandrey/tessera/issues/46
+[i97]: https://github.com/paderinandrey/tessera/issues/97
 
 **Article 9 coverage: 0.9783 (45/46)** — nearly every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
