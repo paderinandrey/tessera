@@ -8,6 +8,7 @@ runtime would skip the NER gates and still report success.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -184,6 +185,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail instead of skipping the NER gates when the layer cannot run",
     )
+    parser.add_argument(
+        "--json",
+        type=Path,
+        metavar="PATH",
+        help="also write the measurement as JSON, for check_published_metrics.py",
+    )
     args = parser.parse_args(argv)
     try:
         detector = build_detector(ner=True if args.require_ner else None)
@@ -331,6 +338,40 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
             "(advisory on the synthetic corpus)"
+        )
+    if args.json is not None:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(
+            json.dumps(
+                {
+                    "per_type": {
+                        entity_type: {
+                            "precision": round(m.precision, 3),
+                            "recall": round(m.recall, 3),
+                            "f1": round(m.f1, 3),
+                            "tp": m.tp,
+                            "fp": m.fp,
+                            "fn": m.fn,
+                        }
+                        for entity_type, m in sorted(summary.per_type.items())
+                    },
+                    "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
+                    "tier1_recall": round(summary.tier1_recall, 4),
+                    "article_9_coverage": {
+                        "ratio": round(overall, 4),
+                        "covered": covered_total,
+                        "gold": gold_total,
+                    },
+                    "unmasked": {
+                        "occurrences": len(unmasked),
+                        "entities": len(distinct),
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
     return 1 if overmasking_failures or article_9_missed or unmasked_over else 0
 

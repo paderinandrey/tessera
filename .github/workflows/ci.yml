@@ -98,7 +98,12 @@ jobs:
       # the runtime is broken, so without it the job would pass green with the
       # NER layer entirely unusable.
       - run: uv run --group ner --group serve pytest -m ner
-      - run: uv run --group ner python ../evaluation/evaluate.py --require-ner
+      - run: uv run --group ner python ../evaluation/evaluate.py --require-ner --json ../evaluation/metrics.json
+      # The README publishes these figures as literal Markdown, and that copy
+      # drifted unnoticed until a reviewer read it against docs/latency.md.
+      # Consumes the JSON the step above wrote rather than measuring again, so
+      # the gate cannot disagree with the run it is checking.
+      - run: make -C .. check-published-metrics METRICS=evaluation/metrics.json
       # Smoke only: the harness must run, but timings on a shared runner are
       # noise and are never asserted. Real numbers come from a known machine
       # and are recorded in the README with its hardware.
