@@ -23,7 +23,7 @@ from tessera_detector.evaluation import (
     summarize,
     unmasked_words,
 )
-from tessera_detector.models import ModelUnavailable
+from tessera_detector.models import HF_REVISION, ModelUnavailable
 from tessera_detector.pipeline import build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
@@ -192,6 +192,12 @@ def main(argv: list[str] | None = None) -> int:
         help="also write the measurement as JSON, for check_published_metrics.py",
     )
     args = parser.parse_args(argv)
+    if args.json is not None:
+        # Before anything that can return early — a model-off run returns 0
+        # without measuring the NER types, and leaving the previous file in
+        # place would let `check_published_metrics.py` accept a measurement
+        # this run did not make.
+        args.json.unlink(missing_ok=True)
     try:
         detector = build_detector(ner=True if args.require_ner else None)
     except (ModelUnavailable, ValueError) as error:
@@ -356,6 +362,12 @@ def main(argv: list[str] | None = None) -> int:
                         for entity_type, m in sorted(summary.per_type.items())
                     },
                     "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
+                    "model_revision": HF_REVISION,
+                    "targets": {
+                        "article_9_coverage": ARTICLE_9_TARGET,
+                        "overmasking_precision": PRECISION_TARGET,
+                        "tier1_recall": TIER1_TARGET,
+                    },
                     "tier1_recall": round(summary.tier1_recall, 4),
                     "article_9_coverage": {
                         "ratio": round(overall, 4),

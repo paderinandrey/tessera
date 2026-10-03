@@ -14,8 +14,10 @@ so there is one measurement and the gate cannot disagree with the run it is
 checking.
 
 **Scope, so the green tick is not read as more than it is.** This checks the
-numeric tables, the Article 9 coverage figure and the Tier 1 recall line. It
-does not check prose counts such as "the eight remaining misses" or
+numeric tables, the Article 9 coverage figure, and the Tier 1 recall gate — both
+that the threshold README publishes is the one `evaluate.py` enforces and that
+the measurement clears it. It does not check prose counts such as
+"the eight remaining misses" or
 `docs/evaluation.md`'s miss inventory: splitting the entities that reach the
 provider into real defects and annotation conventions is a judgement recorded
 per entry in `KNOWN_UNMASKED`, not a number this script can derive. Those
@@ -31,6 +33,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 CORPUS = ROOT / "evaluation" / "corpus" / "public.jsonl"
+MODELS = ROOT / "detector" / "src" / "tessera_detector" / "models.py"
+
 
 # `| PERSON | 0.968 | 0.803 | 0.878 |`, which is the only three-decimal row
 # shape in the file; the surrounding tables are prose or timings.
@@ -38,6 +42,11 @@ ROW = re.compile(
     r"^\|\s*([A-Z][A-Z_0-9]*)\s*\|\s*(\d\.\d{3})\s*\|\s*(\d\.\d{3})\s*\|\s*(\d\.\d{3})\s*\|$"
 )
 COVERAGE = re.compile(r"\*\*Article 9 coverage is (\d\.\d{4}) \((\d+) of (\d+)\)\*\*")
+# `make evaluate   # ... + the Tier 1 recall gate (>= 0.99)`
+TIER1 = re.compile(r"Tier 1 recall gate \(>= (\d\.\d+)\)")
+# Read textually rather than imported: this script runs under plain `python3`,
+# like check_layers.py, and importing the detector would need its environment.
+REVISION = re.compile(r'^HF_REVISION = "([0-9a-f]+)"', re.MULTILINE)
 
 
 def published_rows(text: str) -> dict[str, tuple[str, str, str]]:
@@ -76,14 +85,27 @@ def main() -> int:
         )
         return 1
     measured = json.loads(path.read_text(encoding="utf-8"))
-    # The measurement names the corpus it came from, so a file left over from an
-    # earlier corpus cannot carry this gate green — the one failure that would
-    # look exactly like a pass.
+    # The measurement names what produced it, so a file from an earlier corpus
+    # or an earlier model cannot carry this gate green — the one failure that
+    # would look exactly like a pass. `evaluate.py` also deletes the file at the
+    # start of every run, so a run that does not measure leaves none behind;
+    # these checks cover a file carried in from a different tree.
     corpus = hashlib.sha256(CORPUS.read_bytes()).hexdigest()
     if measured.get("corpus_sha256") != corpus:
         print(
             f"FAIL: {path} measures corpus {measured.get('corpus_sha256')}, "
             f"but the corpus on disk is {corpus}. Re-run the measurement.",
+            file=sys.stderr,
+        )
+        return 1
+    revision = REVISION.search(MODELS.read_text(encoding="utf-8"))
+    if revision is None:
+        print(f"FAIL: no HF_REVISION found in {MODELS}", file=sys.stderr)
+        return 1
+    if measured.get("model_revision") != revision.group(1):
+        print(
+            f"FAIL: {path} measures model {measured.get('model_revision')}, "
+            f"but models.py pins {revision.group(1)}. Re-run the measurement.",
             file=sys.stderr,
         )
         return 1
@@ -117,6 +139,22 @@ def main() -> int:
             "the corpus measures types the README does not publish: "
             + ", ".join(unpublished)
         )
+
+    tier1 = TIER1.search(text)
+    if tier1 is None:
+        failures.append("no Tier 1 recall gate sentence found in README.md")
+    else:
+        target = measured["targets"]["tier1_recall"]
+        if float(tier1.group(1)) != target:
+            failures.append(
+                f"Tier 1 recall gate: README publishes >= {tier1.group(1)}, "
+                f"evaluate.py requires >= {target}"
+            )
+        if measured["tier1_recall"] < target:
+            failures.append(
+                f"Tier 1 recall {measured['tier1_recall']} is below the published "
+                f"target {target}"
+            )
 
     coverage = COVERAGE.search(text)
     if coverage is None:

@@ -47,9 +47,11 @@ columns are comparable to each other even where they differ from the table above
 
 That session predates the apostrophe-bearing surnames the corpus now carries, so every
 quality figure below is against the earlier corpus and none of them matches the README's
-table any more. The fp32 column is what the comparison rests on and all three were measured
-on the same documents, so the verdicts stand; re-measuring fp16 and int8 on the current
-corpus would move all three columns together and change neither.
+table any more. **The verdicts below hold for that corpus and have not been re-established
+on the current one**: all three columns came from the same documents, which is what makes
+them comparable to each other, but neither quantised graph has been measured against the
+apostrophe surnames. Whether `evaluate.py --require-ner` still exits 1 on int8 and still
+finds fp16 indistinguishable is unmeasured, not predicted here.
 
 | size | fp32 | fp16 | int8 | fp16 vs fp32 | int8 vs fp32 |
 |---|---|---|---|---|---|
