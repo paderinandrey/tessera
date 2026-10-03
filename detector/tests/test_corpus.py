@@ -25,6 +25,25 @@ def test_every_annotation_matches_a_non_empty_slice() -> None:
             )
 
 
+def test_every_annotation_lands_on_whole_words() -> None:
+    for doc in _documents():
+        text = doc["text"]
+        for entity in doc["entities"]:
+            start, end = entity["start"], entity["end"]
+            value = text[start:end]
+            assert value == value.strip(), (
+                f"span in {doc['id']} carries surrounding whitespace: {entity} -> {value!r}"
+            )
+            before_char = text[start - 1] if start else ""
+            after_char = text[end] if end < len(text) else ""
+            assert not before_char.isalnum(), (
+                f"span in {doc['id']} starts mid-word: {entity} -> {text[start - 1 : end]!r}"
+            )
+            assert not after_char.isalnum(), (
+                f"span in {doc['id']} ends mid-word: {entity} -> {text[start : end + 1]!r}"
+            )
+
+
 def test_annotations_do_not_overlap() -> None:
     for doc in _documents():
         spans = sorted((e["start"], e["end"]) for e in doc["entities"])
