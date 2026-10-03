@@ -54,6 +54,13 @@ jobs:
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
       - run: git diff --exit-code ../evaluation/corpus
+      # The step above starts a fresh interpreter, so it cannot see a generator
+      # that holds state across calls within one. These two generate twice in
+      # one process. `uv run pytest` above syncs the serve group, which has no
+      # `faker`, so they skip there — hence the explicit group here, and the
+      # variable, which turns that skip into a collection error the way
+      # `--require-ner` does for the NER gates.
+      - run: TESSERA_REQUIRE_EVAL_DEPS=1 uv run --group eval --group serve pytest tests/test_corpus_generation.py
       # The committed OpenAPI document is the schema the gateway will read
       # (REQ-44); it must not drift from the application.
       - run: uv run --group serve python ../evaluation/export_openapi.py
