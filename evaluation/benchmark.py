@@ -177,9 +177,17 @@ def main(argv: list[str] | None = None) -> int:
             # the benchmark's sizes are bounded where a scanned file is not.
             pieces = list(recognizer.windows(text))
             for inference in recognizer.passes:
+                # A tier can hold more than one pass — `person` is asked in its
+                # own as well as in tier 2's — and two rows under one name are
+                # two numbers nobody can attribute. Named by the labels asked
+                # for when a tier is not alone in answering for itself.
+                same_tier = [p for p in recognizer.passes if p.tier == inference.tier]
+                name = f"ner tier {inference.tier}"
+                if len(same_tier) > 1:
+                    name = f"{name} ({', '.join(inference.labels)})"
                 timings.append(
                     Timing(
-                        f"ner tier {inference.tier}",
+                        name,
                         size,
                         measure(
                             partial(_run_pass, recognizer, pieces, inference),
