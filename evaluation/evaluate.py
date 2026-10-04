@@ -8,6 +8,7 @@ runtime would skip the NER gates and still report success.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -22,7 +23,7 @@ from tessera_detector.evaluation import (
     summarize,
     unmasked_words,
 )
-from tessera_detector.models import ModelUnavailable
+from tessera_detector.models import HF_REVISION, ModelUnavailable
 from tessera_detector.pipeline import build_detector
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
@@ -94,6 +95,40 @@ KNOWN_UNMASKED: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         frozenset({"eine"}),
         "the gold includes the article; the mention is masked as HEALTH",
     ),
+    # **Five real defects of one kind, added with the corpus that can show
+    # them.** Until the generator drew apostrophe-bearing surnames this corpus
+    # held none, so the gates could not see the shape at all — measured: zero of
+    # 196 annotated values carried `\'` or `\u2019`. With eleven of them the
+    # detector finds none: it splits at the apostrophe and **both halves reach
+    # the provider**, which is egress rather than an annotation convention.
+    #
+    # Tracked so the gate measures "no *new* leak" as it already does for
+    # `Tessier SA`, not so the leak reads as acceptable. It is not: these are
+    # ordinary surnames in the populations this product is sold into. Issue #97.
+    #
+    # The two spellings behave identically, which is itself the finding — U+2019
+    # is not a tokenizer problem the model handles better, so #69's cheap
+    # narrowing would recover nothing here.
+    ("PERSON", "O'Brien"): (
+        frozenset({"O", "Brien"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "O\u2019Brien"): (
+        frozenset({"O", "Brien"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "D'Angelo"): (
+        frozenset({"D", "Angelo"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "L\u2019H\u00f4pital"): (
+        frozenset({"L", "H\u00f4pital"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
+    ("PERSON", "dell\u2019Orto"): (
+        frozenset({"dell", "Orto"}),
+        "the detector splits a surname at its apostrophe and finds neither half — #97",
+    ),
     ("ORG", "Tessier SA"): (
         frozenset({"Tessier", "SA"}),
         "organization 0.697 against ORG's bar of 0.75 — a near miss on its own label",
@@ -150,7 +185,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail instead of skipping the NER gates when the layer cannot run",
     )
+    parser.add_argument(
+        "--json",
+        type=Path,
+        metavar="PATH",
+        help="also write the measurement as JSON, for check_published_metrics.py",
+    )
     args = parser.parse_args(argv)
+    if args.json is not None:
+        # Before anything that can return early — a model-off run returns 0
+        # without measuring the NER types, and leaving the previous file in
+        # place would let `check_published_metrics.py` accept a measurement
+        # this run did not make.
+        args.json.unlink(missing_ok=True)
     try:
         detector = build_detector(ner=True if args.require_ner else None)
     except (ModelUnavailable, ValueError) as error:
@@ -297,6 +344,46 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
             "(advisory on the synthetic corpus)"
+        )
+    if args.json is not None:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(
+            json.dumps(
+                {
+                    "per_type": {
+                        entity_type: {
+                            "precision": round(m.precision, 3),
+                            "recall": round(m.recall, 3),
+                            "f1": round(m.f1, 3),
+                            "tp": m.tp,
+                            "fp": m.fp,
+                            "fn": m.fn,
+                        }
+                        for entity_type, m in sorted(summary.per_type.items())
+                    },
+                    "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
+                    "model_revision": HF_REVISION,
+                    "targets": {
+                        "article_9_coverage": ARTICLE_9_TARGET,
+                        "overmasking_precision": PRECISION_TARGET,
+                        "tier1_recall": TIER1_TARGET,
+                    },
+                    "tier1_recall": round(summary.tier1_recall, 4),
+                    "article_9_coverage": {
+                        "ratio": round(overall, 4),
+                        "covered": covered_total,
+                        "gold": gold_total,
+                    },
+                    "unmasked": {
+                        "occurrences": len(unmasked),
+                        "entities": len(distinct),
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
     return 1 if overmasking_failures or article_9_missed or unmasked_over else 0
 

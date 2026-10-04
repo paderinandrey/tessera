@@ -1,4 +1,4 @@
-.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke check-entity-types check-layers check-base-install
+.PHONY: corpus evaluate bench openapi test lint model gateway-test gateway-lint compose-smoke check-entity-types check-layers check-base-install check-published-metrics
 
 # The host port the stack publishes. Overridable because 8080 is a popular
 # port; both compose and the smoke test read it from the environment.
@@ -11,13 +11,15 @@ export TESSERA_PORT
 # the developer's audit journal, its salt and the 2 GB weights volume with it.
 # Isolated, the worst a running dev stack can cause is a port collision, which
 # fails loudly.
+METRICS ?= evaluation/metrics.json
+
 COMPOSE_DEMO = docker compose -p tessera-smoke -f docker-compose.yml -f deploy/docker-compose.demo.yml
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
 
 evaluate:
-	uv run --project detector python evaluation/evaluate.py
+	uv run --project detector python evaluation/evaluate.py --json $(METRICS)
 
 bench:
 	uv run --project detector --group ner python evaluation/benchmark.py
@@ -42,6 +44,9 @@ check-entity-types:
 
 check-layers:
 	python3 scripts/check_layers.py
+
+check-published-metrics:
+	python3 scripts/check_published_metrics.py $(METRICS)
 
 # Proves detector/'s runtime imports resolve with nothing but
 # [project.dependencies] installed — the exact gap that let a `packaging`

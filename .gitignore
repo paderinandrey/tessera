@@ -14,6 +14,9 @@ target/
 # Private corpus must never enter the repository
 evaluation/private/
 
+# Written by `make evaluate`, consumed by check-published-metrics
+evaluation/metrics.json
+
 # A developer's own quickstart audit journal, not a repository fixture
 tessera-audit.jsonl*
 

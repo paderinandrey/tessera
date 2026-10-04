@@ -247,7 +247,11 @@ TYPES = {
 
 
 def render(
-    template: str, fakers: dict[str, Faker], lang: str, rng: random.Random
+    template: str,
+    fakers: dict[str, Faker],
+    lang: str,
+    rng: random.Random,
+    apostrophes: random.Random,
 ) -> dict[str, object]:
     value_lang = lang if lang != "mixed" else rng.choice(["fr", "de"])
     faker = fakers[value_lang]
@@ -270,7 +274,15 @@ def render(
                 text += value
             elif name in ("person", "city", "org"):
                 value = {
-                    "person": faker.last_name,
+                    # **`faker.last_name()` is called either way, and the pool
+                    # overrides its result rather than replacing the call.**
+                    # Skipping it consumed one fewer draw from the instance and
+                    # shifted every value after it, so the first version of this
+                    # regenerated the whole corpus — and the recall figures then
+                    # moved for reasons that had nothing to do with an
+                    # apostrophe. The selection has its own `Random` for the
+                    # same reason: `rng` drives every other slot in this loop.
+                    "person": lambda: _apostrophe_or(faker.last_name(), value_lang, apostrophes),
                     "city": faker.city,
                     # faker.company() often returns a bare surname, which no
                     # annotator could tell from a PERSON; a suffix makes the
@@ -294,12 +306,53 @@ def render(
     return {"lang": lang, "text": text, "entities": entities}
 
 
+# Surnames carrying an apostrophe, which `faker.last_name` on these locales never
+# produces — measured: of 196 annotated values in the corpus this generated
+# before they were added, **zero** held `\'` or `\u2019`, while the text around
+# them held seventeen French elisions. So the shape the fence rule prices most
+# heavily was the one shape the quality gates could not see (#69).
+#
+# Both spellings on purpose. `O\'Brien` with U+0027 closes a string in YAML,
+# shell, SQL and Python, and is the character the bare rule is strict for.
+# `O\u2019Brien` with U+2019 closes a string in nothing at all and is refused
+# only because the rule is a list of what is known safe — and it is the one a
+# model actually emits in prose. Neither was reachable from this corpus, so
+# neither narrowing in #69 could be argued from a number.
+#
+# Attested in the populations these locales stand for rather than invented: Irish
+# and Italian-origin surnames are ordinary in France, Germany and Switzerland,
+# which is why the issue names these four.
+APOSTROPHE_SURNAMES = {
+    "fr": ["D\'Angelo", "L\u2019H\u00f4pital", "D\'Amico", "O\u2019Brien"],
+    "de": ["O\'Brien", "dell\u2019Orto", "D\'Agostino", "D\u2019Amico"],
+}
+
+# One person in this many is drawn from the pool above. Six leaves roughly a
+# dozen apostrophe-bearing PERSON values across the corpus — enough for a recall
+# figure to move measurably, and far from enough to make the corpus a test of
+# this one shape.
+APOSTROPHE_IN = 6
+
+
+def _apostrophe_or(drawn: str, lang: str, apostrophes: random.Random) -> str:
+    """One surname in `APOSTROPHE_IN` comes from the pool instead of `drawn`."""
+    pool = APOSTROPHE_SURNAMES[lang]
+    if apostrophes.randrange(APOSTROPHE_IN) == 0:
+        return pool[apostrophes.randrange(len(pool))]
+    return drawn
+
+
 def _tokenize(template: str) -> list[str]:
     return [t for t in re.split(r"(\{\w+\})", template) if t]
 
 
 def main() -> None:
     rng = random.Random(SEED)
+    # Its own stream, so choosing a pool name never perturbs the sequence that
+    # drives every other slot. Built here rather than at module scope so that
+    # calling `main()` twice in one process reseeds it alongside `rng` and the
+    # `Faker` instances, and the second corpus is byte-identical to the first.
+    apostrophes = random.Random(SEED ^ 0x0027)
     fakers = {"fr": Faker("fr_FR"), "de": Faker("de_DE")}
     for f in fakers.values():
         f.seed_instance(SEED)
@@ -307,7 +360,7 @@ def main() -> None:
     pools = [("fr", FR_TEMPLATES, 30), ("de", DE_TEMPLATES, 30), ("mixed", MIXED_TEMPLATES, 20)]
     for lang, templates, count in pools:
         for i in range(count):
-            doc = render(templates[i % len(templates)], fakers, lang, rng)
+            doc = render(templates[i % len(templates)], fakers, lang, rng, apostrophes)
             doc["id"] = f"{lang}-{i:04d}"
             documents.append(doc)
     for i, template in enumerate(CLEAN_TEMPLATES * 5):

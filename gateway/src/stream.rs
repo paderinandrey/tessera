@@ -3882,9 +3882,21 @@ mod buffer_tests {
         // a role" turned out to mean "no parser I listed".
         let kinds: std::collections::BTreeSet<&str> =
             refused["region"].iter().map(|(k, _)| k.as_str()).collect();
+        // **PERSON joined this set when the corpus learned to carry an
+        // apostrophe** (#97), and its arrival is #69's premise arriving as a
+        // measurement: `O'Brien`, `D'Angelo`, `dell’Orto` are the names this
+        // gateway exists for, and the strict rule prices every one of them. It
+        // was absent before only because `faker.last_name` on these locales
+        // never produces an apostrophe — the corpus held zero among 196 values.
+        //
+        // Re-recorded rather than widened. The number this test is named for is
+        // still three *formats* — `@`, `&`, `/` — and PERSON is a fourth *type*
+        // paying for a fourth character, which is the thing worth seeing.
         assert_eq!(
             kinds,
-            ["DE_STEUERNUMMER", "EMAIL", "ORG"].into_iter().collect(),
+            ["DE_STEUERNUMMER", "EMAIL", "ORG", "PERSON"]
+                .into_iter()
+                .collect(),
             "the set of formats a region cannot carry changed: {:#?}",
             refused["region"]
         );
@@ -3922,15 +3934,30 @@ mod buffer_tests {
             "the German company forms are what the ampersand costs in a region"
         );
 
-        // And the apostrophe, which is what #69 was opened about, costs nothing
-        // in either place — the corpus is synthetic and has no name carrying
-        // one. Recorded so the absence is read as "unmeasured" rather than
-        // "measured zero".
-        assert!(
-            !refused["region"]
+        // **And the apostrophe, which is what #69 was opened about, is measured
+        // now.** This used to assert the *absence* of one — the corpus had no
+        // name carrying one, and the tripwire was left so that absence read as
+        // "unmeasured" rather than "measured zero". It fired when the generator
+        // learned to draw them (#97), which is the tripwire working.
+        //
+        // What it measures: every apostrophe-bearing PERSON in the corpus is
+        // refused in a region, in both spellings. `'` closes a string in YAML,
+        // shell, SQL and Python; `’` closes one nowhere and is refused only
+        // because the bare rule lists what is known safe. The count is asserted
+        // rather than the mere existence, so a rule change that recovered some
+        // of them and not others is visible here.
+        let apostrophes = refused["region"]
+            .iter()
+            .filter(|(_, v)| v.contains('\'') || v.contains('\u{2019}'))
+            .count();
+        assert_eq!(
+            apostrophes,
+            11,
+            "the apostrophe cost in a region changed: {:#?}",
+            refused["region"]
                 .iter()
-                .any(|(_, v)| v.contains('\'') || v.contains('\u{2019}')),
-            "the corpus grew an apostrophe name; #69's premise is measurable now"
+                .filter(|(_, v)| v.contains('\'') || v.contains('\u{2019}'))
+                .collect::<Vec<_>>()
         );
     }
 
