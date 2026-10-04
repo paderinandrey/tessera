@@ -329,11 +329,6 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 #
 # Named rather than counted for the same reason `KNOWN_UNMASKED` is: a loss that
 # disappears while another appears holds the total and passes a number.
-# **5 -> 4 when PERSON's bar moved to 0.4** (#101's measurement, applied). The
-# arrival this set had from #97, D'Angelo in mixed-0017, is masked on the joined
-# path at the lower bar. Both paths mask more again: separate 227 -> 229,
-# joined 207 -> 209.
-#
 # Keyed by `row:offset` as well as type and text, because a value alone cannot
 # say *which* occurrence was lost: the corpus annotates dell(U+2019)Orto in three
 # rows and D'Angelo in two, and a loss moving between them would hold a
@@ -345,6 +340,7 @@ LOST_TO_JOINING = frozenset(
         ("fr-0009:32", "POLITICAL_AFFILIATION", "\u00e9cologiste"),
         ("mixed-0004:67", "HEALTH", "eine Hepatitis-B-Infektion"),
         ("mixed-0007:18", "PERSON", "Hermighausen"),
+        ("mixed-0017:18", "PERSON", "D'Angelo"),
     }
 )
 
@@ -425,4 +421,57 @@ def test_joining_does_not_cost_precision(detector: Detector) -> None:
     assert totals["joined_overmasked"] <= totals["separate_overmasked"], (
         "joining over-masked more spans than reading leaves apart: "
         f"{totals['joined_overmasked']} against {totals['separate_overmasked']}"
+    )
+
+
+# The two entities the four-sentence groups lose, which a lower PERSON bar would
+# recover there. Named by row so the shape question stays about these.
+LOST_TO_THE_GROUP_SHAPE = [("de-0004", "dell\u2019Orto"), ("mixed-0017", "D'Angelo")]
+
+
+@pytest.mark.parametrize(
+    ("row_id", "value"),
+    LOST_TO_THE_GROUP_SHAPE,
+    ids=[row for row, _ in LOST_TO_THE_GROUP_SHAPE],
+)
+def test_a_tool_argument_shape_is_found_at_the_shipped_bar(
+    detector: Detector, row_id: str, value: str
+) -> None:
+    """The gain a lower bar shows on `LEAVES` sentences does not exist in the
+    shape production actually joins.
+
+    `_documents()` groups four *unrelated* corpus sentences, because the corpus is
+    sentences — 344 and 399 characters for these two. A `Slot::Json` document's
+    leaves are field values: a name, a city, an identifier. At that size the
+    shipped bar already covers both, measured at 0.658 and 0.348 against 0.5,
+    while the four-sentence shape misses them and 0.4 recovers them at 0.479 and
+    0.411.
+
+    So this is the test that refused a threshold change. #102 moved PERSON to 0.4
+    to follow the selection rule, which maximises joined coverage; review asked
+    whether that coverage is representative, and it is not. Reverted, and this
+    keeps the answer re-runnable rather than leaving it in a closed thread.
+
+    Coverage by position, not by label: one of the two is covered under a
+    different type at this size, and a masking gateway is no worse off for the
+    placeholder's name being wrong — the same reason `_covered` asks by position.
+    """
+    rows = [document for group in _documents() for document in group]
+    row = next(document for document in rows if document["id"] == row_id)
+    leaves = [row["text"][e["start"] : e["end"]] for e in row["entities"]]
+    text = JOIN.join(leaves)
+    assert value in text, f"{value!r} is not one of {row_id}'s annotated values"
+    start = text.index(value)
+    span = Span(
+        entity_type="PERSON",
+        start=start,
+        end=start + len(value),
+        confidence=1.0,
+        recognizer="corpus",
+        tier=1,
+    )
+    assert _covered(text, span, detector.detect(text)), (
+        f"{value!r} reaches the provider in a {len(text)}-character tool-argument "
+        "shape — the bar is now too high for the shape production joins, which is "
+        "a different finding from the one this file's groups measure"
     )
