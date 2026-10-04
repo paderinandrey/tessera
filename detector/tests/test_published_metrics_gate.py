@@ -8,7 +8,16 @@ import pytest
 from tessera_detector.pipeline import build_detector
 from tessera_detector.version import detector_version
 
+# The gate establishes the weights identity itself, from the weights on disk
+# and the installed `ner` group. These tests have neither and are about the
+# agreement logic rather than the weights, so the identity is stubbed — and
+# `test_refuses_other_weights` asserts the comparison against it still happens.
 MODEL_ID = "probe-weights#probe-deps"
+
+
+@pytest.fixture(autouse=True)
+def _stub_expected_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gate, "expected_model_id", lambda: MODEL_ID)
 
 
 def _measurement() -> dict:
@@ -24,6 +33,7 @@ def _measurement() -> dict:
         "detector_version": detector_version(
             MODEL_ID, build_detector(ner=False).catalog_text
         ),
+        "evaluator_sha256": hashlib.sha256(gate.EVALUATOR.read_bytes()).hexdigest(),
         "model_id": MODEL_ID,
         "per_type": {
             entity_type: {
@@ -82,12 +92,41 @@ def test_refuses_another_detector(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert _run(tmp_path, measurement, monkeypatch) == 1
 
 
+def test_refuses_other_weights(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The case a `TESSERA_NER_MODEL` override produces. The gate must compare
+    # against an identity it established, never against the recorded one, or it
+    # accepts anything — which is what reviewers found it doing on #99.
+    measurement = _measurement()
+    measurement["model_id"] = "someone-elses-weights#deps"
+    assert _run(tmp_path, measurement, monkeypatch) == 1
+
+
 def test_refuses_a_measurement_without_a_model_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     measurement = _measurement()
     del measurement["model_id"]
     assert _run(tmp_path, measurement, monkeypatch) == 1
+
+
+def test_refuses_another_evaluator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # `evaluate.py` decides the Article 9 type list, the tier selection and the
+    # aggregation, none of which `detector_version` can see.
+    measurement = _measurement()
+    measurement["evaluator_sha256"] = "0" * 64
+    assert _run(tmp_path, measurement, monkeypatch) == 1
+
+
+def test_refuses_when_the_weights_identity_cannot_be_established(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without weights or the ner group this is unanswerable, and unanswerable
+    # has to fail: passing here would make the gate green on no evidence.
+    def unavailable() -> str:
+        raise RuntimeError("no weights")
+
+    monkeypatch.setattr(gate, "expected_model_id", unavailable)
+    assert _run(tmp_path, _measurement(), monkeypatch) == 1
 
 
 def test_refuses_a_disagreeing_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

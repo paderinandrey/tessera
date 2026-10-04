@@ -209,6 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     # disk by then instead of the code and rules that produced the figures.
     identity = {
         "detector_version": detector_version(detector.model_id, detector.catalog_text),
+        # This script decides the Article 9 type list, the tier selection and the
+        # aggregation, so it moves a published figure without moving anything
+        # `detector_version` covers.
+        "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "model_id": detector.model_id,
     }
     tier1_types = {rule.entity_type for rule in detector.deterministic.rules if rule.tier == 1}

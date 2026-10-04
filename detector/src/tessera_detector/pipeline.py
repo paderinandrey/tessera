@@ -7,6 +7,7 @@ neither layer resolves on its own (REQ-1, REQ-8).
 
 from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError
+from pathlib import Path
 from typing import Protocol
 
 from .deterministic import DeterministicDetector
@@ -137,6 +138,31 @@ class Detector:
         return resolve(spans, specificity=specificity).spans
 
 
+def ner_model_id(path: Path, deterministic_deps: str, ner_deps: str) -> str:
+    """The `model_id` of an NER-backed detector, composed rather than inlined.
+
+    `build_detector` is one caller. The other is
+    `scripts/check_published_metrics.py`, which has to establish what the
+    weights identity *should* be without taking a measurement's word for it —
+    a gate that derives its expectation from the value it is checking accepts
+    anything, which is what reviewers found it doing on #99. Neither input
+    needs an inference session: `weights_digest` hashes files and
+    `dependency_digest` reads installed metadata, so the verifier can reach
+    the same answer the builder does without loading the model.
+
+    Composing it here rather than letting the verifier spell out the same
+    f-string is the point. Two copies of an identity formula drift, and this
+    gate exists to complain about exactly that.
+
+    Every input is an argument, with no defaults and nothing read in here, for
+    the reason `version.version_from` gives for the same shape: a value this
+    function fetched itself would be the package's own copy rather than what a
+    caller actually loaded, and that is the bug the signature exists to make
+    unwriteable.
+    """
+    return f"{MODEL_NAME}@{weights_digest(path)}#{deterministic_deps}#{ner_deps}"
+
+
 def build_detector(
     *, ner: bool | None = None, catalog_text: str | None = None
 ) -> Detector:
@@ -229,10 +255,7 @@ def build_detector(
     return Detector(
         catalog_text=catalog_text,
         recognizer=recognizer,
-        model_id=(
-            f"{MODEL_NAME}@{weights_digest(path)}#{deterministic_deps}"
-            f"#{recognizer.dependency_digest}"
-        ),
+        model_id=ner_model_id(path, deterministic_deps, recognizer.dependency_digest),
     )
 
 
@@ -245,4 +268,5 @@ __all__ = [
     "Detector",
     "NerRecognizer",
     "build_detector",
+    "ner_model_id",
 ]

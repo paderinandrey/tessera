@@ -51,12 +51,14 @@ import pathlib
 import re
 import sys
 
-from tessera_detector.pipeline import build_detector
+from tessera_detector.models import dependency_digest, model_cache_dir
+from tessera_detector.pipeline import PACKAGE_NAME, build_detector, ner_model_id
 from tessera_detector.version import detector_version
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 CORPUS = ROOT / "evaluation" / "corpus" / "public.jsonl"
+EVALUATOR = ROOT / "evaluation" / "evaluate.py"
 
 
 # `| PERSON | 0.968 | 0.803 | 0.878 |`, which is the only three-decimal row
@@ -68,6 +70,20 @@ COVERAGE = re.compile(r"\*\*Article 9 coverage is (\d\.\d{4}) \((\d+) of (\d+)\)
 # `make evaluate   # ... + the Tier 1 recall gate (>= 0.99)`
 TIER1 = re.compile(r"Tier 1 recall gate \(>= (\d\.\d+)\)")
 
+
+
+def expected_model_id() -> str:
+    """What the weights identity has to be, established here rather than read
+    out of the file being checked.
+
+    Composed by `pipeline.ner_model_id`, the same function `build_detector`
+    uses, so the two cannot drift. Needs the weights on disk and the `ner`
+    group installed — both true wherever a measurement could have been taken —
+    and needs no inference session: file hashes and installed metadata only.
+    """
+    return ner_model_id(
+        model_cache_dir(), dependency_digest(PACKAGE_NAME), dependency_digest("gliner")
+    )
 
 
 def published_rows(text: str) -> dict[str, tuple[str, str, str]]:
@@ -119,22 +135,46 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    model_id = measured.get("model_id")
-    if not isinstance(model_id, str):
-        print(f"FAIL: {path} records no model_id", file=sys.stderr)
+    evaluator = hashlib.sha256(EVALUATOR.read_bytes()).hexdigest()
+    if measured.get("evaluator_sha256") != evaluator:
+        # `detector_version` covers the detector, not the script that turns its
+        # spans into the published figures: the Article 9 type list, the tier
+        # selection and the aggregation all live in `evaluate.py` and all move a
+        # number without moving the detector.
+        print(
+            f"FAIL: {path} was written by evaluator "
+            f"{measured.get('evaluator_sha256')}, but evaluate.py is {evaluator}. "
+            "Re-run the measurement.",
+            file=sys.stderr,
+        )
         return 1
-    # `detector_version` is recomputed with the weights identity the measurement
-    # recorded and the catalog a detector built here actually parses, so a
-    # changed threshold, rule, catalog or interpreter moves it. The weights
-    # themselves are taken as recorded: naming them honestly means digesting the
-    # bytes that loaded, which needs the model this script deliberately avoids.
-    expected = detector_version(model_id, build_detector(ner=False).catalog_text)
+    try:
+        wanted_model = expected_model_id()
+    except Exception as error:
+        print(
+            f"FAIL: cannot establish the expected weights identity: {error}. "
+            "This needs the pinned weights (`make model`) and the ner group, "
+            "which any run that could have produced a measurement already had.",
+            file=sys.stderr,
+        )
+        return 1
+    if measured.get("model_id") != wanted_model:
+        print(
+            f"FAIL: {path} was measured with weights {measured.get('model_id')}, "
+            f"but this tree pins {wanted_model}. Figures produced through a "
+            "`TESSERA_NER_MODEL` override are not the published ones.",
+            file=sys.stderr,
+        )
+        return 1
+    # Composed from the identity established above rather than the recorded one,
+    # so nothing in this comparison comes from the file being checked.
+    expected = detector_version(wanted_model, build_detector(ner=False).catalog_text)
     if measured.get("detector_version") != expected:
         print(
             f"FAIL: {path} was measured by detector {measured.get('detector_version')}, "
-            f"but this tree with those weights is {expected}. A threshold, a rule, a "
-            "catalog or the interpreter changed, which moves the figures without "
-            "moving the corpus. Re-run the measurement.",
+            f"but this tree is {expected}. A threshold, a rule, a catalog or the "
+            "interpreter changed, which moves the figures without moving the "
+            "corpus. Re-run the measurement.",
             file=sys.stderr,
         )
         return 1
