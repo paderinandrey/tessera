@@ -81,6 +81,9 @@ entities:
     #
     # So the plateau is gone and 0.5 is no longer what the rule picks — a weaker
     # statement than it being wrong, and the reason it is still shipped.
+    # What is unambiguous is the decision this bar's history actually records:
+    # the selection lands **below 0.7 on 100.0% of resamples**. Lowering it from
+    # 0.7 was right; which low value to sit on is the part that is a choice.
     # `separate_found` is 184 either way: 0.4 finds nothing extra on the path an
     # ordinary request takes, and over-masks twice more there. Its whole gain is
     # on the joined path, which is the path the selection rule was written around

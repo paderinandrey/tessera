@@ -327,6 +327,17 @@ def main() -> int:
     }
     plateau_selections = sum(1 for winners in rounds if set(winners) <= plateau)
     on_plateau = plateau_selections / RESAMPLES
+    # **The decision this script was written to defend, stated directly rather
+    # than through the plateau.** The change it reports on is "lower the bar from
+    # 0.7", and the plateau around the shipped value was a proxy for that — a
+    # faithful one only while the shipped value and the winner were tied. They
+    # are not any more, so the proxy now discards every resample won by the
+    # *other* low threshold and reports a decision as unstable because a
+    # different low value beat it. Asked as itself: how often does the selection
+    # land below the bar this change lowered? Raised by review on #101.
+    LOWERED_FROM = max(THRESHOLDS)
+    lowered = sum(1 for winners in rounds if all(t < LOWERED_FROM for t in winners))
+    on_lowered = lowered / RESAMPLES
 
     # **Around the shipped threshold, which is not always the winner.** This
     # heading used to say "conditioned on the observed winner" and `CHOSEN` used
@@ -365,14 +376,24 @@ def main() -> int:
     # predeclared one failed, and a script that exits 0 on a failed predeclared
     # test is presenting a post-hoc criterion as validation. Disclosure is not a
     # substitute for the verdict. Raised in review on #48.
+    print(
+        f"\n  the selection lands below {LOWERED_FROM} on {on_lowered:.1%} of resamples — "
+        f"the decision this change makes, asked as itself"
+    )
+    if on_lowered < DECISION:
+        print(
+            f"  that is below {DECISION:.0%}: even lowering the bar is not stable here."
+        )
     plateau_text = "/".join(str(t) for t in sorted(plateau))
     print(
-        f"\n  the selection lands on the plateau ({plateau_text}) on {on_plateau:.1%} of "
-        f"resamples — the thresholds tied with {CHOSEN} on joined recall in every group, "
-        f"and so in every possible resample"
+        f"  and on the plateau around the shipped {CHOSEN} ({plateau_text}) on "
+        f"{on_plateau:.1%} — the thresholds tied with it on joined recall in every group"
     )
-    if on_plateau < DECISION:
-        print(f"  even the plateau is below {DECISION:.0%}: the sweep found noise.")
+    if plateau == {CHOSEN}:
+        print(
+            f"  {CHOSEN} has no plateau left: nothing is tied with it per group, so that "
+            "figure is its own stability and not a wider result"
+        )
 
     print()
     if stability < DECISION:
@@ -381,7 +402,10 @@ def main() -> int:
             f"{stability:.1%} of resamples, below {DECISION:.0%}."
         )
         print(f"  {CHOSEN} is NOT calibrated as an exact value and must not be called one.")
-        print("  The plateau result above stands on its own and does not rescue this verdict.")
+        print(
+            f"  The {on_lowered:.1%} above is a different and weaker claim — that the bar "
+            f"belongs below {LOWERED_FROM} — and does not rescue this verdict."
+        )
         return 1
     print(f"  {CHOSEN} is selected on {stability:.1%} of resamples, clearing {DECISION:.0%}")
     return 0
