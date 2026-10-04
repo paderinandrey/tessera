@@ -7,7 +7,7 @@ import pytest
 
 import tessera_detector.ner as ner_module
 from tessera_detector.models import find_model
-from tessera_detector.ner import GlinerRecognizer, load_ner_types
+from tessera_detector.ner import GlinerRecognizer, deduplicated, load_ner_types
 from tessera_detector.spans import Span
 
 pytestmark = pytest.mark.ner
@@ -288,6 +288,11 @@ def test_dispatching_windows_to_threads_changes_no_answer(
     So "the same spans" is not the claim that matters; `map` preserving
     submission order is, and this checks it on a text long enough to fill
     several batches.
+
+    The reference folds `deduplicated` the way `detect` does, because that step
+    is being held constant rather than tested: `person` is asked in two passes
+    now, so a reference without it differs from `detect` on every repeated name
+    and the order claim disappears behind the noise.
     """
     text = "Sehr geehrter Herr Röhrdanz, die Kundin Martina Weber aus Zürich rief an. " * 20
 
@@ -299,7 +304,7 @@ def test_dispatching_windows_to_threads_changes_no_answer(
                 spans.extend(
                     recognizer._spans_from(base, piece, inference, at_boundary=at_boundary)
                 )
-        return spans
+        return deduplicated(spans)
 
     def shape(spans: list[Span]) -> list[tuple[str, int, int, float, bool]]:
         return [(s.entity_type, s.start, s.end, s.confidence, s.boosted) for s in spans]

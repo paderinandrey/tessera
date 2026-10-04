@@ -142,9 +142,9 @@ are published rather than trimmed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| PERSON | 0.968 | 0.803 | 0.878 |
-| LOCATION | 0.727 | 1.000 | 0.842 |
-| ORG | 0.148 | 0.333 | 0.205 |
+| PERSON | 0.959 | 0.934 | 0.947 |
+| LOCATION | 1.000 | 1.000 | 1.000 |
+| ORG | 0.167 | 0.333 | 0.222 |
 
 Article 9 special categories are detected by the same layer at a lower threshold, and
 **Article 9 coverage is 0.9783 (45 of 46)**:
@@ -166,7 +166,7 @@ Article 9 special categories are detected by the same layer at a lower threshold
 The gate that matters is not a per-type score: **every annotated entity with a word
 reaching the provider is named individually**, and `make evaluate` fails on any that is not
 already written down. [Evaluation](docs/evaluation.md) explains what each gate checks and
-what the eight remaining misses are.
+what the four remaining misses are.
 
 ## How fast it is
 
@@ -176,11 +176,17 @@ make bench      # per-layer p95 across three document sizes
 
 Measured on an Apple M3 Pro (11 cores, CPU only) with the pinned fp32 ONNX weights:
 
-| Size | Deterministic | NER tier 2 | NER tier 3 | Total (median) | Total (p95) |
-|---|---|---|---|---|---|
-| sentence (80 chars) | 0.0 ms | 42 ms | 66 ms | 109 ms | 116 ms |
-| paragraph (1 200 chars) | 0.6 ms | 467 ms | 491 ms | 950 ms | 1 108 ms |
-| document (6 000 chars) | 3.3 ms | 2 556 ms | 3 180 ms | 5 524 ms | 6 086 ms |
+| Size | Deterministic | NER tier 2 | NER `person` | NER tier 3 | Total (median) | Total (p95) |
+|---|---|---|---|---|---|---|
+| sentence (80 chars) | 0.0 ms | 49 ms | 42 ms | 80 ms | 110 ms | 134 ms |
+| paragraph (1 200 chars) | 0.9 ms | 544 ms | 600 ms | 648 ms | 1 352 ms | 1 590 ms |
+| document (6 000 chars) | 3.7 ms | 2 938 ms | 2 855 ms | 3 269 ms | 6 767 ms | 7 150 ms |
+
+`person` is asked in a call of its own as well as in tier 2's, because sharing one made a
+competitor take the argmax and then fail its own bar — the whole surname went to the
+provider ([#97](https://github.com/paderinandrey/tessera/issues/97)). It costs about what a
+tier-2 pass costs, which is what the per-pass pricing below predicts: a paragraph's median
+went from 896 ms to 1 352 ms measured in one session.
 
 > **The target is not met.** REQ-38 asks for p95 under 80 ms without the LLM layer, and the
 > detector does not reach it with the NER layer enabled — not by a margin that tuning

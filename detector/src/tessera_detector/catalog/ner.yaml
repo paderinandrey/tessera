@@ -16,6 +16,7 @@
 entities:
   - entity_type: PERSON
     label: person
+    own_pass: true
     # **0.5, on a plateau that is measured; the exact value is a tie-break.**
     # An earlier version of this note said "the number is measured rather than
     # chosen", which the resampling below refutes — see it before quoting this

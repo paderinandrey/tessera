@@ -46,6 +46,10 @@ class NerType:
     # a family name in Vietnamese and `Das` in Bengali, so one on its own is not
     # evidence of anything.
     trim_leading_articles: frozenset[str] = frozenset()
+    # Asks for this label in a call of its own rather than with the rest of its
+    # tier. GLiNER returns one label per span, so labels in a single call bid
+    # against each other and only the argmax survives.
+    own_pass: bool = False
 
 
 def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
@@ -105,6 +109,11 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 "and an article: an article is only trimmed ahead of another trimmable word, and "
                 "listing it in both would trim it unconditionally."
             )
+        own_pass = entry.get("own_pass", False)
+        if not isinstance(own_pass, bool):
+            raise ValueError(
+                f"ner type {entity_type!r} declares own_pass {own_pass!r}, which is not a boolean"
+            )
         types.append(
             NerType(
                 entity_type=entity_type,
@@ -114,9 +123,39 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 specificity=specificity,
                 trim_leading=trim_leading,
                 trim_leading_articles=trim_leading_articles,
+                own_pass=own_pass,
             )
         )
     return tuple(types)
+
+
+def deduplicated(spans: list[Span]) -> list[Span]:
+    """One span per (bounds, type), keeping the highest confidence.
+
+    Two mechanisms produce the same finding twice. Overlapping windows have
+    always been able to: an entity inside the overlap is found in both, at the
+    same absolute offsets. A label with `own_pass` adds the second, since it is
+    asked for in its tier's call and again in its own.
+
+    Order is the order of first appearance, because `detect`'s own comment is
+    explicit that the result is the same list the sequential loop produced —
+    the same order, not merely the same set.
+
+    `pipeline.Detector` already collapsed these through `resolve`, so this
+    changes no masking decision; it makes the recognizer's own output say once
+    what it found once.
+    """
+    best: dict[tuple[int, int, str], Span] = {}
+    order: list[tuple[int, int, str]] = []
+    for span in spans:
+        key = (span.start, span.end, span.entity_type)
+        current = best.get(key)
+        if current is None:
+            order.append(key)
+            best[key] = span
+        elif span.confidence > current.confidence:
+            best[key] = span
+    return [best[key] for key in order]
 
 
 # Boundaries to prefer when cutting, best first: a chunk that ends mid-entity
@@ -658,16 +697,22 @@ class GlinerRecognizer:
         # because a quasi-identifier won the argmax and then failed its bar.
         # Separate passes cost one inference per tier and keep the categories
         # from bidding against each other.
-        by_tier: dict[int, list[NerType]] = {}
+        # A type with `own_pass` gets a call to itself **in addition to** its
+        # tier's, and both results are kept. Competition does not move a score
+        # in one direction: it deflates some and inflates others, so dropping
+        # the grouped call would trade one set of misses for another.
+        by_group: dict[tuple[int, str], list[NerType]] = {}
         for ner_type in self.types:
-            by_tier.setdefault(ner_type.tier, []).append(ner_type)
+            by_group.setdefault((ner_type.tier, ""), []).append(ner_type)
+            if ner_type.own_pass:
+                by_group.setdefault((ner_type.tier, ner_type.label), []).append(ner_type)
         self.passes = tuple(
             InferencePass(
                 tier=tier,
                 labels=tuple(t.label for t in group),
                 threshold=min(t.threshold for t in group),
             )
-            for tier, group in sorted(by_tier.items())
+            for (tier, _), group in sorted(by_group.items())
         )
 
     def _windows(self, chunk: str) -> list[tuple[int, int]]:
@@ -763,7 +808,7 @@ class GlinerRecognizer:
                     drain()
         if batch:
             drain()
-        return spans
+        return deduplicated(spans)
 
 
 __all__ = [
@@ -771,6 +816,7 @@ __all__ = [
     "InferencePass",
     "NerType",
     "chunks",
+    "deduplicated",
     "load_ner_types",
     "token_windows",
 ]

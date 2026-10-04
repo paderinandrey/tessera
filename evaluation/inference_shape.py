@@ -5,35 +5,62 @@ thresholds calibrated without competition, and names `Texier` — claimed by
 `location` at 0.585 while `person`, asked alone, scores it 0.704. That
 mechanism is real and this script confirms it.
 
-The detector asks one question per tier: three tier-2 labels in one call, eleven
-tier-3 labels in another. The alternative is one call per label — no
-competition, and no possibility of one label suppressing another's score.
+The detector used to ask one question per tier: three tier-2 labels in one call,
+eleven tier-3 labels in another. It now asks a third, `person` alone, for the
+reason below. The alternative this script was written to test is one call per
+label — no competition, and no possibility of one label suppressing another's
+score.
 
 Measured over the 130-document public corpus, scored **by position**, because a
 placeholder's name is not what protects anyone:
 
-    grouped (today)      found 185/196   over-masked 34 spans    9.4s
-    one label per call   found 182/196   over-masked 38 spans   34.1s
+    grouped (one call per tier)   found 179/196   over-masked 35 spans   10.6s   2 calls
+    shipped (#97)                 found 184/196   over-masked 35 spans   12.4s   3 calls
+    one label per call            found 180/196   over-masked 37 spans   38.6s  14 calls
 
-**Those two rows on their own are not a fair comparison, and reporting them
-alone was this script's first version.** Every threshold in the catalog was
-swept on the grouped path (#45), so judging the other shape at those numbers
-compares a calibrated configuration against an uncalibrated one. The
-single-label arm therefore gets a sweep of its own:
+**The shipped shape is neither of the two this script was written to compare**,
+and that is #97's answer to #46. `person` is asked in a call of its own *as well
+as* in tier 2's, and the union finds five more entities than grouped **at the
+same over-masking cost**, for one extra call.
 
-    thresholds -0.2      found 187/196   over-masked 58 spans
-    thresholds -0.1      found 186/196   over-masked 46 spans
-    thresholds +0.1      found 180/196   over-masked 28 spans
+The first version of the grouped arm here sorted each tier's labels, which put
+tier 2 in `(location, organization, person)` instead of the catalog's
+`(person, location, organization)`. The labels are an ordered prompt, so that
+changed the question as well as the shape, and it mattered: 28 over-masked spans
+against 35 for the same 179 found. Reported the shipped arm as costing seven
+spans it does not cost. Raised by review on #100, and the tiers are still sorted
+because their order *between* calls is not an input to any of them.
 
-**It can beat the grouped arm on coverage** — 186 and 187 against 185 — which
-the unswept comparison hid. What it cannot do is beat it at *equal* coverage:
-matching 185 lands it near 44 over-masked spans against 34, and it spends 3.6x
-the wall clock getting there. Grouped dominates rather than merely wins, which
-is a weaker claim than the first version made and a true one.
+The script also used to read its grouped arm off `recognizer.passes`, which stopped
+being the grouped shape when #97 landed — so it would have compared the shipped
+hybrid against figures recorded for grouped and called the result a confirmation.
+Raised by review on #100. The grouped arm is composed from `types` now, and
+`shipped` is an arm of its own.
 
-The membership at the unswept point is still worth reading. The single-label arm
-gains exactly one entity — `Texier`, the example #46 is built on — and loses
-four, one of them an Article 9 special category a gate covers.
+**The conclusion this script used to carry — "grouped dominates" — was true of a
+corpus that could not show the case against it.** It was measured before the
+generator drew apostrophe-bearing surnames, of which the corpus then held zero in
+196 annotated values. Grouped loses whole surnames when a tier-2 competitor takes
+the argmax and then fails its own bar, which is #46's mechanism and was invisible
+at the time. The figures above are a re-measurement on the current corpus, so
+they also differ from the ones this docstring used to quote (185/34/9.4s and
+182/38/34.1s) for that second reason.
+
+**Against the shipped shape, one label per call gains nothing.** It loses four:
+`test génétique`, `Humbert et Fils`, and `Haase` and `Marin` — the last two
+because competition *supports* a score as readily as it suppresses one, which is
+the same pair #97 lost when its first attempt removed the grouped call. The
+sweep cannot buy its way past it: matching 184 found costs 46 over-masked spans
+against 35, and 186 costs 57.
+
+    thresholds -0.2      found 186/196   over-masked 57 spans
+    thresholds -0.1      found 184/196   over-masked 46 spans
+    thresholds +0.1      found 177/196   over-masked 27 spans
+
+Every threshold in the catalog was swept on the grouped path (#45), so the
+single-label arm gets offsets of its own rather than being judged at bars
+calibrated for a different shape — this is a frontier, not a calibration, and
+the only question is whether it reaches the shipped arm's coverage at any bar.
 
 **Scores are relative.** With a label set the model contrasts; with one label it
 has nothing to contrast against, and a weak-but-correct label can come out lower
@@ -42,12 +69,17 @@ rather than higher. Competition suppresses some scores and supports others.
 The consequence that outlives this script: **every threshold in the catalog is
 calibrated against competition.** Any change to the asking shape invalidates the
 calibration, and a re-sweep is the price of proposing one — not an optional
-refinement, since without one this script's own first answer was wrong.
+refinement, since without one this script's own first answer was wrong. #97 did
+not pay it, which is why `person`'s own call keeps the catalog's bars: it adds a
+reading rather than replacing the one the bars were swept against.
 
-Not run in CI: it needs the NER weights and takes about **nine minutes** on an
-M-series laptop — the swept rows are the slow part, because a lower bar produces
-many more spans for the resolver to fold. Measured rather than guessed; the
-first version of this line said three, from timing one row and multiplying.
+Not run in CI: it needs the NER weights, and the row times above and below sum
+to about **three minutes** on an M-series laptop plus the model load — the swept
+rows are the slow part, because a lower bar produces many more spans for the
+resolver to fold. Taken from the rows the run prints rather than from a
+stopwatch, and lower than the nine minutes this line used to claim: that figure
+predates both the current corpus and the shipped arm, and is not a number this
+run can confirm.
 
 It is here to be re-run when somebody proposes changing the asking shape.
 
@@ -110,14 +142,42 @@ def main() -> int:
         return 2
 
     recognizer = detector.recognizer
-    grouped = recognizer.passes
+    # **Built rather than read off the recognizer.** `recognizer.passes` used to
+    # be the grouped shape, so this line used to be `grouped = recognizer.passes`
+    # — and #97 made that false: `person` is now asked in a call of its own as
+    # well as in tier 2's, so the tuple holds a third shape and the arm labelled
+    # `grouped` would have been running it while being compared against the
+    # grouped figures recorded above. Raised by review on #100. Composed from
+    # `types` here, which is where the tiers actually live.
+    # Catalog order within a tier, not sorted. The labels are an ordered prompt
+    # to the model, so sorting them changes the input as well as the shape —
+    # `(location, organization, person)` is a different question from
+    # `(person, location, organization)`, and an arm that changes both is not a
+    # controlled comparison. Raised by review on #100; the tiers themselves are
+    # sorted, because their order between calls is not an input to any of them.
+    by_tier: dict[int, list[str]] = {}
+    for kind in recognizer.types:
+        by_tier.setdefault(kind.tier, []).append(kind.label)
+    grouped = tuple(
+        InferencePass(
+            tier=tier,
+            labels=tuple(labels),
+            threshold=min(k.threshold for k in recognizer.types if k.tier == tier),
+        )
+        for tier, labels in sorted(by_tier.items())
+    )
+    shipped = recognizer.passes
     single = tuple(
         InferencePass(tier=kind.tier, labels=(kind.label,), threshold=kind.threshold)
         for kind in sorted(recognizer.types, key=lambda kind: (kind.tier, kind.label))
     )
 
     results = {}
-    for name, passes in (("grouped", grouped), ("one label per call", single)):
+    for name, passes in (
+        ("grouped", grouped),
+        ("shipped (#97)", shipped),
+        ("one label per call", single),
+    ):
         recognizer.passes = passes
         results[name] = _run(detector, rows)
         found, over, elapsed = results[name]
@@ -161,16 +221,20 @@ def main() -> int:
             f"over-masked {over:3} spans   {elapsed:6.1f}s"
         )
         recognizer.types, recognizer._by_label = keep_types, keep_index
-    recognizer.passes = grouped
+    recognizer.passes = shipped
 
-    grouped_found, _, _ = results["grouped"]
+    # Compared against what is shipped, not against `grouped`. The grouped shape
+    # stopped being production in #97, and measuring a candidate against a
+    # baseline nobody runs is how a script keeps confirming a conclusion that has
+    # already moved — the defect review on #100 found one line above.
+    shipped_found, _, _ = results["shipped (#97)"]
     single_found, _, _ = results["one label per call"]
 
-    print("\none label per call gains:")
-    for entity in sorted(single_found - grouped_found):
+    print("\none label per call gains over the shipped shape:")
+    for entity in sorted(single_found - shipped_found):
         print(f"  {entity[0]:11} {entity[3]:12} {entity[4]!r}")
-    print("\none label per call loses:")
-    for entity in sorted(grouped_found - single_found):
+    print("\none label per call loses against it:")
+    for entity in sorted(shipped_found - single_found):
         print(f"  {entity[0]:11} {entity[3]:12} {entity[4]!r}")
 
     # **The verdict is an exit status**, so a future run that reverses it
@@ -182,14 +246,15 @@ def main() -> int:
     # single-label configuration that finds at least as much while over-masking
     # no more? Coverage alone is the number somebody would quote to justify the
     # change, and it is the one that needs its price attached.
-    ceiling = results["grouped"][1]
+    ceiling = results["shipped (#97)"][1]
     dominates = any(
-        found >= len(grouped_found) and over <= ceiling for found, over in frontier
+        found >= len(shipped_found) and over <= ceiling for found, over in frontier
     )
     print(
-        "\na single-label configuration dominates grouped; the asking shape is worth changing"
+        "\na single-label configuration dominates the shipped shape; the asking shape is "
+        "worth changing again"
         if dominates
-        else f"\nno single-label configuration measured finds >= {len(grouped_found)} "
+        else f"\nno single-label configuration measured finds >= {len(shipped_found)} "
         f"while over-masking <= {ceiling}"
     )
     return 0 if dominates else 1
