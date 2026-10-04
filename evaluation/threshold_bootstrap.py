@@ -25,24 +25,38 @@ Predeclared, before running:
   decision    the threshold is calibrated if the selection rule returns it on
               >= 95% of resamples
 
-**The predeclared test fails, and the failure is the useful part.** Re-running
-the selection returns 0.5 on 86.4% of resamples — below the bar — with 0.6
-taking 1.1%, 0.7 and 0.4 none outright, and 12.4% undecided between 0.4 and 0.5.
-So the sweep's *exact value* is not recoverable from resampled data and must not
-be described as calibrated. The script exits non-zero on that verdict.
+**The predeclared test fails, and what fails has changed.** When this was
+written, re-running the selection returned 0.5 on 86.4% of resamples — below the
+bar, but with 98.2% of resamples selecting 0.5 or unable to separate it from 0.4.
+The instability was a tie-break on a plateau and nothing near 0.7 survived.
 
-What is recoverable is the **plateau**: 98.2% of resamples select 0.5 or cannot
-separate it from 0.4 — two thresholds tied on joined recall in every cached
-group, and therefore in every possible resample, separated only by two
-over-masked spans on the separate path. The instability is entirely a tie-break
-between them; nothing near 0.7 survives.
+**Re-measured after #97 gave `person` a call of its own, the selection moves off
+0.5 entirely:**
 
-That distinction is reported as two verdicts rather than folded into one,
-because the second is a criterion written *after* seeing the first fail, and
-that is a thing to declare rather than to quietly substitute. It is defensible
-only because it is the decision the change actually makes — lower the bar from
-0.7 — and not the decision the strict test asks about, which is whether 0.5
-beats 0.4. It does not, reliably, and neither does 0.4 beat 0.5.
+    0.4:  88.9%      0.5:  9.8%      0.6:  0.1%      0.7:  0.0%
+    undecided: 1.2%
+
+0.4 is no longer tied with 0.5; it wins outright, because the shape change moved
+which entities the joined path covers. Per group over the whole corpus:
+
+    0.4   joined_found 182   separate_found 184   lost 4   separate_overmasked 38
+    0.5   joined_found 180   separate_found 184   lost 5   separate_overmasked 36
+
+**What 0.4 buys and where it spends.** Two more entities covered on the *joined*
+path for two more over-masked spans on the *separate* path. `separate_found` is
+184 either way — on the path an ordinary request takes, 0.4 finds nothing extra
+and over-masks twice more. The selection rule prefers it because the rule was
+written around #44's joined-path concern, which is the one case where the gain
+lands. That is a reason to read the rule's verdict rather than apply it: this
+script measures, and whether to spend separate-path precision on joined-path
+recall is not a question a sort key should answer by itself.
+
+It also does not reach what #97 left behind: `person` scores `L(U+2019)Hopital`
+at 0.019 and `dell(U+2019)Orto` at 0.268 asked alone, both below 0.4.
+
+**So the shipped 0.5 can no longer be described as the value the selection rule
+picks**, which is a weaker claim than it being wrong. The catalog still ships
+0.5, deliberately and pending a decision.
 
 **The selection is re-run inside every resample, not conditioned on its own
 result.** A first version fixed 0.5 and bootstrapped the pairwise differences
@@ -97,7 +111,29 @@ CATALOG = (
 )
 TUNED_TYPE = "PERSON"
 THRESHOLDS = (0.4, 0.5, 0.6, 0.7)
-CHOSEN = 0.5
+
+
+def _shipped_threshold() -> float:
+    """What the catalog actually declares, rather than a second copy of it.
+
+    This was `CHOSEN = 0.5`, a literal — so the day the catalog moved, every
+    line below would have reported about a value nothing ships, including the
+    verdict. The same defect review found in `inference_shape.py`'s grouped arm
+    on #100, in a script whose whole job is to judge this number.
+    """
+    catalog = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))
+    for entry in catalog["entities"]:
+        if entry["entity_type"] == TUNED_TYPE:
+            return float(entry["threshold"])
+    raise SystemExit(f"no {TUNED_TYPE} entry in {CATALOG}")
+
+
+CHOSEN = _shipped_threshold()
+if CHOSEN not in THRESHOLDS:
+    raise SystemExit(
+        f"{TUNED_TYPE} ships {CHOSEN}, which is not among the swept values "
+        f"{THRESHOLDS} — add it, or this script judges a number it never measured"
+    )
 RESAMPLES = 2000
 # The rule the sweep applied, as a sort key: **most entities covered on the
 # joined path**, then fewest over-masked spans on the separate path. Written as
@@ -147,6 +183,7 @@ def counts_at(threshold: float, model_path: Path) -> list[dict[str, int]]:
     rows = []
     for group in joined._documents():
         truth, separate, together = joined._rebased(detector, group)
+        text = joined.JOIN.join(document["text"] for document in group)
         entities = [EvalEntity(entity_type=s.entity_type, start=s.start, end=s.end) for s in truth]
 
         def overmasked(predictions: list[Span], gold: list[EvalEntity] = entities) -> int:
@@ -158,12 +195,15 @@ def counts_at(threshold: float, model_path: Path) -> list[dict[str, int]]:
         rows.append(
             {
                 "truth": len(truth),
-                "joined_found": sum(1 for e in truth if joined._covered(e, together)),
-                "separate_found": sum(1 for e in truth if joined._covered(e, separate)),
+                "joined_found": sum(1 for e in truth if joined._covered(text, e, together)),
+                "separate_found": sum(1 for e in truth if joined._covered(text, e, separate)),
+                # `joined._lost`, not a re-implementation of it. This used to ask
+                # `_covered(separate) and not _covered(together)`, which is a
+                # different question — `_lost` is about the *words* a truth leaves
+                # unmasked on each path, and the docstring above claims this
+                # script cannot drift from the gate. It had.
                 "lost_to_joining": sum(
-                    1
-                    for e in truth
-                    if joined._covered(e, separate) and not joined._covered(e, together)
+                    1 for e in truth if joined._lost(text, e, separate, together)
                 ),
                 "joined_overmasked": overmasked(together),
                 "separate_overmasked": overmasked(separate),
