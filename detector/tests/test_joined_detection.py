@@ -329,6 +329,11 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 #
 # Named rather than counted for the same reason `KNOWN_UNMASKED` is: a loss that
 # disappears while another appears holds the total and passes a number.
+# **5 -> 4 when PERSON's bar moved to 0.4** (#101's measurement, applied). The
+# arrival this set had from #97, D'Angelo in mixed-0017, is masked on the joined
+# path at the lower bar. Both paths mask more again: separate 227 -> 229,
+# joined 207 -> 209.
+#
 # Keyed by `row:offset` as well as type and text, because a value alone cannot
 # say *which* occurrence was lost: the corpus annotates dell(U+2019)Orto in three
 # rows and D'Angelo in two, and a loss moving between them would hold a
@@ -340,7 +345,6 @@ LOST_TO_JOINING = frozenset(
         ("fr-0009:32", "POLITICAL_AFFILIATION", "\u00e9cologiste"),
         ("mixed-0004:67", "HEALTH", "eine Hepatitis-B-Infektion"),
         ("mixed-0007:18", "PERSON", "Hermighausen"),
-        ("mixed-0017:18", "PERSON", "D'Angelo"),
     }
 )
 

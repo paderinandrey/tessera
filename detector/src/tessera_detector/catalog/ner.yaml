@@ -17,7 +17,7 @@ entities:
   - entity_type: PERSON
     label: person
     own_pass: true
-    # **0.5, on a plateau that is measured; the exact value is a tie-break.**
+    # **0.4, which is what the selection rule picks; it is not calibrated.**
     # An earlier version of this note said "the number is measured rather than
     # chosen", which the resampling below refutes — see it before quoting this
     # number as calibrated. A threshold is a
@@ -36,10 +36,10 @@ entities:
     #        0.5        182                  4               19             34
     #        0.4        182                  4               19             36
     #
-    # 0.5 recovers eight of the twelve entities joining costs, adds nothing to
-    # over-masking on the joined path and one span on the separate one. 0.4
-    # recovers nothing further and costs two more there, so 0.5 is the top of a
-    # plateau rather than a point on a slope.
+    # 0.5 recovered eight of the twelve entities joining cost, adding nothing to
+    # over-masking on the joined path and one span on the separate one, and 0.4
+    # recovered nothing further — which is why 0.5 was taken at the time. That
+    # table is the *pre-`own_pass`* measurement; see below for where it moved.
     #
     # **Checked by re-running the sweep**, because a best-of-four on 130
     # documents can find noise, and the reported result and the CI gate come
@@ -79,16 +79,29 @@ entities:
     #        0.4        182              184             38
     #        0.5        180              184             36
     #
-    # So the plateau is gone and 0.5 is no longer what the rule picks — a weaker
-    # statement than it being wrong, and the reason it is still shipped.
-    # What is unambiguous is the decision this bar's history actually records:
-    # the selection lands **below 0.7 on 100.0% of resamples**. Lowering it from
-    # 0.7 was right; which low value to sit on is the part that is a choice.
-    # `separate_found` is 184 either way: 0.4 finds nothing extra on the path an
-    # ordinary request takes, and over-masks twice more there. Its whole gain is
-    # on the joined path, which is the path the selection rule was written around
-    # (#44). Spending separate-path precision for joined-path recall is a
-    # decision, and a sort key is not the thing that should make it.
+    # So the plateau is gone, and the bar moved to 0.4 to follow the rule rather
+    # than to overrule it. What is unambiguous either way is the decision this
+    # bar's history records: the selection lands **below 0.7 on 100.0% of
+    # resamples**. Lowering it from 0.7 was right; which low value to sit on is
+    # the part that is a choice, and 0.4 is the one the rule makes.
+    #
+    # **The trade, which is not symmetric and is why the rule is followed here.**
+    # `separate_found` is 184 at both: on the path a plain message takes, 0.4
+    # finds nothing extra and over-masks twice more — PERSON precision 0.959 ->
+    # 0.934, three false positives to five, with recall and the per-document leak
+    # inventory unchanged. Its whole gain is on the joined path, which is also
+    # production: `proxy::mask_all` gives a `Slot::Text` its own call, while a
+    # `Slot::Json` document's leaves are concatenated by `mapping::Shape::of`, so
+    # a tool call's arguments are read as one text. There, 0.4 covers 182 of 196
+    # annotated entities against 180 — two fewer going to the provider.
+    #
+    # Two fewer entities leaving in tool-call arguments against two more
+    # over-masked spans in plain messages. Those costs are not comparable: an
+    # entity nobody masked is the disclosure this gateway exists to prevent and
+    # the unmasked-entity gate names every one individually, while an over-masked
+    # span costs the model a placeholder where a harmless word was and the
+    # over-masking gate asks only for 0.8 against a current 1.000. The asymmetry
+    # is the argument, not the sort key.
     #
     # The `lost to joining` column in the old table is not comparable with the
     # script's output any more: it changed predicate, not behaviour. Measured
@@ -111,7 +124,7 @@ entities:
     # `test_the_lower_threshold_prices_a_role_phrase_and_still_masks_the_name`
     # holds both halves. At 0.4 there are two such spans; at 0.6 none, which is
     # the other defensible answer.
-    threshold: 0.5
+    threshold: 0.4
     tier: 2
     specificity: 30
     # Words a person span may not begin with. The model reads `Der Kunde Karz`

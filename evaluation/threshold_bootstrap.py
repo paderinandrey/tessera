@@ -70,9 +70,19 @@ the definition. `selection_key` reads only `joined_found` and
 `separate_overmasked`, so the selection percentages are unaffected either way.
 Raised by review on #101.
 
-**So the shipped 0.5 can no longer be described as the value the selection rule
-picks**, which is a weaker claim than it being wrong. The catalog still ships
-0.5, deliberately and pending a decision.
+**The bar moved to 0.4**, following the rule rather than overruling it, and the
+run above now judges 0.4: selected on 88.9%, which is still under the predeclared
+95%, so the new value is no more *calibrated* than the old one was. What changed
+is which uncalibrated value the rule prefers.
+
+The argument for following it is the asymmetry rather than the sort key. 0.4
+costs PERSON precision on the separate path — 0.959 to 0.934, three false
+positives to five, with recall and the per-document leak inventory unchanged — and
+buys two entities on the joined path, which is also production: `proxy::mask_all`
+gives a `Slot::Text` its own call, while a `Slot::Json` document's leaves are
+concatenated and read as one text. An entity nobody masked is the disclosure this
+gateway exists to prevent; an over-masked span costs the model a placeholder where
+a harmless word was. See `ner.yaml` for that argument beside the number.
 
 **The selection is re-run inside every resample, not conditioned on its own
 result.** A first version fixed 0.5 and bootstrapped the pairwise differences
