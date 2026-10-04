@@ -24,9 +24,17 @@ cost 544 ms — one pass, near enough, for one label instead of three.
 Medians across three runs of the four-pass build spread about 3% on the document row and
 about 10% on the paragraph, so read the table at that resolution.
 
-Per-layer figures are medians and account for the total: preprocessing is shared across the
-inference passes and timed once, so the parts sum to within a few percent of the whole. The
-p95 column is the number REQ-38 asks about; on a developer machine under load it carries
+**Per-layer figures do not add up to the total, and should not be read as a decomposition.**
+Each pass row times that pass alone; the total row times a whole `detect` call, which hands
+the passes to a thread pool and overlaps them. So the parts are an upper bound on the whole
+rather than its parts: the paragraph rows sum to 1 792 ms against a 1 352 ms total. The
+three-pass figures published before #97 happened to sum to within 1% (467 + 491 against
+950), which made the decomposition reading look right; the same session's three-pass
+measurement here summed to 1 065 ms against 896 ms, so the agreement was a coincidence of
+that run and not a property of the harness. Preprocessing is genuinely shared and timed
+once.
+
+The p95 column is the number REQ-38 asks about; on a developer machine under load it carries
 contention as well as detector behaviour — the document row has measured between 4 854 ms
 and 9 008 ms p95 across runs while its median moved under 10%. Treat the medians as the
 stable signal and p95 as an upper bound until these run on dedicated hardware.

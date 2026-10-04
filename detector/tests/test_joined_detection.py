@@ -78,23 +78,45 @@ def _leaf_ranges(group: list[dict]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _truth_with_origin(group: list[dict]) -> list[tuple[str, Span]]:
+    """Each gold entity in joined coordinates, with the row and offset it came from.
+
+    The origin is part of an entity's identity here. `dell\u2019Orto` is annotated
+    in three rows and `D\'Angelo` in two, so a set keyed by type and text alone
+    cannot tell a loss moving between occurrences of the same value from no
+    change at all — the cancellation this gate exists to refuse, one level down
+    from the one it already refuses. Raised on #100 by both reviewers.
+
+    One walk, used by `_rebased` and by `_lost_members`, so the offset
+    arithmetic has a single copy.
+    """
+    out: list[tuple[str, Span]] = []
+    at = 0
+    for document in group:
+        for entity in document["entities"]:
+            out.append(
+                (
+                    f"{document['id']}:{entity['start']}",
+                    Span(
+                        entity_type=entity["entity_type"],
+                        start=entity["start"] + at,
+                        end=entity["end"] + at,
+                        confidence=1.0,
+                        recognizer="corpus",
+                        tier=1,
+                    ),
+                )
+            )
+        at += len(document["text"]) + len(JOIN)
+    return out
+
+
 def _rebased(detector: Detector, group: list[dict]) -> tuple[list[Span], list[Span], list[Span]]:
     """Truth, separate predictions and joined predictions, all in joined coordinates."""
-    truth: list[Span] = []
+    truth: list[Span] = [span for _, span in _truth_with_origin(group)]
     separate: list[Span] = []
     at = 0
     for document in group:
-        truth += [
-            Span(
-                entity_type=entity["entity_type"],
-                start=entity["start"] + at,
-                end=entity["end"] + at,
-                confidence=1.0,
-                recognizer="corpus",
-                tier=1,
-            )
-            for entity in document["entities"]
-        ]
         separate += [
             span.model_copy(update={"start": span.start + at, "end": span.end + at})
             for span in detector.detect(document["text"])
@@ -304,26 +326,31 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 #
 # Named rather than counted for the same reason `KNOWN_UNMASKED` is: a loss that
 # disappears while another appears holds the total and passes a number.
+# Keyed by `row:offset` as well as type and text, because a value alone cannot
+# say *which* occurrence was lost: the corpus annotates dell(U+2019)Orto in three
+# rows and D'Angelo in two, and a loss moving between them would hold a
+# value-keyed set unchanged. That is the same cancellation this gate refuses one
+# level up, and both reviewers on #100 caught it one level down.
 LOST_TO_JOINING = frozenset(
     {
-        ("HEALTH", "eine Hepatitis-B-Infektion"),
-        ("PERSON", "D'Angelo"),
-        ("PERSON", "Hermighausen"),
-        ("PERSON", "dell\u2019Orto"),
-        ("POLITICAL_AFFILIATION", "\u00e9cologiste"),
+        ("de-0009:42", "PERSON", "dell\u2019Orto"),
+        ("fr-0009:32", "POLITICAL_AFFILIATION", "\u00e9cologiste"),
+        ("mixed-0004:67", "HEALTH", "eine Hepatitis-B-Infektion"),
+        ("mixed-0007:18", "PERSON", "Hermighausen"),
+        ("mixed-0017:18", "PERSON", "D'Angelo"),
     }
 )
 
 
-def _lost_members(detector: Detector) -> frozenset[tuple[str, str]]:
-    """The same walk `_score` counts, naming what it counted."""
+def _lost_members(detector: Detector) -> frozenset[tuple[str, str, str]]:
+    """The same walk `_score` counts, naming what it counted, by occurrence."""
     members = set()
     for group in _documents():
-        truth, separate, joined = _rebased(detector, group)
+        _, separate, joined = _rebased(detector, group)
         text = JOIN.join(document["text"] for document in group)
         members |= {
-            (entity.entity_type, text[entity.start : entity.end])
-            for entity in truth
+            (origin, entity.entity_type, text[entity.start : entity.end])
+            for origin, entity in _truth_with_origin(group)
             if _lost(text, entity, separate, joined)
         }
     return frozenset(members)
