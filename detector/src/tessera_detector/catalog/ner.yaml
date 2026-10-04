@@ -67,6 +67,32 @@ entities:
     # tie-break the sweep applied and is worth exactly what a tie-break is
     # worth. Moving it one notch either way is a catalog edit.
     #
+    # **Everything above was measured before `own_pass`, and the re-measurement
+    # moved it.** Asking `person` in a call of its own as well as in its tier's
+    # changed which entities the joined path covers, so 0.4 and 0.5 are no longer
+    # tied and the selection rule now prefers 0.4 outright:
+    #
+    #   selection returns   0.4  88.9%   0.5  9.8%   0.6  0.1%   0.7  0.0%
+    #                       undecided  1.2%
+    #
+    #   threshold   joined found   separate found   separate over
+    #        0.4        182              184             38
+    #        0.5        180              184             36
+    #
+    # So the plateau is gone and 0.5 is no longer what the rule picks — a weaker
+    # statement than it being wrong, and the reason it is still shipped.
+    # `separate_found` is 184 either way: 0.4 finds nothing extra on the path an
+    # ordinary request takes, and over-masks twice more there. Its whole gain is
+    # on the joined path, which is the path the selection rule was written around
+    # (#44). Spending separate-path precision for joined-path recall is a
+    # decision, and a sort key is not the thing that should make it.
+    #
+    # The `lost to joining` column in the old table is not comparable with the
+    # script's output any more: it changed predicate, not behaviour. Measured
+    # both ways under the current shape, the old full-coverage predicate gives 4
+    # at 0.5 — the historical value exactly — and the gate's own `_lost` gives 5.
+    # The shape change did not move that column at all.
+    #
     # This is resampling, not held-out validation — it bounds how much of the
     # gap is sampling variation in *this* corpus and cannot tell whether the
     # corpus resembles a client's text. The private corpus is the measure that

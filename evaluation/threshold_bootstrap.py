@@ -54,6 +54,22 @@ recall is not a question a sort key should answer by itself.
 It also does not reach what #97 left behind: `person` scores `L(U+2019)Hopital`
 at 0.019 and `dell(U+2019)Orto` at 0.268 asked alone, both below 0.4.
 
+**One column above changed definition rather than behaviour**, and the two are
+easy to confuse because this run reports both kinds of change at once. `lost`
+used to be computed here as "covered apart and not covered together", which is
+not the gate's `_lost` — that one asks which *words* a truth leaves unmasked on
+each path. Measured both ways under the current shape, to separate the effects:
+
+    predicate                   0.4   0.5   0.6   0.7
+    the gate's `_lost`            4     5    10    15
+    the old full-coverage one     3     4     9    14
+
+The old predicate gives 4 at 0.5, which is the historical table's value exactly,
+so **the shape change did not move this column at all** — the whole difference is
+the definition. `selection_key` reads only `joined_found` and
+`separate_overmasked`, so the selection percentages are unaffected either way.
+Raised by review on #101.
+
 **So the shipped 0.5 can no longer be described as the value the selection rule
 picks**, which is a weaker claim than it being wrong. The catalog still ships
 0.5, deliberately and pending a decision.
@@ -248,6 +264,12 @@ def main() -> int:
         print(f"threshold {threshold}: {totals}", flush=True)
 
     groups = len(measured[CHOSEN])
+    totals_over_corpus = {
+        threshold: {
+            key: sum(row[key] for row in measured[threshold]) for key in measured[threshold][0]
+        }
+        for threshold in THRESHOLDS
+    }
     print(f"\nbootstrap, {RESAMPLES} resamples of {groups} document groups")
 
     # The selection re-run inside each resample. This is the question; the
@@ -306,7 +328,19 @@ def main() -> int:
     plateau_selections = sum(1 for winners in rounds if set(winners) <= plateau)
     on_plateau = plateau_selections / RESAMPLES
 
-    print("\n  pairwise margins, conditioned on the observed winner:")
+    # **Around the shipped threshold, which is not always the winner.** This
+    # heading used to say "conditioned on the observed winner" and `CHOSEN` used
+    # to be a literal equal to it. Now `CHOSEN` is whatever the catalog ships, so
+    # when the full-corpus winner is a different value the old heading described
+    # a comparison this code does not make. Both are named instead. Raised by
+    # review on #101.
+    observed = min(THRESHOLDS, key=lambda t: selection_key(totals_over_corpus[t]))
+    if observed != CHOSEN:
+        print(
+            f"\n  the full corpus selects {observed}; {CHOSEN} is what the catalog "
+            "ships, and the margins below are around the shipped value"
+        )
+    print(f"\n  pairwise margins around the shipped threshold ({CHOSEN}):")
     verdicts = []
     for key, want in (("joined_found", "more"), ("lost_to_joining", "fewer")):
         for rival in THRESHOLDS:
