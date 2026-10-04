@@ -14,14 +14,24 @@ score.
 Measured over the 130-document public corpus, scored **by position**, because a
 placeholder's name is not what protects anyone:
 
-    grouped (one call per tier)   found 179/196   over-masked 28 spans   10.9s   2 calls
-    shipped (#97)                 found 184/196   over-masked 35 spans   12.5s   3 calls
-    one label per call            found 180/196   over-masked 37 spans   38.0s  14 calls
+    grouped (one call per tier)   found 179/196   over-masked 35 spans   10.6s   2 calls
+    shipped (#97)                 found 184/196   over-masked 35 spans   12.4s   3 calls
+    one label per call            found 180/196   over-masked 37 spans   38.6s  14 calls
 
 **The shipped shape is neither of the two this script was written to compare**,
 and that is #97's answer to #46. `person` is asked in a call of its own *as well
-as* in tier 2's, and the union beats both arms on coverage at near-grouped cost.
-The script used to read its grouped arm off `recognizer.passes`, which stopped
+as* in tier 2's, and the union finds five more entities than grouped **at the
+same over-masking cost**, for one extra call.
+
+The first version of the grouped arm here sorted each tier's labels, which put
+tier 2 in `(location, organization, person)` instead of the catalog's
+`(person, location, organization)`. The labels are an ordered prompt, so that
+changed the question as well as the shape, and it mattered: 28 over-masked spans
+against 35 for the same 179 found. Reported the shipped arm as costing seven
+spans it does not cost. Raised by review on #100, and the tiers are still sorted
+because their order *between* calls is not an input to any of them.
+
+The script also used to read its grouped arm off `recognizer.passes`, which stopped
 being the grouped shape when #97 landed — so it would have compared the shipped
 hybrid against figures recorded for grouped and called the result a confirmation.
 Raised by review on #100. The grouped arm is composed from `types` now, and
@@ -40,8 +50,8 @@ they also differ from the ones this docstring used to quote (185/34/9.4s and
 `test génétique`, `Humbert et Fils`, and `Haase` and `Marin` — the last two
 because competition *supports* a score as readily as it suppresses one, which is
 the same pair #97 lost when its first attempt removed the grouped call. The
-sweep cannot buy its way past either: matching 184 found costs 46 over-masked
-spans against 35, and 186 costs 57.
+sweep cannot buy its way past it: matching 184 found costs 46 over-masked spans
+against 35, and 186 costs 57.
 
     thresholds -0.2      found 186/196   over-masked 57 spans
     thresholds -0.1      found 184/196   over-masked 46 spans
@@ -139,8 +149,14 @@ def main() -> int:
     # `grouped` would have been running it while being compared against the
     # grouped figures recorded above. Raised by review on #100. Composed from
     # `types` here, which is where the tiers actually live.
+    # Catalog order within a tier, not sorted. The labels are an ordered prompt
+    # to the model, so sorting them changes the input as well as the shape —
+    # `(location, organization, person)` is a different question from
+    # `(person, location, organization)`, and an arm that changes both is not a
+    # controlled comparison. Raised by review on #100; the tiers themselves are
+    # sorted, because their order between calls is not an input to any of them.
     by_tier: dict[int, list[str]] = {}
-    for kind in sorted(recognizer.types, key=lambda kind: (kind.tier, kind.label)):
+    for kind in recognizer.types:
         by_tier.setdefault(kind.tier, []).append(kind.label)
     grouped = tuple(
         InferencePass(
