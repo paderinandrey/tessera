@@ -23,8 +23,9 @@ from tessera_detector.evaluation import (
     summarize,
     unmasked_words,
 )
-from tessera_detector.models import HF_REVISION, ModelUnavailable
+from tessera_detector.models import ModelUnavailable
 from tessera_detector.pipeline import build_detector
+from tessera_detector.version import detector_version
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TIER1_TARGET = 0.99
@@ -203,6 +204,17 @@ def main(argv: list[str] | None = None) -> int:
     except (ModelUnavailable, ValueError) as error:
         print(f"FAIL: --require-ner but the layer cannot run: {error}", file=sys.stderr)
         return 1
+    # Taken here rather than beside the JSON write: the run that follows takes
+    # minutes, and hashing the sources afterwards would describe whatever is on
+    # disk by then instead of the code and rules that produced the figures.
+    identity = {
+        "detector_version": detector_version(detector.model_id, detector.catalog_text),
+        # This script decides the Article 9 type list, the tier selection and the
+        # aggregation, so it moves a published figure without moving anything
+        # `detector_version` covers.
+        "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "model_id": detector.model_id,
+    }
     tier1_types = {rule.entity_type for rule in detector.deterministic.rules if rule.tier == 1}
     per_document = []
     # Bucketed by (language, category): a pooled ratio lets a category go dark
@@ -362,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
                         for entity_type, m in sorted(summary.per_type.items())
                     },
                     "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
-                    "model_revision": HF_REVISION,
+                    **identity,
                     "targets": {
                         "article_9_coverage": ARTICLE_9_TARGET,
                         "overmasking_precision": PRECISION_TARGET,

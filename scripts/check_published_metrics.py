@@ -13,6 +13,27 @@ It reads the measurement from `evaluate.py --json` rather than recomputing it,
 so there is one measurement and the gate cannot disagree with the run it is
 checking.
 
+**And it refuses a measurement that did not come from this tree.** The file
+names the corpus it read and the `detector_version` of the detector that read
+it, because a figure measured by something else passing as a figure measured
+here is the one failure that looks exactly like a success. `evaluate.py` also
+unlinks the file at the start of every run, so a run that does not measure
+leaves none behind; the identities cover a file carried in from elsewhere,
+which unlinking cannot see.
+
+`detector_version` is the detector's own answer to "what determines my output"
+rather than a second one invented here — the weights that actually loaded, the
+NER and deterministic dependency digests, both catalogs, the package source and
+the interpreter. The first version of this check hashed a source tree itself and
+recorded `HF_REVISION`, which `version.py` had already explained is the wrong
+value: the constant names the pinned snapshot, not the weights
+`TESSERA_NER_MODEL` may have loaded instead. Reviewers on #99 pointed at the
+duplication and at what it did not cover.
+
+Imported rather than read textually, so this runs under `uv run --project
+detector` like `check-entity-types` does. The detector it builds is
+deterministic-only, so the gate still needs no weights.
+
 **Scope, so the green tick is not read as more than it is.** This checks the
 numeric tables, the Article 9 coverage figure, and the Tier 1 recall gate — both
 that the threshold README publishes is the one `evaluate.py` enforces and that
@@ -30,10 +51,14 @@ import pathlib
 import re
 import sys
 
+from tessera_detector.models import dependency_digest, model_cache_dir
+from tessera_detector.pipeline import PACKAGE_NAME, build_detector, ner_model_id
+from tessera_detector.version import detector_version
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 CORPUS = ROOT / "evaluation" / "corpus" / "public.jsonl"
-MODELS = ROOT / "detector" / "src" / "tessera_detector" / "models.py"
+EVALUATOR = ROOT / "evaluation" / "evaluate.py"
 
 
 # `| PERSON | 0.968 | 0.803 | 0.878 |`, which is the only three-decimal row
@@ -44,9 +69,21 @@ ROW = re.compile(
 COVERAGE = re.compile(r"\*\*Article 9 coverage is (\d\.\d{4}) \((\d+) of (\d+)\)\*\*")
 # `make evaluate   # ... + the Tier 1 recall gate (>= 0.99)`
 TIER1 = re.compile(r"Tier 1 recall gate \(>= (\d\.\d+)\)")
-# Read textually rather than imported: this script runs under plain `python3`,
-# like check_layers.py, and importing the detector would need its environment.
-REVISION = re.compile(r'^HF_REVISION = "([0-9a-f]+)"', re.MULTILINE)
+
+
+
+def expected_model_id() -> str:
+    """What the weights identity has to be, established here rather than read
+    out of the file being checked.
+
+    Composed by `pipeline.ner_model_id`, the same function `build_detector`
+    uses, so the two cannot drift. Needs the weights on disk and the `ner`
+    group installed — both true wherever a measurement could have been taken —
+    and needs no inference session: file hashes and installed metadata only.
+    """
+    return ner_model_id(
+        model_cache_dir(), dependency_digest(PACKAGE_NAME), dependency_digest("gliner")
+    )
 
 
 def published_rows(text: str) -> dict[str, tuple[str, str, str]]:
@@ -98,14 +135,46 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    revision = REVISION.search(MODELS.read_text(encoding="utf-8"))
-    if revision is None:
-        print(f"FAIL: no HF_REVISION found in {MODELS}", file=sys.stderr)
-        return 1
-    if measured.get("model_revision") != revision.group(1):
+    evaluator = hashlib.sha256(EVALUATOR.read_bytes()).hexdigest()
+    if measured.get("evaluator_sha256") != evaluator:
+        # `detector_version` covers the detector, not the script that turns its
+        # spans into the published figures: the Article 9 type list, the tier
+        # selection and the aggregation all live in `evaluate.py` and all move a
+        # number without moving the detector.
         print(
-            f"FAIL: {path} measures model {measured.get('model_revision')}, "
-            f"but models.py pins {revision.group(1)}. Re-run the measurement.",
+            f"FAIL: {path} was written by evaluator "
+            f"{measured.get('evaluator_sha256')}, but evaluate.py is {evaluator}. "
+            "Re-run the measurement.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        wanted_model = expected_model_id()
+    except Exception as error:
+        print(
+            f"FAIL: cannot establish the expected weights identity: {error}. "
+            "This needs the pinned weights (`make model`) and the ner group, "
+            "which any run that could have produced a measurement already had.",
+            file=sys.stderr,
+        )
+        return 1
+    if measured.get("model_id") != wanted_model:
+        print(
+            f"FAIL: {path} was measured with weights {measured.get('model_id')}, "
+            f"but this tree pins {wanted_model}. Figures produced through a "
+            "`TESSERA_NER_MODEL` override are not the published ones.",
+            file=sys.stderr,
+        )
+        return 1
+    # Composed from the identity established above rather than the recorded one,
+    # so nothing in this comparison comes from the file being checked.
+    expected = detector_version(wanted_model, build_detector(ner=False).catalog_text)
+    if measured.get("detector_version") != expected:
+        print(
+            f"FAIL: {path} was measured by detector {measured.get('detector_version')}, "
+            f"but this tree is {expected}. A threshold, a rule, a catalog or the "
+            "interpreter changed, which moves the figures without moving the "
+            "corpus. Re-run the measurement.",
             file=sys.stderr,
         )
         return 1
@@ -184,8 +253,9 @@ def main() -> int:
         )
         return 1
     print(
-        f"published metrics: {len(published)} rows and the Article 9 coverage "
-        "figure match the corpus"
+        f"published metrics: {len(published)} per-type rows, the Article 9 coverage "
+        "figure and the Tier 1 recall gate match a measurement of this corpus, "
+        f"taken by detector {expected[:12]}"
     )
     return 0
 

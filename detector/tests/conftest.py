@@ -1,11 +1,14 @@
 """Test configuration.
 
-`evaluation/` holds runnable scripts rather than a package, so its modules are
-not importable by name. The benchmark's pure helpers are worth unit-testing, so
-the directory joins the path here instead of in each test file.
+`evaluation/` and `scripts/` hold runnable scripts rather than packages, so
+their modules are not importable by name. The benchmark's pure helpers and the
+source digest the published-metrics gate relies on are worth unit-testing, so
+both directories join the path here instead of in each test file.
 """
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "evaluation"))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "evaluation"))
+sys.path.insert(0, str(ROOT / "scripts"))
