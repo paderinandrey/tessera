@@ -92,16 +92,20 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
+
+from concrete_recognizer import gliner_recognizer
 
 from tessera_detector.ner import InferencePass
-from tessera_detector.pipeline import build_detector
+from tessera_detector.pipeline import Detector, build_detector
+from tessera_detector.spans import Span
 
 CORPUS = Path(__file__).resolve().parent / "corpus" / "public.jsonl"
 
 Entity = tuple[str, int, int, str, str]
 
 
-def _covered(spans: list, start: int, end: int) -> bool:
+def _covered(spans: list[Span], start: int, end: int) -> bool:
     """By position: any prediction covering the characters counts.
 
     Not by type. A span that masks a name while calling it an organization has
@@ -113,7 +117,7 @@ def _covered(spans: list, start: int, end: int) -> bool:
     return any(span.start <= start and span.end >= end for span in spans)
 
 
-def _run(detector, rows: list[dict]) -> tuple[set[Entity], int, float]:
+def _run(detector: Detector, rows: list[dict[str, Any]]) -> tuple[set[Entity], int, float]:
     found: set[Entity] = set()
     over = 0
     started = time.perf_counter()
@@ -141,7 +145,7 @@ def main() -> int:
         print(f"NER is not provisioned ({detector.ner_off_reason}); run `make model`")
         return 2
 
-    recognizer = detector.recognizer
+    recognizer = gliner_recognizer(detector)
     # **Built rather than read off the recognizer.** `recognizer.passes` used to
     # be the grouped shape, so this line used to be `grouped = recognizer.passes`
     # — and #97 made that false: `person` is now asked in a call of its own as

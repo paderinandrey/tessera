@@ -25,6 +25,7 @@ from tessera_detector.evaluation import (
 )
 from tessera_detector.models import ModelUnavailable
 from tessera_detector.pipeline import build_detector
+from tessera_detector.spans import Span
 from tessera_detector.version import detector_version
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
@@ -147,7 +148,7 @@ ARTICLE_9_TYPES = {
 
 
 def unmasked_entities(
-    text: str, entities: list[EvalEntity], predictions: list
+    text: str, entities: list[EvalEntity], predictions: list[Span]
 ) -> list[tuple[str, str, frozenset[str]]]:
     """Annotated entities with words no prediction covers completely.
 
@@ -207,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     # in one language while the aggregate stays above target.
     article_9_buckets: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     overmasking: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-    unmasked: list[tuple[str, str]] = []
+    unmasked: list[tuple[str, str, frozenset[str]]] = []
     for line in CORPUS.read_text(encoding="utf-8").splitlines():
         document = json.loads(line)
         entities = [EvalEntity(**e) for e in document["entities"]]

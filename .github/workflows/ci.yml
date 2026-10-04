@@ -22,7 +22,11 @@ jobs:
       - run: uv sync --locked --group serve
       - run: uv run pytest
       - run: uv run ruff check . ../evaluation ../scripts
-      - run: uv run mypy src
+      # `evaluation/` as well as the package. It was unchecked until #101, and
+      # that is how `threshold_bootstrap.py` called a three-argument function
+      # with two arguments for a month: the script needs the NER weights, so no
+      # job here runs it, and nothing else looked at it either.
+      - run: uv run mypy src ../evaluation
       # `uv sync --group serve` above installs the dev group too (uv's
       # default for a group literally named `dev`), so every step before
       # this one runs with pytest, mypy and ruff's own dependencies sitting

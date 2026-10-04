@@ -20,6 +20,7 @@ this measurement reached the opposite conclusion.
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -46,7 +47,7 @@ def detector() -> Detector:
     return built
 
 
-def _documents() -> list[list[dict]]:
+def _documents() -> list[list[dict[str, Any]]]:
     rows = [
         json.loads(line)
         for line in CORPUS.read_text(encoding="utf-8").splitlines()
@@ -69,7 +70,7 @@ def _inside_one_leaf(span: Span, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= span.start and span.end <= end for start, end in ranges)
 
 
-def _leaf_ranges(group: list[dict]) -> list[tuple[int, int]]:
+def _leaf_ranges(group: list[dict[str, Any]]) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     at = 0
     for document in group:
@@ -78,7 +79,7 @@ def _leaf_ranges(group: list[dict]) -> list[tuple[int, int]]:
     return ranges
 
 
-def _truth_with_origin(group: list[dict]) -> list[tuple[str, Span]]:
+def _truth_with_origin(group: list[dict[str, Any]]) -> list[tuple[str, Span]]:
     """Each gold entity in joined coordinates, with the row and offset it came from.
 
     The origin is part of an entity's identity here. `dell\u2019Orto` is annotated
@@ -111,7 +112,9 @@ def _truth_with_origin(group: list[dict]) -> list[tuple[str, Span]]:
     return out
 
 
-def _rebased(detector: Detector, group: list[dict]) -> tuple[list[Span], list[Span], list[Span]]:
+def _rebased(
+    detector: Detector, group: list[dict[str, Any]]
+) -> tuple[list[Span], list[Span], list[Span]]:
     """Truth, separate predictions and joined predictions, all in joined coordinates."""
     truth: list[Span] = [span for _, span in _truth_with_origin(group)]
     separate: list[Span] = []

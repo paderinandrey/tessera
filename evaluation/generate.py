@@ -12,6 +12,7 @@ import json
 import random
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from faker import Faker
@@ -273,7 +274,10 @@ def render(
                 )
                 text += value
             elif name in ("person", "city", "org"):
-                value = {
+                # Annotated because `faker.city` is one of Faker's dynamic
+                # provider methods and carries no signature, so the dispatch
+                # table's own type is what makes the call below checkable.
+                draw: dict[str, Callable[[], str]] = {
                     # **`faker.last_name()` is called either way, and the pool
                     # overrides its result rather than replacing the call.**
                     # Skipping it consumed one fewer draw from the instance and
@@ -288,7 +292,8 @@ def render(
                     # annotator could tell from a PERSON; a suffix makes the
                     # gold label decidable.
                     "org": lambda: f"{faker.last_name()} {faker.company_suffix()}",
-                }[name]()
+                }
+                value = draw[name]()
                 entity_type = {"person": "PERSON", "city": "LOCATION", "org": "ORG"}[name]
                 entities.append(
                     {"entity_type": entity_type, "start": len(text), "end": len(text) + len(value)}

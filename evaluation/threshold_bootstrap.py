@@ -25,24 +25,54 @@ Predeclared, before running:
   decision    the threshold is calibrated if the selection rule returns it on
               >= 95% of resamples
 
-**The predeclared test fails, and the failure is the useful part.** Re-running
-the selection returns 0.5 on 86.4% of resamples — below the bar — with 0.6
-taking 1.1%, 0.7 and 0.4 none outright, and 12.4% undecided between 0.4 and 0.5.
-So the sweep's *exact value* is not recoverable from resampled data and must not
-be described as calibrated. The script exits non-zero on that verdict.
+**The predeclared test fails, and what fails has changed.** When this was
+written, re-running the selection returned 0.5 on 86.4% of resamples — below the
+bar, but with 98.2% of resamples selecting 0.5 or unable to separate it from 0.4.
+The instability was a tie-break on a plateau and nothing near 0.7 survived.
 
-What is recoverable is the **plateau**: 98.2% of resamples select 0.5 or cannot
-separate it from 0.4 — two thresholds tied on joined recall in every cached
-group, and therefore in every possible resample, separated only by two
-over-masked spans on the separate path. The instability is entirely a tie-break
-between them; nothing near 0.7 survives.
+**Re-measured after #97 gave `person` a call of its own, the selection moves off
+0.5 entirely:**
 
-That distinction is reported as two verdicts rather than folded into one,
-because the second is a criterion written *after* seeing the first fail, and
-that is a thing to declare rather than to quietly substitute. It is defensible
-only because it is the decision the change actually makes — lower the bar from
-0.7 — and not the decision the strict test asks about, which is whether 0.5
-beats 0.4. It does not, reliably, and neither does 0.4 beat 0.5.
+    0.4:  88.9%      0.5:  9.8%      0.6:  0.1%      0.7:  0.0%
+    undecided: 1.2%
+
+0.4 is no longer tied with 0.5; it wins outright, because the shape change moved
+which entities the joined path covers. Per group over the whole corpus:
+
+    0.4   joined_found 182   separate_found 184   lost 4   separate_overmasked 38
+    0.5   joined_found 180   separate_found 184   lost 5   separate_overmasked 36
+
+**What 0.4 buys and where it spends.** Two more entities covered on the *joined*
+path for two more over-masked spans on the *separate* path. `separate_found` is
+184 either way — on the path an ordinary request takes, 0.4 finds nothing extra
+and over-masks twice more. The selection rule prefers it because the rule was
+written around #44's joined-path concern, which is the one case where the gain
+lands. That is a reason to read the rule's verdict rather than apply it: this
+script measures, and whether to spend separate-path precision on joined-path
+recall is not a question a sort key should answer by itself.
+
+It also does not reach what #97 left behind: `person` scores `L(U+2019)Hopital`
+at 0.019 and `dell(U+2019)Orto` at 0.268 asked alone, both below 0.4.
+
+**One column above changed definition rather than behaviour**, and the two are
+easy to confuse because this run reports both kinds of change at once. `lost`
+used to be computed here as "covered apart and not covered together", which is
+not the gate's `_lost` — that one asks which *words* a truth leaves unmasked on
+each path. Measured both ways under the current shape, to separate the effects:
+
+    predicate                   0.4   0.5   0.6   0.7
+    the gate's `_lost`            4     5    10    15
+    the old full-coverage one     3     4     9    14
+
+The old predicate gives 4 at 0.5, which is the historical table's value exactly,
+so **the shape change did not move this column at all** — the whole difference is
+the definition. `selection_key` reads only `joined_found` and
+`separate_overmasked`, so the selection percentages are unaffected either way.
+Raised by review on #101.
+
+**So the shipped 0.5 can no longer be described as the value the selection rule
+picks**, which is a weaker claim than it being wrong. The catalog still ships
+0.5, deliberately and pending a decision.
 
 **The selection is re-run inside every resample, not conditioned on its own
 result.** A first version fixed 0.5 and bootstrapped the pairwise differences
@@ -97,7 +127,29 @@ CATALOG = (
 )
 TUNED_TYPE = "PERSON"
 THRESHOLDS = (0.4, 0.5, 0.6, 0.7)
-CHOSEN = 0.5
+
+
+def _shipped_threshold() -> float:
+    """What the catalog actually declares, rather than a second copy of it.
+
+    This was `CHOSEN = 0.5`, a literal — so the day the catalog moved, every
+    line below would have reported about a value nothing ships, including the
+    verdict. The same defect review found in `inference_shape.py`'s grouped arm
+    on #100, in a script whose whole job is to judge this number.
+    """
+    catalog = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))
+    for entry in catalog["entities"]:
+        if entry["entity_type"] == TUNED_TYPE:
+            return float(entry["threshold"])
+    raise SystemExit(f"no {TUNED_TYPE} entry in {CATALOG}")
+
+
+CHOSEN = _shipped_threshold()
+if CHOSEN not in THRESHOLDS:
+    raise SystemExit(
+        f"{TUNED_TYPE} ships {CHOSEN}, which is not among the swept values "
+        f"{THRESHOLDS} — add it, or this script judges a number it never measured"
+    )
 RESAMPLES = 2000
 # The rule the sweep applied, as a sort key: **most entities covered on the
 # joined path**, then fewest over-masked spans on the separate path. Written as
@@ -147,6 +199,7 @@ def counts_at(threshold: float, model_path: Path) -> list[dict[str, int]]:
     rows = []
     for group in joined._documents():
         truth, separate, together = joined._rebased(detector, group)
+        text = joined.JOIN.join(document["text"] for document in group)
         entities = [EvalEntity(entity_type=s.entity_type, start=s.start, end=s.end) for s in truth]
 
         def overmasked(predictions: list[Span], gold: list[EvalEntity] = entities) -> int:
@@ -158,12 +211,15 @@ def counts_at(threshold: float, model_path: Path) -> list[dict[str, int]]:
         rows.append(
             {
                 "truth": len(truth),
-                "joined_found": sum(1 for e in truth if joined._covered(e, together)),
-                "separate_found": sum(1 for e in truth if joined._covered(e, separate)),
+                "joined_found": sum(1 for e in truth if joined._covered(text, e, together)),
+                "separate_found": sum(1 for e in truth if joined._covered(text, e, separate)),
+                # `joined._lost`, not a re-implementation of it. This used to ask
+                # `_covered(separate) and not _covered(together)`, which is a
+                # different question — `_lost` is about the *words* a truth leaves
+                # unmasked on each path, and the docstring above claims this
+                # script cannot drift from the gate. It had.
                 "lost_to_joining": sum(
-                    1
-                    for e in truth
-                    if joined._covered(e, separate) and not joined._covered(e, together)
+                    1 for e in truth if joined._lost(text, e, separate, together)
                 ),
                 "joined_overmasked": overmasked(together),
                 "separate_overmasked": overmasked(separate),
@@ -208,6 +264,12 @@ def main() -> int:
         print(f"threshold {threshold}: {totals}", flush=True)
 
     groups = len(measured[CHOSEN])
+    totals_over_corpus = {
+        threshold: {
+            key: sum(row[key] for row in measured[threshold]) for key in measured[threshold][0]
+        }
+        for threshold in THRESHOLDS
+    }
     print(f"\nbootstrap, {RESAMPLES} resamples of {groups} document groups")
 
     # The selection re-run inside each resample. This is the question; the
@@ -228,15 +290,15 @@ def main() -> int:
     rounds: list[list[float]] = []
     for _ in range(RESAMPLES):
         sample = [rng.randrange(groups) for _ in range(groups)]
-        totals = {
+        resampled = {
             threshold: {
                 key: sum(measured[threshold][i][key] for i in sample)
                 for key in measured[threshold][0]
             }
             for threshold in THRESHOLDS
         }
-        best = min(selection_key(totals[t]) for t in THRESHOLDS)
-        winners = [t for t in THRESHOLDS if selection_key(totals[t]) == best]
+        best = min(selection_key(resampled[t]) for t in THRESHOLDS)
+        winners = [t for t in THRESHOLDS if selection_key(resampled[t]) == best]
         if len(winners) == 1:
             selected[winners[0]] += 1
         else:
@@ -265,8 +327,31 @@ def main() -> int:
     }
     plateau_selections = sum(1 for winners in rounds if set(winners) <= plateau)
     on_plateau = plateau_selections / RESAMPLES
+    # **The decision this script was written to defend, stated directly rather
+    # than through the plateau.** The change it reports on is "lower the bar from
+    # 0.7", and the plateau around the shipped value was a proxy for that — a
+    # faithful one only while the shipped value and the winner were tied. They
+    # are not any more, so the proxy now discards every resample won by the
+    # *other* low threshold and reports a decision as unstable because a
+    # different low value beat it. Asked as itself: how often does the selection
+    # land below the bar this change lowered? Raised by review on #101.
+    LOWERED_FROM = max(THRESHOLDS)
+    lowered = sum(1 for winners in rounds if all(t < LOWERED_FROM for t in winners))
+    on_lowered = lowered / RESAMPLES
 
-    print("\n  pairwise margins, conditioned on the observed winner:")
+    # **Around the shipped threshold, which is not always the winner.** This
+    # heading used to say "conditioned on the observed winner" and `CHOSEN` used
+    # to be a literal equal to it. Now `CHOSEN` is whatever the catalog ships, so
+    # when the full-corpus winner is a different value the old heading described
+    # a comparison this code does not make. Both are named instead. Raised by
+    # review on #101.
+    observed = min(THRESHOLDS, key=lambda t: selection_key(totals_over_corpus[t]))
+    if observed != CHOSEN:
+        print(
+            f"\n  the full corpus selects {observed}; {CHOSEN} is what the catalog "
+            "ships, and the margins below are around the shipped value"
+        )
+    print(f"\n  pairwise margins around the shipped threshold ({CHOSEN}):")
     verdicts = []
     for key, want in (("joined_found", "more"), ("lost_to_joining", "fewer")):
         for rival in THRESHOLDS:
@@ -291,14 +376,24 @@ def main() -> int:
     # predeclared one failed, and a script that exits 0 on a failed predeclared
     # test is presenting a post-hoc criterion as validation. Disclosure is not a
     # substitute for the verdict. Raised in review on #48.
+    print(
+        f"\n  the selection lands below {LOWERED_FROM} on {on_lowered:.1%} of resamples — "
+        f"the decision this change makes, asked as itself"
+    )
+    if on_lowered < DECISION:
+        print(
+            f"  that is below {DECISION:.0%}: even lowering the bar is not stable here."
+        )
     plateau_text = "/".join(str(t) for t in sorted(plateau))
     print(
-        f"\n  the selection lands on the plateau ({plateau_text}) on {on_plateau:.1%} of "
-        f"resamples — the thresholds tied with {CHOSEN} on joined recall in every group, "
-        f"and so in every possible resample"
+        f"  and on the plateau around the shipped {CHOSEN} ({plateau_text}) on "
+        f"{on_plateau:.1%} — the thresholds tied with it on joined recall in every group"
     )
-    if on_plateau < DECISION:
-        print(f"  even the plateau is below {DECISION:.0%}: the sweep found noise.")
+    if plateau == {CHOSEN}:
+        print(
+            f"  {CHOSEN} has no plateau left: nothing is tied with it per group, so that "
+            "figure is its own stability and not a wider result"
+        )
 
     print()
     if stability < DECISION:
@@ -307,7 +402,10 @@ def main() -> int:
             f"{stability:.1%} of resamples, below {DECISION:.0%}."
         )
         print(f"  {CHOSEN} is NOT calibrated as an exact value and must not be called one.")
-        print("  The plateau result above stands on its own and does not rescue this verdict.")
+        print(
+            f"  The {on_lowered:.1%} above is a different and weaker claim — that the bar "
+            f"belongs below {LOWERED_FROM} — and does not rescue this verdict."
+        )
         return 1
     print(f"  {CHOSEN} is selected on {stability:.1%} of resamples, clearing {DECISION:.0%}")
     return 0
