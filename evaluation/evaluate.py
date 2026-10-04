@@ -26,6 +26,10 @@ from tessera_detector.evaluation import (
 from tessera_detector.models import HF_REVISION, ModelUnavailable
 from tessera_detector.pipeline import build_detector
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+
+from source_digest import source_digest
+
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
 TIER1_TARGET = 0.99
 PRECISION_TARGET = 0.8
@@ -363,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
                     "model_revision": HF_REVISION,
+                    "sources_sha256": source_digest(),
                     "targets": {
                         "article_9_coverage": ARTICLE_9_TARGET,
                         "overmasking_precision": PRECISION_TARGET,

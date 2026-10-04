@@ -13,6 +13,14 @@ It reads the measurement from `evaluate.py --json` rather than recomputing it,
 so there is one measurement and the gate cannot disagree with the run it is
 checking.
 
+**And it refuses a measurement that did not come from this tree.** The file
+names the corpus, the pinned model revision and a digest of the detector
+sources, and all three are checked, because a figure measured by something else
+passing as a figure measured here is the one failure that looks exactly like a
+success. `evaluate.py` also unlinks the file at the start of every run, so a run
+that does not measure leaves none behind; the three identities cover a file
+carried in from elsewhere, which unlinking cannot see.
+
 **Scope, so the green tick is not read as more than it is.** This checks the
 numeric tables, the Article 9 coverage figure, and the Tier 1 recall gate — both
 that the threshold README publishes is the one `evaluate.py` enforces and that
@@ -29,6 +37,8 @@ import json
 import pathlib
 import re
 import sys
+
+from source_digest import source_digest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
@@ -109,6 +119,16 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    sources = source_digest()
+    if measured.get("sources_sha256") != sources:
+        print(
+            f"FAIL: {path} measures detector sources {measured.get('sources_sha256')}, "
+            f"but they now digest to {sources}. An edited threshold or rule changes "
+            "the figures without changing the corpus or the model revision, which is "
+            "the case the other two checks cannot see. Re-run the measurement.",
+            file=sys.stderr,
+        )
+        return 1
     text = README.read_text(encoding="utf-8")
     published = published_rows(text)
     failures = []
@@ -184,8 +204,9 @@ def main() -> int:
         )
         return 1
     print(
-        f"published metrics: {len(published)} rows and the Article 9 coverage "
-        "figure match the corpus"
+        f"published metrics: {len(published)} per-type rows, the Article 9 coverage "
+        "figure and the Tier 1 recall gate match a measurement of this corpus "
+        "(the pinned model revision and the detector sources both agree)"
     )
     return 0
 
