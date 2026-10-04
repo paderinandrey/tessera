@@ -37,7 +37,7 @@ test:
 	cd detector && uv run --group serve pytest
 
 lint:
-	cd detector && uv run ruff check . ../evaluation && uv run mypy src
+	cd detector && uv run ruff check . ../evaluation ../scripts && uv run mypy src
 
 check-entity-types:
 	uv run --project detector python scripts/check_entity_types.py
