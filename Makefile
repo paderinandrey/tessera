@@ -46,7 +46,7 @@ check-layers:
 	python3 scripts/check_layers.py
 
 check-published-metrics:
-	python3 scripts/check_published_metrics.py $(METRICS)
+	uv run --project detector python scripts/check_published_metrics.py $(METRICS)
 
 # Proves detector/'s runtime imports resolve with nothing but
 # [project.dependencies] installed — the exact gap that let a `packaging`

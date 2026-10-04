@@ -14,12 +14,25 @@ so there is one measurement and the gate cannot disagree with the run it is
 checking.
 
 **And it refuses a measurement that did not come from this tree.** The file
-names the corpus, the pinned model revision and a digest of the detector
-sources, and all three are checked, because a figure measured by something else
-passing as a figure measured here is the one failure that looks exactly like a
-success. `evaluate.py` also unlinks the file at the start of every run, so a run
-that does not measure leaves none behind; the three identities cover a file
-carried in from elsewhere, which unlinking cannot see.
+names the corpus it read and the `detector_version` of the detector that read
+it, because a figure measured by something else passing as a figure measured
+here is the one failure that looks exactly like a success. `evaluate.py` also
+unlinks the file at the start of every run, so a run that does not measure
+leaves none behind; the identities cover a file carried in from elsewhere,
+which unlinking cannot see.
+
+`detector_version` is the detector's own answer to "what determines my output"
+rather than a second one invented here — the weights that actually loaded, the
+NER and deterministic dependency digests, both catalogs, the package source and
+the interpreter. The first version of this check hashed a source tree itself and
+recorded `HF_REVISION`, which `version.py` had already explained is the wrong
+value: the constant names the pinned snapshot, not the weights
+`TESSERA_NER_MODEL` may have loaded instead. Reviewers on #99 pointed at the
+duplication and at what it did not cover.
+
+Imported rather than read textually, so this runs under `uv run --project
+detector` like `check-entity-types` does. The detector it builds is
+deterministic-only, so the gate still needs no weights.
 
 **Scope, so the green tick is not read as more than it is.** This checks the
 numeric tables, the Article 9 coverage figure, and the Tier 1 recall gate — both
@@ -38,12 +51,12 @@ import pathlib
 import re
 import sys
 
-from source_digest import source_digest
+from tessera_detector.pipeline import build_detector
+from tessera_detector.version import detector_version
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 CORPUS = ROOT / "evaluation" / "corpus" / "public.jsonl"
-MODELS = ROOT / "detector" / "src" / "tessera_detector" / "models.py"
 
 
 # `| PERSON | 0.968 | 0.803 | 0.878 |`, which is the only three-decimal row
@@ -54,9 +67,7 @@ ROW = re.compile(
 COVERAGE = re.compile(r"\*\*Article 9 coverage is (\d\.\d{4}) \((\d+) of (\d+)\)\*\*")
 # `make evaluate   # ... + the Tier 1 recall gate (>= 0.99)`
 TIER1 = re.compile(r"Tier 1 recall gate \(>= (\d\.\d+)\)")
-# Read textually rather than imported: this script runs under plain `python3`,
-# like check_layers.py, and importing the detector would need its environment.
-REVISION = re.compile(r'^HF_REVISION = "([0-9a-f]+)"', re.MULTILINE)
+
 
 
 def published_rows(text: str) -> dict[str, tuple[str, str, str]]:
@@ -108,24 +119,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    revision = REVISION.search(MODELS.read_text(encoding="utf-8"))
-    if revision is None:
-        print(f"FAIL: no HF_REVISION found in {MODELS}", file=sys.stderr)
+    model_id = measured.get("model_id")
+    if not isinstance(model_id, str):
+        print(f"FAIL: {path} records no model_id", file=sys.stderr)
         return 1
-    if measured.get("model_revision") != revision.group(1):
+    # `detector_version` is recomputed with the weights identity the measurement
+    # recorded and the catalog a detector built here actually parses, so a
+    # changed threshold, rule, catalog or interpreter moves it. The weights
+    # themselves are taken as recorded: naming them honestly means digesting the
+    # bytes that loaded, which needs the model this script deliberately avoids.
+    expected = detector_version(model_id, build_detector(ner=False).catalog_text)
+    if measured.get("detector_version") != expected:
         print(
-            f"FAIL: {path} measures model {measured.get('model_revision')}, "
-            f"but models.py pins {revision.group(1)}. Re-run the measurement.",
-            file=sys.stderr,
-        )
-        return 1
-    sources = source_digest()
-    if measured.get("sources_sha256") != sources:
-        print(
-            f"FAIL: {path} measures detector sources {measured.get('sources_sha256')}, "
-            f"but they now digest to {sources}. An edited threshold or rule changes "
-            "the figures without changing the corpus or the model revision, which is "
-            "the case the other two checks cannot see. Re-run the measurement.",
+            f"FAIL: {path} was measured by detector {measured.get('detector_version')}, "
+            f"but this tree with those weights is {expected}. A threshold, a rule, a "
+            "catalog or the interpreter changed, which moves the figures without "
+            "moving the corpus. Re-run the measurement.",
             file=sys.stderr,
         )
         return 1
@@ -205,8 +214,8 @@ def main() -> int:
         return 1
     print(
         f"published metrics: {len(published)} per-type rows, the Article 9 coverage "
-        "figure and the Tier 1 recall gate match a measurement of this corpus "
-        "(the pinned model revision and the detector sources both agree)"
+        "figure and the Tier 1 recall gate match a measurement of this corpus, "
+        f"taken by detector {expected[:12]}"
     )
     return 0
 
