@@ -290,15 +290,15 @@ def main() -> int:
     rounds: list[list[float]] = []
     for _ in range(RESAMPLES):
         sample = [rng.randrange(groups) for _ in range(groups)]
-        totals = {
+        resampled = {
             threshold: {
                 key: sum(measured[threshold][i][key] for i in sample)
                 for key in measured[threshold][0]
             }
             for threshold in THRESHOLDS
         }
-        best = min(selection_key(totals[t]) for t in THRESHOLDS)
-        winners = [t for t in THRESHOLDS if selection_key(totals[t]) == best]
+        best = min(selection_key(resampled[t]) for t in THRESHOLDS)
+        winners = [t for t in THRESHOLDS if selection_key(resampled[t]) == best]
         if len(winners) == 1:
             selected[winners[0]] += 1
         else:

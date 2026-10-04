@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+from concrete_recognizer import gliner_recognizer
+
 from tessera_detector.ner import GlinerRecognizer, InferencePass
 from tessera_detector.pipeline import DEFAULT_MODEL_ID, Detector, build_detector
 
@@ -157,8 +159,8 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         )
-        recognizer = full.recognizer
-        if recognizer is not None:
+        if full.ner_available:
+            recognizer = gliner_recognizer(full)
             # Preprocessing is shared across the passes and happens once per
             # document, so it is timed once and the passes are timed over its
             # output. Timing whole per-tier detections instead would charge

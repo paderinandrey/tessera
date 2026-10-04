@@ -84,9 +84,17 @@ allowed-confusables = ["–"]
 
 [tool.mypy]
 strict = true
+# `evaluation/threshold_bootstrap.py` imports the joined-path scoring from
+# `tests/` through a `sys.path` insert, deliberately: that scoring lives with the
+# gate that enforces it. Without this, mypy cannot resolve the module, every
+# symbol from it is `Any`, and the exact defect that left that script crashing
+# for a month — a three-argument function called with two — type-checks clean.
+mypy_path = "tests"
 
+# Both live in optional dependency groups, so the environment that type-checks
+# does not install them: `gliner` in `ner`, `faker` in `eval`.
 [[tool.mypy.overrides]]
-module = ["gliner.*"]
+module = ["gliner.*", "faker.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
