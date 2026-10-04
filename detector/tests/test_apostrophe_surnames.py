@@ -9,7 +9,7 @@ another, and a frame written here would be testing a sentence nobody sends.
 
 import pytest
 
-from tessera_detector.models import find_model
+from tessera_detector.models import ModelUnavailable, find_model
 from tessera_detector.pipeline import build_detector
 
 pytestmark = pytest.mark.ner
@@ -21,8 +21,14 @@ def detector():
         pytest.skip("no NER weights: run `make model` or set TESSERA_NER_MODEL")
     try:
         built = build_detector(ner=True)
-    except ImportError:
-        pytest.skip("gliner not installed: run `uv sync --group ner`")
+    except (ModelUnavailable, ValueError) as error:
+        # `ner=True` wraps gliner's own `ImportError` in `ModelUnavailable`, so
+        # catching `ImportError` here caught nothing: with weights cached and the
+        # `ner` group absent — one `make model` followed by `make test` — this
+        # module raised ten errors instead of skipping. `evaluate.py` catches the
+        # same pair at the same boundary. Raised by review on #100 and reproduced
+        # against an exact `--locked --group serve` sync with the weights present.
+        pytest.skip(f"NER layer cannot run ({error}): run `uv sync --group ner`")
     return built
 
 
