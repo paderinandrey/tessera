@@ -96,48 +96,34 @@ KNOWN_UNMASKED: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         frozenset({"eine"}),
         "the gold includes the article; the mention is masked as HEALTH",
     ),
-    # **Five real defects of one kind, added with the corpus that can show
-    # them.** Until the generator drew apostrophe-bearing surnames this corpus
-    # held none, so the gates could not see the shape at all — measured: zero of
-    # 196 annotated values carried `\'` or `\u2019`. With eleven of them the
-    # detector finds none: it splits at the apostrophe and **both halves reach
-    # the provider**, which is egress rather than an annotation convention.
+    # **Two real defects of one kind, down from five.** The corpus grew
+    # apostrophe-bearing surnames so the gates could see the shape at all, and
+    # the detector then found none of them. Diagnosed in #97: it was never
+    # splitting the name. `person` asked in a call of its own scored these well
+    # above its bar, and a tier-2 competitor took the argmax and then failed its
+    # own — the `ver.di` defect `ner.py` documents across tiers, unfixed within
+    # one. `person` now gets a pass of its own in addition to its tier's, and
+    # four of the six occurrences came back.
+    #
+    # These two are what a pass split cannot reach: asked alone, `person` scores
+    # `dell(U+2019)Orto` in de-0004 at 0.268 and `L(U+2019)Hopital` in fr-0017 at
+    # 0.019. Low on their own merits rather than argued down by a competitor, so
+    # they need something other than pass structure. Still #97.
     #
     # Tracked so the gate measures "no *new* leak" as it already does for
     # `Tessier SA`, not so the leak reads as acceptable. It is not: these are
-    # ordinary surnames in the populations this product is sold into. Issue #97.
-    #
-    # The two spellings behave identically, which is itself the finding — U+2019
-    # is not a tokenizer problem the model handles better, so #69's cheap
-    # narrowing would recover nothing here.
-    ("PERSON", "O'Brien"): (
-        frozenset({"O", "Brien"}),
-        "the detector splits a surname at its apostrophe and finds neither half — #97",
-    ),
-    ("PERSON", "O\u2019Brien"): (
-        frozenset({"O", "Brien"}),
-        "the detector splits a surname at its apostrophe and finds neither half — #97",
-    ),
-    ("PERSON", "D'Angelo"): (
-        frozenset({"D", "Angelo"}),
-        "the detector splits a surname at its apostrophe and finds neither half — #97",
-    ),
+    # ordinary surnames in the populations this product is sold into.
     ("PERSON", "L\u2019H\u00f4pital"): (
         frozenset({"L", "H\u00f4pital"}),
-        "the detector splits a surname at its apostrophe and finds neither half — #97",
+        "`person` scores it 0.019 asked alone, so the pass split cannot reach it — #97",
     ),
     ("PERSON", "dell\u2019Orto"): (
         frozenset({"dell", "Orto"}),
-        "the detector splits a surname at its apostrophe and finds neither half — #97",
+        "`person` scores it 0.268 asked alone, so the pass split cannot reach it — #97",
     ),
     ("ORG", "Tessier SA"): (
         frozenset({"Tessier", "SA"}),
         "organization 0.697 against ORG's bar of 0.75 — a near miss on its own label",
-    ),
-    ("PERSON", "Texier"): (
-        frozenset({"Texier"}),
-        "claimed by `location` at 0.585, whose bar is 0.7; asked alone, `person` "
-        "scores it 0.704 — issue #46",
     ),
     ("GENETIC", "test génétique"): (
         frozenset({"test", "génétique"}),

@@ -290,7 +290,43 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 #
 # Re-recorded rather than relaxed, which is what the assertion below demands. The
 # code did not change; the corpus did, and the number is a property of both.
-LOST_TO_JOINING = 7
+#
+# **7 -> 5 when `person` got an inference pass of its own** (#97), and here the
+# number alone would have been ambiguous either way. Both paths mask *more* —
+# separate 222 -> 227, joined 202 -> 207 — and the gap narrowed because joining
+# improved on three entities. Had it widened, that too could have been the
+# baseline improving rather than joining breaking: a count cannot tell those
+# apart, which is the fifth thing this gate could not see. It is a set of names
+# now:
+#
+#   left:  Lenoir, Röhrdanz, Schleich  — joining stopped losing these
+#   added: D(U+2019)Angelo             — per-leaf now finds it, joined does not
+#
+# Named rather than counted for the same reason `KNOWN_UNMASKED` is: a loss that
+# disappears while another appears holds the total and passes a number.
+LOST_TO_JOINING = frozenset(
+    {
+        ("HEALTH", "eine Hepatitis-B-Infektion"),
+        ("PERSON", "D'Angelo"),
+        ("PERSON", "Hermighausen"),
+        ("PERSON", "dell\u2019Orto"),
+        ("POLITICAL_AFFILIATION", "\u00e9cologiste"),
+    }
+)
+
+
+def _lost_members(detector: Detector) -> frozenset[tuple[str, str]]:
+    """The same walk `_score` counts, naming what it counted."""
+    members = set()
+    for group in _documents():
+        truth, separate, joined = _rebased(detector, group)
+        text = JOIN.join(document["text"] for document in group)
+        members |= {
+            (entity.entity_type, text[entity.start : entity.end])
+            for entity in truth
+            if _lost(text, entity, separate, joined)
+        }
+    return frozenset(members)
 
 
 def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector) -> None:
@@ -313,6 +349,7 @@ def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector
     #   loses, because the separate path failed the same test and the errors
     #   cancelled. It read 4 against a real 5.
     totals = _score(detector)
+    members = _lost_members(detector)
 
     # **Asserted exactly, and that is the fourth thing this gate got wrong.**
     # `<=` cannot catch a predicate that stops seeing things: every mutation of
@@ -326,11 +363,18 @@ def test_joining_does_not_lose_more_recall_than_it_does_today(detector: Detector
     # and the alternative is a bound that silently accommodates a gate going
     # dark. The same rule `a_real_tool_payload_fits_the_bounds_this_gateway_
     # ships_with` states one crate over — do not relax it, re-measure.
-    assert totals["lost_to_joining"] == LOST_TO_JOINING, (
-        "the entities joining leaves unmasked and per-leaf detection does not: "
-        f"{totals['lost_to_joining']} against {LOST_TO_JOINING} recorded, of "
-        f"{totals['truth']}. Up is a regression; down is an improvement and a "
-        "constant to re-record — neither is something to widen a bound for."
+    assert members == LOST_TO_JOINING, (
+        "the entities joining leaves unmasked and per-leaf detection does not, of "
+        f"{totals['truth']} annotated. Arrived: {sorted(members - LOST_TO_JOINING)}. "
+        f"Gone: {sorted(LOST_TO_JOINING - members)}. Re-record the set with the "
+        "reason — and read the arrivals before calling them a regression, because "
+        "this set grows when per-leaf detection improves on something joining "
+        "still misses, which is the baseline moving rather than joining breaking."
+    )
+    assert totals["lost_to_joining"] == len(LOST_TO_JOINING), (
+        f"`_lost` counted {totals['lost_to_joining']} but naming them gives "
+        f"{len(members)}: the two walks over the corpus disagree, which means one "
+        "of them is not asking what the other asks."
     )
 
 

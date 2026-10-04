@@ -7,11 +7,22 @@ so far.
 Measured on an Apple M3 Pro (11 cores, CPU only), with the pinned fp32 ONNX weights, over
 text concatenated deterministically from the public corpus:
 
-| Size | Deterministic | Chunk + tokenize | NER tier 2 | NER tier 3 | Total (median) | Total (p95) |
-|---|---|---|---|---|---|---|
-| sentence (80 chars) | 0.0 ms | 0.0 ms | 42 ms | 66 ms | 109 ms | 116 ms |
-| paragraph (1 200 chars, one chunk) | 0.6 ms | 0.3 ms | 467 ms | 491 ms | 950 ms | 1 108 ms |
-| document (6 000 chars, several chunks) | 3.3 ms | 1.9 ms | 2 556 ms | 3 180 ms | 5 524 ms | 6 086 ms |
+| Size | Deterministic | Chunk + tokenize | NER tier 2 | NER `person` | NER tier 3 | Total (median) | Total (p95) |
+|---|---|---|---|---|---|---|---|
+| sentence (80 chars) | 0.0 ms | 0.0 ms | 48.6 ms | 41.8 ms | 79.7 ms | 110 ms | 134 ms |
+| paragraph (1 200 chars, one chunk) | 0.9 ms | 0.3 ms | 544.2 ms | 599.7 ms | 647.9 ms | 1 352 ms | 1 590 ms |
+| document (6 000 chars, several chunks) | 3.7 ms | 2.1 ms | 2 937.9 ms | 2 854.9 ms | 3 268.7 ms | 6 767 ms | 7 150 ms |
+
+**A fourth pass, and it cost what the per-pass claim below says it should.** `person` is
+asked in a call of its own as well as in tier 2's, because sharing one let a competitor take
+the argmax and then fail its own bar, sending whole surnames to the provider (#97). Measured
+against the three-pass build in the same session, which is the only comparison worth making
+on this machine: a paragraph's median total moved 896 ms → 1 352 ms and a document's
+4 587 ms → 6 767 ms. The new row costs 600 ms on a paragraph where tier 2's three labels
+cost 544 ms — one pass, near enough, for one label instead of three.
+
+Medians across three runs of the four-pass build spread about 3% on the document row and
+about 10% on the paragraph, so read the table at that resolution.
 
 Per-layer figures are medians and account for the total: preprocessing is shared across the
 inference passes and timed once, so the parts sum to within a few percent of the whole. The
@@ -26,11 +37,12 @@ stable signal and p95 as an upper bound until these run on dedicated hardware.
 > roughly a second per 1 200 characters on this CPU. Measuring one-sentence documents alone
 > would have reported 116 ms and hidden that, which is why the harness uses a size ladder.
 >
-> The split says two useful things. Chunking and tokenization are free — 1.9 ms on a 6 000
+> The split says two useful things. Chunking and tokenization are free — 2.1 ms on a 6 000
 > character document — so the cost is inference and nothing else. And three quasi-identifier
-> labels cost about as much as eleven Article 9 labels: the price is paid per inference pass,
-> not per label, so adding categories to an existing tier is nearly free while adding a tier
-> is not.
+> labels cost about as much as eleven Article 9 labels, while one label asked alone costs as
+> much as either: the price is paid per inference pass, not per label. Adding categories to
+> an existing pass is nearly free; adding a pass is not, whether it carries eleven labels or
+> one. #97 bought four recovered surnames at exactly that price.
 >
 > Every route to the target measured so far costs something. Collapsing the two inference
 > passes into one comes in faster but loses the Article 9 spans the split exists to protect.

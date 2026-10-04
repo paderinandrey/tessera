@@ -9,33 +9,39 @@ with the wrong bounds, or not found at all — three different rows in three dif
 none of which says "these characters went out". `make evaluate` asks by position and by
 content, and fails on anything not already written down.
 
-Eight are real. Three are threshold misses:
+Four are real. Two are threshold misses:
 
 ```
 GENETIC  'test génétique'   its own label at 0.288, bar 0.30
 ORG      'Tessier SA'       its own label at 0.697, bar 0.75
-PERSON   'Texier'           claimed by `location` at 0.585, whose bar is 0.7
 ```
 
-Two are near misses by 0.012 and 0.053. The third is [#46][i46]: a quasi-identifier wins the
-argmax and then fails a bar the loser would have cleared — asked alone, `person` scores
-`Texier` at 0.704.
+Near misses by 0.012 and 0.053.
 
-The other five are one defect, [#97][i97]: the detector splits a surname at its apostrophe
-and finds neither half, so both reach the provider.
+The other two are [#97][i97], and the mechanism is not the one that issue was
+filed with. It was filed as "the detector splits a surname at its apostrophe and
+finds neither half", from reading this gate's own output: the list beside each
+entry is *the words of the gold value no prediction covers*, and the apostrophe
+separates words in that tokenizer — so a surname nothing covered at all printed
+as two. There was never a split.
+
+What was happening is [#46][i46] inside tier 2. `person`, `location` and
+`organization` shared one inference call, GLiNER returns one label per span, and
+a competitor took the argmax and then failed *its own* bar while `person` would
+have cleared its: `D'Angelo` scored 0.888 as a person asked alone and went out in
+full because `organization` won at 0.603 against a bar of 0.75. `person` now gets
+a call of its own in addition to its tier's, and four of the six occurrences came
+back — along with `Texier`, which this list used to carry for exactly the same
+reason.
 
 ```
-PERSON   "D'Angelo"         reaches the provider as 'D', 'Angelo'
-PERSON   'L’Hôpital'        reaches the provider as 'L', 'Hôpital'
-PERSON   "O'Brien"          reaches the provider as 'O', 'Brien'
-PERSON   'O’Brien'          reaches the provider as 'O', 'Brien'
-PERSON   'dell’Orto'        reaches the provider as 'dell', 'Orto'
+PERSON   'L’Hôpital'        0.019 asked alone, in fr-0017
+PERSON   'dell’Orto'        0.268 asked alone, in de-0004
 ```
 
-Both spellings behave identically — U+2019 is not a form the model handles better than
-U+0027 — and these are the first family of real misses here that is not a threshold: no bar
-is close, because no candidate span covers the whole surname. They are tracked so the gate
-measures "no *new* leak", which is bookkeeping rather than acceptance.
+These two are what a pass split cannot reach: low on their own merits rather than
+argued down by a competitor. Both are tracked so the gate measures "no *new*
+leak", which is bookkeeping rather than acceptance.
 
 The remaining five are an annotation convention. The gold span includes a leading article the
 detector does not predict — `un diabète de type 2` masked as `diabète de type 2` — and `un`
