@@ -434,23 +434,24 @@ LOST_TO_THE_GROUP_SHAPE = [("de-0004", "dell\u2019Orto"), ("mixed-0017", "D'Ange
     LOST_TO_THE_GROUP_SHAPE,
     ids=[row for row, _ in LOST_TO_THE_GROUP_SHAPE],
 )
-def test_a_tool_argument_shape_is_found_at_the_shipped_bar(
+def test_the_shipped_bar_finds_these_names_at_field_length(
     detector: Detector, row_id: str, value: str
 ) -> None:
-    """The gain a lower bar shows on `LEAVES` sentences does not exist in the
-    shape production actually joins.
+    """How much the bar depends on surrounding text, pinned at the short end.
 
-    `_documents()` groups four *unrelated* corpus sentences, because the corpus is
-    sentences — 344 and 399 characters for these two. A `Slot::Json` document's
-    leaves are field values: a name, a city, an identifier. At that size the
-    shipped bar already covers both, measured at 0.658 and 0.348 against 0.5,
-    while the four-sentence shape misses them and 0.4 recovers them at 0.479 and
-    0.411.
+    These two names are missed at 0.5 in `_documents()`'s four-sentence groups —
+    344 and 399 characters — and found at 0.5 here, where the leaves are the row's
+    gold values alone, 46 and 53 characters. Same names, same bar, opposite
+    answers: the variable is context length.
 
-    So this is the test that refused a threshold change. #102 moved PERSON to 0.4
-    to follow the selection rule, which maximises joined coverage; review asked
-    whether that coverage is representative, and it is not. Reverted, and this
-    keeps the answer re-runnable rather than leaving it in a closed thread.
+    **This does not establish what a tool call looks like, and an earlier version
+    of it claimed to.** `proxy::document_detection` joins every string and numeric
+    leaf of a JSON document, so an argument carrying one prose field reaches the
+    long end honestly; keeping only the gold values is the most favourable payload
+    there is. Raised by review on #102 against the refutation this test was
+    written to carry. What it pins is the short end of a measured range, which is
+    worth having because the range is what makes the threshold question
+    shape-bound — see #103.
 
     Coverage by position, not by label: one of the two is covered under a
     different type at this size, and a masking gateway is no worse off for the
