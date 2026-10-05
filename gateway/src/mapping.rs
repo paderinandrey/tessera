@@ -5511,6 +5511,125 @@ mod tests {
         );
     }
 
+    /// The leaf shape a real joined call has, which is not the shape the
+    /// evaluation corpus scores against (#103).
+    ///
+    /// `evaluation/corpus/public.jsonl` is sentences, and
+    /// `detector/tests/test_joined_detection._documents` groups four of them
+    /// into a document — four leaves of about ninety characters, joined to
+    /// 344–399. #102 compared that against the *gold values alone*, 46–53
+    /// characters, and concluded the corpus group was too long to be
+    /// representative. Measured here against the one real payload this
+    /// repository holds, **that conclusion was reached from the wrong end**:
+    ///
+    /// | | leaves | joined characters |
+    /// |---|---|---|
+    /// | `WebFetch` schema | 2 | 71 |
+    /// | `Edit` schema | 4 | 180 |
+    /// | `Read` schema | 8 | 373 |
+    /// | `Agent` schema | 20 | 721 |
+    /// | `Artifact` schema | 29 | 1 587 |
+    /// | a four-sentence corpus group | 4 | 344–399 |
+    ///
+    /// A corpus group's *joined* length sits in the middle of that range, so
+    /// 344–399 is an ordinary size for a production document rather than an
+    /// inflated one. What does not match is the **granularity**: across these
+    /// ten schemas the leaves run 1 to 276 characters with a median of 37, and
+    /// 42 of 79 are 40 or shorter. Production joins many short leaves; the
+    /// corpus joins four long ones. So neither measurement #102 made covers the
+    /// shape a tool call actually has — a name in a six-character leaf inside a
+    /// document of 1 587 — and the fixtures #103 asks for are the ones that
+    /// would.
+    ///
+    /// **Tool definitions, not tool arguments**, and the gap matters: these are
+    /// the shape the gateway charges and detects today, and they are the only
+    /// real payload here, but an argument payload is a different population and
+    /// this measurement does not stand in for one. What it establishes is the
+    /// granularity question, which both populations share.
+    ///
+    /// A description is its own call and so is not joined with anything; the
+    /// ten here run 240 to 745 characters, which is the other size a detect
+    /// call comes in.
+    #[test]
+    fn a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones() {
+        let tools: Vec<Value> =
+            serde_json::from_str(include_str!("testdata/claude_code_tools.json")).unwrap();
+        let mut lengths: Vec<usize> = Vec::new();
+        let mut joined: Vec<(&str, usize, usize)> = Vec::new();
+        let mut descriptions: Vec<usize> = Vec::new();
+        for tool in &tools {
+            if let Some(description) = tool["description"].as_str() {
+                descriptions.push(description.chars().count());
+            }
+            let leaves = json_leaves(&tool["input_schema"], Shape::Schema).unwrap();
+            let mut call = 0usize;
+            for leaf in &leaves {
+                let length = match leaf {
+                    Leaf::Text(text) => text.chars().count(),
+                    Leaf::Number(number) => number.chars().count(),
+                };
+                lengths.push(length);
+                call += length;
+            }
+            joined.push((
+                tool["name"].as_str().unwrap(),
+                leaves.len(),
+                call + Joined::separator_chars(leaves.len()),
+            ));
+        }
+
+        lengths.sort_unstable();
+        // Nearest-rank, stated rather than left to a library: the figures in
+        // the table above are only re-derivable if the rule that produced them
+        // is written down.
+        let percentile = |p: usize| lengths[lengths.len() * p / 100];
+        assert_eq!(lengths.len(), 79, "schema leaves, of either kind");
+        assert_eq!(
+            (lengths[0], percentile(50), *lengths.last().unwrap()),
+            (1, 37, 276),
+            "the leaf lengths production joins"
+        );
+        assert_eq!(
+            lengths.iter().filter(|&&l| l <= 40).count(),
+            42,
+            "leaves no longer than 40 characters — more than half, and the \
+             corpus has none at all"
+        );
+
+        // **The corpus group is not an outlier in joined length.** Asserted
+        // both ways round, because the claim above is that 344-399 sits
+        // *inside* this range and a one-sided bound could not say that.
+        let shortest = joined.iter().map(|&(_, _, c)| c).min().unwrap();
+        let longest = joined.iter().map(|&(_, _, c)| c).max().unwrap();
+        assert_eq!(
+            (shortest, longest),
+            (71, 1_587),
+            "joined characters per call"
+        );
+        assert!(
+            shortest < 344 && longest > 399,
+            "a four-sentence corpus group at 344-399 must fall inside the \
+             measured range for the granularity reading above to be the \
+             finding: {shortest}..{longest}"
+        );
+
+        // The leaf *count* is where the corpus is wrong, and it is wrong in
+        // one direction: four is at the bottom of what production sends.
+        let widest = joined.iter().map(|&(_, n, _)| n).max().unwrap();
+        assert_eq!(widest, 29, "leaves in the widest schema (`Artifact`)");
+
+        descriptions.sort_unstable();
+        assert_eq!(
+            (
+                descriptions.len(),
+                descriptions[0],
+                *descriptions.last().unwrap()
+            ),
+            (10, 240, 745),
+            "a description is a call of its own, and this is the size it comes in"
+        );
+    }
+
     /// What the real payload's *numbers* are, and what a detector could make of
     /// them.
     ///
