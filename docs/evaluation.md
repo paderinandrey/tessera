@@ -162,6 +162,16 @@ count and every argument leaf's *length* stay unmeasured — a value is the call
 nothing here samples one — so the lengths below come from the definition population and are
 an assumption.
 
+**Text leaves only.** Every leaf in this corpus is a string. A JSON number is a
+`Leaf::Number`, which is never masked: production refuses the whole request when a
+deterministic span lands on one and forwards the digits otherwise, and both branches are
+gated in the gateway (`proxy::tests::a_number_carrying_personal_data_refuses_the_request`,
+`a_number_the_exemption_forwards_is_journalled_as_forwarded`). The measured payload's twelve
+numeric leaves are schema bounds and count toward the distributions above as text. No
+annotated value in the corpus is digit-only — card numbers carry spaces, a Steuernummer
+slashes — so none could have been sent as a number, and the corpus test fails if one is
+added.
+
 `evaluation/corpus/documents.jsonl` draws its leaf counts from both lists and its lengths
 from that distribution, with the same seeded value generators the sentence corpus uses. 60
 documents, 378 leaves, 222 annotations. `detector/tests/test_document_corpus.py` scores it

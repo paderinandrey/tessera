@@ -318,6 +318,22 @@ def test_the_fixture_still_has_the_leaf_shape_the_real_payload_has() -> None:
     assert sum(1 for length in lengths if length <= 40) == 211, (
         "leaves no longer than 40 characters — 56% here against 53% measured"
     )
+    digit_only = [
+        (d["id"], leaf["text"][e["start"] : e["end"]])
+        for d in documents
+        for leaf in d["leaves"]
+        for e in leaf["entities"]
+        if leaf["text"][e["start"] : e["end"]].isdigit()
+    ]
+    assert not digit_only, (
+        "an annotated value made only of digits could be sent as a JSON number, "
+        "and a `Leaf::Number` is not masked: production refuses the request on a "
+        "deterministic span and forwards the digits on any other "
+        "(`proxy::tests::a_number_carrying_personal_data_refuses_the_request`, "
+        "`a_number_the_exemption_forwards_is_journalled_as_forwarded`). These "
+        "inventories model text leaves only, so this corpus must not hold one: "
+        f"{digit_only}"
+    )
 
 
 def test_the_joined_path_leaves_these_entities_with_the_provider(
