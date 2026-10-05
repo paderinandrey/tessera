@@ -5695,6 +5695,35 @@ mod tests {
             "properties whose value yields no leaf, since `walk` skips booleans"
         );
 
+        // Outside the crate: the image build copies `src` alone and never
+        // compiles tests, so this resolves only under `cfg(test)`.
+        let generator = include_str!("../../evaluation/generate_documents.py");
+        let literal = |name: &str| -> Vec<usize> {
+            let line = generator
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} = [")))
+                .unwrap_or_else(|| panic!("`{name} = [...]` not found in the generator"));
+            line[line.find('[').unwrap() + 1..line.rfind(']').unwrap()]
+                .split(',')
+                .map(|n| n.trim().parse().unwrap())
+                .collect()
+        };
+        let schema_leaves: Vec<usize> = joined.iter().map(|&(_, n, _)| n).collect();
+        assert_eq!(
+            literal("SCHEMA_LEAF_COUNTS"),
+            schema_leaves,
+            "the generator's definition leaf counts must be this payload's, tool \
+             by tool — regenerate the corpus and re-record its inventories after \
+             changing either"
+        );
+        assert_eq!(
+            literal("ARGUMENT_FIELD_COUNTS"),
+            properties,
+            "the generator's property-count proxy must be this payload's, tool by \
+             tool — regenerate the corpus and re-record its inventories after \
+             changing either"
+        );
+
         descriptions.sort_unstable();
         assert_eq!(
             (
