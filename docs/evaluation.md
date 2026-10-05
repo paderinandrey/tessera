@@ -148,14 +148,19 @@ leaves of ninety characters are not what production joins. [#102][i102] read thi
 way round by comparing against the gold values alone — 46–53 characters — which is the most
 favourable payload rather than the representative one.
 
-**Two populations, and the corpus covers both.** The figures above are tool *definitions* —
-`Shape::Schema` documents the gateway joins and detects on every request carrying tools, so
-a production shape rather than a proxy for one. A tool *argument* is a `Shape::Instance`
-document and no captured one exists here; what the same payload says about it is how many
-leaves it can hold, since each schema declares 2 to 15 properties, 47 in all. An argument
-therefore tops out at 15 leaves where a definition reaches 29. An argument leaf's *length*
-stays unmeasured — a value is the caller's data and nothing here samples one — so the
-lengths below come from the definition population and are an assumption.
+**Two populations: one measured, one approximated.** The figures above are tool
+*definitions* — `Shape::Schema` documents the gateway joins and detects on every request
+carrying tools, so a production shape rather than a proxy for one. A tool *argument* is a
+`Shape::Instance` document and no captured one exists here. What stands in for it is the
+number of top-level properties each schema declares, 2 to 15, 47 in all — **a proxy, not a
+bound in either direction.** `Shape::Instance` recurses, so a property holding an array or
+an object yields as many leaves as it holds, and `Artifact.capabilities` is an open object:
+nothing caps an argument. A boolean yields no leaf at all. For this payload those are one
+property of 47 and four, which makes the proxy reasonable here and nothing more; the
+gateway test names both sets so the error cannot grow unnoticed. An argument's real leaf
+count and every argument leaf's *length* stay unmeasured — a value is the caller's data and
+nothing here samples one — so the lengths below come from the definition population and are
+an assumption.
 
 `evaluation/corpus/documents.jsonl` draws its leaf counts from both lists and its lengths
 from that distribution, with the same seeded value generators the sentence corpus uses. 60

@@ -5546,17 +5546,23 @@ mod tests {
     /// the gateway joins and detects it on every request that carries tools, so
     /// the figures above are a production shape and not a proxy for one. An
     /// argument is a `Shape::Instance` document, a different population, and no
-    /// captured one exists in this repository — but each schema *declares* the
-    /// shape its arguments may take, which is measurable from the same file:
-    /// **47 top-level properties across the ten tools, 2 to 15 per tool**,
-    /// against 2 to 29 schema leaves. So an argument object's leaf count tops
-    /// out at 15 where a definition reaches 29, and its floor is the `required`
-    /// list, which runs 0 to 3.
+    /// captured one exists in this repository. Each schema declares **2 to 15
+    /// top-level properties, 47 in all**, and the corpus uses those counts as a
+    /// **proxy** for an argument's leaf count — not a bound in either direction.
+    /// `Shape::Instance` recurses, so a property holding an array or an object
+    /// yields as many leaves as it holds, and `Artifact.capabilities` is an open
+    /// object (`additionalProperties: {}`): the schema puts no ceiling on an
+    /// argument at all. And a boolean yields none, so the count is not a floor
+    /// either. The two ways the proxy can be wrong are named below rather than
+    /// left to be rediscovered; for this payload they are one property of 47
+    /// and four, which is why the proxy is a reasonable one here and nothing
+    /// more.
     ///
-    /// What stays unmeasured is an argument leaf's *length*: a value is the
-    /// caller's data, and nothing here samples it. Raised by review on #105,
-    /// against a corpus that took these counts and called itself the argument
-    /// shape.
+    /// What stays unmeasured is an argument's real leaf count and every
+    /// argument leaf's *length*: a value is the caller's data, and nothing here
+    /// samples it. Raised twice by review on #105 — first against a corpus that
+    /// took the definition counts and called itself the argument shape, then
+    /// against the property counts being called a ceiling.
     ///
     /// A description is its own call and so is not joined with anything; the
     /// ten here run 240 to 745 characters, which is the other size a detect
@@ -5629,18 +5635,32 @@ mod tests {
         let widest = joined.iter().map(|&(_, n, _)| n).max().unwrap();
         assert_eq!(widest, 29, "leaves in the widest schema (`Artifact`)");
 
-        // **The argument shape, from what each schema declares about it.** The
-        // only part of an argument payload this file can speak for: a
-        // `Shape::Instance` document carries at most one leaf per declared
-        // property, so these are a ceiling a definition's own leaf count
-        // overshoots. `evaluation/generate_documents.py` draws from both lists
-        // for that reason.
+        // **Declared properties, a proxy for an argument's leaf count.**
+        // `evaluation/generate_documents.py` draws from this list alongside the
+        // definition counts above.
         let mut properties: Vec<usize> = Vec::new();
-        let mut required: Vec<usize> = Vec::new();
+        let mut many: Vec<String> = Vec::new();
+        let mut none: Vec<String> = Vec::new();
         for tool in &tools {
-            let schema = &tool["input_schema"];
-            properties.push(schema["properties"].as_object().map_or(0, |p| p.len()));
-            required.push(schema["required"].as_array().map_or(0, |r| r.len()));
+            let name = tool["name"].as_str().unwrap();
+            let declared = tool["input_schema"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            properties.push(declared.len());
+            for (property, schema) in &declared {
+                let kind = schema["type"].as_str();
+                if matches!(kind, Some("array" | "object"))
+                    || schema.get("items").is_some()
+                    || schema.get("properties").is_some()
+                    || schema.get("additionalProperties").is_some()
+                {
+                    many.push(format!("{name}.{property}"));
+                }
+                if matches!(kind, Some("boolean" | "null")) {
+                    none.push(format!("{name}.{property}"));
+                }
+            }
         }
         assert_eq!(properties.iter().sum::<usize>(), 47, "declared properties");
         assert_eq!(
@@ -5649,23 +5669,30 @@ mod tests {
                 *properties.iter().max().unwrap()
             ),
             (2, 15),
-            "properties per tool — the ceiling on an argument object's leaves"
+            "properties per tool"
         );
-        assert!(
-            *properties.iter().max().unwrap() < widest,
-            "the argument ceiling must sit below the definition's leaf count, or \
-             the two populations are not the distinct shapes the corpus treats \
-             them as: {} against {widest}",
-            properties.iter().max().unwrap()
+        // **The proxy's two errors, named.** A property that can hold an array
+        // or an object makes the count an undercount with no limit — this one
+        // is an open object — and a boolean makes it an overcount. Members
+        // rather than counts, so a payload that gains a nested property says
+        // which one and how far the proxy just drifted.
+        many.sort();
+        none.sort();
+        assert_eq!(
+            many,
+            ["Artifact.capabilities"],
+            "properties whose value can yield any number of leaves — each one \
+             removes the ceiling from that tool's argument count"
         );
         assert_eq!(
-            (
-                *required.iter().min().unwrap(),
-                *required.iter().max().unwrap()
-            ),
-            (0, 3),
-            "required fields — the floor, and a tool with none of its own can \
-             be called with an empty object"
+            none,
+            [
+                "Artifact.force",
+                "Bash.dangerouslyDisableSandbox",
+                "Bash.run_in_background",
+                "Edit.replace_all",
+            ],
+            "properties whose value yields no leaf, since `walk` skips booleans"
         );
 
         descriptions.sort_unstable();

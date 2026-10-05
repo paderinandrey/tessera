@@ -14,16 +14,19 @@ its leaf count is at the bottom of what production sends.
 every request carrying tools, and it is what the figures above are taken from —
 a production shape, not a proxy for one. A tool *argument* is a
 `Shape::Instance` document, a different population, and no captured one exists
-here. What the same file does say about arguments is how many leaves they can
-hold: each schema declares 2 to 15 properties, 47 in all, so an argument's leaf
-count tops out where a definition's reaches 29. Both counts drive the documents
-below.
+here. What the same file offers instead is a proxy: each schema declares 2 to 15
+top-level properties, 47 in all. It is not a bound in either direction — a
+property holding an array or object yields as many leaves as it holds, and
+`Artifact.capabilities` is an open object, so nothing caps an argument; a boolean
+yields none. For this payload those are one property and four, which makes the
+proxy a reasonable one and nothing more. Both counts drive the documents below.
 
-What stays unmeasured is an argument leaf's **length**. A value is the caller's
-data and nothing here samples it, so the lengths come from the definition
-population and are an assumption rather than a measurement. Raised by review on
-#105, against an earlier version of this file that took the definition counts
-and called itself the argument shape.
+What stays unmeasured is an argument's real leaf count and every argument
+leaf's **length**. A value is the caller's data and nothing here samples it, so
+the lengths come from the definition population and are an assumption rather
+than a measurement. Raised twice by review on #105: once against an earlier
+version that took the definition counts and called itself the argument shape,
+and once against the property counts being called a ceiling.
 
 This generator does not touch `public.jsonl`: the published metrics are tied to
 that file's digest, and a corpus regenerated for a reason unrelated to them has
@@ -59,14 +62,15 @@ OUTPUT = Path(__file__).parent / "corpus" / "documents.jsonl"
 # `Shape::Schema` walk of its `input_schema`, which is what the gateway joins
 # today.
 SCHEMA_LEAF_COUNTS = [8, 2, 4, 5, 2, 3, 20, 29, 2, 4]
-# The properties each schema *declares*, which is the most leaves an argument
-# object for that tool can carry. The only thing this payload says about the
-# argument population, and it says the counts are smaller: 15 at the ceiling
-# against 29.
+# The properties each schema *declares*, used as a proxy for an argument's leaf
+# count. Not a bound: `Shape::Instance` recurses into nested values, an open
+# object has no limit, and a boolean yields no leaf. The gateway test pins which
+# properties make the proxy wrong in each direction.
 ARGUMENT_FIELD_COUNTS = [4, 2, 4, 5, 2, 2, 8, 15, 2, 3]
 # Interleaved so the corpus covers both, document by document, rather than
 # averaging them into a shape neither population has. Four — what the sentence
-# corpus groups — appears here, but as the floor rather than the whole corpus.
+# corpus groups — appears here as an ordinary member rather than as the whole
+# corpus.
 LEAF_COUNTS = [
     count
     for pair in zip(SCHEMA_LEAF_COUNTS, ARGUMENT_FIELD_COUNTS, strict=True)

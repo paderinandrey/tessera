@@ -19,7 +19,7 @@ the representative one.
 
 `evaluation/corpus/documents.jsonl` is that shape: leaf counts taken from the
 real payload — both the leaves each tool *definition* joins and the properties
-each schema *declares*, which is the ceiling on an argument object — leaf
+each schema *declares*, used as a proxy for an argument's leaf count — leaf
 lengths matched to the definition population's distribution, and the same
 synthetic value generators the sentence corpus uses. What the lengths are for an
 argument leaf is not measured anywhere, because a value is the caller's data and
@@ -271,15 +271,15 @@ def test_the_fixture_still_has_the_leaf_shape_the_real_payload_has() -> None:
         "annotated entities — near the sentence corpus's 196, which is what makes "
         "an inventory from one comparable in size to an inventory from the other"
     )
-    # Both populations, which is what the ceiling and the floor here say. 29 is
-    # the widest tool *definition*; 15 is the most properties any of the ten
-    # declares, so an argument object cannot reach 29 and the corpus would be
-    # one population wide if only the upper figure appeared. 2 is the floor of
-    # both, and the four-leaf document the sentence corpus groups is in here as
-    # an ordinary member rather than as the shape.
+    # Both populations. 29 is the widest tool *definition*; 15 is the largest
+    # declared-property count, which stands in for an argument and is a proxy
+    # rather than a ceiling — an open object puts no limit on an argument, and
+    # the gateway test names the property that does it. The four-leaf document
+    # the sentence corpus groups is in here as an ordinary member rather than
+    # as the shape.
     assert (counts[0], counts[-1]) == (2, 29), "leaves per document"
     assert 15 in counts, (
-        "the argument ceiling must appear as a document in its own right, or "
+        "the largest property-count proxy must appear as a document, or "
         "`ARGUMENT_FIELD_COUNTS` is no longer reaching the corpus"
     )
     # The distribution, against the measured p50=37, p75=78, p90=128, max=276.
