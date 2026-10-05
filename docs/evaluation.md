@@ -155,8 +155,10 @@ carrying tools, so a production shape rather than a proxy for one. A tool *argum
 number of top-level properties each schema declares, 2 to 15, 47 in all — **a proxy, not a
 bound in either direction.** `Shape::Instance` recurses, so a property holding an array or
 an object yields as many leaves as it holds, and `Artifact.capabilities` is an open object:
-nothing caps an argument. A boolean yields no leaf at all. For this payload those are one
-property of 47 and four, which makes the proxy reasonable here and nothing more; the
+nothing caps an argument. A boolean yields no leaf at all, and a property declaring no
+`type` — `Artifact.contract`, `SendMessage.message` — can do either. For this payload three
+properties of 47 can yield any number of leaves and six can yield none, which makes the
+proxy reasonable here and nothing more; the
 gateway test names both sets so the error cannot grow unnoticed. An argument's real leaf
 count and every argument leaf's *length* stay unmeasured — a value is the caller's data and
 nothing here samples one — so the lengths below come from the definition population and are
@@ -168,9 +170,10 @@ deterministic span lands on one and forwards the digits otherwise, and both bran
 gated in the gateway (`proxy::tests::a_number_carrying_personal_data_refuses_the_request`,
 `a_number_the_exemption_forwards_is_journalled_as_forwarded`). The measured payload's twelve
 numeric leaves are schema bounds and count toward the distributions above as text. No
-annotated value in the corpus is digit-only — card numbers carry spaces, a Steuernummer
-slashes — so none could have been sent as a number, and the corpus test fails if one is
-added.
+annotated value in the corpus has the shape of a JSON number — card numbers carry spaces, a
+Steuernummer slashes — so none could have been sent as one, and the corpus test fails if one
+is added. The check is the JSON number grammar itself, signs, fractions and exponents
+included, so `-42` and `1e10` are caught as well as `42`.
 
 `evaluation/corpus/documents.jsonl` draws its leaf counts from both lists and its lengths
 from that distribution, with the same seeded value generators the sentence corpus uses. 60

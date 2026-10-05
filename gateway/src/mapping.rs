@@ -5553,10 +5553,12 @@ mod tests {
     /// yields as many leaves as it holds, and `Artifact.capabilities` is an open
     /// object (`additionalProperties: {}`): the schema puts no ceiling on an
     /// argument at all. And a boolean yields none, so the count is not a floor
-    /// either. The two ways the proxy can be wrong are named below rather than
-    /// left to be rediscovered; for this payload they are one property of 47
-    /// and four, which is why the proxy is a reasonable one here and nothing
-    /// more.
+    /// either. A property that declares no `type` can be any of these, so it
+    /// errs in both directions. The two ways the proxy can be wrong are named
+    /// below rather than left to be rediscovered; for this payload they are
+    /// three properties of 47 that can yield any number of leaves and six that
+    /// can yield none — two of them, untyped, in both lists — which is why the
+    /// proxy is a reasonable one here and nothing more.
     ///
     /// What stays unmeasured is an argument's real leaf count and every
     /// argument leaf's *length*: a value is the caller's data, and nothing here
@@ -5649,15 +5651,22 @@ mod tests {
                 .unwrap_or_default();
             properties.push(declared.len());
             for (property, schema) in &declared {
-                let kind = schema["type"].as_str();
-                if matches!(kind, Some("array" | "object"))
+                let kinds: Vec<&str> = match &schema["type"] {
+                    Value::String(kind) => vec![kind.as_str()],
+                    Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                let untyped = kinds.is_empty();
+                let may = |wanted: &[&str]| kinds.iter().any(|kind| wanted.contains(kind));
+                if untyped
+                    || may(&["array", "object"])
                     || schema.get("items").is_some()
                     || schema.get("properties").is_some()
                     || schema.get("additionalProperties").is_some()
                 {
                     many.push(format!("{name}.{property}"));
                 }
-                if matches!(kind, Some("boolean" | "null")) {
+                if untyped || may(&["boolean", "null"]) {
                     none.push(format!("{name}.{property}"));
                 }
             }
@@ -5671,28 +5680,30 @@ mod tests {
             (2, 15),
             "properties per tool"
         );
-        // **The proxy's two errors, named.** A property that can hold an array
-        // or an object makes the count an undercount with no limit — this one
-        // is an open object — and a boolean makes it an overcount. Members
-        // rather than counts, so a payload that gains a nested property says
-        // which one and how far the proxy just drifted.
         many.sort();
         none.sort();
         assert_eq!(
             many,
-            ["Artifact.capabilities"],
+            [
+                "Artifact.capabilities",
+                "Artifact.contract",
+                "SendMessage.message",
+            ],
             "properties whose value can yield any number of leaves — each one \
              removes the ceiling from that tool's argument count"
         );
         assert_eq!(
             none,
             [
+                "Artifact.contract",
                 "Artifact.force",
                 "Bash.dangerouslyDisableSandbox",
                 "Bash.run_in_background",
                 "Edit.replace_all",
+                "SendMessage.message",
             ],
-            "properties whose value yields no leaf, since `walk` skips booleans"
+            "properties whose value can yield no leaf, since `walk` skips booleans \
+             and nulls — an untyped property is in both lists"
         );
 
         // Outside the crate: the image build copies `src` alone and never

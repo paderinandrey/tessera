@@ -28,6 +28,7 @@ uses them.
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,10 @@ from tessera_detector.pipeline import Detector, build_detector
 from tessera_detector.spans import Span
 
 pytestmark = pytest.mark.ner
+
+# RFC 8259 section 6, in ASCII: `json.loads` also accepts `NaN` and `Infinity`,
+# and `\d` matches non-ASCII digits, neither of which a JSON number can hold.
+JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
 CORPUS = Path(__file__).resolve().parents[2] / "evaluation" / "corpus" / "documents.jsonl"
 # What `mapping::Shape::of` puts between leaves.
@@ -318,21 +323,21 @@ def test_the_fixture_still_has_the_leaf_shape_the_real_payload_has() -> None:
     assert sum(1 for length in lengths if length <= 40) == 211, (
         "leaves no longer than 40 characters — 56% here against 53% measured"
     )
-    digit_only = [
+    number_shaped = [
         (d["id"], leaf["text"][e["start"] : e["end"]])
         for d in documents
         for leaf in d["leaves"]
         for e in leaf["entities"]
-        if leaf["text"][e["start"] : e["end"]].isdigit()
+        if JSON_NUMBER.fullmatch(leaf["text"][e["start"] : e["end"]])
     ]
-    assert not digit_only, (
-        "an annotated value made only of digits could be sent as a JSON number, "
+    assert not number_shaped, (
+        "an annotated value with the shape of a JSON number could be sent as one, "
         "and a `Leaf::Number` is not masked: production refuses the request on a "
         "deterministic span and forwards the digits on any other "
         "(`proxy::tests::a_number_carrying_personal_data_refuses_the_request`, "
         "`a_number_the_exemption_forwards_is_journalled_as_forwarded`). These "
         "inventories model text leaves only, so this corpus must not hold one: "
-        f"{digit_only}"
+        f"{number_shaped}"
     )
 
 

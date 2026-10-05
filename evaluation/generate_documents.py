@@ -18,8 +18,10 @@ here. What the same file offers instead is a proxy: each schema declares 2 to 15
 top-level properties, 47 in all. It is not a bound in either direction — a
 property holding an array or object yields as many leaves as it holds, and
 `Artifact.capabilities` is an open object, so nothing caps an argument; a boolean
-yields none. For this payload those are one property and four, which makes the
-proxy a reasonable one and nothing more. Both counts drive the documents below.
+yields none, and a property declaring no `type` can do either. For this payload
+those are three properties that can yield any number of leaves and six that can
+yield none, two of them untyped and in both, which makes the proxy a reasonable
+one and nothing more. Both counts drive the documents below.
 
 What stays unmeasured is an argument's real leaf count and every argument
 leaf's **length**. A value is the caller's data and nothing here samples it, so
