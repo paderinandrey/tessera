@@ -422,3 +422,59 @@ def test_joining_does_not_cost_precision(detector: Detector) -> None:
         "joining over-masked more spans than reading leaves apart: "
         f"{totals['joined_overmasked']} against {totals['separate_overmasked']}"
     )
+
+
+# The two entities the four-sentence groups lose, which a lower PERSON bar would
+# recover there. Named by row so the shape question stays about these.
+LOST_TO_THE_GROUP_SHAPE = [("de-0004", "dell\u2019Orto"), ("mixed-0017", "D'Angelo")]
+
+
+@pytest.mark.parametrize(
+    ("row_id", "value"),
+    LOST_TO_THE_GROUP_SHAPE,
+    ids=[row for row, _ in LOST_TO_THE_GROUP_SHAPE],
+)
+def test_the_shipped_bar_finds_these_names_at_field_length(
+    detector: Detector, row_id: str, value: str
+) -> None:
+    """How much the bar depends on surrounding text, pinned at the short end.
+
+    These two names are missed at 0.5 in `_documents()`'s four-sentence groups —
+    344 and 399 characters — and found at 0.5 here, where the leaves are the row's
+    gold values alone, 46 and 53 characters. Same names, same bar, opposite
+    answers: the variable is context length.
+
+    **This does not establish what a tool call looks like, and an earlier version
+    of it claimed to.** `proxy::document_detection` joins every string and numeric
+    leaf of a JSON document, so an argument carrying one prose field reaches the
+    long end honestly; keeping only the gold values is the most favourable payload
+    there is. Raised by review on #102 against the refutation this test was
+    written to carry. What it pins is the short end of a measured range, which is
+    worth having because the range is what makes the threshold question
+    shape-bound — see #103.
+
+    Coverage by position, not by label: one of the two is covered under a
+    different type at this size, and a masking gateway is no worse off for the
+    placeholder's name being wrong — the same reason `_covered` asks by position.
+    """
+    rows = [document for group in _documents() for document in group]
+    row = next(document for document in rows if document["id"] == row_id)
+    leaves = [row["text"][e["start"] : e["end"]] for e in row["entities"]]
+    text = JOIN.join(leaves)
+    assert value in text, f"{value!r} is not one of {row_id}'s annotated values"
+    start = text.index(value)
+    span = Span(
+        entity_type="PERSON",
+        start=start,
+        end=start + len(value),
+        confidence=1.0,
+        recognizer="corpus",
+        tier=1,
+    )
+    assert _covered(text, span, detector.detect(text)), (
+        f"{value!r} is no longer covered at {len(text)} characters, where it was. "
+        "That is the short end of the measured range moving, and nothing more: this "
+        "payload is gold values only, which no evidence makes representative of a "
+        "tool call, so this failure is not a reason to lower the bar. Re-measure "
+        "the range and see #103 before treating it as a production regression."
+    )

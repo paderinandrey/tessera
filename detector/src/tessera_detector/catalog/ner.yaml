@@ -90,6 +90,34 @@ entities:
     # (#44). Spending separate-path precision for joined-path recall is a
     # decision, and a sort key is not the thing that should make it.
     #
+    # **0.4 was applied and reverted, and the reason is that neither shape is
+    # established.** The rule's two recovered entities are `dell(U+2019)Orto` in
+    # de-0004 and `D'Angelo` in mixed-0017, and whether they are missed at 0.5
+    # depends entirely on how much text surrounds them. Measured:
+    #
+    #   context                                  chars   0.5           0.4
+    #   D'Angelo, its own sentence                 103   PERSON 0.888   same
+    #   D'Angelo, gold values only                  53   PERSON 0.658   same
+    #   D'Angelo, four unrelated sentences         399   MISS           0.479
+    #   dell(U+2019)Orto, gold values               46   covered        same
+    #   dell(U+2019)Orto, four unrelated sentences 344   MISS           0.411
+    #
+    # So the rule's gain exists at four-sentence length and not at field length,
+    # and **neither is known to be a tool call's**. `_documents()` groups four
+    # unrelated corpus sentences because the corpus is sentences. The short end
+    # was built by keeping only the gold values, which is the most favourable
+    # payload there is, and `proxy::document_detection` joins *every* string and
+    # numeric leaf — so an argument carrying one prose field reaches the long end
+    # honestly. Both shapes were raised by review on #102, the second one against
+    # my own refutation of the first.
+    #
+    # The bar stays at 0.5 for want of an established reason to move it, not
+    # because 0.4 was shown worthless. Moving it costs plain-message precision
+    # that *is* measured — 0.959 to 0.934, three false positives to five — against
+    # a joined-path gain whose existence in production nobody has measured. #103
+    # holds the shape question, and it has to be answered before this rule's
+    # primary objective means anything.
+    #
     # The `lost to joining` column in the old table is not comparable with the
     # script's output any more: it changed predicate, not behaviour. Measured
     # both ways under the current shape, the old full-coverage predicate gives 4
