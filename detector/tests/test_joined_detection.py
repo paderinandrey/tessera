@@ -472,7 +472,9 @@ def test_the_shipped_bar_finds_these_names_at_field_length(
         tier=1,
     )
     assert _covered(text, span, detector.detect(text)), (
-        f"{value!r} reaches the provider in a {len(text)}-character tool-argument "
-        "shape — the bar is now too high for the shape production joins, which is "
-        "a different finding from the one this file's groups measure"
+        f"{value!r} is no longer covered at {len(text)} characters, where it was. "
+        "That is the short end of the measured range moving, and nothing more: this "
+        "payload is gold values only, which no evidence makes representative of a "
+        "tool call, so this failure is not a reason to lower the bar. Re-measure "
+        "the range and see #103 before treating it as a production regression."
     )
