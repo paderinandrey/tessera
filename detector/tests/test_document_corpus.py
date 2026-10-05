@@ -1,4 +1,4 @@
-"""What reaches the provider when a document's leaves are a tool call's fields (#103).
+"""What reaches the provider when a JSON document's leaves are read as one (#103).
 
 **An absolute inventory, which the joined-path gate next door is not.**
 `test_joined_detection.LOST_TO_JOINING` holds misses *relative* to reading the
@@ -18,8 +18,13 @@ gold values alone, which is the most favourable payload there is rather than
 the representative one.
 
 `evaluation/corpus/documents.jsonl` is that shape: leaf counts taken from the
-real payload's schemas, leaf lengths matched to its distribution, and the same
-synthetic value generators the sentence corpus uses.
+real payload — both the leaves each tool *definition* joins and the properties
+each schema *declares*, which is the ceiling on an argument object — leaf
+lengths matched to the definition population's distribution, and the same
+synthetic value generators the sentence corpus uses. What the lengths are for an
+argument leaf is not measured anywhere, because a value is the caller's data and
+nothing here samples one; `evaluation/generate_documents.py` says so where it
+uses them.
 """
 
 import json
@@ -123,12 +128,19 @@ def _reaching_the_provider(detector: Detector) -> tuple[
     return frozenset(joined_out), frozenset(separate_out), annotated
 
 
-# **The two inventories, and the reason both are here.** The counts coincide —
-# 33 of 183 annotated entities reach the provider on each path — and a gate
-# written on the count alone would have reported that joining costs nothing.
-# Eight members differ in each direction. That is the same cancellation
-# `test_joined_detection` refuses one level up, met again at the level of the
-# absolute figure, and it is why #103 asks for members rather than a number.
+# **The two inventories, and the reason both are here.** Of 222 annotated
+# entities, 50 reach the provider when the leaves are read together and 36 when
+# each is read alone — but the net 14 is not the loss. Twenty entities leak only
+# when joined and six only when apart, so six cancel inside the difference. That
+# is the same cancellation `test_joined_detection` refuses one level up, met
+# again at the level of the absolute figure, and it is why #103 asks for members
+# rather than a number.
+#
+# An earlier version of this corpus made the point more sharply and by accident:
+# built from definition leaf counts alone, it put both totals at 33 and the net
+# at zero. Mixing in the argument counts moved both numbers and the symmetry
+# turned out to be a property of that corpus. Worth keeping as a warning about
+# what a net figure is worth — #105.
 #
 # **Re-record, do not relax.** A number that goes down is an improvement and
 # these assertions fail on it too: an upper bound would silently accommodate a
@@ -136,77 +148,97 @@ def _reaching_the_provider(detector: Detector) -> tuple[
 # door.
 UNMASKED_JOINED = frozenset(
     {
-        ('doc-0003:3:0', 'SEX_LIFE', 'une interruption de grossesse'),
-        ('doc-0006:14:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0007:14:0', 'DE_STEUERNUMMER', '126/734/94551'),
-        ('doc-0007:16:19', 'PERSON', 'Förster'),
-        ('doc-0007:25:29', 'GENETIC', 'séquençage ADN'),
-        ('doc-0007:26:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
-        ('doc-0007:4:0', 'BIOMETRIC', 'Fingerabdruck'),
-        ('doc-0012:0:0', 'POLITICAL_AFFILIATION', 'socialiste'),
-        ('doc-0012:2:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0014:0:0', 'PHILOSOPHICAL_BELIEF', 'athée'),
-        ('doc-0016:0:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0016:11:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0016:6:0', 'DE_STEUERNUMMER', '125/601/58393'),
-        ('doc-0017:11:15', 'PERSON', 'Hövel'),
-        ('doc-0017:7:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
-        ('doc-0020:5:0', 'DE_STEUERNUMMER', '554/835/49146'),
-        ('doc-0022:1:0', 'DE_STEUERNUMMER', '145/452/53574'),
-        ('doc-0023:1:0', 'DE_STEUERNUMMER', '884/134/90923'),
-        ('doc-0023:2:0', 'POLITICAL_AFFILIATION', 'écologiste'),
-        ('doc-0026:18:14', 'PERSON', 'L\u2019H\u00f4pital'),
-        ('doc-0027:13:0', 'GENETIC', 'DNA-Analyse'),
-        ('doc-0030:1:0', 'ETHNICITY', 'noir de peau'),
-        ('doc-0031:0:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0032:1:0', 'SEXUAL_ORIENTATION', 'bisexuelle'),
-        ('doc-0036:12:21', 'PERSON', 'Wende'),
-        ('doc-0036:13:19', 'PERSON', 'Weimer'),
-        ('doc-0036:2:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0036:5:0', 'DE_STEUERNUMMER', '761/926/11328'),
-        ('doc-0036:9:0', 'BIOMETRIC', 'Gesichtsscan'),
-        ('doc-0037:0:18', 'PERSON', 'Pölitz'),
-        ('doc-0037:28:62', 'HEALTH', 'un diabète de type 2'),
-        ('doc-0037:5:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0037:9:34', 'PERSON', 'dell\u2019Orto'),
+        ('doc-0004:1:0', 'SEX_LIFE', 'une interruption de grossesse'),
+        ('doc-0010:0:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0012:15:0', 'DE_STEUERNUMMER', '126/734/94551'),
+        ('doc-0012:17:19', 'PERSON', 'Förster'),
+        ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
+        ('doc-0013:2:37', 'BIOMETRIC', 'reconnaissance faciale'),
+        ('doc-0013:6:29', 'GENETIC', 'séquençage ADN'),
+        ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
+        ('doc-0014:14:0', 'RELIGION', 'jüdisch'),
+        ('doc-0014:20:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0014:25:0', 'ORG', 'Marie et Fils'),
+        ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
+        ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
+        ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
+        ('doc-0015:9:0', 'DE_STEUERNUMMER', '125/601/58393'),
+        ('doc-0017:0:0', 'POLITICAL_AFFILIATION', 'écologiste'),
+        ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
+        ('doc-0021:0:15', 'PERSON', 'Hövel'),
+        ('doc-0029:1:0', 'DE_STEUERNUMMER', '554/835/49146'),
+        ('doc-0032:0:0', 'DE_STEUERNUMMER', '145/452/53574'),
+        ('doc-0032:18:0', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
+        ('doc-0032:19:0', 'ETHNICITY', 'métisse'),
+        ('doc-0032:4:0', 'DE_STEUERNUMMER', '884/134/90923'),
+        ('doc-0032:5:0', 'POLITICAL_AFFILIATION', 'écologiste'),
+        ('doc-0032:7:42', 'PHILOSOPHICAL_BELIEF', 'atheistisch'),
+        ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
+        ('doc-0034:3:14', 'PERSON', 'L\u2019H\u00f4pital'),
+        ('doc-0034:3:39', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
+        ('doc-0034:4:0', 'LOCATION', 'Kelheim'),
+        ('doc-0035:12:0', 'ETHNICITY', 'noir de peau'),
+        ('doc-0036:1:0', 'RELIGION', 'jüdisch'),
+        ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
+        ('doc-0043:0:0', 'DE_STEUERNUMMER', '761/926/11328'),
+        ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
+        ('doc-0045:1:21', 'PERSON', 'Wende'),
+        ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
+        ('doc-0048:0:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0050:0:34', 'PERSON', 'dell\u2019Orto'),
+        ('doc-0052:10:46', 'ETHNICITY', 'kurdischer Herkunft'),
+        ('doc-0052:14:62', 'HEALTH', 'un diabète de type 2'),
+        ('doc-0053:5:25', 'BIOMETRIC', 'Gesichtsscan'),
+        ('doc-0053:5:42', 'PERSON', 'Zimmer'),
+        ('doc-0054:12:16', 'PERSON', 'Jungfer'),
+        ('doc-0054:22:0', 'LOCATION', 'Lebrun-sur-Étienne'),
+        ('doc-0054:27:0', 'PHILOSOPHICAL_BELIEF', 'athée'),
+        ('doc-0054:6:37', 'BIOMETRIC', 'reconnaissance faciale'),
+        ('doc-0054:6:65', 'PERSON', 'Dijoux'),
+        ('doc-0055:11:38', 'HEALTH', 'un diabète de type 2'),
+        ('doc-0055:13:63', 'HEALTH', 'une sclérose en plaques'),
+        ('doc-0055:6:0', 'LOCATION', 'Poirier'),
     }
 )
 
 UNMASKED_SEPARATE = frozenset(
     {
-        ('doc-0003:3:0', 'SEX_LIFE', 'une interruption de grossesse'),
-        ('doc-0006:14:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0007:14:0', 'DE_STEUERNUMMER', '126/734/94551'),
-        ('doc-0007:25:29', 'GENETIC', 'séquençage ADN'),
-        ('doc-0007:26:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
-        ('doc-0007:4:0', 'BIOMETRIC', 'Fingerabdruck'),
-        ('doc-0008:1:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
-        ('doc-0010:5:0', 'ORG', 'Röhrdanz GmbH & Co. OHG'),
-        ('doc-0012:2:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0016:0:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0016:11:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0016:6:0', 'DE_STEUERNUMMER', '125/601/58393'),
-        ('doc-0017:11:15', 'PERSON', 'Hövel'),
-        ('doc-0017:7:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
-        ('doc-0020:2:0', 'ETHNICITY', 'métisse'),
-        ('doc-0020:5:0', 'DE_STEUERNUMMER', '554/835/49146'),
-        ('doc-0022:1:0', 'DE_STEUERNUMMER', '145/452/53574'),
-        ('doc-0023:1:0', 'DE_STEUERNUMMER', '884/134/90923'),
-        ('doc-0026:18:14', 'PERSON', 'L\u2019H\u00f4pital'),
-        ('doc-0026:6:0', 'ETHNICITY', 'métisse'),
-        ('doc-0026:9:0', 'ETHNICITY', 'métisse'),
-        ('doc-0027:13:0', 'GENETIC', 'DNA-Analyse'),
-        ('doc-0027:8:18', 'GENETIC', 'Erbgutuntersuchung'),
-        ('doc-0028:1:0', 'POLITICAL_OPINION', 'monarchistisch'),
-        ('doc-0030:1:0', 'ETHNICITY', 'noir de peau'),
-        ('doc-0031:0:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0036:12:21', 'PERSON', 'Wende'),
-        ('doc-0036:19:0', 'POLITICAL_OPINION', 'eurokritisch'),
-        ('doc-0036:2:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0036:5:0', 'DE_STEUERNUMMER', '761/926/11328'),
-        ('doc-0036:9:0', 'BIOMETRIC', 'Gesichtsscan'),
-        ('doc-0037:28:62', 'HEALTH', 'un diabète de type 2'),
-        ('doc-0037:5:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0004:1:0', 'SEX_LIFE', 'une interruption de grossesse'),
+        ('doc-0010:0:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0012:15:0', 'DE_STEUERNUMMER', '126/734/94551'),
+        ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
+        ('doc-0013:6:29', 'GENETIC', 'séquençage ADN'),
+        ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
+        ('doc-0014:13:0', 'ORG', 'Röhrdanz GmbH & Co. OHG'),
+        ('doc-0014:20:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
+        ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
+        ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
+        ('doc-0015:9:0', 'DE_STEUERNUMMER', '125/601/58393'),
+        ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
+        ('doc-0021:0:15', 'PERSON', 'Hövel'),
+        ('doc-0028:0:0', 'ETHNICITY', 'métisse'),
+        ('doc-0029:1:0', 'DE_STEUERNUMMER', '554/835/49146'),
+        ('doc-0032:0:0', 'DE_STEUERNUMMER', '145/452/53574'),
+        ('doc-0032:19:0', 'ETHNICITY', 'métisse'),
+        ('doc-0032:4:0', 'DE_STEUERNUMMER', '884/134/90923'),
+        ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
+        ('doc-0034:13:18', 'GENETIC', 'Erbgutuntersuchung'),
+        ('doc-0034:18:0', 'GENETIC', 'DNA-Analyse'),
+        ('doc-0034:3:14', 'PERSON', 'L\u2019H\u00f4pital'),
+        ('doc-0035:12:0', 'ETHNICITY', 'noir de peau'),
+        ('doc-0035:6:0', 'POLITICAL_OPINION', 'monarchistisch'),
+        ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
+        ('doc-0041:3:0', 'BIOMETRIC', 'empreinte digitale'),
+        ('doc-0043:0:0', 'DE_STEUERNUMMER', '761/926/11328'),
+        ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
+        ('doc-0045:1:21', 'PERSON', 'Wende'),
+        ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
+        ('doc-0048:0:0', 'TRADE_UNION', 'ver.di'),
+        ('doc-0052:14:62', 'HEALTH', 'un diabète de type 2'),
+        ('doc-0054:22:0', 'LOCATION', 'Lebrun-sur-Étienne'),
+        ('doc-0055:11:38', 'HEALTH', 'un diabète de type 2'),
+        ('doc-0055:13:63', 'HEALTH', 'une sclérose en plaques'),
     }
 )
 
@@ -234,23 +266,30 @@ def test_the_fixture_still_has_the_leaf_shape_the_real_payload_has() -> None:
         # sets of figures are comparable rather than merely adjacent.
         return lengths[total * p // 100]
 
-    assert (len(documents), total) == (40, 316), "documents and leaves"
-    assert sum(len(leaf["entities"]) for d in documents for leaf in d["leaves"]) == 183, (
+    assert (len(documents), total) == (60, 378), "documents and leaves"
+    assert sum(len(leaf["entities"]) for d in documents for leaf in d["leaves"]) == 222, (
         "annotated entities — near the sentence corpus's 196, which is what makes "
         "an inventory from one comparable in size to an inventory from the other"
     )
-    # Leaf counts straight from the real payload's ten schemas, so the
-    # four-leaf document the sentence corpus groups is present but is the floor
-    # rather than the whole corpus.
+    # Both populations, which is what the ceiling and the floor here say. 29 is
+    # the widest tool *definition*; 15 is the most properties any of the ten
+    # declares, so an argument object cannot reach 29 and the corpus would be
+    # one population wide if only the upper figure appeared. 2 is the floor of
+    # both, and the four-leaf document the sentence corpus groups is in here as
+    # an ordinary member rather than as the shape.
     assert (counts[0], counts[-1]) == (2, 29), "leaves per document"
+    assert 15 in counts, (
+        "the argument ceiling must appear as a document in its own right, or "
+        "`ARGUMENT_FIELD_COUNTS` is no longer reaching the corpus"
+    )
     # The distribution, against the measured p50=37, p75=78, p90=128, max=276.
     assert (percentile(50), percentile(75), percentile(90)) == (32, 77, 115), (
         "leaf-length percentiles; the real payload gives 37, 78 and 128, and "
         "this fixture is built to sit near them rather than on them"
     )
     assert (lengths[0], lengths[-1]) == (1, 280), "the ends, measured at 1 and 276"
-    assert sum(1 for length in lengths if length <= 40) == 174, (
-        "leaves no longer than 40 characters — 55% here against 53% measured"
+    assert sum(1 for length in lengths if length <= 40) == 211, (
+        "leaves no longer than 40 characters — 56% here against 53% measured"
     )
 
 
@@ -278,23 +317,34 @@ def test_the_separate_path_leaves_these_entities_with_the_provider(
     )
 
 
-def test_the_paths_leak_equally_many_entities_and_not_the_same_ones(
+def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     detector: Detector,
 ) -> None:
     """The finding this corpus was built to make visible, asserted on its own.
 
-    Both inventories hold 33 members. Eight are in one and not the other, in
-    each direction, so neither path dominates and the equal totals are a
-    coincidence of this corpus rather than a property of the detector. A
-    reviewer reading only the two numbers above would conclude the leaf shape
-    makes no difference; it makes a different one.
+    50 against 36 is a net of 14. The directional figure is 20: six entities
+    leak only when the leaves are read apart, and each one pays for a different
+    entity that leaks only when they are joined. A reader of the two totals
+    alone would price joining at 14 names; it costs 20 and buys back 6, and
+    they are not the same names.
+
+    Asserted separately from the inventories above because it is a different
+    claim about them — the sets could both be re-recorded correctly while this
+    relation silently inverted.
     """
     joined, separate, _ = _reaching_the_provider(detector)
-    assert len(joined) == len(separate) == 33, "the totals that coincide"
-    assert len(joined - separate) == len(separate - joined) == 8, (
-        "entities one path leaks and the other does not, in each direction: "
-        f"joined-only {sorted(joined - separate)}, separate-only "
-        f"{sorted(separate - joined)}"
+    assert (len(joined), len(separate)) == (50, 36), "the two totals"
+    assert len(joined - separate) == 20, (
+        "entities joining leaks and reading apart does not — the directional "
+        f"loss: {sorted(joined - separate)}"
+    )
+    assert len(separate - joined) == 6, (
+        "and the ones going the other way, which is what makes the net "
+        f"misleading: {sorted(separate - joined)}"
+    )
+    assert len(joined - separate) > len(joined) - len(separate), (
+        "the directional loss must exceed the net, or there is nothing here a "
+        "net figure would have hidden and this test has stopped saying anything"
     )
 
 

@@ -127,7 +127,7 @@ orientation — each clause gets its own label.
 `mask_all` gives a `Slot::Text` its own `detect` call, so everything above is measured on
 the shape it is sent in. A `Slot::Json` document is different: `Shape::of` concatenates its
 leaves, one call reads them together, and `Joined::split` returns the spans afterwards. A
-tool call's arguments are that shape.
+tool definition and a tool call's arguments are both that shape.
 
 **The corpus above cannot stand in for it, and the reason is granularity rather than
 length.** Measured on `gateway/src/testdata/claude_code_tools.json`, the one real payload
@@ -148,10 +148,19 @@ leaves of ninety characters are not what production joins. [#102][i102] read thi
 way round by comparing against the gold values alone — 46–53 characters — which is the most
 favourable payload rather than the representative one.
 
-`evaluation/corpus/documents.jsonl` is the representative one: leaf counts taken from those
-ten schemas, leaf lengths matched to their distribution, and the same seeded value
-generators the sentence corpus uses. 40 documents, 316 leaves, 183 annotations.
-`detector/tests/test_document_corpus.py` scores it and `pytest -m ner` gates it.
+**Two populations, and the corpus covers both.** The figures above are tool *definitions* —
+`Shape::Schema` documents the gateway joins and detects on every request carrying tools, so
+a production shape rather than a proxy for one. A tool *argument* is a `Shape::Instance`
+document and no captured one exists here; what the same payload says about it is how many
+leaves it can hold, since each schema declares 2 to 15 properties, 47 in all. An argument
+therefore tops out at 15 leaves where a definition reaches 29. An argument leaf's *length*
+stays unmeasured — a value is the caller's data and nothing here samples one — so the
+lengths below come from the definition population and are an assumption.
+
+`evaluation/corpus/documents.jsonl` draws its leaf counts from both lists and its lengths
+from that distribution, with the same seeded value generators the sentence corpus uses. 60
+documents, 378 leaves, 222 annotations. `detector/tests/test_document_corpus.py` scores it
+and `pytest -m ner` gates it.
 
 **Absolute inventories, which the gate next door is not.**
 `test_joined_detection.LOST_TO_JOINING` holds entities joining loses *relative* to reading
@@ -161,17 +170,24 @@ remained unmeasured. The two inventories here ask the plain question instead: wh
 reach the provider, on each path, regardless of the other.
 
 ```
-183 annotated
- 33 reach the provider when the leaves are read together
- 33 reach the provider when each leaf is read alone
-  8 are in the first and not the second — and 8 the other way round
+222 annotated
+ 50 reach the provider when the leaves are read together
+ 36 reach the provider when each leaf is read alone
+ 20 leak only when joined — and 6 only when apart
 ```
 
-**The totals coincide and the sets do not.** A gate on the count would have reported that
-the leaf shape costs nothing; it costs something different. Both inventories are therefore
-listed by member and asserted exactly, for the reason given above — a bound lets a fixed
-leak pay for a new one, and an upper bound additionally accommodates a predicate that stops
-seeing things.
+**The net is 14 and the loss is 20.** Six entities leak only when the leaves are read apart,
+and each pays for a different entity that leaks only when they are joined, so a reader of
+the two totals prices joining at 14 names when it costs 20 and buys back 6 — and they are
+not the same names. Both inventories are therefore listed by member and asserted exactly,
+for the reason given above: a bound lets a fixed leak pay for a new one, and an upper bound
+additionally accommodates a predicate that stops seeing things.
+
+> An earlier version of this corpus made the point by accident. Built from the definition
+> leaf counts alone, it put both totals at 33 with a net of zero — which read as a stronger
+> finding and was a property of that corpus. Mixing in the argument counts moved both
+> numbers. The relation above is asserted on its own for that reason, separately from the
+> two sets.
 
 Two findings came out of the first run. `DE_STEUERNUMMER` publishes 1.000 recall above
 because its `confidence` is below its own `threshold` and every Steuernummer in the sentence

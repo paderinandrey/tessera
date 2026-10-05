@@ -170,14 +170,15 @@ what the four remaining misses are.
 
 **That holds for one of the two production shapes, and the table above is measured on the
 same one.** Every row of the corpus behind it is a sentence, which is what `mask_all` sends
-for a plain message. A JSON document — a tool call's arguments — has its leaves joined into
-one text instead, and production joins many short leaves rather than a few long ones:
-measured on a real tool payload, 79 leaves with a median of 37 characters. That shape has a
-corpus of its own, `evaluation/corpus/documents.jsonl`, and an inventory of its own in
-`detector/tests/test_document_corpus.py` — **33 of its 183 annotated entities reach the
-provider on each path, and eight of the 33 differ between them**, so the two shapes do not
-leak the same things. Those figures are gated by `pytest -m ner` rather than published here;
-the asymmetry is [#103](https://github.com/paderinandrey/tessera/issues/103).
+for a plain message. A JSON document — a tool definition, or a tool call's arguments — has
+its leaves joined into one text instead, and production joins many short leaves rather than
+a few long ones: measured on a real tool payload, 79 leaves with a median of 37 characters.
+That shape has a corpus of its own, `evaluation/corpus/documents.jsonl`, and an inventory of
+its own in `detector/tests/test_document_corpus.py` — **of 222 annotated entities, 50 reach
+the provider when the leaves are read together and 36 when each is read alone**. The net 14
+understates it: 20 leak only when joined and 6 only when apart. Those figures are gated by
+`pytest -m ner` rather than published here; the asymmetry is
+[#103](https://github.com/paderinandrey/tessera/issues/103).
 
 One row above is a property of that corpus and not of the detector: `DE_STEUERNUMMER` reads
 1.000 because every Steuernummer in the sentence corpus sits next to the word that boosts

@@ -1,4 +1,4 @@
-"""Synthetic JSON-document corpus: the shape a tool call's arguments have (#103).
+"""Synthetic corpus of joined JSON documents, in the shape production sends (#103).
 
 `corpus/public.jsonl` is sentences, and the joined-path tests group four of them
 into a document. Measured against the one real payload this repository holds —
@@ -9,10 +9,25 @@ that group has the wrong granularity: production joins **many short leaves**
 while the group joins four of about ninety. Its joined *length* is ordinary;
 its leaf count is at the bottom of what production sends.
 
-This generator writes the other shape, so the joined path can be scored against
-a document that looks like one. It does not touch `public.jsonl`: the published
-metrics are tied to that file's digest, and a corpus regenerated for a reason
-unrelated to them has moved a published number here before.
+**Two populations, and this file is honest about which it measures.** A tool
+*definition* is a `Shape::Schema` document that the gateway joins and detects on
+every request carrying tools, and it is what the figures above are taken from —
+a production shape, not a proxy for one. A tool *argument* is a
+`Shape::Instance` document, a different population, and no captured one exists
+here. What the same file does say about arguments is how many leaves they can
+hold: each schema declares 2 to 15 properties, 47 in all, so an argument's leaf
+count tops out where a definition's reaches 29. Both counts drive the documents
+below.
+
+What stays unmeasured is an argument leaf's **length**. A value is the caller's
+data and nothing here samples it, so the lengths come from the definition
+population and are an assumption rather than a measurement. Raised by review on
+#105, against an earlier version of this file that took the definition counts
+and called itself the argument shape.
+
+This generator does not touch `public.jsonl`: the published metrics are tied to
+that file's digest, and a corpus regenerated for a reason unrelated to them has
+moved a published number here before.
 
 Run from the repository root:
     uv run --project detector --group eval python evaluation/generate_documents.py
@@ -38,16 +53,33 @@ from generate import (
 SEED = 20261005
 OUTPUT = Path(__file__).parent / "corpus" / "documents.jsonl"
 
-# Leaves per document, taken from the real payload rather than chosen: these
-# are the ten schemas' leaf counts in `claude_code_tools.json`, in its order.
-# Four — what the sentence corpus groups — is at the bottom of this list, and
-# nothing in it stands for a document of four long leaves.
-LEAF_COUNTS = [8, 2, 4, 5, 2, 3, 20, 29, 2, 4]
+# Leaves per document, taken from the real payload rather than chosen.
+#
+# The leaves each tool *definition* presents to one detect call — a
+# `Shape::Schema` walk of its `input_schema`, which is what the gateway joins
+# today.
+SCHEMA_LEAF_COUNTS = [8, 2, 4, 5, 2, 3, 20, 29, 2, 4]
+# The properties each schema *declares*, which is the most leaves an argument
+# object for that tool can carry. The only thing this payload says about the
+# argument population, and it says the counts are smaller: 15 at the ceiling
+# against 29.
+ARGUMENT_FIELD_COUNTS = [4, 2, 4, 5, 2, 2, 8, 15, 2, 3]
+# Interleaved so the corpus covers both, document by document, rather than
+# averaging them into a shape neither population has. Four — what the sentence
+# corpus groups — appears here, but as the floor rather than the whole corpus.
+LEAF_COUNTS = [
+    count
+    for pair in zip(SCHEMA_LEAF_COUNTS, ARGUMENT_FIELD_COUNTS, strict=True)
+    for count in pair
+]
 
-# How many documents. Chosen so the annotation count lands near the sentence
-# corpus's 196, which is what makes an inventory from one comparable in size to
-# an inventory from the other.
-DOCUMENTS = 40
+# How many documents. Three full passes over `LEAF_COUNTS`, so each of the ten
+# tools contributes its definition count and its argument count the same number
+# of times — an uneven tail would weight one population over the other for no
+# reason. It also lands the annotation count near the sentence corpus's 196,
+# which is what makes an inventory from one comparable in size to an inventory
+# from the other.
+DOCUMENTS = 3 * len(LEAF_COUNTS)
 
 # Filler leaves: what a tool call carries that holds no personal data. The
 # bands exist because the measured distribution has both ends — a one-character

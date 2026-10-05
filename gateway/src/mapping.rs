@@ -5541,11 +5541,22 @@ mod tests {
     /// document of 1 587 — and the fixtures #103 asks for are the ones that
     /// would.
     ///
-    /// **Tool definitions, not tool arguments**, and the gap matters: these are
-    /// the shape the gateway charges and detects today, and they are the only
-    /// real payload here, but an argument payload is a different population and
-    /// this measurement does not stand in for one. What it establishes is the
-    /// granularity question, which both populations share.
+    /// **Tool definitions, not tool arguments**, and the gap is measured here
+    /// rather than disclaimed. A definition is a `Shape::Schema` document and
+    /// the gateway joins and detects it on every request that carries tools, so
+    /// the figures above are a production shape and not a proxy for one. An
+    /// argument is a `Shape::Instance` document, a different population, and no
+    /// captured one exists in this repository — but each schema *declares* the
+    /// shape its arguments may take, which is measurable from the same file:
+    /// **47 top-level properties across the ten tools, 2 to 15 per tool**,
+    /// against 2 to 29 schema leaves. So an argument object's leaf count tops
+    /// out at 15 where a definition reaches 29, and its floor is the `required`
+    /// list, which runs 0 to 3.
+    ///
+    /// What stays unmeasured is an argument leaf's *length*: a value is the
+    /// caller's data, and nothing here samples it. Raised by review on #105,
+    /// against a corpus that took these counts and called itself the argument
+    /// shape.
     ///
     /// A description is its own call and so is not joined with anything; the
     /// ten here run 240 to 745 characters, which is the other size a detect
@@ -5617,6 +5628,45 @@ mod tests {
         // one direction: four is at the bottom of what production sends.
         let widest = joined.iter().map(|&(_, n, _)| n).max().unwrap();
         assert_eq!(widest, 29, "leaves in the widest schema (`Artifact`)");
+
+        // **The argument shape, from what each schema declares about it.** The
+        // only part of an argument payload this file can speak for: a
+        // `Shape::Instance` document carries at most one leaf per declared
+        // property, so these are a ceiling a definition's own leaf count
+        // overshoots. `evaluation/generate_documents.py` draws from both lists
+        // for that reason.
+        let mut properties: Vec<usize> = Vec::new();
+        let mut required: Vec<usize> = Vec::new();
+        for tool in &tools {
+            let schema = &tool["input_schema"];
+            properties.push(schema["properties"].as_object().map_or(0, |p| p.len()));
+            required.push(schema["required"].as_array().map_or(0, |r| r.len()));
+        }
+        assert_eq!(properties.iter().sum::<usize>(), 47, "declared properties");
+        assert_eq!(
+            (
+                *properties.iter().min().unwrap(),
+                *properties.iter().max().unwrap()
+            ),
+            (2, 15),
+            "properties per tool — the ceiling on an argument object's leaves"
+        );
+        assert!(
+            *properties.iter().max().unwrap() < widest,
+            "the argument ceiling must sit below the definition's leaf count, or \
+             the two populations are not the distinct shapes the corpus treats \
+             them as: {} against {widest}",
+            properties.iter().max().unwrap()
+        );
+        assert_eq!(
+            (
+                *required.iter().min().unwrap(),
+                *required.iter().max().unwrap()
+            ),
+            (0, 3),
+            "required fields — the floor, and a tool with none of its own can \
+             be called with an empty object"
+        );
 
         descriptions.sort_unstable();
         assert_eq!(
