@@ -71,8 +71,9 @@ the definition. `selection_key` reads only `joined_found` and
 Raised by review on #101.
 
 **So the shipped 0.5 can no longer be described as the value the selection rule
-picks**, which is a weaker claim than it being wrong. The catalog still ships
-0.5, deliberately and pending a decision.
+picks**, which is a weaker claim than it being wrong. Over the document corpus
+(`--corpus documents`) the rule picks 0.4 on 95.3% of resamples; the catalog
+keeps 0.5 as a decision recorded in #106.
 
 **The selection is re-run inside every resample, not conditioned on its own
 result.** A first version fixed 0.5 and bootstrapped the pairwise differences
