@@ -71,8 +71,9 @@ the definition. `selection_key` reads only `joined_found` and
 Raised by review on #101.
 
 **So the shipped 0.5 can no longer be described as the value the selection rule
-picks**, which is a weaker claim than it being wrong. The catalog still ships
-0.5, deliberately and pending a decision.
+picks**, which is a weaker claim than it being wrong. Over the document corpus
+(`--corpus documents`) the rule picks 0.4 on 95.3% of resamples; the catalog
+keeps 0.5 as a decision recorded in #106.
 
 **The selection is re-run inside every resample, not conditioned on its own
 result.** A first version fixed 0.5 and bootstrapped the pairwise differences
@@ -98,9 +99,11 @@ group, so without it the run reaches `GlinerRecognizer` and fails on the import
 even where `TESSERA_NER_MODEL` supplies the weights.
 """
 
+import argparse
 import copy
 import random
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import yaml
@@ -109,6 +112,7 @@ import yaml
 # that gate cannot drift into measuring two different things.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "detector" / "tests"))
 
+import test_document_corpus as documents
 import test_joined_detection as joined
 
 from tessera_detector.evaluation import EvalEntity, overmasking_counts
@@ -192,14 +196,44 @@ def types_at(threshold: float) -> tuple[NerType, ...]:
     return types
 
 
-def counts_at(threshold: float, model_path: Path) -> list[dict[str, int]]:
+CORPORA = ("sentences", "documents")
+
+
+def _groups(
+    detector: Detector, corpus: str
+) -> Iterator[tuple[str, list[Span], list[Span], list[Span]]]:
+    if corpus == "sentences":
+        for group in joined._documents():
+            truth, separate, together = joined._rebased(detector, group)
+            text = joined.JOIN.join(document["text"] for document in group)
+            yield text, truth, separate, together
+        return
+    crossing: list[tuple[str, str, str]] = []
+    for document in documents._documents():
+        joined_text, origins, apart, read_together = documents._rebased(detector, document)
+        ranges, at = [], 0
+        for leaf in document["leaves"]:
+            ranges.append((at, at + len(leaf["text"])))
+            at += len(leaf["text"]) + len(documents.JOIN)
+        crossing += [
+            (document["id"], span.entity_type, joined_text[span.start : span.end])
+            for span in read_together
+            if not joined._inside_one_leaf(span, ranges)
+        ]
+        yield joined_text, [span for _, span in origins], apart, read_together
+    if crossing:
+        raise SystemExit(
+            f"joined spans cross a leaf boundary at this threshold, so production "
+            f"refuses those documents and the counts do not describe them: {crossing}"
+        )
+
+
+def counts_at(threshold: float, model_path: Path, corpus: str) -> list[dict[str, int]]:
     recognizer = GlinerRecognizer(model_path, types=types_at(threshold))
     detector = Detector(recognizer=recognizer, model_id=f"bootstrap@{threshold}")
     redacted = joined._redacted_types(detector)
     rows = []
-    for group in joined._documents():
-        truth, separate, together = joined._rebased(detector, group)
-        text = joined.JOIN.join(document["text"] for document in group)
+    for text, truth, separate, together in _groups(detector, corpus):
         entities = [EvalEntity(entity_type=s.entity_type, start=s.start, end=s.end) for s in truth]
 
         def overmasked(predictions: list[Span], gold: list[EvalEntity] = entities) -> int:
@@ -251,6 +285,14 @@ def bootstrap(
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--corpus",
+        choices=CORPORA,
+        default="sentences",
+        help="sentences: public.jsonl grouped four to a document; documents: documents.jsonl",
+    )
+    corpus = parser.parse_args().corpus
     model_path = find_model()
     if model_path is None:
         print("no NER weights: run `make model` or set TESSERA_NER_MODEL", file=sys.stderr)
@@ -258,7 +300,7 @@ def main() -> int:
 
     measured = {}
     for threshold in THRESHOLDS:
-        measured[threshold] = counts_at(threshold, model_path)
+        measured[threshold] = counts_at(threshold, model_path, corpus)
         rows = measured[threshold]
         totals = {key: sum(row[key] for row in rows) for key in rows[0]}
         print(f"threshold {threshold}: {totals}", flush=True)
@@ -270,7 +312,9 @@ def main() -> int:
         }
         for threshold in THRESHOLDS
     }
-    print(f"\nbootstrap, {RESAMPLES} resamples of {groups} document groups")
+    print(
+        f"\nbootstrap over the {corpus} corpus, {RESAMPLES} resamples of {groups} document groups"
+    )
 
     # The selection re-run inside each resample. This is the question; the
     # pairwise margins below are the follow-up.

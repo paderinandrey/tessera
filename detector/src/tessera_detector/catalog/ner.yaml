@@ -111,12 +111,13 @@ entities:
     # honestly. Both shapes were raised by review on #102, the second one against
     # my own refutation of the first.
     #
-    # The bar stays at 0.5 for want of an established reason to move it, not
-    # because 0.4 was shown worthless. Moving it costs plain-message precision
-    # that *is* measured — 0.959 to 0.934, three false positives to five — against
-    # a joined-path gain whose existence in production nobody has measured. #103
-    # holds the shape question, and it has to be answered before this rule's
-    # primary objective means anything.
+    # **Re-measured on a production-shaped corpus (#106), and 0.5 kept as a
+    # decision.** Over `documents.jsonl` (#105) the selection picks 0.4 on 95.3%
+    # of resamples, clearing the predeclared bar. On JSON documents it covers
+    # `Förster`, `Hövel` and `Zimmer` and loses none; on plain messages it finds
+    # nothing extra and masks `Bonjour` and `Der Kunde` as PERSON. The
+    # maintainer chose 0.5 on that trade: the margin is a hair over 95% and the
+    # corpus's argument half is a proxy.
     #
     # The `lost to joining` column in the old table is not comparable with the
     # script's output any more: it changed predicate, not behaviour. Measured
