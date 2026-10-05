@@ -57,6 +57,10 @@ jobs:
       # The committed corpus must regenerate byte-identical (seeded) — this
       # gates both generator determinism and corpus freshness.
       - run: uv run --group eval python ../evaluation/generate.py
+      # The document corpus is a second artifact in the same directory, and the
+      # diff below covers the directory — so without this step a stale
+      # documents.jsonl passes the freshness gate by not being regenerated.
+      - run: uv run --group eval python ../evaluation/generate_documents.py
       - run: git diff --exit-code ../evaluation/corpus
       # The step above starts a fresh interpreter, so it cannot see a generator
       # that holds state across calls within one. These two generate twice in

@@ -17,6 +17,7 @@ COMPOSE_DEMO = docker compose -p tessera-smoke -f docker-compose.yml -f deploy/d
 
 corpus:
 	uv run --project detector --group eval python evaluation/generate.py
+	uv run --project detector --group eval python evaluation/generate_documents.py
 
 evaluate:
 	uv run --project detector python evaluation/evaluate.py --json $(METRICS)

@@ -5511,6 +5511,242 @@ mod tests {
         );
     }
 
+    /// The leaf shape a real joined call has, which is not the shape the
+    /// evaluation corpus scores against (#103).
+    ///
+    /// `evaluation/corpus/public.jsonl` is sentences, and
+    /// `detector/tests/test_joined_detection._documents` groups four of them
+    /// into a document — four leaves of about ninety characters, joined to
+    /// 344–399. #102 compared that against the *gold values alone*, 46–53
+    /// characters, and concluded the corpus group was too long to be
+    /// representative. Measured here against the one real payload this
+    /// repository holds, **that conclusion was reached from the wrong end**:
+    ///
+    /// | | leaves | joined characters |
+    /// |---|---|---|
+    /// | `WebFetch` schema | 2 | 71 |
+    /// | `Edit` schema | 4 | 180 |
+    /// | `Read` schema | 8 | 373 |
+    /// | `Agent` schema | 20 | 721 |
+    /// | `Artifact` schema | 29 | 1 587 |
+    /// | a four-sentence corpus group | 4 | 344–399 |
+    ///
+    /// A corpus group's *joined* length sits in the middle of that range, so
+    /// 344–399 is an ordinary size for a production document rather than an
+    /// inflated one. What does not match is the **granularity**: across these
+    /// ten schemas the leaves run 1 to 276 characters with a median of 37, and
+    /// 42 of 79 are 40 or shorter. Production joins many short leaves; the
+    /// corpus joins four long ones. So neither measurement #102 made covers the
+    /// shape a tool call actually has — a name in a six-character leaf inside a
+    /// document of 1 587 — and the fixtures #103 asks for are the ones that
+    /// would.
+    ///
+    /// **Tool definitions, not tool arguments**, and the gap is measured here
+    /// rather than disclaimed. A definition is a `Shape::Schema` document and
+    /// the gateway joins and detects it on every request that carries tools, so
+    /// the figures above are a production shape and not a proxy for one. An
+    /// argument is a `Shape::Instance` document, a different population, and no
+    /// captured one exists in this repository. Each schema declares **2 to 15
+    /// top-level properties, 47 in all**, and the corpus uses those counts as a
+    /// **proxy** for an argument's leaf count — not a bound in either direction.
+    /// `Shape::Instance` recurses, so a property holding an array or an object
+    /// yields as many leaves as it holds, and `Artifact.capabilities` is an open
+    /// object (`additionalProperties: {}`): the schema puts no ceiling on an
+    /// argument at all. And a boolean yields none, so the count is not a floor
+    /// either. A property that declares no `type` can be any of these, so it
+    /// errs in both directions. The two ways the proxy can be wrong are named
+    /// below rather than left to be rediscovered; for this payload they are
+    /// three properties of 47 that can yield any number of leaves and six that
+    /// can yield none — two of them, untyped, in both lists — which is why the
+    /// proxy is a reasonable one here and nothing more.
+    ///
+    /// What stays unmeasured is an argument's real leaf count and every
+    /// argument leaf's *length*: a value is the caller's data, and nothing here
+    /// samples it. Raised twice by review on #105 — first against a corpus that
+    /// took the definition counts and called itself the argument shape, then
+    /// against the property counts being called a ceiling.
+    ///
+    /// A description is its own call and so is not joined with anything; the
+    /// ten here run 240 to 745 characters, which is the other size a detect
+    /// call comes in.
+    #[test]
+    fn a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones() {
+        let tools: Vec<Value> =
+            serde_json::from_str(include_str!("testdata/claude_code_tools.json")).unwrap();
+        let mut lengths: Vec<usize> = Vec::new();
+        let mut joined: Vec<(&str, usize, usize)> = Vec::new();
+        let mut descriptions: Vec<usize> = Vec::new();
+        for tool in &tools {
+            if let Some(description) = tool["description"].as_str() {
+                descriptions.push(description.chars().count());
+            }
+            let leaves = json_leaves(&tool["input_schema"], Shape::Schema).unwrap();
+            let mut call = 0usize;
+            for leaf in &leaves {
+                let length = match leaf {
+                    Leaf::Text(text) => text.chars().count(),
+                    Leaf::Number(number) => number.chars().count(),
+                };
+                lengths.push(length);
+                call += length;
+            }
+            joined.push((
+                tool["name"].as_str().unwrap(),
+                leaves.len(),
+                call + Joined::separator_chars(leaves.len()),
+            ));
+        }
+
+        lengths.sort_unstable();
+        // Nearest-rank, stated rather than left to a library: the figures in
+        // the table above are only re-derivable if the rule that produced them
+        // is written down.
+        let percentile = |p: usize| lengths[lengths.len() * p / 100];
+        assert_eq!(lengths.len(), 79, "schema leaves, of either kind");
+        assert_eq!(
+            (lengths[0], percentile(50), *lengths.last().unwrap()),
+            (1, 37, 276),
+            "the leaf lengths production joins"
+        );
+        assert_eq!(
+            lengths.iter().filter(|&&l| l <= 40).count(),
+            42,
+            "leaves no longer than 40 characters — more than half, and the \
+             corpus has none at all"
+        );
+
+        // **The corpus group is not an outlier in joined length.** Asserted
+        // both ways round, because the claim above is that 344-399 sits
+        // *inside* this range and a one-sided bound could not say that.
+        let shortest = joined.iter().map(|&(_, _, c)| c).min().unwrap();
+        let longest = joined.iter().map(|&(_, _, c)| c).max().unwrap();
+        assert_eq!(
+            (shortest, longest),
+            (71, 1_587),
+            "joined characters per call"
+        );
+        assert!(
+            shortest < 344 && longest > 399,
+            "a four-sentence corpus group at 344-399 must fall inside the \
+             measured range for the granularity reading above to be the \
+             finding: {shortest}..{longest}"
+        );
+
+        // The leaf *count* is where the corpus is wrong, and it is wrong in
+        // one direction: four is at the bottom of what production sends.
+        let widest = joined.iter().map(|&(_, n, _)| n).max().unwrap();
+        assert_eq!(widest, 29, "leaves in the widest schema (`Artifact`)");
+
+        // **Declared properties, a proxy for an argument's leaf count.**
+        // `evaluation/generate_documents.py` draws from this list alongside the
+        // definition counts above.
+        let mut properties: Vec<usize> = Vec::new();
+        let mut many: Vec<String> = Vec::new();
+        let mut none: Vec<String> = Vec::new();
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let declared = tool["input_schema"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            properties.push(declared.len());
+            for (property, schema) in &declared {
+                let kinds: Vec<&str> = match &schema["type"] {
+                    Value::String(kind) => vec![kind.as_str()],
+                    Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                let untyped = kinds.is_empty();
+                let may = |wanted: &[&str]| kinds.iter().any(|kind| wanted.contains(kind));
+                if untyped
+                    || may(&["array", "object"])
+                    || schema.get("items").is_some()
+                    || schema.get("properties").is_some()
+                    || schema.get("additionalProperties").is_some()
+                {
+                    many.push(format!("{name}.{property}"));
+                }
+                if untyped || may(&["boolean", "null"]) {
+                    none.push(format!("{name}.{property}"));
+                }
+            }
+        }
+        assert_eq!(properties.iter().sum::<usize>(), 47, "declared properties");
+        assert_eq!(
+            (
+                *properties.iter().min().unwrap(),
+                *properties.iter().max().unwrap()
+            ),
+            (2, 15),
+            "properties per tool"
+        );
+        many.sort();
+        none.sort();
+        assert_eq!(
+            many,
+            [
+                "Artifact.capabilities",
+                "Artifact.contract",
+                "SendMessage.message",
+            ],
+            "properties whose value can yield any number of leaves — each one \
+             removes the ceiling from that tool's argument count"
+        );
+        assert_eq!(
+            none,
+            [
+                "Artifact.contract",
+                "Artifact.force",
+                "Bash.dangerouslyDisableSandbox",
+                "Bash.run_in_background",
+                "Edit.replace_all",
+                "SendMessage.message",
+            ],
+            "properties whose value can yield no leaf, since `walk` skips booleans \
+             and nulls — an untyped property is in both lists"
+        );
+
+        // Outside the crate: the image build copies `src` alone and never
+        // compiles tests, so this resolves only under `cfg(test)`.
+        let generator = include_str!("../../evaluation/generate_documents.py");
+        let literal = |name: &str| -> Vec<usize> {
+            let line = generator
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} = [")))
+                .unwrap_or_else(|| panic!("`{name} = [...]` not found in the generator"));
+            line[line.find('[').unwrap() + 1..line.rfind(']').unwrap()]
+                .split(',')
+                .map(|n| n.trim().parse().unwrap())
+                .collect()
+        };
+        let schema_leaves: Vec<usize> = joined.iter().map(|&(_, n, _)| n).collect();
+        assert_eq!(
+            literal("SCHEMA_LEAF_COUNTS"),
+            schema_leaves,
+            "the generator's definition leaf counts must be this payload's, tool \
+             by tool — regenerate the corpus and re-record its inventories after \
+             changing either"
+        );
+        assert_eq!(
+            literal("ARGUMENT_FIELD_COUNTS"),
+            properties,
+            "the generator's property-count proxy must be this payload's, tool by \
+             tool — regenerate the corpus and re-record its inventories after \
+             changing either"
+        );
+
+        descriptions.sort_unstable();
+        assert_eq!(
+            (
+                descriptions.len(),
+                descriptions[0],
+                *descriptions.last().unwrap()
+            ),
+            (10, 240, 745),
+            "a description is a call of its own, and this is the size it comes in"
+        );
+    }
+
     /// What the real payload's *numbers* are, and what a detector could make of
     /// them.
     ///

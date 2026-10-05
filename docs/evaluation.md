@@ -9,6 +9,11 @@ with the wrong bounds, or not found at all — three different rows in three dif
 none of which says "these characters went out". `make evaluate` asks by position and by
 content, and fails on anything not already written down.
 
+That is true of **one** of the two shapes production sends — every row of this corpus is a
+sentence, which is what a plain message is. The other shape is below, under
+[a JSON document is not a sentence](#a-json-document-is-not-a-sentence), and it is not
+published here.
+
 Four are real. Two are threshold misses:
 
 ```
@@ -116,3 +121,103 @@ orientation — each clause gets its own label.
 > job — the earlier number was measured on a corpus with almost nothing to get wrong.
 > The privately annotated corpus on real texts is the measure that counts, and it is
 > reported separately.
+
+## A JSON document is not a sentence
+
+`mask_all` gives a `Slot::Text` its own `detect` call, so everything above is measured on
+the shape it is sent in. A `Slot::Json` document is different: `Shape::of` concatenates its
+leaves, one call reads them together, and `Joined::split` returns the spans afterwards. A
+tool definition and a tool call's arguments are both that shape.
+
+**The corpus above cannot stand in for it, and the reason is granularity rather than
+length.** Measured on `gateway/src/testdata/claude_code_tools.json`, the one real payload
+this repository holds, and pinned in
+`mapping::a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones`:
+
+| | leaves | joined characters |
+|---|---|---|
+| `WebFetch` schema | 2 | 71 |
+| `Read` schema | 8 | 373 |
+| `Agent` schema | 20 | 721 |
+| `Artifact` schema | 29 | 1 587 |
+| four grouped corpus sentences | 4 | 344–399 |
+
+Across those ten schemas the leaves run 1 to 276 characters, median 37, and 42 of 79 are no
+longer than 40. A grouped corpus document's *joined length* is an ordinary size; its four
+leaves of ninety characters are not what production joins. [#102][i102] read this the other
+way round by comparing against the gold values alone — 46–53 characters — which is the most
+favourable payload rather than the representative one.
+
+**Two populations: one measured, one approximated.** The figures above are tool
+*definitions* — `Shape::Schema` documents the gateway joins and detects on every request
+carrying tools, so a production shape rather than a proxy for one. A tool *argument* is a
+`Shape::Instance` document and no captured one exists here. What stands in for it is the
+number of top-level properties each schema declares, 2 to 15, 47 in all — **a proxy, not a
+bound in either direction.** `Shape::Instance` recurses, so a property holding an array or
+an object yields as many leaves as it holds, and `Artifact.capabilities` is an open object:
+nothing caps an argument. A boolean yields no leaf at all, and a property declaring no
+`type` — `Artifact.contract`, `SendMessage.message` — can do either. For this payload three
+properties of 47 can yield any number of leaves and six can yield none, which makes the
+proxy reasonable here and nothing more; the
+gateway test names both sets so the error cannot grow unnoticed. An argument's real leaf
+count and every argument leaf's *length* stay unmeasured — a value is the caller's data and
+nothing here samples one — so the lengths below come from the definition population and are
+an assumption.
+
+**Text leaves only.** Every leaf in this corpus is a string. A JSON number is a
+`Leaf::Number`, which is never masked: production refuses the whole request when a
+deterministic span lands on one and forwards the digits otherwise, and both branches are
+gated in the gateway (`proxy::tests::a_number_carrying_personal_data_refuses_the_request`,
+`a_number_the_exemption_forwards_is_journalled_as_forwarded`). The measured payload's twelve
+numeric leaves are schema bounds and count toward the distributions above as text. No
+annotated value in the corpus has the shape of a JSON number — card numbers carry spaces, a
+Steuernummer slashes — so none could have been sent as one, and the corpus test fails if one
+is added. The check is the JSON number grammar itself, signs, fractions and exponents
+included, so `-42` and `1e10` are caught as well as `42`.
+
+`evaluation/corpus/documents.jsonl` draws its leaf counts from both lists and its lengths
+from that distribution, with the same seeded value generators the sentence corpus uses. 60
+documents, 378 leaves, 222 annotations. `detector/tests/test_document_corpus.py` scores it
+and `pytest -m ner` gates it.
+
+**Absolute inventories, which the gate next door is not.**
+`test_joined_detection.LOST_TO_JOINING` holds entities joining loses *relative* to reading
+the leaves apart, so an entity missed on both paths is absent from it by construction —
+that is why the stronger claim at the top of this page could be published while this
+remained unmeasured. The two inventories here ask the plain question instead: whose words
+reach the provider, on each path, regardless of the other.
+
+```
+222 annotated
+ 50 reach the provider when the leaves are read together
+ 36 reach the provider when each leaf is read alone
+ 20 leak only when joined — and 6 only when apart
+```
+
+**The net is 14 and the loss is 20.** Six entities leak only when the leaves are read apart,
+and each pays for a different entity that leaks only when they are joined, so a reader of
+the two totals prices joining at 14 names when it costs 20 and buys back 6 — and they are
+not the same names. Both inventories are therefore listed by member and asserted exactly,
+for the reason given above: a bound lets a fixed leak pay for a new one, and an upper bound
+additionally accommodates a predicate that stops seeing things.
+
+> An earlier version of this corpus made the point by accident. Built from the definition
+> leaf counts alone, it put both totals at 33 with a net of zero — which read as a stronger
+> finding and was a property of that corpus. Mixing in the argument counts moved both
+> numbers. The relation above is asserted on its own for that reason, separately from the
+> two sets.
+
+Two findings came out of the first run. `DE_STEUERNUMMER` publishes 1.000 recall above
+because its `confidence` is below its own `threshold` and every Steuernummer in the sentence
+corpus sits next to the word that boosts it over the bar; standing alone in a field it is
+not detected at all, and the JSON *key* that would carry that word is never scanned
+([#104][i104]). And the apostrophe surnames [#97][i97] left behind are here too, in a shape
+where nothing surrounds them.
+
+**What is not done.** These figures are gated but not published: `metrics.json` and the
+README tables are tied to `public.jsonl` by digest, and giving this corpus the same standing
+is a separate change. [#103][i103] stays open for it.
+
+[i102]: https://github.com/paderinandrey/tessera/pull/102
+[i103]: https://github.com/paderinandrey/tessera/issues/103
+[i104]: https://github.com/paderinandrey/tessera/issues/104

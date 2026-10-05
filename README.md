@@ -125,7 +125,7 @@ Measured on the public synthetic corpus (FR/DE with code-switching, checksum-val
 synthetic identifiers, seeded generation), reproducible by anyone:
 
 ```bash
-make corpus     # regenerates evaluation/corpus/public.jsonl byte-identically
+make corpus     # regenerates both corpora in evaluation/corpus/ byte-identically
 make evaluate   # per-type precision/recall/F1 + the Tier 1 recall gate (>= 0.99)
 ```
 
@@ -167,6 +167,23 @@ The gate that matters is not a per-type score: **every annotated entity with a w
 reaching the provider is named individually**, and `make evaluate` fails on any that is not
 already written down. [Evaluation](docs/evaluation.md) explains what each gate checks and
 what the four remaining misses are.
+
+**That holds for one of the two production shapes, and the table above is measured on the
+same one.** Every row of the corpus behind it is a sentence, which is what `mask_all` sends
+for a plain message. A JSON document — a tool definition, or a tool call's arguments — has
+its leaves joined into one text instead, and production joins many short leaves rather than
+a few long ones: measured on a real tool payload, 79 leaves with a median of 37 characters.
+That shape has a corpus of its own, `evaluation/corpus/documents.jsonl`, and an inventory of
+its own in `detector/tests/test_document_corpus.py` — **of 222 annotated entities, 50 reach
+the provider when the leaves are read together and 36 when each is read alone**. The net 14
+understates it: 20 leak only when joined and 6 only when apart. Those figures are gated by
+`pytest -m ner` rather than published here; the asymmetry is
+[#103](https://github.com/paderinandrey/tessera/issues/103).
+
+One row above is a property of that corpus and not of the detector: `DE_STEUERNUMMER` reads
+1.000 because every Steuernummer in the sentence corpus sits next to the word that boosts
+it over its own threshold. Standing alone in a field, the same value is not detected at all
+— [#104](https://github.com/paderinandrey/tessera/issues/104).
 
 ## How fast it is
 
@@ -227,8 +244,9 @@ detector/     Python detection service: deterministic recognizers with checksum
               validation, NER (GLiNER/ONNX), context boosting. Stable HTTP contract.
 gateway/      Rust reverse proxy: drop-in base URL for OpenAI- and Anthropic-shaped
               requests, masking and restoration, buffered and streamed.
-evaluation/   Public synthetic corpus and metrics harness. The manually annotated
-              corpus stays private and never enters this repository.
+evaluation/   Public synthetic corpora — sentences and JSON documents — and the
+              metrics harness. The manually annotated corpus stays private and
+              never enters this repository.
 ```
 
 ## License
