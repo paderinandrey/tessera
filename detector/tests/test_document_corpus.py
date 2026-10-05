@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from test_joined_detection import _inside_one_leaf
 
 from tessera_detector.evaluation import unmasked_words
 from tessera_detector.pipeline import Detector, build_detector
@@ -112,12 +113,34 @@ def _reaching_the_provider(detector: Detector) -> tuple[
     Absolute: an entity is in a set when *any* word of it is left unmasked on
     that path, regardless of what the other path does. Words rather than spans
     or characters, which is the question `unmasked_words` exists to answer.
+
+    **Only meaningful while no joined span crosses a leaf boundary**, and so
+    refused rather than computed when one does. Production passes the joined
+    spans through `Joined::split`, which rejects a span that straddles two
+    leaves or lands in a separator with `BadSpan("across a joined boundary")` —
+    the whole request fails and none of the document reaches the provider. Read
+    as ordinary masking here, such a span would report unrelated entities as
+    leaks, or cover filler and leave both sets unchanged, while describing a
+    request production never sends. Checked inside the walk rather than in a
+    test of its own, so no inventory can pass on a corpus where it fails; the
+    predicate is `test_joined_detection`'s, not a copy. Raised by review on
+    #105.
     """
     joined_out: set[tuple[str, str, str]] = set()
     separate_out: set[tuple[str, str, str]] = set()
+    crossing: list[tuple[str, str, str]] = []
     annotated = 0
     for document in _documents():
         text, truth, separate, joined = _rebased(detector, document)
+        ranges, at = [], 0
+        for leaf in document["leaves"]:
+            ranges.append((at, at + len(leaf["text"])))
+            at += len(leaf["text"]) + len(JOIN)
+        crossing += [
+            (document["id"], span.entity_type, text[span.start : span.end])
+            for span in joined
+            if not _inside_one_leaf(span, ranges)
+        ]
         annotated += len(truth)
         for origin, span in truth:
             member = (origin, span.entity_type, text[span.start : span.end])
@@ -125,6 +148,10 @@ def _reaching_the_provider(detector: Detector) -> tuple[
                 joined_out.add(member)
             if unmasked_words(text, span.start, span.end, separate):
                 separate_out.add(member)
+    assert not crossing, (
+        "joined spans cross a leaf boundary, so production refuses these "
+        f"documents outright and the inventories do not describe them: {crossing}"
+    )
     return frozenset(joined_out), frozenset(separate_out), annotated
 
 
