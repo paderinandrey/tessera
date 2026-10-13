@@ -189,8 +189,8 @@ reach the provider, on each path, regardless of the other.
 
 ```
 222 annotated
- 50 reach the provider when the leaves are read together
- 36 reach the provider when each leaf is read alone
+ 44 reach the provider when the leaves are read together
+ 30 reach the provider when each leaf is read alone
  20 leak only when joined — and 6 only when apart
 ```
 
@@ -207,11 +207,14 @@ additionally accommodates a predicate that stops seeing things.
 > numbers. The relation above is asserted on its own for that reason, separately from the
 > two sets.
 
-Two findings came out of the first run. `DE_STEUERNUMMER` publishes 1.000 recall above
-because its `confidence` is below its own `threshold` and every Steuernummer in the sentence
-corpus sits next to the word that boosts it over the bar; standing alone in a field it is
+Two findings came out of the first run. `DE_STEUERNUMMER` published 1.000 recall above
+because its `confidence` was below its own `threshold` and every Steuernummer in the sentence
+corpus sits next to the word that boosts it over the bar; standing alone in a field it was
 not detected at all, and the JSON *key* that would carry that word is never scanned
-([#104][i104]). And the apostrophe surnames [#97][i97] left behind are here too, in a shape
+([#104][i104]). The slash form now masks unaided, which took six entities out of both
+inventories — 50 and 36 before, 44 and 30 after, nothing else moving. The 13-digit form
+still needs its trigger: 1.5% of millisecond timestamps pass its format check, and a JSON
+number with a deterministic type refuses the whole request. And the apostrophe surnames [#97][i97] left behind are here too, in a shape
 where nothing surrounds them.
 
 **What is not done.** These figures are gated but not published: `metrics.json` and the
