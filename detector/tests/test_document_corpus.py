@@ -161,7 +161,7 @@ def _reaching_the_provider(detector: Detector) -> tuple[
 
 
 # **The two inventories, and the reason both are here.** Of 222 annotated
-# entities, 50 reach the provider when the leaves are read together and 36 when
+# entities, 44 reach the provider when the leaves are read together and 30 when
 # each is read alone — but the net 14 is not the loss. Twenty entities leak only
 # when joined and six only when apart, so six cancel inside the difference. That
 # is the same cancellation `test_joined_detection` refuses one level up, met
@@ -182,7 +182,6 @@ UNMASKED_JOINED = frozenset(
     {
         ('doc-0004:1:0', 'SEX_LIFE', 'une interruption de grossesse'),
         ('doc-0010:0:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0012:15:0', 'DE_STEUERNUMMER', '126/734/94551'),
         ('doc-0012:17:19', 'PERSON', 'Förster'),
         ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
         ('doc-0013:2:37', 'BIOMETRIC', 'reconnaissance faciale'),
@@ -194,15 +193,11 @@ UNMASKED_JOINED = frozenset(
         ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
         ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0015:9:0', 'DE_STEUERNUMMER', '125/601/58393'),
         ('doc-0017:0:0', 'POLITICAL_AFFILIATION', 'écologiste'),
         ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
         ('doc-0021:0:15', 'PERSON', 'Hövel'),
-        ('doc-0029:1:0', 'DE_STEUERNUMMER', '554/835/49146'),
-        ('doc-0032:0:0', 'DE_STEUERNUMMER', '145/452/53574'),
         ('doc-0032:18:0', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
         ('doc-0032:19:0', 'ETHNICITY', 'métisse'),
-        ('doc-0032:4:0', 'DE_STEUERNUMMER', '884/134/90923'),
         ('doc-0032:5:0', 'POLITICAL_AFFILIATION', 'écologiste'),
         ('doc-0032:7:42', 'PHILOSOPHICAL_BELIEF', 'atheistisch'),
         ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
@@ -212,7 +207,6 @@ UNMASKED_JOINED = frozenset(
         ('doc-0035:12:0', 'ETHNICITY', 'noir de peau'),
         ('doc-0036:1:0', 'RELIGION', 'jüdisch'),
         ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0043:0:0', 'DE_STEUERNUMMER', '761/926/11328'),
         ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
         ('doc-0045:1:21', 'PERSON', 'Wende'),
         ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
@@ -237,7 +231,6 @@ UNMASKED_SEPARATE = frozenset(
     {
         ('doc-0004:1:0', 'SEX_LIFE', 'une interruption de grossesse'),
         ('doc-0010:0:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0012:15:0', 'DE_STEUERNUMMER', '126/734/94551'),
         ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
         ('doc-0013:6:29', 'GENETIC', 'séquençage ADN'),
         ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
@@ -246,14 +239,10 @@ UNMASKED_SEPARATE = frozenset(
         ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
         ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0015:9:0', 'DE_STEUERNUMMER', '125/601/58393'),
         ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
         ('doc-0021:0:15', 'PERSON', 'Hövel'),
         ('doc-0028:0:0', 'ETHNICITY', 'métisse'),
-        ('doc-0029:1:0', 'DE_STEUERNUMMER', '554/835/49146'),
-        ('doc-0032:0:0', 'DE_STEUERNUMMER', '145/452/53574'),
         ('doc-0032:19:0', 'ETHNICITY', 'métisse'),
-        ('doc-0032:4:0', 'DE_STEUERNUMMER', '884/134/90923'),
         ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
         ('doc-0034:13:18', 'GENETIC', 'Erbgutuntersuchung'),
         ('doc-0034:18:0', 'GENETIC', 'DNA-Analyse'),
@@ -262,7 +251,6 @@ UNMASKED_SEPARATE = frozenset(
         ('doc-0035:6:0', 'POLITICAL_OPINION', 'monarchistisch'),
         ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0041:3:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0043:0:0', 'DE_STEUERNUMMER', '761/926/11328'),
         ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
         ('doc-0045:1:21', 'PERSON', 'Wende'),
         ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
@@ -370,7 +358,7 @@ def test_the_net_difference_between_the_paths_understates_what_joining_loses(
 ) -> None:
     """The finding this corpus was built to make visible, asserted on its own.
 
-    50 against 36 is a net of 14. The directional figure is 20: six entities
+    44 against 30 is a net of 14. The directional figure is 20: six entities
     leak only when the leaves are read apart, and each one pays for a different
     entity that leaks only when they are joined. A reader of the two totals
     alone would price joining at 14 names; it costs 20 and buys back 6, and
@@ -381,7 +369,7 @@ def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     relation silently inverted.
     """
     joined, separate, _ = _reaching_the_provider(detector)
-    assert (len(joined), len(separate)) == (50, 36), "the two totals"
+    assert (len(joined), len(separate)) == (44, 30), "the two totals"
     assert len(joined - separate) == 20, (
         "entities joining leaks and reading apart does not — the directional "
         f"loss: {sorted(joined - separate)}"
@@ -396,59 +384,44 @@ def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     )
 
 
-# `confidence` below `threshold` means the pattern alone cannot mask: it needs a
-# trigger word within `boost.window` tokens. In `public.jsonl` the Steuernummer
-# template always supplies one — "Steuernummer {stnr} des Mandanten …" — so the
-# published per-type recall for this identifier is 1.0 and tier 1 recall is
-# 1.0, both measured over text that always carries the context the rule needs.
-#
-# A field payload does not carry it. `{"steuernummer": "125/601/58393"}` puts
-# the trigger word in the **key**, and a key is never scanned: `mapping::walk`
-# iterates the fields and yields only their values, because masking a key would
-# break the call it dispatches. So the one place a JSON document keeps that
-# context is the one place detection cannot see it, and the value goes to the
-# provider whole.
-NEEDS_A_TRIGGER_WORD = frozenset({"DE_STEUERNUMMER"})
+NEEDS_A_TRIGGER_WORD = frozenset({"de_steuernummer_unified"})
 
 
-def test_only_these_identifiers_cannot_mask_without_a_trigger_word() -> None:
-    """The class, enumerated, so a second member cannot arrive unnoticed.
-
-    Needs no model: this is the catalog's own arithmetic. A new identifier
-    declaring `confidence` below its `threshold` is one more value that a bare
-    field leaf loses, and nothing else in this repository would say so — the
-    corpus the per-type recall is published from puts every identifier in a
-    sentence that supplies its trigger.
-    """
+def test_only_these_rules_cannot_mask_without_a_trigger_word() -> None:
     rules = build_detector().deterministic.rules
-    needs = {rule.entity_type for rule in rules if rule.confidence < rule.threshold}
+    needs = {rule.id for rule in rules if rule.confidence < rule.threshold}
     assert needs == NEEDS_A_TRIGGER_WORD, (
-        "identifiers whose pattern cannot reach their own threshold unaided. "
+        "catalog rules whose pattern cannot reach their own threshold unaided. "
         f"Arrived: {sorted(needs - NEEDS_A_TRIGGER_WORD)}. Gone: "
-        f"{sorted(NEEDS_A_TRIGGER_WORD - needs)}. A new member is a value that a "
-        "JSON field leaf loses, because the key that would carry its trigger "
-        "word is not scanned — see the comment above and #104."
+        f"{sorted(NEEDS_A_TRIGGER_WORD - needs)}. A member is a value a JSON field "
+        "leaf loses: the key that would carry its trigger word is never scanned "
+        "(#104)."
     )
 
 
-def test_a_bare_steuernummer_leaf_reaches_the_provider() -> None:
-    """The class's one member, demonstrated end to end rather than argued.
-
-    Three texts, one value: alone it is not detected at all, and either form of
-    surrounding context rescues it. The middle case is what `public.jsonl`
-    measures; the first is what a tool call sends.
-    """
+def test_a_bare_steuernummer_leaf_is_masked_in_its_slash_form_only() -> None:
     detector = build_detector()
-    value = "125/601/58393"
-    assert detector.detect(value) == [], (
-        "a bare Steuernummer was detected, so the boost is no longer what "
-        "carries it — re-read this test's premise before re-recording it"
+    slash = "125/601/58393"
+    found = [
+        span for span in detector.detect(slash) if slash[span.start : span.end] == slash
+    ]
+    assert found and found[0].entity_type == "DE_STEUERNUMMER", (
+        "a bare slash-form Steuernummer reached the provider — the #104 fix "
+        "no longer holds"
     )
-    for context in (f"Steuernummer {value}", f'{{"steuernummer": "{value}"}}'):
-        found = [
+    unified = "9181081508155"
+    assert detector.detect(unified) == [], (
+        "a bare 13-digit Steuernummer was detected. That form stays behind its "
+        "trigger because 1.5% of millisecond timestamps pass `de_stnr` and a JSON "
+        "number with a deterministic type refuses the request; re-read #104 "
+        "before re-recording this"
+    )
+    for context in (f"Steuernummer {unified}", f'{{"steuernummer": "{unified}"}}'):
+        rescued = [
             span
             for span in detector.detect(context)
-            if context[span.start : span.end] == value
+            if context[span.start : span.end] == unified
         ]
-        assert found, f"the trigger word did not rescue the value in {context!r}"
-        assert found[0].entity_type == "DE_STEUERNUMMER"
+        assert rescued and rescued[0].entity_type == "DE_STEUERNUMMER", (
+            f"the trigger word did not rescue the 13-digit form in {context!r}"
+        )

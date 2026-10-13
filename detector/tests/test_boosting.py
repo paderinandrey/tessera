@@ -7,26 +7,44 @@ def detect(text: str) -> list[Span]:
 
 
 def test_steuernummer_with_trigger_detected_and_boosted() -> None:
-    # No checksum exists for the Steuernummer: base confidence 0.6 sits below the
-    # 0.7 threshold and only a context trigger lifts it over.
-    text = "Die Steuernummer 181/815/08155 des Mandanten liegt vor."
+    # The 13-digit form's base confidence 0.6 sits below the 0.7 threshold and
+    # only a context trigger lifts it over.
+    text = "Die Steuernummer 9181081508155 des Mandanten liegt vor."
     (span,) = detect(text)
     assert span.entity_type == "DE_STEUERNUMMER"
-    assert text[span.start : span.end] == "181/815/08155"
+    assert text[span.start : span.end] == "9181081508155"
     assert span.boosted is True
     assert span.confidence == 0.8
     assert span.tier == 1
 
 
 def test_steuernummer_without_trigger_stays_below_threshold() -> None:
-    assert detect("Referenz 181/815/08155 im Anhang.") == []
+    assert detect("Referenz 9181081508155 im Anhang.") == []
+
+
+def test_slash_form_steuernummer_needs_no_trigger() -> None:
+    # A JSON field carries the trigger in its key, which is never scanned (#104).
+    text = "Referenz 181/815/08155 im Anhang."
+    (span,) = detect(text)
+    assert span.entity_type == "DE_STEUERNUMMER"
+    assert text[span.start : span.end] == "181/815/08155"
+    assert span.boosted is False
+    assert span.confidence == 0.7
+    (bare,) = detect("181/815/08155")
+    assert bare.entity_type == "DE_STEUERNUMMER"
+
+
+def test_slash_form_steuernummer_is_still_boosted_by_a_trigger() -> None:
+    (span,) = detect("Die Steuernummer 181/815/08155 des Mandanten liegt vor.")
+    assert span.boosted is True
+    assert span.confidence == 0.9
 
 
 def test_trigger_outside_window_does_not_boost() -> None:
     # The trigger sits more than six tokens away from the candidate.
     text = (
         "Die Steuernummer wurde gestern per Post an die neue Adresse geschickt, "
-        "siehe 181/815/08155."
+        "siehe 9181081508155."
     )
     assert detect(text) == []
 
@@ -70,13 +88,13 @@ def test_13_digit_steuernummer_beats_card_rule() -> None:
 
 def test_window_counts_punctuation_separated_terms() -> None:
     # Comma-glued terms are separate tokens: the trigger sits 7 tokens away.
-    assert detect("Steuernummer,a,b,c,d,e,f,g,181/815/08155") == []
+    assert detect("Steuernummer,a,b,c,d,e,f,g,9181081508155") == []
 
 
 def test_multi_token_trigger_must_be_contiguous_on_one_side() -> None:
     # "st" before and "nr" after the candidate must not concatenate into the
     # canonical "st nr" trigger — it never occurs contiguously in the input.
-    assert detect("st 181/815/08155 nr") == []
+    assert detect("st 9181081508155 nr") == []
 
 
 def test_boost_addition_rounds_at_threshold() -> None:
@@ -103,7 +121,7 @@ def test_context_scan_is_char_bounded() -> None:
     # The context window is local by definition: a single enormous token between
     # trigger and candidate pushes the trigger beyond the bounded character scan.
     blob = "y" * 2000
-    assert detect(f"Steuernummer {blob} 181/815/08155") == []
+    assert detect(f"Steuernummer {blob} 9181081508155") == []
 
 
 def test_boost_never_reduces_confidence() -> None:
@@ -129,5 +147,5 @@ identifiers:
 def test_truncated_token_at_scan_cutoff_is_dropped() -> None:
     # The scan slice starts inside "post-nr": the truncated "st-nr" fragment
     # must not canonicalize into a complete "st nr" trigger.
-    text = "post-nr " + "y" * 377 + " 181/815/08155"
+    text = "post-nr " + "y" * 377 + " 9181081508155"
     assert detect(text) == []
