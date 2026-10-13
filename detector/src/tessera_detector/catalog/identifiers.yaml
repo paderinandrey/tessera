@@ -101,8 +101,10 @@ identifiers:
 
   # The 13-digit form stays below its threshold: 1.5% of millisecond timestamps
   # pass `de_stnr`, and a JSON number carrying a deterministic type refuses the
-  # whole request. Only a context trigger lifts it over.
-  - id: de_steuernummer_unified
+  # whole request. Only a context trigger lifts it over. Same `id` as the slash
+  # form: it is the public `recognizer` value (`catalog:de_steuernummer`) both
+  # forms returned before the split.
+  - id: de_steuernummer
     entity_type: DE_STEUERNUMMER
     tier: 1
     validator: de_stnr

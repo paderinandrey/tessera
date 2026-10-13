@@ -34,6 +34,13 @@ def test_slash_form_steuernummer_needs_no_trigger() -> None:
     assert bare.entity_type == "DE_STEUERNUMMER"
 
 
+def test_both_steuernummer_forms_keep_the_public_recognizer_value() -> None:
+    slash = detect("Referenz 181/815/08155 im Anhang.")
+    unified = detect("Steuernummer 9181081508155 bitte angeben.")
+    assert [s.recognizer for s in slash] == ["catalog:de_steuernummer"]
+    assert [s.recognizer for s in unified] == ["catalog:de_steuernummer"]
+
+
 def test_slash_form_steuernummer_is_still_boosted_by_a_trigger() -> None:
     (span,) = detect("Die Steuernummer 181/815/08155 des Mandanten liegt vor.")
     assert span.boosted is True

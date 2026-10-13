@@ -384,12 +384,14 @@ def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     )
 
 
-NEEDS_A_TRIGGER_WORD = frozenset({"de_steuernummer_unified"})
+NEEDS_A_TRIGGER_WORD = frozenset({("de_steuernummer", r"\b(?<!\d[ ./])\d{13}(?![ ./]?\d)\b")})
 
 
 def test_only_these_rules_cannot_mask_without_a_trigger_word() -> None:
     rules = build_detector().deterministic.rules
-    needs = {rule.id for rule in rules if rule.confidence < rule.threshold}
+    needs = {
+        (rule.id, rule.pattern.pattern) for rule in rules if rule.confidence < rule.threshold
+    }
     assert needs == NEEDS_A_TRIGGER_WORD, (
         "catalog rules whose pattern cannot reach their own threshold unaided. "
         f"Arrived: {sorted(needs - NEEDS_A_TRIGGER_WORD)}. Gone: "
