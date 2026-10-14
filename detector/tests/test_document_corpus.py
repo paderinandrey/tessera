@@ -3,9 +3,8 @@
 **An absolute inventory, which the joined-path gate next door is not.**
 `test_joined_detection.LOST_TO_JOINING` holds misses *relative* to reading the
 leaves apart, so an entity missed on both paths is absent from it by
-construction. That is the gentler half of the picture, and the README's claim —
-every annotated entity with a word reaching the provider is named individually
-— is published only for the separate path over `public.jsonl`.
+construction. The joined-path figures `evaluate.py` publishes are held to the
+inventory below, member for member.
 
 **And a different corpus, because the old one has the wrong leaf shape.**
 `_documents()` over `public.jsonl` groups four sentences of about ninety
@@ -33,9 +32,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_joined_detection import _inside_one_leaf
 
-from tessera_detector.evaluation import unmasked_words
+from tessera_detector.evaluation import (
+    JOINED_LEAF_SEPARATOR,
+    inside_one_leaf,
+    leaf_ranges,
+    unmasked_words,
+)
 from tessera_detector.pipeline import Detector, build_detector
 from tessera_detector.spans import Span
 
@@ -46,8 +49,7 @@ pytestmark = pytest.mark.ner
 JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
 CORPUS = Path(__file__).resolve().parents[2] / "evaluation" / "corpus" / "documents.jsonl"
-# What `mapping::Shape::of` puts between leaves.
-JOIN = "\n\n"
+JOIN = JOINED_LEAF_SEPARATOR
 
 
 @pytest.fixture(scope="module")
@@ -137,14 +139,11 @@ def _reaching_the_provider(detector: Detector) -> tuple[
     annotated = 0
     for document in _documents():
         text, truth, separate, joined = _rebased(detector, document)
-        ranges, at = [], 0
-        for leaf in document["leaves"]:
-            ranges.append((at, at + len(leaf["text"])))
-            at += len(leaf["text"]) + len(JOIN)
+        ranges = leaf_ranges([leaf["text"] for leaf in document["leaves"]])
         crossing += [
             (document["id"], span.entity_type, text[span.start : span.end])
             for span in joined
-            if not _inside_one_leaf(span, ranges)
+            if not inside_one_leaf(span, ranges)
         ]
         annotated += len(truth)
         for origin, span in truth:
@@ -338,6 +337,17 @@ def test_the_joined_path_leaves_these_entities_with_the_provider(
         f"intact when the document's leaves are read together. Arrived: "
         f"{sorted(joined - UNMASKED_JOINED)}. Gone: {sorted(UNMASKED_JOINED - joined)}. "
         "Re-record the set with the reason."
+    )
+
+
+def test_the_published_figures_come_from_the_same_members(detector: Detector) -> None:
+    import evaluate
+
+    leaks, _, _ = evaluate.json_document_figures(detector)
+    assert leaks == UNMASKED_JOINED, (
+        "`evaluate.py` publishes a different set of joined-path leaks than this "
+        f"inventory gates. Only in evaluate: {sorted(leaks - UNMASKED_JOINED)}. "
+        f"Only here: {sorted(UNMASKED_JOINED - leaks)}."
     )
 
 

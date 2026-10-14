@@ -24,15 +24,21 @@ from typing import Any
 
 import pytest
 
-from tessera_detector.evaluation import EvalEntity, overmasking_counts, unmasked_words
+from tessera_detector.evaluation import (
+    JOINED_LEAF_SEPARATOR,
+    EvalEntity,
+    inside_one_leaf,
+    leaf_ranges,
+    overmasking_counts,
+    unmasked_words,
+)
 from tessera_detector.pipeline import Detector, build_detector
 from tessera_detector.spans import Span
 
 pytestmark = pytest.mark.ner
 
 CORPUS = Path(__file__).resolve().parents[2] / "evaluation" / "corpus" / "public.jsonl"
-# What `mapping::Shape::of` puts between leaves.
-JOIN = "\n\n"
+JOIN = JOINED_LEAF_SEPARATOR
 # Leaves per synthetic document. A tool call's arguments carry a handful of
 # short values; four is that shape, and the remainder of the corpus is scored
 # as a smaller document rather than dropped.
@@ -60,23 +66,11 @@ def _documents() -> list[list[dict[str, Any]]]:
     return [rows[at : at + LEAVES] for at in range(0, len(rows), LEAVES)]
 
 
-def _inside_one_leaf(span: Span, ranges: list[tuple[int, int]]) -> bool:
-    """Whether production could return this span to a leaf.
-
-    Mirrors `mapping::Joined::split`: a span that straddles two leaves or lands
-    in a separator is refused there and the request fails, so it is not a
-    detection and must not be scored as one.
-    """
-    return any(start <= span.start and span.end <= end for start, end in ranges)
+_inside_one_leaf = inside_one_leaf
 
 
 def _leaf_ranges(group: list[dict[str, Any]]) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    at = 0
-    for document in group:
-        ranges.append((at, at + len(document["text"])))
-        at += len(document["text"]) + len(JOIN)
-    return ranges
+    return leaf_ranges([document["text"] for document in group])
 
 
 def _truth_with_origin(group: list[dict[str, Any]]) -> list[tuple[str, Span]]:

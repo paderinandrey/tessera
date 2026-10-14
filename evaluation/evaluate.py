@@ -15,20 +15,24 @@ from collections import defaultdict
 from pathlib import Path
 
 from tessera_detector.evaluation import (
+    JOINED_LEAF_SEPARATOR,
     EvalEntity,
     evaluate_document,
     group_coverage,
+    inside_one_leaf,
+    leaf_ranges,
     overmasking_counts,
     precision_gate_failures,
     summarize,
     unmasked_words,
 )
 from tessera_detector.models import ModelUnavailable
-from tessera_detector.pipeline import build_detector
+from tessera_detector.pipeline import Detector, build_detector
 from tessera_detector.spans import Span
 from tessera_detector.version import detector_version
 
 CORPUS = Path(__file__).parent / "corpus" / "public.jsonl"
+DOCUMENTS = Path(__file__).parent / "corpus" / "documents.jsonl"
 TIER1_TARGET = 0.99
 PRECISION_TARGET = 0.8
 # Both are REQ-38 targets, but only LOCATION is enforceable on the synthetic
@@ -164,6 +168,58 @@ def unmasked_entities(
                 (entity.entity_type, text[entity.start : entity.end], frozenset(carrying))
             )
     return leaked
+
+
+def json_document_figures(
+    detector: Detector,
+) -> tuple[frozenset[tuple[str, str, str]], int, int]:
+    """Joined-path leaks by occurrence, and Article 9 coverage, over `documents.jsonl`.
+
+    Each document is read the way the gateway reads a `Slot::Json`: its leaves
+    joined into one text and detected together.
+    """
+    leaks: set[tuple[str, str, str]] = set()
+    covered = gold = 0
+    crossing: list[tuple[str, str, str]] = []
+    for line in DOCUMENTS.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        document = json.loads(line)
+        texts = [leaf["text"] for leaf in document["leaves"]]
+        text = JOINED_LEAF_SEPARATOR.join(texts)
+        ranges = leaf_ranges(texts)
+        predictions = detector.detect(text)
+        crossing += [
+            (document["id"], span.entity_type, text[span.start : span.end])
+            for span in predictions
+            if not inside_one_leaf(span, ranges)
+        ]
+        entities = []
+        for index, (leaf, (offset, _)) in enumerate(zip(document["leaves"], ranges, strict=True)):
+            for annotated in leaf["entities"]:
+                entity = EvalEntity(
+                    entity_type=annotated["entity_type"],
+                    start=annotated["start"] + offset,
+                    end=annotated["end"] + offset,
+                )
+                entities.append(entity)
+                if unmasked_words(text, entity.start, entity.end, predictions):
+                    leaks.add(
+                        (
+                            f"{document['id']}:{index}:{annotated['start']}",
+                            entity.entity_type,
+                            text[entity.start : entity.end],
+                        )
+                    )
+        for _, hit in group_coverage(entities, predictions, types=ARTICLE_9_TYPES):
+            covered += int(hit)
+            gold += 1
+    if crossing:
+        raise SystemExit(
+            "FAIL: joined spans cross a leaf boundary in documents.jsonl, so the "
+            f"gateway refuses those documents and no figure describes them: {crossing}"
+        )
+    return frozenset(leaks), covered, gold
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -344,6 +400,14 @@ def main(argv: list[str] | None = None) -> int:
             f"WARN: {entity_type} precision {precision:.4f} below target {PRECISION_TARGET} "
             "(advisory on the synthetic corpus)"
         )
+    document_leaks, document_covered, document_gold = json_document_figures(detector)
+    document_entities = {(entity_type, value) for _, entity_type, value in document_leaks}
+    document_ratio = document_covered / document_gold if document_gold else 0.0
+    print(
+        f"\nJSON documents, leaves read together (advisory): {len(document_leaks)} "
+        f"occurrences of {len(document_entities)} entities reach the provider; "
+        f"Article 9 coverage {document_ratio:.4f} ({document_covered}/{document_gold})"
+    )
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(
@@ -376,6 +440,18 @@ def main(argv: list[str] | None = None) -> int:
                     "unmasked": {
                         "occurrences": len(unmasked),
                         "entities": len(distinct),
+                    },
+                    "documents": {
+                        "corpus_sha256": hashlib.sha256(DOCUMENTS.read_bytes()).hexdigest(),
+                        "unmasked": {
+                            "occurrences": len(document_leaks),
+                            "entities": len(document_entities),
+                        },
+                        "article_9_coverage": {
+                            "ratio": round(document_ratio, 4),
+                            "covered": document_covered,
+                            "gold": document_gold,
+                        },
                     },
                 },
                 indent=2,
