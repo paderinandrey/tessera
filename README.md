@@ -142,21 +142,21 @@ are published rather than trimmed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| PERSON | 0.958 | 0.908 | 0.932 |
+| PERSON | 0.959 | 0.934 | 0.947 |
 | LOCATION | 1.000 | 1.000 | 1.000 |
 | ORG | 0.167 | 0.333 | 0.222 |
 
 Article 9 special categories are detected by the same layer at a lower threshold, and
 **Article 9 coverage is 1.0000 (46 of 46)**. That bar was lowered from 0.30 to 0.20 for
-[#109](https://github.com/paderinandrey/tessera/issues/109), and it relabels two surnames: `Mercier` is
-masked as `ETHNICITY` and `Hermighausen` as `TRADE_UNION`, which is why `PERSON` recall reads
-0.908 above. Nothing leaks; the placeholder's type is wrong
+[#109](https://github.com/paderinandrey/tessera/issues/109). A special-category reading that
+overlaps a `PERSON` reading still has to clear 0.30 to name the span, so a surname the model
+half-reads as an ethnicity or a trade union keeps its `PERSON` placeholder
 ([#112](https://github.com/paderinandrey/tessera/issues/112)):
 
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
 | BIOMETRIC | 1.000 | 1.000 | 1.000 |
-| ETHNICITY | 0.857 | 1.000 | 0.923 |
+| ETHNICITY | 1.000 | 1.000 | 1.000 |
 | GENETIC | 1.000 | 1.000 | 1.000 |
 | HEALTH | 0.667 | 1.000 | 0.800 |
 | PHILOSOPHICAL_BELIEF | 0.000 | 0.000 | 0.000 |
@@ -165,7 +165,7 @@ masked as `ETHNICITY` and `Hermighausen` as `TRADE_UNION`, which is why `PERSON`
 | RELIGION | 0.500 | 1.000 | 0.667 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
 | SEX_LIFE | 0.000 | 0.000 | 0.000 |
-| TRADE_UNION | 0.267 | 1.000 | 0.421 |
+| TRADE_UNION | 0.276 | 1.000 | 0.432 |
 
 The gate that matters is not a per-type score: **every annotated entity with a word
 reaching the provider is named individually**, and `make evaluate` fails on any that is not

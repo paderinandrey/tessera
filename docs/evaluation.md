@@ -18,9 +18,17 @@ Two are real, and both are [#97][i97]. Two near misses used to sit beside them �
 `test génétique` at 0.288 against Article 9's bar of 0.30, and `Tessier SA` at 0.697
 against ORG's 0.75 — and lowering the Article 9 bars to 0.20 for [#109][i109] took both off
 the list: the first is masked as `GENETIC`, the second as `TRADE_UNION`, a label that is
-wrong and a span that is not. The same change masks the surnames `Mercier` as `ETHNICITY`
-and `Hermighausen` as `TRADE_UNION` ([#112][i112]): nothing leaks, the placeholder's type
-does.
+wrong and a span that is not. The same change first masked the surnames `Mercier` as
+`ETHNICITY` and `Hermighausen` as `TRADE_UNION` ([#112][i112]). They read `PERSON` again
+because a special-category reading that overlaps a `PERSON` reading must still clear 0.30
+(`outranks_tier_3_below` in `ner.yaml`). Across both corpora the special-category readings
+of surnames that overlap a `PERSON` reading score 0.225–0.299, except `L’Hôpital` in fr-0014
+at 0.380, which stays `TRADE_UNION`; the real special categories score 0.354 or more. The
+`PERSON` score does not separate the two groups — 0.55–0.97 against the surnames, 0.52–0.94
+against the special categories — so letting the higher score win instead would label `homosexuell` and six JSON
+values `PERSON`, moving Article 9 coverage to 45/46 on sentences and 57/84 on documents.
+`Tessier SA` stays `TRADE_UNION`: no `ORG` reading clears its bar, so there is nothing for
+a rule to prefer.
 
 For the two [#97][i97] entries, the mechanism is not the one that issue was
 filed with. It was filed as "the detector splits a surname at its apostrophe and

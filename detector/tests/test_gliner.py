@@ -7,7 +7,7 @@ import pytest
 
 import tessera_detector.ner as ner_module
 from tessera_detector.models import find_model
-from tessera_detector.ner import GlinerRecognizer, deduplicated, load_ner_types
+from tessera_detector.ner import GlinerRecognizer, contested, deduplicated, load_ner_types
 from tessera_detector.spans import Span
 
 pytestmark = pytest.mark.ner
@@ -125,6 +125,30 @@ def test_an_article_9_mention_is_never_missed_by_the_whole_group(
     ):
         found = {s.entity_type for s in recognizer.detect(text)} & article_9
         assert found, f"no Article 9 span at all in: {text}"
+
+
+@pytest.mark.parametrize(
+    ("text", "surname"),
+    [
+        ("Mercier, de confession musulmane, demande un aménagement d'horaire.", "Mercier"),
+        (
+            "Die Rechnung pour Hermighausen référence la Steuer-ID 47 865 083 214 et "
+            "l'IBAN CH39 0076 2000 3100 9422 3.",
+            "Hermighausen",
+        ),
+    ],
+)
+def test_a_surname_is_not_reported_as_a_special_category(
+    recognizer: GlinerRecognizer, text: str, surname: str
+) -> None:
+    start = text.index(surname)
+    covering = {
+        (s.entity_type, s.tier)
+        for s in recognizer.detect(text)
+        if s.start < start + len(surname) and start < s.end
+    }
+    assert ("PERSON", 2) in covering, covering
+    assert all(tier != 3 for _, tier in covering), covering
 
 
 def test_a_person_span_drops_the_role_noun_and_title_in_front_of_the_name(
@@ -289,7 +313,7 @@ def test_dispatching_windows_to_threads_changes_no_answer(
     submission order is, and this checks it on a text long enough to fill
     several batches.
 
-    The reference folds `deduplicated` the way `detect` does, because that step
+    The reference folds `deduplicated` and `contested` the way `detect` does, because that step
     is being held constant rather than tested: `person` is asked in two passes
     now, so a reference without it differs from `detect` on every repeated name
     and the order claim disappears behind the noise.
@@ -304,7 +328,7 @@ def test_dispatching_windows_to_threads_changes_no_answer(
                 spans.extend(
                     recognizer._spans_from(base, piece, inference, at_boundary=at_boundary)
                 )
-        return deduplicated(spans)
+        return contested(deduplicated(spans), recognizer.types)
 
     def shape(spans: list[Span]) -> list[tuple[str, int, int, float, bool]]:
         return [(s.entity_type, s.start, s.end, s.confidence, s.boosted) for s in spans]
