@@ -214,8 +214,8 @@ not detected at all, and the JSON *key* that would carry that word is never scan
 ([#104][i104]). The slash form now masks unaided, which took six entities out of both
 inventories — 50 and 36 before, 44 and 30 after, nothing else moving. The 13-digit form
 still needs its trigger: 1.5% of millisecond timestamps pass its format check, and a JSON
-number with a deterministic type refuses the whole request. And the apostrophe surnames
-[#97][i97] left behind are here too, in a shape where nothing surrounds them.
+number with a deterministic type refuses the whole request. And the apostrophe-bearing
+surnames [#97][i97] left behind are here too, in a shape where nothing surrounds them.
 
 **Published, as advisory.** `make evaluate` reads every document the way the gateway reads a
 `Slot::Json` and records two figures in `metrics.json` beside the sentence corpus's: the
