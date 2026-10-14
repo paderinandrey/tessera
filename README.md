@@ -142,18 +142,22 @@ are published rather than trimmed:
 | FR_NIF | 1.000 | 1.000 | 1.000 |
 | FR_NIR | 1.000 | 1.000 | 1.000 |
 | IBAN | 1.000 | 1.000 | 1.000 |
-| PERSON | 0.959 | 0.934 | 0.947 |
+| PERSON | 0.958 | 0.908 | 0.932 |
 | LOCATION | 1.000 | 1.000 | 1.000 |
 | ORG | 0.167 | 0.333 | 0.222 |
 
 Article 9 special categories are detected by the same layer at a lower threshold, and
-**Article 9 coverage is 0.9783 (45 of 46)**:
+**Article 9 coverage is 1.0000 (46 of 46)**. That bar was lowered from 0.30 to 0.20 for
+[#109](https://github.com/paderinandrey/tessera/issues/109), and it relabels two surnames: `Mercier` is
+masked as `ETHNICITY` and `Hermighausen` as `TRADE_UNION`, which is why `PERSON` recall reads
+0.908 above. Nothing leaks; the placeholder's type is wrong
+([#112](https://github.com/paderinandrey/tessera/issues/112)):
 
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
 | BIOMETRIC | 1.000 | 1.000 | 1.000 |
-| ETHNICITY | 1.000 | 1.000 | 1.000 |
-| GENETIC | 1.000 | 0.750 | 0.857 |
+| ETHNICITY | 0.857 | 1.000 | 0.923 |
+| GENETIC | 1.000 | 1.000 | 1.000 |
 | HEALTH | 0.667 | 1.000 | 0.800 |
 | PHILOSOPHICAL_BELIEF | 0.000 | 0.000 | 0.000 |
 | POLITICAL_AFFILIATION | 1.000 | 1.000 | 1.000 |
@@ -161,12 +165,12 @@ Article 9 special categories are detected by the same layer at a lower threshold
 | RELIGION | 0.500 | 1.000 | 0.667 |
 | SEXUAL_ORIENTATION | 1.000 | 1.000 | 1.000 |
 | SEX_LIFE | 0.000 | 0.000 | 0.000 |
-| TRADE_UNION | 0.286 | 1.000 | 0.444 |
+| TRADE_UNION | 0.267 | 1.000 | 0.421 |
 
 The gate that matters is not a per-type score: **every annotated entity with a word
 reaching the provider is named individually**, and `make evaluate` fails on any that is not
 already written down. [Evaluation](docs/evaluation.md) explains what each gate checks and
-what the four remaining misses are.
+what the two remaining misses are.
 
 **That holds for one of the two production shapes, and the table above is measured on the
 same one.** Every row of the corpus behind it is a sentence, which is what `mask_all` sends
@@ -176,13 +180,13 @@ a few long ones: measured on a real tool payload, 79 leaves with a median of 37 
 That shape has a corpus of its own, `evaluation/corpus/documents.jsonl`, measured by the same
 `make evaluate`:
 
-**On JSON documents, 44 occurrences of 34 annotated entities reach the provider, and Article 9
-coverage is 0.6429 (54 of 84)**
+**On JSON documents, 35 occurrences of 30 annotated entities reach the provider, and Article 9
+coverage is 0.7500 (63 of 84)**
 
 These figures are advisory — published and checked against the measurement, but not held to
-the 0.95 target above, which they do not meet. Half of the special-category values standing
-alone in a field go out: the word that describes them is in the JSON key, and keys are never
-scanned ([#109](https://github.com/paderinandrey/tessera/issues/109)). Every one of the 44 is
+the 0.95 target above, which they do not meet. 17 of the 46 special-category values standing
+alone in a field still go out: the word that describes them is in the JSON key, and keys are
+never scanned ([#109](https://github.com/paderinandrey/tessera/issues/109)). Every one of the 35 is
 named in `detector/tests/test_document_corpus.py`, and a new one fails `pytest -m ner`.
 
 `DE_STEUERNUMMER`'s 1.000 is measured on sentences that always carry the word *Steuernummer*.

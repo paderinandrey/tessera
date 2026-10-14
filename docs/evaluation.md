@@ -14,16 +14,15 @@ sentence, which is what a plain message is. The other shape is below, under
 [a JSON document is not a sentence](#a-json-document-is-not-a-sentence); its figures are
 published too, as advisory.
 
-Four are real. Two are threshold misses:
+Two are real, and both are [#97][i97]. Two near misses used to sit beside them —
+`test génétique` at 0.288 against Article 9's bar of 0.30, and `Tessier SA` at 0.697
+against ORG's 0.75 — and lowering the Article 9 bars to 0.20 for [#109][i109] took both off
+the list: the first is masked as `GENETIC`, the second as `TRADE_UNION`, a label that is
+wrong and a span that is not. The same change masks the surnames `Mercier` as `ETHNICITY`
+and `Hermighausen` as `TRADE_UNION` ([#112][i112]): nothing leaks, the placeholder's type
+does.
 
-```
-GENETIC  'test génétique'   its own label at 0.288, bar 0.30
-ORG      'Tessier SA'       its own label at 0.697, bar 0.75
-```
-
-Near misses by 0.012 and 0.053.
-
-The other two are [#97][i97], and the mechanism is not the one that issue was
+For the two [#97][i97] entries, the mechanism is not the one that issue was
 filed with. It was filed as "the detector splits a surname at its apostrophe and
 finds neither half", from reading this gate's own output: the list beside each
 entry is *the words of the gold value no prediction covers*, and the apostrophe
@@ -67,7 +66,7 @@ down about a specific entity, not a spelling rule.
 [i46]: https://github.com/paderinandrey/tessera/issues/46
 [i97]: https://github.com/paderinandrey/tessera/issues/97
 
-**Article 9 coverage: 0.9783 (45/46)** — nearly every special-category mention in the
+**Article 9 coverage: 1.0000 (46/46)** — every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
 across eleven detector types rather than eight: the regulation protects political opinions,
 a stated view that names no party needs a label separate from `political party`, and the
@@ -84,7 +83,7 @@ orientation — each clause gets its own label.
 > still redacted, which is what REQ-3's "misses are not tolerable" is actually about — a
 > special-category mention reaching the model provider unredacted. Which of the eight
 > labels wins is second-order, so the report shows it and the gate does not. Their
-> precision is left ungated on purpose: at threshold 0.30 the layer over-reports by
+> precision is left ungated on purpose: at threshold 0.20 the layer over-reports by
 > design, because over-redaction is the safe failure for this category.
 >
 > The NER rows are flattered in one direction and penalised in another. Names, cities
@@ -189,14 +188,14 @@ reach the provider, on each path, regardless of the other.
 
 ```
 222 annotated
- 44 reach the provider when the leaves are read together
- 30 reach the provider when each leaf is read alone
- 20 leak only when joined — and 6 only when apart
+ 35 reach the provider when the leaves are read together
+ 23 reach the provider when each leaf is read alone
+ 16 leak only when joined — and 4 only when apart
 ```
 
-**The net is 14 and the loss is 20.** Six entities leak only when the leaves are read apart,
+**The net is 12 and the loss is 16.** Four entities leak only when the leaves are read apart,
 and each pays for a different entity that leaks only when they are joined, so a reader of
-the two totals prices joining at 14 names when it costs 20 and buys back 6 — and they are
+the two totals prices joining at 12 names when it costs 16 and buys back 4 — and they are
 not the same names. Both inventories are therefore listed by member and asserted exactly,
 for the reason given above: a bound lets a fixed leak pay for a new one, and an upper bound
 additionally accommodates a predicate that stops seeing things.
@@ -222,11 +221,13 @@ surnames [#97][i97] left behind are here too, in a shape where nothing surrounds
 joined-path leaks, counted by occurrence and by distinct entity, and Article 9 coverage
 through the same `group_coverage` the sentence gate uses. The README publishes both and
 `check-published-metrics` holds them to the measurement, tied to `documents.jsonl` by its own
-digest. They are not held to the 0.95 Article 9 target, which they do not meet: 0.6429, and
-half of the special-category values standing alone in a field go out because the word that
+digest. They are not held to the 0.95 Article 9 target, which they do not meet: 0.7500 at the
+0.20 bar (0.6429 at 0.30), and 17 of the 46 special-category values standing alone in a field
+still go out because the word that
 describes them is in the JSON key ([#109][i109]). The named inventory stays the gate, and a
 test holds the evaluator's walk to it member for member, so the two cannot disagree.
 
 [i102]: https://github.com/paderinandrey/tessera/pull/102
 [i104]: https://github.com/paderinandrey/tessera/issues/104
 [i109]: https://github.com/paderinandrey/tessera/issues/109
+[i112]: https://github.com/paderinandrey/tessera/issues/112

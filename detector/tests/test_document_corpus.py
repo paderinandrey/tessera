@@ -115,22 +115,15 @@ UNMASKED_JOINED = frozenset(
         ('doc-0010:0:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0012:17:19', 'PERSON', 'Förster'),
         ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
-        ('doc-0013:2:37', 'BIOMETRIC', 'reconnaissance faciale'),
         ('doc-0013:6:29', 'GENETIC', 'séquençage ADN'),
         ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
-        ('doc-0014:14:0', 'RELIGION', 'jüdisch'),
         ('doc-0014:20:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0014:25:0', 'ORG', 'Marie et Fils'),
-        ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
         ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0017:0:0', 'POLITICAL_AFFILIATION', 'écologiste'),
         ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
         ('doc-0021:0:15', 'PERSON', 'Hövel'),
-        ('doc-0032:18:0', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
-        ('doc-0032:19:0', 'ETHNICITY', 'métisse'),
         ('doc-0032:5:0', 'POLITICAL_AFFILIATION', 'écologiste'),
-        ('doc-0032:7:42', 'PHILOSOPHICAL_BELIEF', 'atheistisch'),
         ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
         ('doc-0034:3:14', 'PERSON', 'L\u2019H\u00f4pital'),
         ('doc-0034:3:39', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
@@ -140,10 +133,8 @@ UNMASKED_JOINED = frozenset(
         ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
         ('doc-0045:1:21', 'PERSON', 'Wende'),
-        ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
         ('doc-0048:0:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0050:0:34', 'PERSON', 'dell\u2019Orto'),
-        ('doc-0052:10:46', 'ETHNICITY', 'kurdischer Herkunft'),
         ('doc-0052:14:62', 'HEALTH', 'un diabète de type 2'),
         ('doc-0053:5:25', 'BIOMETRIC', 'Gesichtsscan'),
         ('doc-0053:5:42', 'PERSON', 'Zimmer'),
@@ -165,25 +156,18 @@ UNMASKED_SEPARATE = frozenset(
         ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
         ('doc-0013:6:29', 'GENETIC', 'séquençage ADN'),
         ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
-        ('doc-0014:13:0', 'ORG', 'Röhrdanz GmbH & Co. OHG'),
         ('doc-0014:20:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
         ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
         ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
         ('doc-0021:0:15', 'PERSON', 'Hövel'),
-        ('doc-0028:0:0', 'ETHNICITY', 'métisse'),
-        ('doc-0032:19:0', 'ETHNICITY', 'métisse'),
-        ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
         ('doc-0034:13:18', 'GENETIC', 'Erbgutuntersuchung'),
         ('doc-0034:18:0', 'GENETIC', 'DNA-Analyse'),
         ('doc-0034:3:14', 'PERSON', 'L\u2019H\u00f4pital'),
         ('doc-0035:12:0', 'ETHNICITY', 'noir de peau'),
-        ('doc-0035:6:0', 'POLITICAL_OPINION', 'monarchistisch'),
         ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0041:3:0', 'BIOMETRIC', 'empreinte digitale'),
         ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
-        ('doc-0045:1:21', 'PERSON', 'Wende'),
         ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
         ('doc-0048:0:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0052:14:62', 'HEALTH', 'un diabète de type 2'),
@@ -278,12 +262,12 @@ def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     detector: Detector,
 ) -> None:
     joined, separate, _ = _reaching_the_provider(detector)
-    assert (len(joined), len(separate)) == (44, 30), "the two totals"
-    assert len(joined - separate) == 20, (
+    assert (len(joined), len(separate)) == (35, 23), "the two totals"
+    assert len(joined - separate) == 16, (
         "entities joining leaks and reading apart does not — the directional "
         f"loss: {sorted(joined - separate)}"
     )
-    assert len(separate - joined) == 6, (
+    assert len(separate - joined) == 4, (
         "and the ones going the other way, which is what makes the net "
         f"misleading: {sorted(separate - joined)}"
     )

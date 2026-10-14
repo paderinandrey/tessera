@@ -210,31 +210,31 @@ entities:
   # checksum-backed identifier.
   - entity_type: HEALTH
     label: medical condition
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: BIOMETRIC
     label: biometric data
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: GENETIC
     label: genetic data
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: ETHNICITY
     label: ethnic origin
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: POLITICAL_AFFILIATION
     label: political party
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
@@ -242,25 +242,25 @@ entities:
   # view that names no party needs a label of its own to have any chance.
   - entity_type: POLITICAL_OPINION
     label: political opinion
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: RELIGION
     label: religion
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: TRADE_UNION
     label: trade union
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: SEXUAL_ORIENTATION
     label: sexual orientation
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
@@ -269,12 +269,12 @@ entities:
   # gets its own label rather than being folded into its neighbour.
   - entity_type: PHILOSOPHICAL_BELIEF
     label: philosophical belief
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
 
   - entity_type: SEX_LIFE
     label: sex life
-    threshold: 0.30
+    threshold: 0.20
     tier: 3
     specificity: 35
