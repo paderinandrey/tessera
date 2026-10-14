@@ -15,14 +15,13 @@ from collections import defaultdict
 from pathlib import Path
 
 from tessera_detector.evaluation import (
-    JOINED_LEAF_SEPARATOR,
     EvalEntity,
     evaluate_document,
     group_coverage,
-    inside_one_leaf,
-    leaf_ranges,
+    joined_in_context,
     overmasking_counts,
     precision_gate_failures,
+    returned_to_values,
     summarize,
     unmasked_words,
 )
@@ -168,7 +167,8 @@ def json_document_figures(
     """Joined-path leaks by occurrence, and Article 9 coverage, over `documents.jsonl`.
 
     Each document is read the way the gateway reads a `Slot::Json`: its leaves
-    joined into one text and detected together.
+    joined into one text, short values after their member name, and detected
+    together.
     """
     leaks: set[tuple[str, str, str]] = set()
     covered = gold = 0
@@ -177,17 +177,16 @@ def json_document_figures(
         if not line.strip():
             continue
         document = json.loads(line)
-        texts = [leaf["text"] for leaf in document["leaves"]]
-        text = JOINED_LEAF_SEPARATOR.join(texts)
-        ranges = leaf_ranges(texts)
-        predictions = detector.detect(text)
+        joined = joined_in_context([(leaf["key"], leaf["text"]) for leaf in document["leaves"]])
+        text = joined.text
+        predictions, refused = returned_to_values(joined, detector.detect(text))
         crossing += [
-            (document["id"], span.entity_type, text[span.start : span.end])
-            for span in predictions
-            if not inside_one_leaf(span, ranges)
+            (document["id"], span.entity_type, text[span.start : span.end]) for span in refused
         ]
         entities = []
-        for index, (leaf, (offset, _)) in enumerate(zip(document["leaves"], ranges, strict=True)):
+        for index, (leaf, (offset, _)) in enumerate(
+            zip(document["leaves"], joined.ranges, strict=True)
+        ):
             for annotated in leaf["entities"]:
                 entity = EvalEntity(
                     entity_type=annotated["entity_type"],

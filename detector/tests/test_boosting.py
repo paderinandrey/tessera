@@ -23,7 +23,6 @@ def test_steuernummer_without_trigger_stays_below_threshold() -> None:
 
 
 def test_slash_form_steuernummer_needs_no_trigger() -> None:
-    # A JSON field carries the trigger in its key, which is never scanned (#104).
     text = "Referenz 181/815/08155 im Anhang."
     (span,) = detect(text)
     assert span.entity_type == "DE_STEUERNUMMER"

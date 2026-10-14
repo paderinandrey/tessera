@@ -3753,7 +3753,7 @@ fn descend_into(shape: Shape, key: &str, value: &Value) -> Option<Shape> {
 }
 
 /// A value a document carries, in the order the walk finds it. Keys are absent
-/// by construction: this walk descends into values and never yields a name.
+/// by construction: a name travels beside a leaf, never as one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Leaf {
     Text(String),
@@ -3791,6 +3791,10 @@ pub enum Leaf {
 /// not promise.
 const JOIN_SEPARATOR: &str = "\n\n";
 
+/// The longest value, in whitespace-separated words, that is shown to the
+/// detector after its member name.
+pub const CONTEXT_MAX_WORDS: usize = 3;
+
 /// Several text leaves presented to the detector as one call.
 ///
 /// One call per string is not merely slow, it is blind: a two-character leaf
@@ -3806,14 +3810,26 @@ pub struct Joined {
     /// so a byte-based offset here would put a span inside the wrong leaf
     /// rather than out of range, and nothing would fail.
     ranges: Vec<std::ops::Range<usize>>,
+    /// Where each leaf's member name begins, equal to its range's start when
+    /// the leaf is shown without one.
+    contexts: Vec<usize>,
 }
 
 impl Joined {
+    #[cfg(test)]
     pub fn of(leaves: &[&str]) -> Self {
+        let keyless: Vec<(Option<&str>, &str)> = leaves.iter().map(|leaf| (None, *leaf)).collect();
+        Self::in_context(&keyless)
+    }
+
+    /// Leaves joined as `of` joins them, each value of at most
+    /// `CONTEXT_MAX_WORDS` words preceded by `key: ` where it has a key.
+    pub fn in_context(leaves: &[(Option<&str>, &str)]) -> Self {
         let mut text = String::new();
         let mut ranges = Vec::with_capacity(leaves.len());
+        let mut contexts = Vec::with_capacity(leaves.len());
         let mut at = 0usize;
-        for (index, leaf) in leaves.iter().enumerate() {
+        for (index, (key, leaf)) in leaves.iter().enumerate() {
             // Between leaves, never after the last: one leaf has to join to
             // itself byte for byte, or the detection cache stops recognising a
             // text it has already seen and every second turn pays again.
@@ -3821,12 +3837,23 @@ impl Joined {
                 text.push_str(JOIN_SEPARATOR);
                 at += JOIN_SEPARATOR.chars().count();
             }
+            contexts.push(at);
+            if let Some(key) = key.filter(|_| leaf.split_whitespace().count() <= CONTEXT_MAX_WORDS)
+            {
+                text.push_str(key);
+                text.push_str(": ");
+                at += key.chars().count() + 2;
+            }
             let length = leaf.chars().count();
             ranges.push(at..at + length);
             text.push_str(leaf);
             at += length;
         }
-        Self { text, ranges }
+        Self {
+            text,
+            ranges,
+            contexts,
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -3857,43 +3884,65 @@ impl Joined {
     /// The result has one entry per leaf, empty where the detector found
     /// nothing — `replace_text_leaves` corresponds by position, so a leaf
     /// without spans still has to occupy its place.
+    ///
+    /// A span inside a leaf's member name is dropped, and one that begins there
+    /// and ends in the value is cut to the value.
     pub fn split(&self, spans: &[Span]) -> Result<Vec<Vec<Span>>, MappingError> {
         let mut out = vec![Vec::new(); self.ranges.len()];
         for span in spans {
             let leaf = self
                 .ranges
                 .iter()
-                .position(|range| {
-                    range.start < range.end && range.start <= span.start && span.end <= range.end
+                .zip(&self.contexts)
+                .position(|(range, &context)| {
+                    context < range.end && context <= span.start && span.end <= range.end
                 })
                 // Inside no single leaf: either straddling two of them or
                 // landing in a separator we inserted. Neither can be applied,
                 // and neither may be dropped.
                 .ok_or(MappingError::BadSpan("across a joined boundary"))?;
-            let start = self.ranges[leaf].start;
+            let range = &self.ranges[leaf];
+            if span.end <= range.start {
+                continue;
+            }
             out[leaf].push(Span {
                 entity_type: span.entity_type.clone(),
-                start: span.start - start,
-                end: span.end - start,
+                start: span.start.max(range.start) - range.start,
+                end: span.end - range.start,
             });
         }
         Ok(out)
     }
 }
 
+#[cfg(test)]
 pub fn json_leaves(value: &Value, shape: Shape) -> Result<Vec<Leaf>, MappingError> {
+    Ok(json_leaves_in_context(value, shape)?
+        .into_iter()
+        .map(|(_, leaf)| leaf)
+        .collect())
+}
+
+/// `json_leaves`, each leaf paired with the name of the member holding it when
+/// that member belongs to an `Instance` object. An array's items share the
+/// array's name; a schema keyword names nothing.
+pub fn json_leaves_in_context(
+    value: &Value,
+    shape: Shape,
+) -> Result<Vec<(Option<String>, Leaf)>, MappingError> {
     let mut leaves = Vec::new();
     let mut nodes = 0usize;
-    walk(value, shape, 0, &mut nodes, &mut leaves)?;
+    walk(value, shape, None, 0, &mut nodes, &mut leaves)?;
     Ok(leaves)
 }
 
 fn walk(
     value: &Value,
     shape: Shape,
+    key: Option<&str>,
     depth: usize,
     nodes: &mut usize,
-    leaves: &mut Vec<Leaf>,
+    leaves: &mut Vec<(Option<String>, Leaf)>,
 ) -> Result<(), MappingError> {
     if depth > MAX_JSON_DEPTH {
         return Err(MappingError::TooDeep);
@@ -3903,11 +3952,13 @@ fn walk(
         return Err(MappingError::TooLarge);
     }
     match value {
-        Value::String(text) => leaves.push(Leaf::Text(text.clone())),
-        Value::Number(number) => leaves.push(Leaf::Number(number.to_string())),
+        Value::String(text) => leaves.push((key.map(str::to_owned), Leaf::Text(text.clone()))),
+        Value::Number(number) => {
+            leaves.push((key.map(str::to_owned), Leaf::Number(number.to_string())))
+        }
         Value::Array(items) => {
             for item in items {
-                walk(item, shape, depth + 1, nodes, leaves)?;
+                walk(item, shape, key, depth + 1, nodes, leaves)?;
             }
         }
         Value::Object(fields) => {
@@ -3916,7 +3967,8 @@ fn walk(
             // `descend_into` says whether this field's *value* is one too.
             for (key, item) in fields {
                 if let Some(inner) = descend_into(shape, key, item) {
-                    walk(item, inner, depth + 1, nodes, leaves)?;
+                    let named = (shape == Shape::Instance).then_some(key.as_str());
+                    walk(item, inner, named, depth + 1, nodes, leaves)?;
                 }
             }
         }
@@ -6713,6 +6765,101 @@ mod tests {
                 vec![span_at("PERSON", 0, 7)],
             ],
             "each span is returned to its leaf and rebased to that leaf's start"
+        );
+    }
+
+    #[test]
+    fn a_short_value_is_joined_after_its_member_name() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("testdata/joined_in_context.json")).unwrap();
+        for case in &cases {
+            let leaves: Vec<(Option<&str>, &str)> = case["leaves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| (pair[0].as_str(), pair[1].as_str().unwrap()))
+                .collect();
+            let joined = Joined::in_context(&leaves);
+            assert_eq!(joined.text(), case["text"].as_str().unwrap());
+            let ranges: Vec<Vec<usize>> = serde_json::from_value(case["ranges"].clone()).unwrap();
+            let contexts: Vec<usize> = serde_json::from_value(case["contexts"].clone()).unwrap();
+            assert_eq!(
+                joined
+                    .ranges
+                    .iter()
+                    .map(|range| vec![range.start, range.end])
+                    .collect::<Vec<_>>(),
+                ranges
+            );
+            assert_eq!(joined.contexts, contexts);
+        }
+    }
+
+    #[test]
+    fn a_span_in_a_member_name_is_dropped_and_one_reaching_into_the_value_is_cut_to_it() {
+        let joined = Joined::in_context(&[(Some("religion"), "athée"), (Some("Weber"), "Weber")]);
+        assert_eq!(joined.text(), "religion: athée\n\nWeber: Weber");
+        let split = joined
+            .split(&[
+                span_at("RELIGION", 0, 15),
+                span_at("PERSON", 17, 22),
+                span_at("PERSON", 24, 29),
+            ])
+            .unwrap();
+        assert_eq!(
+            split,
+            vec![
+                vec![span_at("RELIGION", 0, 5)],
+                vec![span_at("PERSON", 0, 5)]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_span_from_one_value_into_the_next_member_name_is_still_refused() {
+        let joined = Joined::in_context(&[(Some("a"), "Weber"), (Some("b"), "Bern")]);
+        assert_eq!(joined.text(), "a: Weber\n\nb: Bern");
+        assert!(matches!(
+            joined.split(&[span_at("PERSON", 3, 11)]),
+            Err(MappingError::BadSpan(_))
+        ));
+    }
+
+    #[test]
+    fn only_an_instance_object_names_its_members() {
+        let document = json!({
+            "religion": "athée",
+            "tags": ["CGT", "FO"],
+            "nested": {"owner": "Weber"}
+        });
+        let names: Vec<Option<String>> = json_leaves_in_context(&document, Shape::Instance)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            ["owner", "religion", "tags", "tags"]
+                .map(|name| Some(name.to_owned()))
+                .to_vec()
+        );
+
+        let schema = json!({
+            "type": "object",
+            "description": "Weber",
+            "default": {"owner": "Weber"},
+            "properties": {"limit": {"type": "integer", "maximum": 9_007_199_254_740_991u64}}
+        });
+        let names: Vec<Option<String>> = json_leaves_in_context(&schema, Shape::Schema)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&Some("owner".to_owned())), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|name| name.is_some()).count(),
+            1,
+            "a schema keyword is not a member name: {names:?}"
         );
     }
 

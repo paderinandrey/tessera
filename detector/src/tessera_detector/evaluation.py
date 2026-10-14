@@ -273,6 +273,58 @@ def leaf_ranges(leaves: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
+# `mapping::CONTEXT_MAX_WORDS`.
+JOINED_CONTEXT_MAX_WORDS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class JoinedDocument:
+    """`mapping::Joined::in_context`: the text, each value's range, and where
+    each leaf's member name begins."""
+
+    text: str
+    ranges: list[tuple[int, int]]
+    contexts: list[int]
+
+
+def joined_in_context(leaves: list[tuple[str | None, str]]) -> JoinedDocument:
+    text = ""
+    ranges: list[tuple[int, int]] = []
+    contexts: list[int] = []
+    for index, (key, value) in enumerate(leaves):
+        if index:
+            text += JOINED_LEAF_SEPARATOR
+        contexts.append(len(text))
+        if key is not None and len(value.split()) <= JOINED_CONTEXT_MAX_WORDS:
+            text += f"{key}: "
+        ranges.append((len(text), len(text) + len(value)))
+        text += value
+    return JoinedDocument(text=text, ranges=ranges, contexts=contexts)
+
+
+def returned_to_values(
+    joined: JoinedDocument, spans: list[Span]
+) -> tuple[list[Span], list[Span]]:
+    """`mapping::Joined::split` without the rebasing: the spans it keeps, cut to
+    their value, and the ones it refuses."""
+    kept: list[Span] = []
+    refused: list[Span] = []
+    for span in spans:
+        leaf = next(
+            (
+                (start, end)
+                for (start, end), context in zip(joined.ranges, joined.contexts, strict=True)
+                if context < end and context <= span.start and span.end <= end
+            ),
+            None,
+        )
+        if leaf is None:
+            refused.append(span)
+        elif span.end > leaf[0]:
+            kept.append(span.model_copy(update={"start": max(span.start, leaf[0])}))
+    return kept, refused
+
+
 def inside_one_leaf(span: Span, ranges: list[tuple[int, int]]) -> bool:
     """Whether the gateway could return this span to a leaf.
 
