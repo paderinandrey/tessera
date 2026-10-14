@@ -257,3 +257,26 @@ def unmasked_words(text: str, start: int, end: int, predictions: list[Span]) -> 
             for index in range(start + match.start(), start + match.end())
         )
     ]
+
+
+# What `mapping::Shape::of` puts between a JSON document's leaves in the gateway.
+JOINED_LEAF_SEPARATOR = "\n\n"
+
+
+def leaf_ranges(leaves: list[str]) -> list[tuple[int, int]]:
+    """Each leaf's `(start, end)` in the text `JOINED_LEAF_SEPARATOR` joins them into."""
+    ranges = []
+    at = 0
+    for leaf in leaves:
+        ranges.append((at, at + len(leaf)))
+        at += len(leaf) + len(JOINED_LEAF_SEPARATOR)
+    return ranges
+
+
+def inside_one_leaf(span: Span, ranges: list[tuple[int, int]]) -> bool:
+    """Whether the gateway could return this span to a leaf.
+
+    `mapping::Joined::split` refuses a span that straddles two leaves or lands in
+    a separator, and the request fails, so such a span is not a detection.
+    """
+    return any(start <= span.start and span.end <= end for start, end in ranges)

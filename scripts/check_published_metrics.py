@@ -35,10 +35,11 @@ detector` like `check-entity-types` does. The detector it builds is
 deterministic-only, so the gate still needs no weights.
 
 **Scope, so the green tick is not read as more than it is.** This checks the
-numeric tables, the Article 9 coverage figure, and the Tier 1 recall gate — both
-that the threshold README publishes is the one `evaluate.py` enforces and that
-the measurement clears it. It does not check prose counts such as
-"the eight remaining misses" or
+numeric tables, the Article 9 coverage figure, the JSON-document figures, and the
+Tier 1 recall gate — both that the threshold README publishes is the one
+`evaluate.py` enforces and that the measurement clears it. The JSON-document
+figures are checked for agreement only: no threshold applies to them. It does
+not check prose counts such as "the eight remaining misses" or
 `docs/evaluation.md`'s miss inventory: splitting the entities that reach the
 provider into real defects and annotation conventions is a judgement recorded
 per entry in `KNOWN_UNMASKED`, not a number this script can derive. Those
@@ -58,6 +59,7 @@ from tessera_detector.version import detector_version
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 CORPUS = ROOT / "evaluation" / "corpus" / "public.jsonl"
+DOCUMENTS = ROOT / "evaluation" / "corpus" / "documents.jsonl"
 EVALUATOR = ROOT / "evaluation" / "evaluate.py"
 
 
@@ -67,6 +69,11 @@ ROW = re.compile(
     r"^\|\s*([A-Z][A-Z_0-9]*)\s*\|\s*(\d\.\d{3})\s*\|\s*(\d\.\d{3})\s*\|\s*(\d\.\d{3})\s*\|$"
 )
 COVERAGE = re.compile(r"\*\*Article 9 coverage is (\d\.\d{4}) \((\d+) of (\d+)\)\*\*")
+DOCUMENT_FIGURES = re.compile(
+    r"\*\*On\s+JSON\s+documents,\s+(\d+)\s+occurrences\s+of\s+(\d+)\s+annotated\s+"
+    r"entities\s+reach\s+the\s+provider,\s+and\s+Article\s+9\s+coverage\s+is\s+"
+    r"(\d\.\d{4})\s+\((\d+)\s+of\s+(\d+)\)\*\*"
+)
 # `make evaluate   # ... + the Tier 1 recall gate (>= 0.99)`
 TIER1 = re.compile(r"Tier 1 recall gate \(>= (\d\.\d+)\)")
 
@@ -132,6 +139,15 @@ def main() -> int:
         print(
             f"FAIL: {path} measures corpus {measured.get('corpus_sha256')}, "
             f"but the corpus on disk is {corpus}. Re-run the measurement.",
+            file=sys.stderr,
+        )
+        return 1
+    documents = hashlib.sha256(DOCUMENTS.read_bytes()).hexdigest()
+    recorded = measured.get("documents", {}).get("corpus_sha256")
+    if recorded != documents:
+        print(
+            f"FAIL: {path} measures document corpus {recorded}, but the document "
+            f"corpus on disk is {documents}. Re-run the measurement.",
             file=sys.stderr,
         )
         return 1
@@ -242,6 +258,27 @@ def main() -> int:
                 f"({want['covered']} of {want['gold']})"
             )
 
+    figures = DOCUMENT_FIGURES.search(text)
+    if figures is None:
+        failures.append("no JSON-document figures sentence found in README.md")
+    else:
+        occurrences, entities, ratio, covered, gold = figures.groups()
+        doc = measured["documents"]
+        want = (
+            doc["unmasked"]["occurrences"],
+            doc["unmasked"]["entities"],
+            f"{doc['article_9_coverage']['ratio']:.4f}",
+            doc["article_9_coverage"]["covered"],
+            doc["article_9_coverage"]["gold"],
+        )
+        got = (int(occurrences), int(entities), ratio, int(covered), int(gold))
+        if got != want:
+            failures.append(
+                f"JSON documents: README publishes {got[0]} occurrences of {got[1]} "
+                f"entities and Article 9 {got[2]} ({got[3]} of {got[4]}); measured "
+                f"{want[0]} of {want[1]} and {want[2]} ({want[3]} of {want[4]})"
+            )
+
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
     if failures:
@@ -254,7 +291,8 @@ def main() -> int:
         return 1
     print(
         f"published metrics: {len(published)} per-type rows, the Article 9 coverage "
-        "figure and the Tier 1 recall gate match a measurement of this corpus, "
+        "figure, the Tier 1 recall gate and the JSON-document figures match a "
+        "measurement of both corpora, "
         f"taken by detector {expected[:12]}"
     )
     return 0

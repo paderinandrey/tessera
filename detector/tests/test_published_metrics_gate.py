@@ -26,8 +26,10 @@ def _measurement() -> dict:
     rows = gate.published_rows(readme)
     coverage = gate.COVERAGE.search(readme)
     tier1 = gate.TIER1.search(readme)
-    assert coverage is not None and tier1 is not None
+    figures = gate.DOCUMENT_FIGURES.search(readme)
+    assert coverage is not None and tier1 is not None and figures is not None
     ratio, covered, gold = coverage.groups()
+    occurrences, entities, doc_ratio, doc_covered, doc_gold = figures.groups()
     return {
         "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
         "detector_version": detector_version(
@@ -54,6 +56,15 @@ def _measurement() -> dict:
         "tier1_recall": 1.0,
         "targets": {"tier1_recall": float(tier1.group(1))},
         "unmasked": {"occurrences": 0, "entities": 0},
+        "documents": {
+            "corpus_sha256": hashlib.sha256(gate.DOCUMENTS.read_bytes()).hexdigest(),
+            "unmasked": {"occurrences": int(occurrences), "entities": int(entities)},
+            "article_9_coverage": {
+                "ratio": float(doc_ratio),
+                "covered": int(doc_covered),
+                "gold": int(doc_gold),
+            },
+        },
     }
 
 
@@ -171,4 +182,24 @@ def test_refuses_disagreeing_article_9_coverage(
 ) -> None:
     measurement = _measurement()
     measurement["article_9_coverage"]["covered"] += 1
+    assert _run(tmp_path, measurement, monkeypatch) == 1
+
+
+def test_refuses_another_document_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    measurement = _measurement()
+    measurement["documents"]["corpus_sha256"] = hashlib.sha256(b"not it").hexdigest()
+    assert _run(tmp_path, measurement, monkeypatch) == 1
+
+
+def test_refuses_disagreeing_document_figures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for field in ("occurrences", "entities"):
+        measurement = _measurement()
+        measurement["documents"]["unmasked"][field] += 1
+        assert _run(tmp_path, measurement, monkeypatch) == 1, field
+    measurement = _measurement()
+    measurement["documents"]["article_9_coverage"]["covered"] += 1
     assert _run(tmp_path, measurement, monkeypatch) == 1

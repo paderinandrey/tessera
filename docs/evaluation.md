@@ -11,8 +11,8 @@ content, and fails on anything not already written down.
 
 That is true of **one** of the two shapes production sends — every row of this corpus is a
 sentence, which is what a plain message is. The other shape is below, under
-[a JSON document is not a sentence](#a-json-document-is-not-a-sentence), and it is not
-published here.
+[a JSON document is not a sentence](#a-json-document-is-not-a-sentence); its figures are
+published too, as advisory.
 
 Four are real. Two are threshold misses:
 
@@ -214,13 +214,19 @@ not detected at all, and the JSON *key* that would carry that word is never scan
 ([#104][i104]). The slash form now masks unaided, which took six entities out of both
 inventories — 50 and 36 before, 44 and 30 after, nothing else moving. The 13-digit form
 still needs its trigger: 1.5% of millisecond timestamps pass its format check, and a JSON
-number with a deterministic type refuses the whole request. And the apostrophe surnames [#97][i97] left behind are here too, in a shape
-where nothing surrounds them.
+number with a deterministic type refuses the whole request. And the apostrophe-bearing
+surnames [#97][i97] left behind are here too, in a shape where nothing surrounds them.
 
-**What is not done.** These figures are gated but not published: `metrics.json` and the
-README tables are tied to `public.jsonl` by digest, and giving this corpus the same standing
-is a separate change. [#103][i103] stays open for it.
+**Published, as advisory.** `make evaluate` reads every document the way the gateway reads a
+`Slot::Json` and records two figures in `metrics.json` beside the sentence corpus's: the
+joined-path leaks, counted by occurrence and by distinct entity, and Article 9 coverage
+through the same `group_coverage` the sentence gate uses. The README publishes both and
+`check-published-metrics` holds them to the measurement, tied to `documents.jsonl` by its own
+digest. They are not held to the 0.95 Article 9 target, which they do not meet: 0.6429, and
+half of the special-category values standing alone in a field go out because the word that
+describes them is in the JSON key ([#109][i109]). The named inventory stays the gate, and a
+test holds the evaluator's walk to it member for member, so the two cannot disagree.
 
 [i102]: https://github.com/paderinandrey/tessera/pull/102
-[i103]: https://github.com/paderinandrey/tessera/issues/103
 [i104]: https://github.com/paderinandrey/tessera/issues/104
+[i109]: https://github.com/paderinandrey/tessera/issues/109
