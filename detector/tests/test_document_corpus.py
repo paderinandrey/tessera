@@ -1,30 +1,4 @@
-"""What reaches the provider when a JSON document's leaves are read as one (#103).
-
-**An absolute inventory, which the joined-path gate next door is not.**
-`test_joined_detection.LOST_TO_JOINING` holds misses *relative* to reading the
-leaves apart, so an entity missed on both paths is absent from it by
-construction. The joined-path figures `evaluate.py` publishes are held to the
-inventory below, member for member.
-
-**And a different corpus, because the old one has the wrong leaf shape.**
-`_documents()` over `public.jsonl` groups four sentences of about ninety
-characters. Measured against the one real payload this repository holds, in
-`mapping::a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones`,
-production joins 79 leaves across ten schemas with a median of 37 characters
-and 42 of them no longer than 40. The group's joined *length* is ordinary; its
-granularity is not, and #102 reached the opposite reading by comparing against
-gold values alone, which is the most favourable payload there is rather than
-the representative one.
-
-`evaluation/corpus/documents.jsonl` is that shape: leaf counts taken from the
-real payload — both the leaves each tool *definition* joins and the properties
-each schema *declares*, used as a proxy for an argument's leaf count — leaf
-lengths matched to the definition population's distribution, and the same
-synthetic value generators the sentence corpus uses. What the lengths are for an
-argument leaf is not measured anywhere, because a value is the caller's data and
-nothing here samples one; `evaluation/generate_documents.py` says so where it
-uses them.
-"""
+"""What reaches the provider when a JSON document's leaves are read together (#105)."""
 
 import json
 import re
@@ -69,12 +43,6 @@ def _documents() -> list[dict[str, Any]]:
 
 
 def _truth_with_origin(document: dict[str, Any]) -> list[tuple[str, Span]]:
-    """Each gold entity in joined coordinates, keyed by the leaf it came from.
-
-    Keyed by `document:leaf:offset` for the reason `test_joined_detection`
-    gives: a value alone cannot say which occurrence was lost, and this corpus
-    repeats `ver.di` and `métisse` across documents and within them.
-    """
     out: list[tuple[str, Span]] = []
     at = 0
     for index, leaf in enumerate(document["leaves"]):
@@ -115,24 +83,6 @@ def _rebased(
 def _reaching_the_provider(detector: Detector) -> tuple[
     frozenset[tuple[str, str, str]], frozenset[tuple[str, str, str]], int
 ]:
-    """Both absolute inventories in one walk, so they cannot drift apart.
-
-    Absolute: an entity is in a set when *any* word of it is left unmasked on
-    that path, regardless of what the other path does. Words rather than spans
-    or characters, which is the question `unmasked_words` exists to answer.
-
-    **Only meaningful while no joined span crosses a leaf boundary**, and so
-    refused rather than computed when one does. Production passes the joined
-    spans through `Joined::split`, which rejects a span that straddles two
-    leaves or lands in a separator with `BadSpan("across a joined boundary")` —
-    the whole request fails and none of the document reaches the provider. Read
-    as ordinary masking here, such a span would report unrelated entities as
-    leaks, or cover filler and leave both sets unchanged, while describing a
-    request production never sends. Checked inside the walk rather than in a
-    test of its own, so no inventory can pass on a corpus where it fails; the
-    predicate is `test_joined_detection`'s, not a copy. Raised by review on
-    #105.
-    """
     joined_out: set[tuple[str, str, str]] = set()
     separate_out: set[tuple[str, str, str]] = set()
     crossing: list[tuple[str, str, str]] = []
@@ -159,24 +109,6 @@ def _reaching_the_provider(detector: Detector) -> tuple[
     return frozenset(joined_out), frozenset(separate_out), annotated
 
 
-# **The two inventories, and the reason both are here.** Of 222 annotated
-# entities, 44 reach the provider when the leaves are read together and 30 when
-# each is read alone — but the net 14 is not the loss. Twenty entities leak only
-# when joined and six only when apart, so six cancel inside the difference. That
-# is the same cancellation `test_joined_detection` refuses one level up, met
-# again at the level of the absolute figure, and it is why #103 asks for members
-# rather than a number.
-#
-# An earlier version of this corpus made the point more sharply and by accident:
-# built from definition leaf counts alone, it put both totals at 33 and the net
-# at zero. Mixing in the argument counts moved both numbers and the symmetry
-# turned out to be a property of that corpus. Worth keeping as a warning about
-# what a net figure is worth — #105.
-#
-# **Re-record, do not relax.** A number that goes down is an improvement and
-# these assertions fail on it too: an upper bound would silently accommodate a
-# predicate that stops seeing things, which has happened twice in the gate next
-# door.
 UNMASKED_JOINED = frozenset(
     {
         ('doc-0004:1:0', 'SEX_LIFE', 'une interruption de grossesse'),
@@ -263,26 +195,12 @@ UNMASKED_SEPARATE = frozenset(
 
 
 def test_the_fixture_still_has_the_leaf_shape_the_real_payload_has() -> None:
-    """The corpus is only worth scoring while it keeps the shape it was built for.
-
-    Without this the fixture could drift back towards a few long leaves — which
-    is what `public.jsonl` grouped into fours already is — and the inventories
-    below would go on passing while measuring the shape they were written to
-    replace. The target figures come from
-    `mapping::a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones`,
-    which measures `gateway/src/testdata/claude_code_tools.json`.
-
-    Pinned exactly, because the corpus is committed and seeded: a tolerance
-    would be a band around a constant.
-    """
     documents = _documents()
     lengths = sorted(len(leaf["text"]) for d in documents for leaf in d["leaves"])
     counts = sorted(len(d["leaves"]) for d in documents)
     total = len(lengths)
 
     def percentile(p: int) -> int:
-        # Nearest-rank, the same rule the Rust measurement states, so the two
-        # sets of figures are comparable rather than merely adjacent.
         return lengths[total * p // 100]
 
     assert (len(documents), total) == (60, 378), "documents and leaves"
@@ -290,18 +208,11 @@ def test_the_fixture_still_has_the_leaf_shape_the_real_payload_has() -> None:
         "annotated entities — near the sentence corpus's 196, which is what makes "
         "an inventory from one comparable in size to an inventory from the other"
     )
-    # Both populations. 29 is the widest tool *definition*; 15 is the largest
-    # declared-property count, which stands in for an argument and is a proxy
-    # rather than a ceiling — an open object puts no limit on an argument, and
-    # the gateway test names the property that does it. The four-leaf document
-    # the sentence corpus groups is in here as an ordinary member rather than
-    # as the shape.
     assert (counts[0], counts[-1]) == (2, 29), "leaves per document"
     assert 15 in counts, (
         "the largest property-count proxy must appear as a document, or "
         "`ARGUMENT_FIELD_COUNTS` is no longer reaching the corpus"
     )
-    # The distribution, against the measured p50=37, p75=78, p90=128, max=276.
     assert (percentile(50), percentile(75), percentile(90)) == (32, 77, 115), (
         "leaf-length percentiles; the real payload gives 37, 78 and 128, and "
         "this fixture is built to sit near them rather than on them"
@@ -366,18 +277,6 @@ def test_the_separate_path_leaves_these_entities_with_the_provider(
 def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     detector: Detector,
 ) -> None:
-    """The finding this corpus was built to make visible, asserted on its own.
-
-    44 against 30 is a net of 14. The directional figure is 20: six entities
-    leak only when the leaves are read apart, and each one pays for a different
-    entity that leaks only when they are joined. A reader of the two totals
-    alone would price joining at 14 names; it costs 20 and buys back 6, and
-    they are not the same names.
-
-    Asserted separately from the inventories above because it is a different
-    claim about them — the sets could both be re-recorded correctly while this
-    relation silently inverted.
-    """
     joined, separate, _ = _reaching_the_provider(detector)
     assert (len(joined), len(separate)) == (44, 30), "the two totals"
     assert len(joined - separate) == 20, (

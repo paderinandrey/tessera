@@ -1,38 +1,4 @@
-"""Synthetic corpus of joined JSON documents, in the shape production sends (#103).
-
-`corpus/public.jsonl` is sentences, and the joined-path tests group four of them
-into a document. Measured against the one real payload this repository holds —
-`gateway/src/testdata/claude_code_tools.json`, pinned in
-`mapping::a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones` —
-that group has the wrong granularity: production joins **many short leaves**
-(79 of them across ten schemas, median 37 characters, 42 no longer than 40),
-while the group joins four of about ninety. Its joined *length* is ordinary;
-its leaf count is at the bottom of what production sends.
-
-**Two populations, and this file is honest about which it measures.** A tool
-*definition* is a `Shape::Schema` document that the gateway joins and detects on
-every request carrying tools, and it is what the figures above are taken from —
-a production shape, not a proxy for one. A tool *argument* is a
-`Shape::Instance` document, a different population, and no captured one exists
-here. What the same file offers instead is a proxy: each schema declares 2 to 15
-top-level properties, 47 in all. It is not a bound in either direction — a
-property holding an array or object yields as many leaves as it holds, and
-`Artifact.capabilities` is an open object, so nothing caps an argument; a boolean
-yields none, and a property declaring no `type` can do either. For this payload
-those are three properties that can yield any number of leaves and six that can
-yield none, two of them untyped and in both, which makes the proxy a reasonable
-one and nothing more. Both counts drive the documents below.
-
-What stays unmeasured is an argument's real leaf count and every argument
-leaf's **length**. A value is the caller's data and nothing here samples it, so
-the lengths come from the definition population and are an assumption rather
-than a measurement. Raised twice by review on #105: once against an earlier
-version that took the definition counts and called itself the argument shape,
-and once against the property counts being called a ceiling.
-
-This generator does not touch `public.jsonl`: the published metrics are tied to
-that file's digest, and a corpus regenerated for a reason unrelated to them has
-moved a published number here before.
+"""Synthetic corpus of JSON documents whose leaves the gateway joins (#105).
 
 Run from the repository root:
     uv run --project detector --group eval python evaluation/generate_documents.py
@@ -58,39 +24,18 @@ from generate import (
 SEED = 20261005
 OUTPUT = Path(__file__).parent / "corpus" / "documents.jsonl"
 
-# Leaves per document, taken from the real payload rather than chosen.
-#
-# The leaves each tool *definition* presents to one detect call — a
-# `Shape::Schema` walk of its `input_schema`, which is what the gateway joins
-# today.
+# Both lists are checked per tool against gateway/src/testdata/claude_code_tools.json
+# by `mapping::a_real_joined_call_is_many_short_leaves_rather_than_a_few_long_ones`.
 SCHEMA_LEAF_COUNTS = [8, 2, 4, 5, 2, 3, 20, 29, 2, 4]
-# The properties each schema *declares*, used as a proxy for an argument's leaf
-# count. Not a bound: `Shape::Instance` recurses into nested values, an open
-# object has no limit, and a boolean yields no leaf. The gateway test pins which
-# properties make the proxy wrong in each direction.
 ARGUMENT_FIELD_COUNTS = [4, 2, 4, 5, 2, 2, 8, 15, 2, 3]
-# Interleaved so the corpus covers both, document by document, rather than
-# averaging them into a shape neither population has. Four — what the sentence
-# corpus groups — appears here as an ordinary member rather than as the whole
-# corpus.
 LEAF_COUNTS = [
     count
     for pair in zip(SCHEMA_LEAF_COUNTS, ARGUMENT_FIELD_COUNTS, strict=True)
     for count in pair
 ]
 
-# How many documents. Three full passes over `LEAF_COUNTS`, so each of the ten
-# tools contributes its definition count and its argument count the same number
-# of times — an uneven tail would weight one population over the other for no
-# reason. It also lands the annotation count near the sentence corpus's 196,
-# which is what makes an inventory from one comparable in size to an inventory
-# from the other.
 DOCUMENTS = 3 * len(LEAF_COUNTS)
 
-# Filler leaves: what a tool call carries that holds no personal data. The
-# bands exist because the measured distribution has both ends — a one-character
-# leaf and a 276-character one — and a filler pool of uniform length would hit
-# the median while matching the shape nowhere.
 TINY = ["string", "object", "array", "auto", "high", "low", "json", "utf-8", "1", "true", "none"]
 SHORT = [
     "/srv/app/config/settings.yaml",
@@ -131,14 +76,7 @@ LONG = [
     "ändern, weshalb die fachliche Prüfung vor und nicht nach dem Aufruf stattfindet.",
 ]
 
-# Which share of a document's leaves carry something annotated. The rest is
-# filler — a payload where every leaf holds personal data would make the joined
-# path look harder than it is, and the measurement this corpus exists for is
-# about what surrounding text does to a score.
 ANNOTATED_SHARE = 0.45
-# Of the annotated leaves, how many are a value standing alone rather than a
-# sentence with a value inside it. A tool call has both: `"customer": "Lenoir"`
-# and a `note` field holding prose.
 BARE_SHARE = 0.7
 
 _TEMPLATES = FR_TEMPLATES + DE_TEMPLATES + MIXED_TEMPLATES
@@ -147,7 +85,6 @@ _TEMPLATES = FR_TEMPLATES + DE_TEMPLATES + MIXED_TEMPLATES
 def _bare_leaf(
     rng: random.Random, fakers: dict[str, Faker], apostrophes: random.Random
 ) -> dict[str, Any]:
-    """One annotated value, alone in its leaf — the `"iban": "CH93…"` shape."""
     lang = rng.choice(["fr", "de"])
     faker = fakers[lang]
     kind = rng.choice([*TYPES, "email", "person", "org", "city", *ARTICLE_9_SLOTS])
@@ -176,7 +113,6 @@ def _bare_leaf(
 def _prose_leaf(
     rng: random.Random, fakers: dict[str, Faker], apostrophes: random.Random
 ) -> dict[str, Any]:
-    """A sentence with values inside it — the `note` or `description` field."""
     template = rng.choice(_TEMPLATES)
     lang = "mixed" if template in MIXED_TEMPLATES else ("fr" if template in FR_TEMPLATES else "de")
     rendered = render(template, fakers, lang, rng, apostrophes)
@@ -190,9 +126,6 @@ def _filler_leaf(rng: random.Random) -> dict[str, Any]:
 
 def main() -> None:
     rng = random.Random(SEED)
-    # Its own stream, for the reason `generate.py` gives: a pool draw that
-    # shares `rng` shifts every value after it, and the corpus then moves for a
-    # reason that has nothing to do with the change being made.
     apostrophes = random.Random(SEED ^ 0x0027)
     fakers = {"fr": Faker("fr_FR"), "de": Faker("de_DE")}
     for faker in fakers.values():

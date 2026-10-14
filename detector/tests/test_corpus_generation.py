@@ -64,9 +64,6 @@ def _generate_documents(
 def test_document_generation_is_stable_within_one_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The same property as above and it is not inherited: this generator draws
-    # from `generate`'s `render`, which draws from the `Faker` instances *this*
-    # `main()` seeds, and from an apostrophe stream of its own.
     first, second = _generate_documents(tmp_path, monkeypatch, runs=2)
     assert first == second
 
@@ -81,13 +78,6 @@ def test_document_generation_reproduces_the_committed_corpus(
 def test_the_document_generator_does_not_touch_the_published_corpus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`public.jsonl` is what the published metrics are tied to by digest.
-
-    The two generators share `render`, `TYPES` and the apostrophe pool, so a
-    change made for the document corpus reaches the sentence one — and a corpus
-    regenerated for an unrelated reason has moved a published number here
-    before. Asserted rather than remembered.
-    """
     before = hashlib.sha256(COMMITTED.read_bytes()).hexdigest()
     _generate_documents(tmp_path, monkeypatch, runs=1)
     assert hashlib.sha256(COMMITTED.read_bytes()).hexdigest() == before
