@@ -186,7 +186,7 @@ coverage is 0.7500 (63 of 84)**
 These figures are advisory — published and checked against the measurement, but not held to
 the 0.95 target above, which they do not meet. 17 of the 46 special-category values standing
 alone in a field still go out: the word that describes them is in the JSON key, and keys are
-never scanned ([#109](https://github.com/paderinandrey/tessera/issues/109)). Every one of the 44 is
+never scanned ([#109](https://github.com/paderinandrey/tessera/issues/109)). Every one of the 35 is
 named in `detector/tests/test_document_corpus.py`, and a new one fails `pytest -m ner`.
 
 `DE_STEUERNUMMER`'s 1.000 is measured on sentences that always carry the word *Steuernummer*.

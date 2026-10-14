@@ -66,7 +66,7 @@ down about a specific entity, not a spelling rule.
 [i46]: https://github.com/paderinandrey/tessera/issues/46
 [i97]: https://github.com/paderinandrey/tessera/issues/97
 
-**Article 9 coverage: 0.9783 (45/46)** — nearly every special-category mention in the
+**Article 9 coverage: 1.0000 (46/46)** — every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
 across eleven detector types rather than eight: the regulation protects political opinions,
 a stated view that names no party needs a label separate from `political party`, and the
