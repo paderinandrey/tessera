@@ -87,7 +87,7 @@ def test_corpus_covers_every_article_9_category_in_each_language(language: str) 
 
 
 def test_corpus_keeps_entity_free_documents() -> None:
-    # At threshold 0.30 a corpus of positives only would hide the noise the
+    # At threshold 0.20 a corpus of positives only would hide the noise the
     # threshold buys, and the reported precision would mean nothing.
     empty = [doc for doc in _documents() if not doc["entities"]]
     assert len(empty) >= 10, f"only {len(empty)} entity-free documents"

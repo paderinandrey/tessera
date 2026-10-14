@@ -131,7 +131,7 @@ def test_article_9_uses_the_aggressive_threshold() -> None:
     # threshold is far below the quasi-identifiers'.
     by_type = {t.entity_type: t for t in load_ner_types()}
     for entity_type in ARTICLE_9_TYPES:
-        assert by_type[entity_type].threshold == 0.30
+        assert by_type[entity_type].threshold == 0.20
 
 
 def test_article_9_sits_in_its_own_tier() -> None:

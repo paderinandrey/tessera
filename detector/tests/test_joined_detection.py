@@ -328,11 +328,14 @@ def test_no_joined_span_crosses_a_leaf_boundary(detector: Detector) -> None:
 # rows and D'Angelo in two, and a loss moving between them would hold a
 # value-keyed set unchanged. That is the same cancellation this gate refuses one
 # level up, and both reviewers on #100 caught it one level down.
+#
+# **5 -> 4 with the Article 9 bars at 0.20** (#109): joining now covers
+# `écologiste` and `eine Hepatitis-B-Infektion`; `Tessier SA` arrived because
+# per-leaf detection now masks it (as TRADE_UNION, #112) and joining does not.
 LOST_TO_JOINING = frozenset(
     {
         ("de-0009:42", "PERSON", "dell\u2019Orto"),
-        ("fr-0009:32", "POLITICAL_AFFILIATION", "\u00e9cologiste"),
-        ("mixed-0004:67", "HEALTH", "eine Hepatitis-B-Infektion"),
+        ("fr-0005:11", "ORG", "Tessier SA"),
         ("mixed-0007:18", "PERSON", "Hermighausen"),
         ("mixed-0017:18", "PERSON", "D'Angelo"),
     }

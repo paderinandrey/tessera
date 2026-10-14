@@ -70,7 +70,7 @@ ARTICLE_9_TARGET = 0.95
 # not a matching entry: if `un diabète de type 2` begins leaving `diabète` too,
 # this stops matching and the gate fails.
 #
-# **Five of the eight are an annotation convention and three are real.** The
+# **Five of the seven are an annotation convention and two are real.** The
 # convention is the gold span including a leading article the detector does not
 # predict — `un diabète de type 2` masked as `diabète de type 2` — and `un` is
 # not personal data, the same argument the `PERSON` trimming rule makes for
@@ -125,14 +125,6 @@ KNOWN_UNMASKED: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     ("PERSON", "dell\u2019Orto"): (
         frozenset({"dell", "Orto"}),
         "`person` scores it 0.268 asked alone, so the pass split cannot reach it — #97",
-    ),
-    ("ORG", "Tessier SA"): (
-        frozenset({"Tessier", "SA"}),
-        "organization 0.697 against ORG's bar of 0.75 — a near miss on its own label",
-    ),
-    ("GENETIC", "test génétique"): (
-        frozenset({"test", "génétique"}),
-        "genetic data 0.288 against a bar of 0.30 — a near miss by twelve thousandths",
     ),
 }
 
