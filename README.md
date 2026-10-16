@@ -180,20 +180,22 @@ a few long ones: measured on a real tool payload, 79 leaves with a median of 37 
 That shape has a corpus of its own, `evaluation/corpus/documents.jsonl`, measured by the same
 `make evaluate`:
 
-**On JSON documents, 35 occurrences of 30 annotated entities reach the provider, and Article 9
-coverage is 0.7500 (63 of 84)**
+**On JSON documents, 26 occurrences of 22 annotated entities reach the provider, and Article 9
+coverage is 0.8095 (68 of 84)**
 
 These figures are advisory — published and checked against the measurement, but not held to
-the 0.95 target above, which they do not meet. 17 of the 46 special-category values standing
-alone in a field still go out: the word that describes them is in the JSON key, and keys are
-never scanned ([#109](https://github.com/paderinandrey/tessera/issues/109)). Every one of the 35 is
-named in `detector/tests/test_document_corpus.py`, and a new one fails `pytest -m ner`.
+the 0.95 target above, which they do not meet. A value of three words or fewer is shown to the
+detector after its member name, `religion: athée`, because the name is often the only thing
+that says what the value is; the name itself is never masked
+([#109](https://github.com/paderinandrey/tessera/issues/109)). 12 of the 46 special-category
+values standing alone in a field still go out. Every one of the 26 is named in
+`detector/tests/test_document_corpus.py`, and a new one fails `pytest -m ner`.
 
 `DE_STEUERNUMMER`'s 1.000 is measured on sentences that always carry the word *Steuernummer*.
-A JSON field puts that word in its key, which is never scanned, so the slash form
-(`125/601/58393`) now masks without it. The 13-digit form still needs the word — 1.5% of
-millisecond timestamps pass its format check, and a JSON number with a deterministic type
-refuses the whole request — so standing alone in a field it is not detected
+The slash form (`125/601/58393`) masks without it. The 13-digit form still needs the word —
+1.5% of millisecond timestamps pass its format check — and in a JSON field the word can come
+from the member name: `{"steuernummer": 9181081508155}` refuses the request, because a JSON
+number with a deterministic type refuses the whole request
 ([#104](https://github.com/paderinandrey/tessera/issues/104)).
 
 ## How fast it is

@@ -82,10 +82,9 @@ identifiers:
     # match from stopping mid-label.
     pattern: '(?<![\w.!#$%&''*+/=?^_`{|}~-])[\w!#$%&''*+/=?^_`{|}~-]+(?:\.[\w!#$%&''*+/=?^_`{|}~-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+(?=[A-Za-z0-9-]{0,62}[A-Za-z])[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?![A-Za-z0-9-])'
 
-  # No checksum exists for the Steuernummer (structural validation only). A JSON
-  # key is never scanned, so a trigger word in `{"steuernummer": ...}` cannot reach
-  # the detector (#104). The slash form masks unaided: it cannot be a JSON number,
-  # so it never meets the gateway's numeric-leaf refusal.
+  # No checksum exists for the Steuernummer (structural validation only). The
+  # slash form masks unaided: it cannot be a JSON number, so it never meets the
+  # gateway's numeric-leaf refusal (#104).
   - id: de_steuernummer
     entity_type: DE_STEUERNUMMER
     tier: 1
@@ -101,7 +100,8 @@ identifiers:
 
   # The 13-digit form stays below its threshold: 1.5% of millisecond timestamps
   # pass `de_stnr`, and a JSON number carrying a deterministic type refuses the
-  # whole request. Only a context trigger lifts it over. Same `id` as the slash
+  # whole request. Only a context trigger lifts it over, which in a JSON field
+  # can be the member name (#109). Same `id` as the slash
   # form: it is the public `recognizer` value (`catalog:de_steuernummer`) both
   # forms returned before the split.
   - id: de_steuernummer

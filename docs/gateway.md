@@ -52,7 +52,12 @@ leaves the client no way to learn why. What is required of them is that they be 
 the argument for leaving the characters alone is an argument about the character set, and
 a structured value has no characters — `{"name": {"owner": "Martina Weber"}}` was admitted
 and forwarded verbatim until the type was checked. So the residual a name carries is a
-string the caller chose, which is smaller than "whatever the caller put under `name`". Arguments are walked as JSON and only string leaves
+string the caller chose, which is smaller than "whatever the caller put under `name`".
+A member name is still *read*: a value of three words or fewer in an instance object is
+shown to the detector after it, `religion: athée`, because the name is often the only thing
+that says what the value is. A span found in the name is dropped, so the name reaches the
+provider as written, and a number under `steuernummer` now refuses the request where it was
+forwarded before. Arguments are walked as JSON and only string leaves
 are touched, so the masker never sees a brace or a quote and cannot hand back a document
 the client fails to parse — and a tool call in a response is restored before the client
 executes it, the one place here where a failed restoration would be a wrong action rather

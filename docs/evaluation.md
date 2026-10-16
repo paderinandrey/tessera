@@ -26,7 +26,8 @@ of surnames that overlap a `PERSON` reading score 0.225–0.299, except `L’Hô
 at 0.380, which stays `TRADE_UNION`; the real special categories score 0.354 or more. The
 `PERSON` score does not separate the two groups — 0.55–0.97 against the surnames, 0.52–0.94
 against the special categories — so letting the higher score win instead would label `homosexuell` and six JSON
-values `PERSON`, moving Article 9 coverage to 45/46 on sentences and 57/84 on documents.
+values `PERSON`, moving Article 9 coverage to 45/46 on sentences and from 63/84 to 57/84 on documents
+(measured before member names were shown, [#109][i109]).
 `Tessier SA` stays `TRADE_UNION`: no `ORG` reading clears its bar, so there is nothing for
 a rule to prefer.
 
@@ -134,7 +135,9 @@ orientation — each clause gets its own label.
 `mask_all` gives a `Slot::Text` its own `detect` call, so everything above is measured on
 the shape it is sent in. A `Slot::Json` document is different: `Shape::of` concatenates its
 leaves, one call reads them together, and `Joined::split` returns the spans afterwards. A
-tool definition and a tool call's arguments are both that shape.
+tool definition and a tool call's arguments are both that shape. A value of at most three
+words that sits in an instance object is shown after its member name — `religion: athée` —
+and a span found in the name is dropped ([#109][i109]).
 
 **The corpus above cannot stand in for it, and the reason is granularity rather than
 length.** Measured on `gateway/src/testdata/claude_code_tools.json`, the one real payload
@@ -196,15 +199,16 @@ reach the provider, on each path, regardless of the other.
 
 ```
 222 annotated
- 35 reach the provider when the leaves are read together
- 23 reach the provider when each leaf is read alone
- 16 leak only when joined — and 4 only when apart
+ 26 reach the provider when the leaves are read together
+ 19 reach the provider when each leaf is read alone
+ 11 leak only when joined — and 4 only when apart
 ```
 
-**The net is 12 and the loss is 16.** Four entities leak only when the leaves are read apart,
+**The net is 7 and the loss is 11.** Four entities leak only when the leaves are read apart,
 and each pays for a different entity that leaks only when they are joined, so a reader of
-the two totals prices joining at 12 names when it costs 16 and buys back 4 — and they are
-not the same names. Both inventories are therefore listed by member and asserted exactly,
+the two totals prices joining at 7 names when it costs 11 and buys back 4 — and they are
+not the same names. Both paths show a short value after its member name, as production
+does. Both inventories are therefore listed by member and asserted exactly,
 for the reason given above: a bound lets a fixed leak pay for a new one, and an upper bound
 additionally accommodates a predicate that stops seeing things.
 
@@ -217,8 +221,8 @@ additionally accommodates a predicate that stops seeing things.
 Two findings came out of the first run. `DE_STEUERNUMMER` published 1.000 recall above
 because its `confidence` was below its own `threshold` and every Steuernummer in the sentence
 corpus sits next to the word that boosts it over the bar; standing alone in a field it was
-not detected at all, and the JSON *key* that would carry that word is never scanned
-([#104][i104]). The slash form now masks unaided, which took six entities out of both
+not detected at all, and the JSON *key* that would carry that word was not then shown to
+the detector ([#104][i104]). The slash form now masks unaided, which took six entities out of both
 inventories — 50 and 36 before, 44 and 30 after, nothing else moving. The 13-digit form
 still needs its trigger: 1.5% of millisecond timestamps pass its format check, and a JSON
 number with a deterministic type refuses the whole request. And the apostrophe-bearing
@@ -229,10 +233,21 @@ surnames [#97][i97] left behind are here too, in a shape where nothing surrounds
 joined-path leaks, counted by occurrence and by distinct entity, and Article 9 coverage
 through the same `group_coverage` the sentence gate uses. The README publishes both and
 `check-published-metrics` holds them to the measurement, tied to `documents.jsonl` by its own
-digest. They are not held to the 0.95 Article 9 target, which they do not meet: 0.7500 at the
-0.20 bar (0.6429 at 0.30), and 17 of the 46 special-category values standing alone in a field
-still go out because the word that
-describes them is in the JSON key ([#109][i109]). The named inventory stays the gate, and a
+digest. They are not held to the 0.95 Article 9 target, which they do not meet: 0.8095 with
+member names shown, 0.7500 without them at the 0.20 bar, 0.6429 at 0.30. 12 of the 46
+special-category values standing alone in a field still go out ([#109][i109]).
+
+**Why a member name only before a short value.** Measured on this corpus with the leaves
+read together, before the change: 35 leaks, and bare values with a descriptive name covered
+18 of 29. A name before every leaf took leaks to 29, and the meaningless prefix `field: `
+before every leaf to 31 — most of that gain was the `name: value` framing, not the name.
+A name before values of three words or fewer took leaks to 26 and descriptive bare values to
+23 of 29, while `field: ` before the same leaves stayed at 35, so that gain is the name's.
+Prose carries its own context, and a name in front of it only dilutes the window. The cut
+of three words is chosen on this corpus. Three values are lost that were found before —
+`agnostisch` and `monarchistisch` under `input`, `agnostique` under `belief` — and each is
+found when its leaf is read alone, with or without the name, so it is the joined text that
+loses them rather than the name that misleads. The named inventory stays the gate, and a
 test holds the evaluator's walk to it member for member, so the two cannot disagree.
 
 [i102]: https://github.com/paderinandrey/tessera/pull/102

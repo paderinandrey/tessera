@@ -364,18 +364,25 @@ fn document_detection(
     document: &Value,
     shape: mapping::Shape,
 ) -> Result<(Vec<mapping::Leaf>, Option<mapping::Joined>), mapping::MappingError> {
-    let leaves = mapping::json_leaves(document, shape)?;
-    let rendered: Vec<&str> = leaves
+    let (keys, leaves): (Vec<Option<&str>>, Vec<mapping::Leaf>) =
+        mapping::json_leaves_in_context(document, shape)?
+            .into_iter()
+            .unzip();
+    let rendered: Vec<(Option<&str>, &str)> = keys
         .iter()
-        .map(|leaf| match leaf {
-            mapping::Leaf::Text(text) => text.as_str(),
-            mapping::Leaf::Number(number) => number.as_str(),
+        .zip(&leaves)
+        .map(|(key, leaf)| {
+            let value = match leaf {
+                mapping::Leaf::Text(text) => text.as_str(),
+                mapping::Leaf::Number(number) => number.as_str(),
+            };
+            (*key, value)
         })
         .collect();
     // A document with no leaves at all asks the detector nothing: `{}`, or one
     // whose every field is a boolean or a null, both of which `json_leaves`
     // skips.
-    let joined = (!rendered.is_empty()).then(|| mapping::Joined::of(&rendered));
+    let joined = (!rendered.is_empty()).then(|| mapping::Joined::in_context(&rendered));
     Ok((leaves, joined))
 }
 
@@ -546,12 +553,6 @@ async fn mask_all(
                 let per_leaf = if let Some(joined) = joined {
                     let spans = detector.detect(joined.text(), credential).await?;
                     documents += 1;
-                    total += spans.len();
-                    // Read off the joined text with the spans as the detector
-                    // reported them, before any rebasing — the values are the
-                    // same either way and this cannot disagree with `split`
-                    // about which leaf they fell in.
-                    count_occurrences(joined.text(), &spans, &mut found);
                     // Bounds and ordering checked against the text the detector
                     // actually saw, where "past the end" still means something.
                     // After rebasing, an out-of-range span could land plausibly
@@ -584,6 +585,14 @@ async fn mask_all(
                     return Err(ProxyError::Mapping(MappingError::MaskCountMismatch(
                         "the detector's spans were split across a different number of leaves",
                     )));
+                }
+                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                    let value = match leaf {
+                        mapping::Leaf::Text(text) => text,
+                        mapping::Leaf::Number(number) => number,
+                    };
+                    total += spans.len();
+                    count_occurrences(value, spans, &mut found);
                 }
                 // **A number is looked at and never replaced.** `[CREDIT_CARD_1]`
                 // in a field a schema declared numeric is a type error the
@@ -1766,30 +1775,59 @@ mod tests {
         key_from(&headers, &OpenAi, true).unwrap().unwrap()
     }
 
-    /// A detector that finds "Weber" and nothing else. wiremock takes the
-    /// first mount that matches, so the specific rule is mounted first.
-    async fn detector_finding_weber() -> MockServer {
-        use wiremock::matchers::body_string_contains;
+    /// Answers each `/detect` with a span over `value` wherever `context`
+    /// occurs in the text it is sent, at the offsets the text actually has.
+    struct Finding {
+        context: &'static str,
+        value: &'static str,
+        layers_run: &'static [&'static str],
+    }
+
+    impl wiremock::Respond for Finding {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).expect("a JSON body");
+            let text = body["text"].as_str().expect("a text");
+            let inner = self
+                .context
+                .find(self.value)
+                .expect("the value is in its context");
+            let inner = self.context[..inner].chars().count();
+            let length = self.value.chars().count();
+            let spans: Vec<Value> = text
+                .match_indices(self.context)
+                .map(|(at, _)| text[..at].chars().count() + inner)
+                .map(|start| {
+                    json!({"entity_type": "PERSON", "start": start, "end": start + length,
+                           "confidence": 1.0, "recognizer": "ner:fake",
+                           "tier": 2, "boosted": false})
+                })
+                .collect();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"spans": spans, "layers_run": self.layers_run}))
+        }
+    }
+
+    async fn detector_finding(
+        context: &'static str,
+        value: &'static str,
+        layers_run: &'static [&'static str],
+    ) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/detect"))
-            .and(body_string_contains(SECRET))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    json!({"spans": person_span(), "layers_run": ["deterministic"]}),
-                ),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
-            )
+            .respond_with(Finding {
+                context,
+                value,
+                layers_run,
+            })
             .mount(&server)
             .await;
         server
+    }
+
+    /// A detector that finds "Weber" and nothing else.
+    async fn detector_finding_weber() -> MockServer {
+        detector_finding(SECRET, SECRET, &["deterministic"]).await
     }
 
     fn state(detector: &MockServer, upstream: &MockServer) -> Arc<AppState> {
@@ -2249,7 +2287,7 @@ mod tests {
         let seen = &detector.received_requests().await.unwrap()[0];
         let asked: Value = serde_json::from_slice(&seen.body).expect("a JSON body");
         assert_eq!(
-            asked["text"], "4111111111111111\n\n1.5",
+            asked["text"], "card: 4111111111111111\n\nratio: 1.5",
             "both numbers went in one call, rendered as the client wrote them"
         );
         let sent = sent_to(&upstream).await;
@@ -2267,7 +2305,7 @@ mod tests {
         // passes for the wrong reason it is not because the span drifted into
         // a neighbouring string.
         let detector = detector_returning(json!([
-            {"entity_type": "CREDIT_CARD", "start": 0, "end": 16}
+            {"entity_type": "CREDIT_CARD", "start": 6, "end": 22}
         ]))
         .await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
@@ -2421,7 +2459,9 @@ mod tests {
             .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
             .collect();
         assert!(
-            asked.iter().any(|body| body["text"] == "Martina Weber"),
+            asked
+                .iter()
+                .any(|body| body["text"] == "owner: Martina Weber"),
             "the value was never shown to the detector: {asked:?}"
         );
         let sent = sent_to(&upstream).await;
@@ -2465,7 +2505,9 @@ mod tests {
             .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
             .collect();
         assert!(
-            asked.iter().any(|body| body["text"] == "Martina Weber"),
+            asked
+                .iter()
+                .any(|body| body["text"] == "owner: Martina Weber"),
             "the value was never shown to the detector: {asked:?}"
         );
         assert_eq!(
@@ -2507,7 +2549,9 @@ mod tests {
             .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
             .collect();
         assert!(
-            asked.iter().any(|body| body["text"] == "Martina Weber"),
+            asked
+                .iter()
+                .any(|body| body["text"] == "owner: Martina Weber"),
             "the value was never shown to the detector: {asked:?}"
         );
         assert_eq!(
@@ -2667,27 +2711,7 @@ mod tests {
     /// different answers. `detector_finding_weber` cannot serve these: its span
     /// is five characters and these need thirteen.
     async fn detector_finding_martina_weber() -> MockServer {
-        use wiremock::matchers::body_string_contains;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .and(body_string_contains("Martina"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "spans": [{"entity_type": "PERSON", "start": 0, "end": 13,
-                           "confidence": 1.0, "recognizer": "ner:fake",
-                           "tier": 2, "boosted": false}],
-                "layers_run": ["deterministic"]})))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
-            )
-            .mount(&server)
-            .await;
-        server
+        detector_finding("Martina Weber", "Martina Weber", &["deterministic"]).await
     }
 
     #[tokio::test]
@@ -3383,28 +3407,7 @@ mod tests {
     /// other text. Separate from `detector_finding_weber`, whose span is fixed
     /// at 0..5 and would land on `Marti`.
     async fn detector_finding_martina() -> MockServer {
-        use wiremock::matchers::body_string_contains;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .and(body_string_contains("Martina Weber"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "spans": [{"entity_type": "PERSON", "start": 8, "end": 13,
-                           "confidence": 1.0, "recognizer": "ner:fake",
-                           "tier": 2, "boosted": false}],
-                "layers_run": ["ner"]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/detect"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"spans": [], "layers_run": ["ner"]})),
-            )
-            .mount(&server)
-            .await;
-        server
+        detector_finding("Martina Weber", "Weber", &["ner"]).await
     }
 
     #[tokio::test]
@@ -3480,12 +3483,12 @@ mod tests {
         // Both leaves go into one detection call, so the text no longer starts
         // at zero. The offsets here are the detector's view of the joined text
         // — `card` sorts before `note`, so the sixteen digits come first and
-        // `Weber` begins after the separator, at 18. An implementation that
+        // `Weber` begins after the separator and its member name, at 30. An implementation that
         // joins the number in without extending the split correspondence
         // rebases this span against the wrong leaf, or refuses it as out of
         // range.
         let detector = detector_returning(json!([
-            {"entity_type": "PERSON", "start": 18, "end": 23}
+            {"entity_type": "PERSON", "start": 30, "end": 35}
         ]))
         .await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
@@ -3518,7 +3521,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_call_is_masked_going_up_and_restored_coming_back() {
-        let detector = detector_returning(person_span()).await;
+        let detector = detector_finding_weber().await;
         let upstream = upstream_returning(
             "/v1/messages",
             json!({"content": [
@@ -3574,7 +3577,7 @@ mod tests {
         // has no way to learn why.
         let detector = detector_finding_weber().await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
-        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
         let (status, body) = call(
             state,
             "/v1/messages",
@@ -3597,6 +3600,17 @@ mod tests {
         assert!(
             input.get("Weber").is_some(),
             "the key must reach the upstream verbatim: {input}"
+        );
+        let asked = &detector.received_requests().await.unwrap()[0];
+        let asked: Value = serde_json::from_slice(&asked.body).expect("a JSON body");
+        assert_eq!(asked["text"], "Weber: Weber", "the key is shown as context");
+        let masked = journal(&path)
+            .into_iter()
+            .find(|line| line["event"] == "masked")
+            .expect("a masked record");
+        assert_eq!(
+            masked["spans"], 1,
+            "the occurrence in the key is neither masked nor counted: {masked}"
         );
     }
 
@@ -7323,7 +7337,7 @@ mod tests {
         // from `count_distinct`, and the `Json` arm has to call it for the
         // same reason the `Text` arm does — a slot kind is not a reason for a
         // request to go unrecorded.
-        let detector = detector_returning(person_span()).await;
+        let detector = detector_finding_weber().await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
         let body = json!({
@@ -7368,7 +7382,7 @@ mod tests {
         // cannot reach the file through it — which is the whole reason the
         // vocabulary is fixed.
         let detector = detector_returning(json!([
-            {"entity_type": "CREDIT_CARD", "start": 0, "end": 16}
+            {"entity_type": "CREDIT_CARD", "start": 16, "end": 32}
         ]))
         .await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;

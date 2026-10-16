@@ -8,9 +8,9 @@ from typing import Any
 import pytest
 
 from tessera_detector.evaluation import (
-    JOINED_LEAF_SEPARATOR,
-    inside_one_leaf,
-    leaf_ranges,
+    JoinedDocument,
+    joined_in_context,
+    returned_to_values,
     unmasked_words,
 )
 from tessera_detector.pipeline import Detector, build_detector
@@ -23,7 +23,6 @@ pytestmark = pytest.mark.ner
 JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 
 CORPUS = Path(__file__).resolve().parents[2] / "evaluation" / "corpus" / "documents.jsonl"
-JOIN = JOINED_LEAF_SEPARATOR
 
 
 @pytest.fixture(scope="module")
@@ -42,10 +41,14 @@ def _documents() -> list[dict[str, Any]]:
     ]
 
 
+def _joined(document: dict[str, Any]) -> JoinedDocument:
+    return joined_in_context([(leaf["key"], leaf["text"]) for leaf in document["leaves"]])
+
+
 def _truth_with_origin(document: dict[str, Any]) -> list[tuple[str, Span]]:
     out: list[tuple[str, Span]] = []
-    at = 0
-    for index, leaf in enumerate(document["leaves"]):
+    joined = _joined(document)
+    for index, (leaf, (at, _)) in enumerate(zip(document["leaves"], joined.ranges, strict=True)):
         for entity in leaf["entities"]:
             out.append(
                 (
@@ -60,24 +63,24 @@ def _truth_with_origin(document: dict[str, Any]) -> list[tuple[str, Span]]:
                     ),
                 )
             )
-        at += len(leaf["text"]) + len(JOIN)
     return out
 
 
 def _rebased(
     detector: Detector, document: dict[str, Any]
-) -> tuple[str, list[tuple[str, Span]], list[Span], list[Span]]:
-    leaves = [leaf["text"] for leaf in document["leaves"]]
-    text = JOIN.join(leaves)
+) -> tuple[str, list[tuple[str, Span]], list[Span], list[Span], list[Span]]:
+    whole = _joined(document)
     separate: list[Span] = []
-    at = 0
-    for leaf in leaves:
+    for leaf, (at, _) in zip(document["leaves"], whole.ranges, strict=True):
+        alone = joined_in_context([(leaf["key"], leaf["text"])])
+        kept, _ = returned_to_values(alone, detector.detect(alone.text))
+        shift = at - alone.ranges[0][0]
         separate += [
-            span.model_copy(update={"start": span.start + at, "end": span.end + at})
-            for span in detector.detect(leaf)
+            span.model_copy(update={"start": span.start + shift, "end": span.end + shift})
+            for span in kept
         ]
-        at += len(leaf) + len(JOIN)
-    return text, _truth_with_origin(document), separate, detector.detect(text)
+    joined, refused = returned_to_values(whole, detector.detect(whole.text))
+    return whole.text, _truth_with_origin(document), separate, joined, refused
 
 
 def _reaching_the_provider(detector: Detector) -> tuple[
@@ -88,12 +91,9 @@ def _reaching_the_provider(detector: Detector) -> tuple[
     crossing: list[tuple[str, str, str]] = []
     annotated = 0
     for document in _documents():
-        text, truth, separate, joined = _rebased(detector, document)
-        ranges = leaf_ranges([leaf["text"] for leaf in document["leaves"]])
+        text, truth, separate, joined, refused = _rebased(detector, document)
         crossing += [
-            (document["id"], span.entity_type, text[span.start : span.end])
-            for span in joined
-            if not inside_one_leaf(span, ranges)
+            (document["id"], span.entity_type, text[span.start : span.end]) for span in refused
         ]
         annotated += len(truth)
         for origin, span in truth:
@@ -112,40 +112,31 @@ def _reaching_the_provider(detector: Detector) -> tuple[
 UNMASKED_JOINED = frozenset(
     {
         ('doc-0004:1:0', 'SEX_LIFE', 'une interruption de grossesse'),
-        ('doc-0010:0:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0012:17:19', 'PERSON', 'Förster'),
         ('doc-0012:5:0', 'BIOMETRIC', 'Fingerabdruck'),
         ('doc-0013:6:29', 'GENETIC', 'séquençage ADN'),
         ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
         ('doc-0014:20:0', 'TRADE_UNION', 'ver.di'),
-        ('doc-0014:25:0', 'ORG', 'Marie et Fils'),
+        ('doc-0014:3:0', 'PHILOSOPHICAL_BELIEF', 'agnostisch'),
         ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
         ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
         ('doc-0021:0:15', 'PERSON', 'Hövel'),
-        ('doc-0032:5:0', 'POLITICAL_AFFILIATION', 'écologiste'),
-        ('doc-0033:2:0', 'ETHNICITY', 'métisse'),
         ('doc-0034:3:14', 'PERSON', 'L\u2019H\u00f4pital'),
         ('doc-0034:3:39', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
-        ('doc-0034:4:0', 'LOCATION', 'Kelheim'),
         ('doc-0035:12:0', 'ETHNICITY', 'noir de peau'),
-        ('doc-0036:1:0', 'RELIGION', 'jüdisch'),
+        ('doc-0035:6:0', 'POLITICAL_OPINION', 'monarchistisch'),
         ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
         ('doc-0045:1:21', 'PERSON', 'Wende'),
         ('doc-0048:0:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0050:0:34', 'PERSON', 'dell\u2019Orto'),
         ('doc-0052:14:62', 'HEALTH', 'un diabète de type 2'),
+        ('doc-0053:0:0', 'PHILOSOPHICAL_BELIEF', 'agnostique'),
         ('doc-0053:5:25', 'BIOMETRIC', 'Gesichtsscan'),
         ('doc-0053:5:42', 'PERSON', 'Zimmer'),
         ('doc-0054:12:16', 'PERSON', 'Jungfer'),
-        ('doc-0054:22:0', 'LOCATION', 'Lebrun-sur-Étienne'),
-        ('doc-0054:27:0', 'PHILOSOPHICAL_BELIEF', 'athée'),
         ('doc-0054:6:37', 'BIOMETRIC', 'reconnaissance faciale'),
         ('doc-0054:6:65', 'PERSON', 'Dijoux'),
         ('doc-0055:11:38', 'HEALTH', 'un diabète de type 2'),
         ('doc-0055:13:63', 'HEALTH', 'une sclérose en plaques'),
-        ('doc-0055:6:0', 'LOCATION', 'Poirier'),
     }
 )
 
@@ -158,17 +149,13 @@ UNMASKED_SEPARATE = frozenset(
         ('doc-0013:7:68', 'HEALTH', 'eine Hepatitis-B-Infektion'),
         ('doc-0014:20:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0015:14:0', 'SEX_LIFE', 'un suivi en PMA'),
-        ('doc-0015:3:0', 'BIOMETRIC', 'empreinte digitale'),
         ('doc-0020:4:0', 'SEX_LIFE', 'eine Kinderwunschbehandlung'),
         ('doc-0021:0:15', 'PERSON', 'Hövel'),
         ('doc-0034:13:18', 'GENETIC', 'Erbgutuntersuchung'),
-        ('doc-0034:18:0', 'GENETIC', 'DNA-Analyse'),
         ('doc-0034:3:14', 'PERSON', 'L\u2019H\u00f4pital'),
         ('doc-0035:12:0', 'ETHNICITY', 'noir de peau'),
         ('doc-0038:0:0', 'SEX_LIFE', 'un suivi en PMA'),
         ('doc-0041:3:0', 'BIOMETRIC', 'empreinte digitale'),
-        ('doc-0044:2:0', 'BIOMETRIC', 'Gesichtsscan'),
-        ('doc-0046:4:0', 'POLITICAL_OPINION', 'eurokritisch'),
         ('doc-0048:0:0', 'TRADE_UNION', 'ver.di'),
         ('doc-0052:14:62', 'HEALTH', 'un diabète de type 2'),
         ('doc-0054:22:0', 'LOCATION', 'Lebrun-sur-Étienne'),
@@ -262,8 +249,8 @@ def test_the_net_difference_between_the_paths_understates_what_joining_loses(
     detector: Detector,
 ) -> None:
     joined, separate, _ = _reaching_the_provider(detector)
-    assert (len(joined), len(separate)) == (35, 23), "the two totals"
-    assert len(joined - separate) == 16, (
+    assert (len(joined), len(separate)) == (26, 19), "the two totals"
+    assert len(joined - separate) == 11, (
         "entities joining leaks and reading apart does not — the directional "
         f"loss: {sorted(joined - separate)}"
     )
@@ -289,8 +276,7 @@ def test_only_these_rules_cannot_mask_without_a_trigger_word() -> None:
         "catalog rules whose pattern cannot reach their own threshold unaided. "
         f"Arrived: {sorted(needs - NEEDS_A_TRIGGER_WORD)}. Gone: "
         f"{sorted(NEEDS_A_TRIGGER_WORD - needs)}. A member is a value a JSON field "
-        "leaf loses: the key that would carry its trigger word is never scanned "
-        "(#104)."
+        "leaf loses unless its key carries the trigger word (#104, #109)."
     )
 
 

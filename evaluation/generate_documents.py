@@ -78,12 +78,48 @@ LONG = [
 
 ANNOTATED_SHARE = 0.45
 BARE_SHARE = 0.7
+OPAQUE_KEY_SHARE = 0.3
+
+DESCRIPTIVE_KEYS = {
+    "iban": ["iban", "bank_account", "kontonummer", "compte_bancaire"],
+    "nir": ["nir", "numero_securite_sociale", "social_security_number"],
+    "nif": ["nif", "numero_fiscal", "tax_number"],
+    "avs": ["avs", "ahv_nummer", "numero_avs"],
+    "idnr": ["steuer_id", "steueridentifikationsnummer", "tax_id"],
+    "stnr": ["steuernummer", "tax_number", "stnr"],
+    "card": ["card_number", "kartennummer", "numero_carte"],
+    "email": ["email", "e_mail", "courriel", "contact_email"],
+    "person": ["last_name", "nachname", "nom", "customer_name"],
+    "org": ["company", "firma", "employer", "societe"],
+    "city": ["city", "stadt", "ville", "place_of_birth"],
+    "health": ["diagnosis", "diagnose", "medical_condition", "pathologie"],
+    "biometric": ["biometric_method", "biometrie", "authentication_factor"],
+    "genetic": ["genetic_test", "gentest", "examen_genetique"],
+    "ethnicity": ["ethnic_origin", "herkunft", "origine_ethnique"],
+    "race": ["ethnicity", "hautfarbe", "origine"],
+    "political": ["political_party", "partei", "parti_politique"],
+    "opinion": ["political_opinion", "politische_meinung", "opinion_politique"],
+    "religion": ["religion", "konfession", "confession"],
+    "union": ["trade_union", "gewerkschaft", "syndicat"],
+    "philosophy": ["belief", "weltanschauung", "conviction"],
+    "sexlife": ["sex_life", "sexualleben", "vie_sexuelle"],
+    "orientation": ["sexual_orientation", "sexuelle_orientierung", "orientation_sexuelle"],
+}
+OPAQUE_KEYS = ["value", "data", "v", "field_3", "attr_12", "input", "x"]
+PROSE_KEYS = ["note", "description", "comment", "kommentar", "message", "remarque"]
+FILLER_KEYS = ["type", "format", "path", "request_id", "status", "query", "summary", "text"]
+
+
+def _key(keys: random.Random, descriptive: list[str]) -> str:
+    if keys.random() < OPAQUE_KEY_SHARE:
+        return keys.choice(OPAQUE_KEYS)
+    return keys.choice(descriptive)
 
 _TEMPLATES = FR_TEMPLATES + DE_TEMPLATES + MIXED_TEMPLATES
 
 
 def _bare_leaf(
-    rng: random.Random, fakers: dict[str, Faker], apostrophes: random.Random
+    rng: random.Random, fakers: dict[str, Faker], apostrophes: random.Random, keys: random.Random
 ) -> dict[str, Any]:
     lang = rng.choice(["fr", "de"])
     faker = fakers[lang]
@@ -105,28 +141,34 @@ def _bare_leaf(
         entity_type, by_language = ARTICLE_9_SLOTS[kind]
         value = rng.choice(by_language[lang])
     return {
+        "key": _key(keys, DESCRIPTIVE_KEYS[kind]),
         "text": value,
         "entities": [{"entity_type": entity_type, "start": 0, "end": len(value)}],
     }
 
 
 def _prose_leaf(
-    rng: random.Random, fakers: dict[str, Faker], apostrophes: random.Random
+    rng: random.Random, fakers: dict[str, Faker], apostrophes: random.Random, keys: random.Random
 ) -> dict[str, Any]:
     template = rng.choice(_TEMPLATES)
     lang = "mixed" if template in MIXED_TEMPLATES else ("fr" if template in FR_TEMPLATES else "de")
     rendered = render(template, fakers, lang, rng, apostrophes)
-    return {"text": rendered["text"], "entities": rendered["entities"]}
+    return {
+        "key": _key(keys, PROSE_KEYS),
+        "text": rendered["text"],
+        "entities": rendered["entities"],
+    }
 
 
-def _filler_leaf(rng: random.Random) -> dict[str, Any]:
+def _filler_leaf(rng: random.Random, keys: random.Random) -> dict[str, Any]:
     pool = rng.choices([TINY, SHORT, MEDIUM, WIDE, LONG], weights=[18, 30, 24, 18, 10])[0]
-    return {"text": rng.choice(pool), "entities": []}
+    return {"key": _key(keys, FILLER_KEYS), "text": rng.choice(pool), "entities": []}
 
 
 def main() -> None:
     rng = random.Random(SEED)
     apostrophes = random.Random(SEED ^ 0x0027)
+    keys = random.Random(SEED ^ 0x6B6579)
     fakers = {"fr": Faker("fr_FR"), "de": Faker("de_DE")}
     for faker in fakers.values():
         faker.seed_instance(SEED)
@@ -138,11 +180,11 @@ def main() -> None:
         for _ in range(count):
             if rng.random() < ANNOTATED_SHARE:
                 if rng.random() < BARE_SHARE:
-                    leaves.append(_bare_leaf(rng, fakers, apostrophes))
+                    leaves.append(_bare_leaf(rng, fakers, apostrophes, keys))
                 else:
-                    leaves.append(_prose_leaf(rng, fakers, apostrophes))
+                    leaves.append(_prose_leaf(rng, fakers, apostrophes, keys))
             else:
-                leaves.append(_filler_leaf(rng))
+                leaves.append(_filler_leaf(rng, keys))
         documents.append({"id": f"doc-{index:04d}", "leaves": leaves})
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)

@@ -210,15 +210,12 @@ def _groups(
         return
     crossing: list[tuple[str, str, str]] = []
     for document in documents._documents():
-        joined_text, origins, apart, read_together = documents._rebased(detector, document)
-        ranges, at = [], 0
-        for leaf in document["leaves"]:
-            ranges.append((at, at + len(leaf["text"])))
-            at += len(leaf["text"]) + len(documents.JOIN)
+        joined_text, origins, apart, read_together, refused = documents._rebased(
+            detector, document
+        )
         crossing += [
             (document["id"], span.entity_type, joined_text[span.start : span.end])
-            for span in read_together
-            if not joined._inside_one_leaf(span, ranges)
+            for span in refused
         ]
         yield joined_text, [span for _, span in origins], apart, read_together
     if crossing:
