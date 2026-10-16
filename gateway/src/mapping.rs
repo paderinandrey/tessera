@@ -1129,7 +1129,7 @@ impl Mapping {
         detected: Vec<Span>,
         searchable: impl Fn(usize, usize) -> bool,
     ) -> Vec<Span> {
-        if self.by_value.is_empty() || text.is_empty() {
+        if self.by_value.is_empty() || text.is_empty() || check_spans(text, &detected).is_err() {
             return detected;
         }
         let mut char_at = vec![0usize; text.len() + 1];
@@ -4411,6 +4411,15 @@ mod tests {
             mapping.with_known_values("Bob: x", Vec::new(), |start, _| start >= 5),
             Vec::new()
         );
+    }
+
+    #[test]
+    fn malformed_detector_spans_are_handed_back_for_mask_to_refuse() {
+        let mapping = knowing(&[("PERSON", "Weber")]);
+        let detected = vec![span("PERSON", 0, 12), span("LOCATION", 0, 3)];
+        let spans = mapping.with_known_values("Martina Weber", detected.clone(), |_, _| true);
+        assert_eq!(spans, detected);
+        assert!(mapping.clone().mask("Martina Weber", &spans).is_err());
     }
 
     #[test]

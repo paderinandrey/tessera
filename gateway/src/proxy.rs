@@ -499,6 +499,7 @@ async fn mask_all(
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(body, pointer)?;
                 let detected = detector.detect(&text, credential).await?;
+                mapping::check_spans(&text, &detected)?;
                 texts += 1;
                 total += detected.len();
                 count_occurrences(&text, &detected, &mut found);
@@ -685,11 +686,13 @@ async fn mask_all(
                 // `?`, so those placeholders would in fact be discarded — but
                 // this check is also strictly cheaper than reaching the same
                 // answer later, and it does not depend on that being true.
-                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                for ((leaf, spans), masked_spans) in
+                    leaves.iter().zip(&detected_per_leaf).zip(&per_leaf)
+                {
                     let mapping::Leaf::Number(number) = leaf else {
                         continue;
                     };
-                    if spans.iter().any(|span| {
+                    if spans.iter().chain(masked_spans).any(|span| {
                         let entity_type = span.entity_type.as_str();
                         !mapping::ENTITY_TYPES.contains(&entity_type)
                             || mapping::DETERMINISTIC_TYPES.contains(&entity_type)
@@ -2829,6 +2832,69 @@ mod tests {
             egress.contains(r#"{\"name\":\"Bob\"}"#),
             "a value that never reappeared was masked: {egress}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_number_the_detector_calls_a_card_refuses_even_when_the_session_knew_it_as_a_name() {
+        let detector = MockServer::start().await;
+        let found = |entity_type: &str, start: usize| {
+            ResponseTemplate::new(200).set_body_json(json!({"spans": [
+                {"entity_type": entity_type, "start": start, "end": start + 16,
+                 "confidence": 1.0, "recognizer": "fake", "tier": 1, "boosted": false}],
+                "layers_run": ["deterministic"]}))
+        };
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains("Kunde"))
+            .respond_with(found("PERSON", 6))
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains(
+                "card: 4111111111111111",
+            ))
+            .respond_with(found("CREDIT_CARD", 6))
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "Kunde 4111111111111111."}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"card\":4111111111111111}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+            &headers,
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
