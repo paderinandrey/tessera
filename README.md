@@ -68,14 +68,15 @@ nothing less.
 
 **What the diagram does not show: the gateway masks what it scans, and it does not scan
 everything.** If you are deciding whether to point an agent at a customer folder — the
-prompt, the tool definitions, the tool arguments and the tool results are covered, and the
-request envelope around them is not.
+prompt, the tool definitions, the tool arguments, the tool results and every field of a
+message are covered, and the request envelope around them is not.
 
 - **Image and audio parts are forwarded untouched.** Nothing here reads pixels, so a
   photograph of an identity document reaches the provider as your client sent it.
-- **A body or message field this gateway describes no slot for travels exactly as
-  written** — `metadata`, `stop`, `prediction.content`, a JSON Schema in `response_format`,
-  Anthropic's `stop_sequences`, or a field a client invents.
+- **A body field this gateway describes no slot for travels exactly as written** —
+  `metadata`, `stop`, `prediction.content`, a JSON Schema in `response_format`, Anthropic's
+  `stop_sequences`, or a top-level field a client invents. A message field it describes no
+  slot for is refused, and the model's reasoning a client echoes back is masked.
 - **Digits on a numeric leaf of a tool document go unchanged** where the *model* found a
   name, a place, an organisation or an Article 9 category there, because a placeholder
   would turn a number into a string. A *catalog* type in that position — an IBAN, a tax
