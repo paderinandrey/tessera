@@ -498,7 +498,8 @@ async fn mask_all(
         match slot {
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(body, pointer)?;
-                let spans = detector.detect(&text, credential).await?;
+                let spans =
+                    mapping.with_known_values(&text, detector.detect(&text, credential).await?);
                 texts += 1;
                 total += spans.len();
                 count_occurrences(&text, &spans, &mut found);
@@ -551,7 +552,10 @@ async fn mask_all(
                 // the same mechanism as between two strings, and no new
                 // variant.
                 let per_leaf = if let Some(joined) = joined {
-                    let spans = detector.detect(joined.text(), credential).await?;
+                    let spans = mapping.with_known_values(
+                        joined.text(),
+                        detector.detect(joined.text(), credential).await?,
+                    );
                     documents += 1;
                     // Bounds and ordering checked against the text the detector
                     // actually saw, where "past the end" still means something.
@@ -2669,6 +2673,67 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_value_the_session_issued_is_masked_when_detection_misses_it_on_the_echo() {
+        let detector = detector_finding("Mitglied bei ver.di", "ver.di", &["deterministic"]).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant",
+                "content": "ok", "reasoning": "Die Datei nennt [PERSON_1]."}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+        let ask = json!({"role": "user", "content": "Mitglied bei ver.di"});
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let reply: Value = serde_json::from_str(&first).unwrap();
+        let echoed = reply["choices"][0]["message"].clone();
+        assert_eq!(echoed["reasoning"], "Die Datei nennt ver.di.");
+
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask, echoed,
+                   {"role": "user", "content": "und ver.di?"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let received = upstream.received_requests().await.unwrap();
+        let egress = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(
+            !egress.contains("ver.di"),
+            "a known value went up: {egress}"
+        );
+        assert_eq!(egress.matches("[PERSON_1]").count(), 3, "{egress}");
+
+        let (status, third) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask,
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "send", "arguments": "{\"to\":\"ver.di\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "sent"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{third}");
+        let received = upstream.received_requests().await.unwrap();
+        let egress = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(
+            !egress.contains("ver.di"),
+            "a known value went up in a document: {egress}"
+        );
     }
 
     #[tokio::test]
