@@ -876,7 +876,10 @@ impl<'a> StreamRestorer<'a> {
         if terminates == Terminates::Nothing {
             return Ok(out);
         }
-        let (current, documents) = self.flush(&terminates)?;
+        let (current, documents) = match self.flush(&terminates) {
+            Ok(flushed) => flushed,
+            Err(error) => return Err(self.keep(out, error)),
+        };
         out.push_str(&documents);
         out.push_str(&current);
         Ok(out)
@@ -2307,6 +2310,31 @@ mod restorer_tests {
             call < finish,
             "the call went out after its finish: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_failed_finish_beside_text_still_salvages_what_it_released() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "safe text"}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "id": "a", "function": {"name": "f", "arguments": "{bad"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": ""},
+                "finish_reason": "tool_calls"}]}),
+        );
+        let served = restorer.push(body.as_bytes());
+        assert!(
+            served.is_err(),
+            "a malformed document was served: {served:?}"
+        );
+        let salvaged = restorer.salvage();
+        assert!(
+            salvaged.contains("safe text"),
+            "text released before the failure was lost: {salvaged}"
+        );
+        assert!(!salvaged.contains("{bad"), "{salvaged}");
     }
 
     #[test]
