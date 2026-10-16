@@ -364,7 +364,7 @@ fn document_detection(
     document: &Value,
     shape: mapping::Shape,
 ) -> Result<(Vec<mapping::Leaf>, Option<mapping::Joined>), mapping::MappingError> {
-    let (keys, leaves): (Vec<Option<String>>, Vec<mapping::Leaf>) =
+    let (keys, leaves): (Vec<Option<&str>>, Vec<mapping::Leaf>) =
         mapping::json_leaves_in_context(document, shape)?
             .into_iter()
             .unzip();
@@ -376,7 +376,7 @@ fn document_detection(
                 mapping::Leaf::Text(text) => text.as_str(),
                 mapping::Leaf::Number(number) => number.as_str(),
             };
-            (key.as_deref(), value)
+            (*key, value)
         })
         .collect();
     // A document with no leaves at all asks the detector nothing: `{}`, or one

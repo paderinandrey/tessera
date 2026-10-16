@@ -97,5 +97,32 @@
       0,
       25
     ]
+  },
+  {
+    "leaves": [
+      [
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "x"
+      ],
+      [
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "y"
+      ]
+    ],
+    "text": "x\n\nkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk: y",
+    "ranges": [
+      [
+        0,
+        1
+      ],
+      [
+        69,
+        70
+      ]
+    ],
+    "contexts": [
+      0,
+      3
+    ]
   }
 ]

@@ -3795,6 +3795,11 @@ const JOIN_SEPARATOR: &str = "\n\n";
 /// detector after its member name.
 pub const CONTEXT_MAX_WORDS: usize = 3;
 
+/// The longest member name, in characters, that is shown at all. Every leaf
+/// under an array repeats its name in the joined text, so this bounds what a
+/// document can add to it before `max_tool_chars` is checked.
+pub const CONTEXT_MAX_KEY_CHARS: usize = 64;
+
 /// Several text leaves presented to the detector as one call.
 ///
 /// One call per string is not merely slow, it is blind: a two-character leaf
@@ -3823,7 +3828,8 @@ impl Joined {
     }
 
     /// Leaves joined as `of` joins them, each value of at most
-    /// `CONTEXT_MAX_WORDS` words preceded by `key: ` where it has a key.
+    /// `CONTEXT_MAX_WORDS` words preceded by `key: ` where it has a key of at
+    /// most `CONTEXT_MAX_KEY_CHARS` characters.
     pub fn in_context(leaves: &[(Option<&str>, &str)]) -> Self {
         let mut text = String::new();
         let mut ranges = Vec::with_capacity(leaves.len());
@@ -3838,8 +3844,10 @@ impl Joined {
                 at += JOIN_SEPARATOR.chars().count();
             }
             contexts.push(at);
-            if let Some(key) = key.filter(|_| leaf.split_whitespace().count() <= CONTEXT_MAX_WORDS)
-            {
+            if let Some(key) = key.filter(|key| {
+                key.chars().count() <= CONTEXT_MAX_KEY_CHARS
+                    && leaf.split_whitespace().count() <= CONTEXT_MAX_WORDS
+            }) {
                 text.push_str(key);
                 text.push_str(": ");
                 at += key.chars().count() + 2;
@@ -3929,20 +3937,20 @@ pub fn json_leaves(value: &Value, shape: Shape) -> Result<Vec<Leaf>, MappingErro
 pub fn json_leaves_in_context(
     value: &Value,
     shape: Shape,
-) -> Result<Vec<(Option<String>, Leaf)>, MappingError> {
+) -> Result<Vec<(Option<&str>, Leaf)>, MappingError> {
     let mut leaves = Vec::new();
     let mut nodes = 0usize;
     walk(value, shape, None, 0, &mut nodes, &mut leaves)?;
     Ok(leaves)
 }
 
-fn walk(
-    value: &Value,
+fn walk<'a>(
+    value: &'a Value,
     shape: Shape,
-    key: Option<&str>,
+    key: Option<&'a str>,
     depth: usize,
     nodes: &mut usize,
-    leaves: &mut Vec<(Option<String>, Leaf)>,
+    leaves: &mut Vec<(Option<&'a str>, Leaf)>,
 ) -> Result<(), MappingError> {
     if depth > MAX_JSON_DEPTH {
         return Err(MappingError::TooDeep);
@@ -3952,10 +3960,8 @@ fn walk(
         return Err(MappingError::TooLarge);
     }
     match value {
-        Value::String(text) => leaves.push((key.map(str::to_owned), Leaf::Text(text.clone()))),
-        Value::Number(number) => {
-            leaves.push((key.map(str::to_owned), Leaf::Number(number.to_string())))
-        }
+        Value::String(text) => leaves.push((key, Leaf::Text(text.clone()))),
+        Value::Number(number) => leaves.push((key, Leaf::Number(number.to_string()))),
         Value::Array(items) => {
             for item in items {
                 walk(item, shape, key, depth + 1, nodes, leaves)?;
@@ -6826,22 +6832,47 @@ mod tests {
     }
 
     #[test]
+    fn a_long_member_name_is_not_shown_however_many_items_share_it() {
+        let shown = "k".repeat(CONTEXT_MAX_KEY_CHARS);
+        let hidden = "k".repeat(CONTEXT_MAX_KEY_CHARS + 1);
+        let items = vec![Value::String(String::new()); 1000];
+        let document = json!({ hidden.clone(): items, shown.clone(): "x" });
+        let leaves = json_leaves_in_context(&document, Shape::Instance).unwrap();
+        let rendered: Vec<(Option<&str>, &str)> = leaves
+            .iter()
+            .map(|(name, leaf)| match leaf {
+                Leaf::Text(text) => (*name, text.as_str()),
+                Leaf::Number(number) => (*name, number.as_str()),
+            })
+            .collect();
+        let joined = Joined::in_context(&rendered);
+        assert_eq!(
+            joined.text().matches(hidden.as_str()).count(),
+            0,
+            "a name past the bound is never repeated into the text"
+        );
+        assert!(joined.text().starts_with(&format!("{shown}: x")));
+        assert!(
+            joined.text().chars().count()
+                <= leaves.len() * (CONTEXT_MAX_KEY_CHARS + 2 + JOIN_SEPARATOR.len()) + 1
+        );
+    }
+
+    #[test]
     fn only_an_instance_object_names_its_members() {
         let document = json!({
             "religion": "athée",
             "tags": ["CGT", "FO"],
             "nested": {"owner": "Weber"}
         });
-        let names: Vec<Option<String>> = json_leaves_in_context(&document, Shape::Instance)
+        let names: Vec<Option<&str>> = json_leaves_in_context(&document, Shape::Instance)
             .unwrap()
             .into_iter()
             .map(|(name, _)| name)
             .collect();
         assert_eq!(
             names,
-            ["owner", "religion", "tags", "tags"]
-                .map(|name| Some(name.to_owned()))
-                .to_vec()
+            [Some("owner"), Some("religion"), Some("tags"), Some("tags")]
         );
 
         let schema = json!({
@@ -6850,12 +6881,12 @@ mod tests {
             "default": {"owner": "Weber"},
             "properties": {"limit": {"type": "integer", "maximum": 9_007_199_254_740_991u64}}
         });
-        let names: Vec<Option<String>> = json_leaves_in_context(&schema, Shape::Schema)
+        let names: Vec<Option<&str>> = json_leaves_in_context(&schema, Shape::Schema)
             .unwrap()
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        assert!(names.contains(&Some("owner".to_owned())), "{names:?}");
+        assert!(names.contains(&Some("owner")), "{names:?}");
         assert_eq!(
             names.iter().filter(|name| name.is_some()).count(),
             1,

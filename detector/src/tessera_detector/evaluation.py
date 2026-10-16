@@ -273,8 +273,9 @@ def leaf_ranges(leaves: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
-# `mapping::CONTEXT_MAX_WORDS`.
+# `mapping::CONTEXT_MAX_WORDS` and `mapping::CONTEXT_MAX_KEY_CHARS`.
 JOINED_CONTEXT_MAX_WORDS = 3
+JOINED_CONTEXT_MAX_KEY_CHARS = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +296,11 @@ def joined_in_context(leaves: list[tuple[str | None, str]]) -> JoinedDocument:
         if index:
             text += JOINED_LEAF_SEPARATOR
         contexts.append(len(text))
-        if key is not None and len(value.split()) <= JOINED_CONTEXT_MAX_WORDS:
+        if (
+            key is not None
+            and len(key) <= JOINED_CONTEXT_MAX_KEY_CHARS
+            and len(value.split()) <= JOINED_CONTEXT_MAX_WORDS
+        ):
             text += f"{key}: "
         ranges.append((len(text), len(text) + len(value)))
         text += value
