@@ -871,7 +871,15 @@ impl<'a> StreamRestorer<'a> {
         let released = previous
             .map(|pending| pending.event.render())
             .unwrap_or_default();
-        Ok(self.release(released))
+        let mut out = self.release(released);
+        let terminates = self.provider.stream_terminates(&parsed);
+        if terminates == Terminates::Nothing {
+            return Ok(out);
+        }
+        let (current, documents) = self.flush(&terminates)?;
+        out.push_str(&documents);
+        out.push_str(&current);
+        Ok(out)
     }
 
     /// Keep an event that ends nothing. With something already waiting it goes
@@ -2270,6 +2278,64 @@ mod restorer_tests {
         let document: Value = serde_json::from_str(&openai_tool_json(&rendered, 0))
             .expect("the client's reassembled document must parse");
         assert_eq!(document, json!({"to": "Weber"}));
+    }
+
+    #[test]
+    fn a_finish_reason_beside_text_closes_the_tool_runs_of_its_choice() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": null, "tool_calls": [
+                {"index": 0, "id": "a", "type": "function",
+                 "function": {"name": "f", "arguments": ""}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": null, "tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"to\":\"[PERSON_1]\"}"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "", "role": "assistant"},
+                "finish_reason": "tool_calls"}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "", "role": "assistant"},
+                "finish_reason": "tool_calls"}]}),
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+        let document: Value = serde_json::from_str(&openai_tool_json(&rendered, 0))
+            .expect("the client's reassembled document must parse");
+        assert_eq!(document, json!({"to": "Weber"}));
+        let call = rendered.find("Weber").unwrap();
+        let finish = rendered.find("finish_reason\":\"tool_calls").unwrap();
+        assert!(
+            call < finish,
+            "the call went out after its finish: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_finish_reason_beside_text_completes_a_split_placeholder() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "Hallo [PER"}}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": "SON_1]"},
+                "finish_reason": "stop"}]}),
+        );
+        let rendered = restorer.push(body.as_bytes()).unwrap();
+        let mut text = String::new();
+        for line in rendered.split('\n') {
+            if let Some(data) = line.strip_prefix("data: ") {
+                let event: Value = serde_json::from_str(data).unwrap();
+                text.push_str(
+                    event["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .unwrap_or(""),
+                );
+            }
+        }
+        assert_eq!(text, "Hallo Weber", "{rendered}");
+        assert!(
+            rendered.contains("\"finish_reason\":\"stop\""),
+            "{rendered}"
+        );
     }
 
     #[test]
