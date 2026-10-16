@@ -184,8 +184,8 @@ gateway scans is forwarded unmasked* above — a claim about the way up, which t
 before this one are not. **Image and audio parts are forwarded untouched**, including a
 screenshot inside a tool result, which is the same exposure through a different field rather
 than a new one. Nothing here reads pixels, so a photograph of an identity document reaches the
-provider as the client sent it. And **the body and the message levels are not allowlisted at
-all** — see below, because that is the other half of the closed-allowlist claim.
+provider as the client sent it. And **the body level is not allowlisted at all** — see
+below, because that is the other half of the closed-allowlist claim.
 
 Tool traffic is masked now, streamed as well as buffered, so what it still refuses is worth
 stating on its own. A
@@ -221,18 +221,32 @@ addressed by nothing and forwarded. It is refused on every other role now, in th
 `if` that selects the allowlist, because a denylist entry would refuse the tool message the
 field belongs to.
 
-**That closure is scoped to the tool structures, and the body and the message levels have
-no allowlist at all.** It is true of a tool definition, a tool call, a tool result and a
-content block, where it was hard-won; it is false one field over. A body field this gateway
+**That closure covers the tool structures and the messages, and the body level has no
+allowlist at all.** It is true of a tool definition, a tool call, a tool result, a content
+block and a message, where it was hard-won; it is false one level up. A body field this gateway
 describes no slot for travels to the provider exactly as the caller wrote it — verified for
 OpenAI's `response_format.json_schema.schema`, which is *the same artifact* as a tool's
 `parameters` (a client-authored JSON Schema whose `description`, `enum` and `default` are
 prose the model reads); `prediction.content`, the Predicted Outputs field editor clients
 fill with whole file contents; `metadata`; `stop`; a top-level `safety_identifier`; and
-Anthropic's `stop_sequences`. A field invented on a *message* travels the same way. If you
-are deciding whether to point an agent at a customer folder: the prompt, the tool
-definitions, the tool arguments and the tool results are covered, and the request envelope
-around them is not.
+Anthropic's `stop_sequences`. If you are deciding whether to point an agent at a customer
+folder: the prompt, the tool definitions, the tool arguments, the tool results and every
+field of a message are covered, and the request envelope around them is not.
+
+**A message field this gateway does not describe is refused.** The message level was open
+until an agent run through OpenRouter showed what that cost: the provider returns the
+model's reasoning beside `content` — `reasoning`, and `reasoning_details[].text` — the
+gateway restores every string of a reply on the way down, and the agent echoes the
+assistant turn back as history. The reasoning reached the provider on the next turn holding
+the name, the IBAN, the e-mail address, the diagnosis and the union the tool result had
+masked: values this gateway had written into it itself, sent by a client doing nothing
+unusual. `reasoning`, `reasoning_content`, `refusal` and the `text` and `summary` of each
+`reasoning_details` entry are masked as message text now. An entry's `data` and
+`signature` are forwarded whole: the first is ciphertext only the provider can read, the
+second the provider's signature over its own text, which masking the text may already have
+invalidated. `audio`, `function_call`, `annotations` and a `tool_call_id` outside a tool
+message pass only empty, which is how an SDK serializes them by default; a populated one is
+refused. A message whose `role` is not one the provider defines is refused.
 It is also what closes two things a caller may miss. Anthropic's **citations** are refused
 on the request path — a `text` block may carry `cited_text`, which is quoted source
 material, and clients echo assistant turns back as history, so a conversation that used

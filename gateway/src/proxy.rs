@@ -2605,6 +2605,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_restored_into_a_reply_is_masked_when_the_client_echoes_it() {
+        let detector = detector_finding_martina_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {
+                "role": "assistant", "content": "ok",
+                "reasoning": "Frau [PERSON_1] erinnern",
+                "reasoning_details": [{"type": "reasoning.text", "index": 0,
+                                       "format": "unknown",
+                                       "text": "Frau [PERSON_1] erinnern"}]
+            }}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+        let ask = json!({"role": "user", "content": "Schreib Martina Weber"});
+
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let reply: Value = serde_json::from_str(&first).unwrap();
+        let echoed = reply["choices"][0]["message"].clone();
+        assert_eq!(echoed["reasoning"], "Frau Martina Weber erinnern");
+
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask, echoed,
+                   {"role": "user", "content": "danke"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let received = upstream.received_requests().await.unwrap();
+        let egress = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(
+            !egress.contains("Martina Weber"),
+            "echoed reasoning reached the upstream unmasked: {egress}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_field_no_slot_addresses_never_reaches_the_upstream() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+        )
+        .await;
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi", "note": "Martina Weber"}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_tool_call_id_on_a_non_tool_message_never_reaches_the_upstream() {
         // The allowlist carrying `tool_call_id` is selected by `role ==
         // "tool"`, and the denylist that runs for every message does not carry

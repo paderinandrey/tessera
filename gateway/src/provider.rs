@@ -857,6 +857,45 @@ const OPENAI_TOOL_MESSAGE_FIELDS: [Field; 3] = [
 /// `content_block_fields` governs it by the block's own type.
 const OPENAI_NON_TOOL_MESSAGE_FIELDS: [&str; 1] = ["tool_call_id"];
 
+const OPENAI_MESSAGE_FIELDS: [Field; 12] = [
+    Field::one_of(
+        "role",
+        &["system", "developer", "user", "assistant", "function"],
+    ),
+    Field::described("content"),
+    Field::described("name"),
+    Field::described("tool_calls"),
+    Field::described("refusal"),
+    Field::described("reasoning"),
+    Field::described("reasoning_content"),
+    Field::described("reasoning_details"),
+    Field::nothing("tool_call_id", "a tool message's own field"),
+    Field::nothing("function_call", "the deprecated single-call shape"),
+    Field::nothing("audio", "audio output, refused on the body"),
+    Field::nothing("annotations", "URL citations quoting fetched pages"),
+];
+
+const OPENAI_MESSAGE_TEXT_FIELDS: [&str; 3] = ["refusal", "reasoning", "reasoning_content"];
+
+// OpenRouter's `reasoning_details` entries: `reasoning.text` carries `text` and
+// an optional `signature`, `reasoning.summary` carries `summary`, and
+// `reasoning.encrypted` carries `data`, which only the provider can read.
+const OPENAI_REASONING_DETAIL_FIELDS: [Field; 8] = [
+    Field::dispatch("type"),
+    Field::dispatch("id"),
+    Field::dispatch("format"),
+    Field::number("index"),
+    Field::described("text"),
+    Field::described("summary"),
+    Field::unscanned("data", "ciphertext the provider issued and alone can read"),
+    Field::unscanned("signature", "the provider's signature over its own text"),
+];
+
+const ANTHROPIC_MESSAGE_FIELDS: [Field; 2] = [
+    Field::one_of("role", &["user", "assistant"]),
+    Field::described("content"),
+];
+
 /// `tool_choice` forces or forbids a call. Which fields are legal depends on
 /// its `type`, so this dispatches on that string to pick a list exactly as
 /// `content_block_fields` does, and for the same reason: one flat list would
@@ -1150,6 +1189,32 @@ fn tool_call_slots(
 
 /// A field that should hold a maskable string. Absent is fine; present but not
 /// a string cannot be masked, so it is refused rather than forwarded as it is.
+fn reasoning_detail_slots(
+    prefix: &str,
+    details: &Value,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    let details = details.as_array().ok_or(ShapeError::Request("openai"))?;
+    for (index, detail) in details.iter().enumerate() {
+        known_fields(
+            detail,
+            &OPENAI_REASONING_DETAIL_FIELDS,
+            "reasoning detail field",
+            "openai",
+        )?;
+        for field in ["text", "summary"] {
+            identifier_pointer(
+                detail,
+                &format!("/{field}"),
+                format!("{prefix}/{index}/{field}"),
+                "openai",
+                out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn identifier_pointer(
     body: &Value,
     lookup: &str,
@@ -1608,6 +1673,7 @@ impl Provider for OpenAi {
                 // `OPENAI_NON_TOOL_MESSAGE_FIELDS` — the allowlist above being
                 // chosen by the role is exactly what stopped anything asking.
                 reject_tool_fields(message, &OPENAI_NON_TOOL_MESSAGE_FIELDS, "openai")?;
+                known_fields(message, &OPENAI_MESSAGE_FIELDS, "message field", "openai")?;
             }
             identifier_pointer(
                 message,
@@ -1616,6 +1682,25 @@ impl Provider for OpenAi {
                 "openai",
                 &mut pointers,
             )?;
+            for field in OPENAI_MESSAGE_TEXT_FIELDS {
+                identifier_pointer(
+                    message,
+                    &format!("/{field}"),
+                    format!("/messages/{index}/{field}"),
+                    "openai",
+                    &mut pointers,
+                )?;
+            }
+            if let Some(details) = message
+                .get("reasoning_details")
+                .filter(|value| !value.is_null())
+            {
+                reasoning_detail_slots(
+                    &format!("/messages/{index}/reasoning_details"),
+                    details,
+                    &mut pointers,
+                )?;
+            }
             // Null content is an assistant turn that carried tool calls
             // instead: the provider writes it that way and clients echo it
             // back, so reading it as an unreadable content shape refused the
@@ -1925,6 +2010,12 @@ impl Provider for Anthropic {
         for (index, message) in messages.iter().enumerate() {
             require_scannable_message(message, &["content"], "anthropic")?;
             reject_tool_fields(message, &ANTHROPIC_MESSAGE_TOOL_FIELDS, "anthropic")?;
+            known_fields(
+                message,
+                &ANTHROPIC_MESSAGE_FIELDS,
+                "message field",
+                "anthropic",
+            )?;
             if let Some(content) = message.get("content") {
                 content_pointers(
                     &format!("/messages/{index}/content"),
@@ -2575,6 +2666,81 @@ mod tests {
                 text("/messages/0/content")
             ]
         );
+    }
+
+    #[test]
+    fn openai_masks_the_model_text_an_assistant_turn_carries_besides_content() {
+        let body = json!({"messages": [{
+            "role": "assistant", "content": null, "refusal": "Weber",
+            "reasoning": "Weber", "reasoning_content": "Weber",
+            "reasoning_details": [
+                {"type": "reasoning.text", "id": "r1", "format": "unknown", "index": 0,
+                 "text": "Weber", "signature": "c2ln"},
+                {"type": "reasoning.summary", "summary": "Weber"},
+                {"type": "reasoning.encrypted", "data": "ZW5j"}
+            ],
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "f", "arguments": "{}"}}],
+            "audio": null, "function_call": null, "annotations": []
+        }]});
+        assert_eq!(
+            OpenAi.request_pointers(&body).unwrap(),
+            vec![
+                text("/messages/0/refusal"),
+                text("/messages/0/reasoning"),
+                text("/messages/0/reasoning_content"),
+                text("/messages/0/reasoning_details/0/text"),
+                text("/messages/0/reasoning_details/1/summary"),
+                Slot::Json {
+                    pointer: "/messages/0/tool_calls/0/function/arguments".to_owned(),
+                    embedded: true,
+                    shape: Shape::Instance,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_field_no_slot_addresses_is_refused() {
+        for role in ["system", "developer", "user", "assistant", "function"] {
+            let body = json!({"messages": [
+                {"role": role, "content": "hi", "note": "Martina Weber"}]});
+            assert!(
+                matches!(
+                    OpenAi.request_pointers(&body),
+                    Err(ShapeError::Unsupported("openai", "message field"))
+                ),
+                "{role}: {:?}",
+                OpenAi.request_pointers(&body)
+            );
+        }
+        for refused in [
+            json!({"role": "Martina Weber", "content": "hi"}),
+            json!({"role": "assistant", "content": "hi",
+                   "annotations": [{"type": "url_citation", "url_citation": {"title": "Weber"}}]}),
+            json!({"role": "assistant", "content": "hi", "audio": {"id": "a1"}}),
+            json!({"role": "assistant", "content": "hi", "reasoning": {"text": "Weber"}}),
+            json!({"role": "assistant", "content": "hi", "reasoning_details": {"text": "Weber"}}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.text", "note": "Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.text", "text": ["Weber"]}]}),
+        ] {
+            assert!(
+                OpenAi
+                    .request_pointers(&json!({"messages": [refused]}))
+                    .is_err(),
+                "admitted {refused}"
+            );
+        }
+        let anthropic = json!({"messages": [
+            {"role": "user", "content": "hi", "note": "Martina Weber"}]});
+        assert!(matches!(
+            Anthropic.request_pointers(&anthropic),
+            Err(ShapeError::Unsupported("anthropic", "message field"))
+        ));
+        let anthropic = json!({"messages": [{"role": "Martina Weber", "content": "hi"}]});
+        assert!(Anthropic.request_pointers(&anthropic).is_err());
     }
 
     #[test]
