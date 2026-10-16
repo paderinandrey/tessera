@@ -98,7 +98,7 @@ impl DetectorClient {
     /// promoting an entry because a request *asked about* it would let the
     /// bounds decide what stays cached.
     pub fn would_be_cached(&self, text: &str, credential: Option<&[u8]>) -> bool {
-        self.cache.contains(credential, text)
+        text.is_empty() || self.cache.contains(credential, text)
     }
 
     pub async fn detect(
@@ -106,6 +106,9 @@ impl DetectorClient {
         text: &str,
         credential: Option<&[u8]>,
     ) -> Result<Vec<Span>, DetectorError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
         if let Some(spans) = self.cache.get(credential, text) {
             return Ok(spans);
         }
@@ -168,6 +171,20 @@ mod tests {
     /// The span cap tests that are not about the cap itself pass this, so a
     /// handful of spans never accidentally brushes against it.
     const UNCAPPED: usize = usize::MAX;
+
+    #[tokio::test]
+    async fn an_empty_text_is_answered_without_a_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(ResponseTemplate::new(422))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = DetectorClient::new(server.uri(), Duration::from_secs(5), 16, UNCAPPED);
+        assert!(client.would_be_cached("", None));
+        assert_eq!(client.detect("", None).await.unwrap(), Vec::new());
+    }
 
     #[tokio::test]
     async fn spans_come_back_from_the_service() {
