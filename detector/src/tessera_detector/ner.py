@@ -50,6 +50,7 @@ class NerType:
     # tier. GLiNER returns one label per span, so labels in a single call bid
     # against each other and only the argmax survives.
     own_pass: bool = False
+    outranks_tier_3_below: float | None = None
 
 
 def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
@@ -114,6 +115,20 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
             raise ValueError(
                 f"ner type {entity_type!r} declares own_pass {own_pass!r}, which is not a boolean"
             )
+        outranks = entry.get("outranks_tier_3_below")
+        if outranks is not None and (
+            isinstance(outranks, bool)
+            or not isinstance(outranks, int | float)
+            or not 0.0 < outranks <= 1.0
+        ):
+            raise ValueError(
+                f"ner type {entity_type!r} declares outranks_tier_3_below {outranks!r} "
+                "outside the (0.0, 1.0] range"
+            )
+        if outranks is not None and tier == 3:
+            raise ValueError(
+                f"ner type {entity_type!r} is tier 3 and cannot outrank tier 3"
+            )
         types.append(
             NerType(
                 entity_type=entity_type,
@@ -124,6 +139,7 @@ def load_ner_types(config_text: str | None = None) -> tuple[NerType, ...]:
                 trim_leading=trim_leading,
                 trim_leading_articles=trim_leading_articles,
                 own_pass=own_pass,
+                outranks_tier_3_below=None if outranks is None else float(outranks),
             )
         )
     return tuple(types)
@@ -156,6 +172,45 @@ def deduplicated(spans: list[Span]) -> list[Span]:
         elif span.confidence > current.confidence:
             best[key] = span
     return [best[key] for key in order]
+
+
+def contested(spans: list[Span], types: Iterable[NerType]) -> list[Span]:
+    """Tier-3 readings that lose an overlap to a type declaring `outranks_tier_3_below`.
+
+    A tier-3 span scoring under that bar, overlapping a span of that type, takes
+    the type's identity and keeps its own extent; the highest-scoring rival wins.
+    """
+    bars = {
+        t.entity_type: t.outranks_tier_3_below
+        for t in types
+        if t.outranks_tier_3_below is not None
+    }
+    result = []
+    for span in spans:
+        if span.tier == 3:
+            rival = max(
+                (
+                    other
+                    for other in spans
+                    if other.entity_type in bars
+                    and span.confidence < bars[other.entity_type]
+                    and other.start < span.end
+                    and span.start < other.end
+                ),
+                key=lambda other: other.confidence,
+                default=None,
+            )
+            if rival is not None:
+                span = span.model_copy(
+                    update={
+                        "entity_type": rival.entity_type,
+                        "confidence": rival.confidence,
+                        "tier": rival.tier,
+                        "boosted": rival.boosted,
+                    }
+                )
+        result.append(span)
+    return deduplicated(result)
 
 
 # Boundaries to prefer when cutting, best first: a chunk that ends mid-entity
@@ -808,7 +863,7 @@ class GlinerRecognizer:
                     drain()
         if batch:
             drain()
-        return deduplicated(spans)
+        return contested(deduplicated(spans), self.types)
 
 
 __all__ = [
@@ -816,6 +871,7 @@ __all__ = [
     "InferencePass",
     "NerType",
     "chunks",
+    "contested",
     "deduplicated",
     "load_ner_types",
     "token_windows",
