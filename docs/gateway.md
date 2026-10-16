@@ -23,9 +23,13 @@ an earlier turn already masked is masked again wherever it reappears as a whole 
 where the detector does not find it this time: the gateway restores a model's reply in full,
 clients echo replies back as history, and the detector reads the echo in a context it has
 never seen. A live agent run sent `ver.di` up that way — masked in the tool result, restored
-into the model's reasoning, echoed, and missed in the new sentence. A detected span takes
-precedence over a known value it overlaps; a value inside a longer word (`Weber` in
-`Weberstrasse`) is left alone. Identifiers outside the
+into the model's reasoning, echoed, and missed in the new sentence. A known value that
+contains the spans the detector found there replaces them, so `Martina` detected inside a
+known `Martina Weber` does not leave ` Weber` behind; one that only crosses a detected span
+yields to it. A value inside a longer word (`Weber` in `Weberstrasse`) is left alone, and in
+a JSON document only a leaf's own value is searched, never the member name shown to the
+detector beside it. The journal still counts what the detector found, not what the session
+recognised. Identifiers outside the
 message content are masked too — OpenAI's `user` and per-message `name`, Anthropic's
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.

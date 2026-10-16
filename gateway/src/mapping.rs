@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
 
@@ -1123,7 +1123,12 @@ impl Mapping {
         Ok(result)
     }
 
-    pub fn with_known_values(&self, text: &str, detected: Vec<Span>) -> Vec<Span> {
+    pub fn with_known_values(
+        &self,
+        text: &str,
+        detected: Vec<Span>,
+        searchable: impl Fn(usize, usize) -> bool,
+    ) -> Vec<Span> {
         if self.by_value.is_empty() || text.is_empty() {
             return detected;
         }
@@ -1135,10 +1140,10 @@ impl Mapping {
         }
         char_at[text.len()] = count;
         let chars: Vec<char> = text.chars().collect();
+        let word = |c: char| c.is_alphanumeric() || c == '_';
         let bounded = |start: usize, end: usize| {
-            let alnum = |c: char| c.is_alphanumeric() || c == '_';
-            !(start > 0 && alnum(chars[start - 1]) && alnum(chars[start]))
-                && !(end < chars.len() && alnum(chars[end - 1]) && alnum(chars[end]))
+            !(start > 0 && word(chars[start - 1]) && word(chars[start]))
+                && !(end < chars.len() && word(chars[end - 1]) && word(chars[end]))
         };
 
         let mut known: Vec<(&String, &str)> = self
@@ -1156,25 +1161,47 @@ impl Mapping {
                 .then(a.0.cmp(b.0))
         });
 
-        let mut spans = detected;
-        let mut taken: Vec<(usize, usize)> = spans.iter().map(|s| (s.start, s.end)).collect();
+        let mut taken: BTreeMap<usize, (Span, bool)> = detected
+            .into_iter()
+            .map(|span| (span.start, (span, true)))
+            .collect();
         for (value, entity_type) in known {
             for (byte, _) in text.match_indices(value.as_str()) {
                 let start = char_at[byte];
                 let end = char_at[byte + value.len()];
-                if !bounded(start, end) || taken.iter().any(|&(s, e)| start < e && s < end) {
+                if !bounded(start, end) || !searchable(start, end) {
                     continue;
                 }
-                taken.push((start, end));
-                spans.push(Span {
-                    entity_type: entity_type.to_owned(),
-                    start,
-                    end,
+                let overlapping: Vec<usize> = taken
+                    .range(..end)
+                    .rev()
+                    .take_while(|(_, (span, _))| span.end > start)
+                    .map(|(&key, _)| key)
+                    .collect();
+                let displaces = overlapping.iter().all(|key| {
+                    let (span, detected) = &taken[key];
+                    *detected && start <= span.start && span.end <= end
                 });
+                if !displaces {
+                    continue;
+                }
+                for key in overlapping {
+                    taken.remove(&key);
+                }
+                taken.insert(
+                    start,
+                    (
+                        Span {
+                            entity_type: entity_type.to_owned(),
+                            start,
+                            end,
+                        },
+                        false,
+                    ),
+                );
             }
         }
-        spans.sort_by_key(|span| span.start);
-        spans
+        taken.into_values().map(|(span, _)| span).collect()
     }
 
     /// Commit `other`'s new pairs, in the order they were issued, until `cap`
@@ -3918,6 +3945,12 @@ impl Joined {
         }
     }
 
+    pub fn within_a_leaf(&self, start: usize, end: usize) -> bool {
+        self.ranges
+            .iter()
+            .any(|range| range.start <= start && end <= range.end)
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -4318,7 +4351,7 @@ mod tests {
     fn a_value_the_session_issued_is_masked_without_being_detected_again() {
         let mapping = knowing(&[("TRADE_UNION", "ver.di"), ("PERSON", "Weber")]);
         let text = "Grüße: Since the file mentions ver.di, Weber.";
-        let spans = mapping.with_known_values(text, Vec::new());
+        let spans = mapping.with_known_values(text, Vec::new(), |_, _| true);
         assert_eq!(
             spans,
             vec![span("TRADE_UNION", 31, 37), span("PERSON", 39, 44)]
@@ -4341,7 +4374,7 @@ mod tests {
             "an [PERSON_1] schreiben",
         ] {
             assert_eq!(
-                mapping.with_known_values(text, Vec::new()),
+                mapping.with_known_values(text, Vec::new(), |_, _| true),
                 Vec::new(),
                 "{text}"
             );
@@ -4349,21 +4382,43 @@ mod tests {
     }
 
     #[test]
-    fn a_detected_span_wins_over_a_known_value_it_overlaps() {
+    fn a_known_value_displaces_only_the_detected_spans_it_contains() {
         let mapping = knowing(&[("PERSON", "Martina Weber"), ("PERSON", "Weber")]);
-        let detected = vec![span("LOCATION", 0, 7)];
+        let text = "Martina Weber und Weber";
+        let all = |_: usize, _: usize| true;
         assert_eq!(
-            mapping.with_known_values("Martina Weber und Weber", detected),
-            vec![
-                span("LOCATION", 0, 7),
-                span("PERSON", 8, 13),
-                span("PERSON", 18, 23)
-            ]
-        );
-        assert_eq!(
-            mapping.with_known_values("Martina Weber und Weber", Vec::new()),
+            mapping.with_known_values(text, vec![span("LOCATION", 0, 7)], all),
             vec![span("PERSON", 0, 13), span("PERSON", 18, 23)]
         );
+        assert_eq!(
+            mapping.with_known_values(text, vec![span("LOCATION", 8, 17)], all),
+            vec![span("LOCATION", 8, 17), span("PERSON", 18, 23)]
+        );
+        assert_eq!(
+            mapping.with_known_values(text, Vec::new(), all),
+            vec![span("PERSON", 0, 13), span("PERSON", 18, 23)]
+        );
+    }
+
+    #[test]
+    fn a_known_value_is_found_only_where_the_caller_says_to_look() {
+        let mapping = knowing(&[("PERSON", "Bob")]);
+        assert_eq!(
+            mapping.with_known_values("name: Bob", Vec::new(), |start, _| start >= 6),
+            vec![span("PERSON", 6, 9)]
+        );
+        assert_eq!(
+            mapping.with_known_values("Bob: x", Vec::new(), |start, _| start >= 5),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn many_repeats_of_a_known_value_are_all_masked() {
+        let mapping = knowing(&[("PERSON", "Weber")]);
+        let text = "Weber ".repeat(20_000);
+        let spans = mapping.with_known_values(&text, Vec::new(), |_, _| true);
+        assert_eq!(spans.len(), 20_000);
     }
 
     /// A deterministic generator, so a failure is a bug rather than a Tuesday.

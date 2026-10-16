@@ -49,7 +49,9 @@ detections and one call, so these are not a count of the detector's traffic.
 named them, and `spans` counts occurrences; the gap between them is a value
 found more than once under the same name within the same request, not anything
 a session did — detection runs over every text on every request whether or not
-one is attached.
+one is attached. A value the session already issued is masked again where the
+detector misses it, and that occurrence is not counted here: these two fields
+describe the detector's findings, not everything that was masked.
 A type name the detector reports that is not one of the twenty-two this gateway
 declares is counted under `unvalidated` rather than written out, since the name
 arrived from outside the perimeter and a name is a place a value can hide.
