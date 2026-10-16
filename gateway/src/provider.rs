@@ -880,19 +880,37 @@ const OPENAI_MESSAGE_TEXT_FIELDS: [&str; 3] = ["refusal", "reasoning", "reasonin
 // OpenRouter's `reasoning_details` entries: `reasoning.text` carries `text` and
 // an optional `signature`, `reasoning.summary` carries `summary`, and
 // `reasoning.encrypted` carries `data`, which only the provider can read.
-const OPENAI_REASONING_DETAIL_FIELDS: [Field; 8] = [
-    Field::one_of(
-        "type",
-        &["reasoning.text", "reasoning.summary", "reasoning.encrypted"],
-    ),
+const OPENAI_REASONING_TEXT_FIELDS: [Field; 6] = [
+    Field::elsewhere("type", "reasoning_detail_fields"),
     Field::dispatch("id"),
     Field::dispatch("format"),
     Field::number("index"),
     Field::described("text"),
-    Field::described("summary"),
-    Field::unscanned("data", "ciphertext the provider issued and alone can read"),
-    Field::unscanned("signature", "the provider's signature over its own text"),
+    Field::dispatch("signature"),
 ];
+const OPENAI_REASONING_SUMMARY_FIELDS: [Field; 5] = [
+    Field::elsewhere("type", "reasoning_detail_fields"),
+    Field::dispatch("id"),
+    Field::dispatch("format"),
+    Field::number("index"),
+    Field::described("summary"),
+];
+const OPENAI_REASONING_ENCRYPTED_FIELDS: [Field; 5] = [
+    Field::elsewhere("type", "reasoning_detail_fields"),
+    Field::dispatch("id"),
+    Field::dispatch("format"),
+    Field::number("index"),
+    Field::dispatch("data"),
+];
+
+fn reasoning_detail_fields(detail: &Value) -> Result<&'static [Field], ShapeError> {
+    match detail.get("type").and_then(Value::as_str) {
+        Some("reasoning.text") => Ok(&OPENAI_REASONING_TEXT_FIELDS),
+        Some("reasoning.summary") => Ok(&OPENAI_REASONING_SUMMARY_FIELDS),
+        Some("reasoning.encrypted") => Ok(&OPENAI_REASONING_ENCRYPTED_FIELDS),
+        _ => Err(ShapeError::Unsupported("openai", "reasoning detail type")),
+    }
+}
 
 const ANTHROPIC_MESSAGE_FIELDS: [Field; 2] = [
     Field::one_of("role", &["user", "assistant"]),
@@ -1201,7 +1219,7 @@ fn reasoning_detail_slots(
     for (index, detail) in details.iter().enumerate() {
         known_fields(
             detail,
-            &OPENAI_REASONING_DETAIL_FIELDS,
+            reasoning_detail_fields(detail)?,
             "reasoning detail field",
             "openai",
         )?;
@@ -2361,8 +2379,16 @@ mod tests {
             ),
             ("OPENAI_MESSAGE_FIELDS", &OPENAI_MESSAGE_FIELDS[..]),
             (
-                "OPENAI_REASONING_DETAIL_FIELDS",
-                &OPENAI_REASONING_DETAIL_FIELDS[..],
+                "OPENAI_REASONING_TEXT_FIELDS",
+                &OPENAI_REASONING_TEXT_FIELDS[..],
+            ),
+            (
+                "OPENAI_REASONING_SUMMARY_FIELDS",
+                &OPENAI_REASONING_SUMMARY_FIELDS[..],
+            ),
+            (
+                "OPENAI_REASONING_ENCRYPTED_FIELDS",
+                &OPENAI_REASONING_ENCRYPTED_FIELDS[..],
             ),
             ("ANTHROPIC_MESSAGE_FIELDS", &ANTHROPIC_MESSAGE_FIELDS[..]),
             ("content_block_fields(text)", content_block_fields("text")),
@@ -2490,7 +2516,7 @@ mod tests {
             }
         }
         assert_eq!(
-            dispatch, 18,
+            dispatch, 24,
             "each of these is a string this gateway forwards on purpose — the caller's on a \
              request, the model's on a response — so adding one is a decision and not a \
              discovery. It counts entries and not distinct keys, so splitting one list into \
@@ -2734,6 +2760,24 @@ mod tests {
                    "reasoning_details": [{"type": "reasoning.text", "note": "Weber"}]}),
             json!({"role": "assistant", "content": "hi",
                    "reasoning_details": [{"type": "Martina Weber", "text": "hi"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.text", "data": "Martina Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.summary", "data": "Martina Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.summary", "text": "Martina Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.text", "summary": "Martina Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.encrypted", "text": "Martina Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.encrypted",
+                                          "data": {"owner": "Martina Weber"}}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "reasoning.text", "text": "hi",
+                                          "signature": {"owner": "Martina Weber"}}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"text": "hi"}]}),
             json!({"role": "assistant", "content": "hi",
                    "reasoning_details": [{"type": "reasoning.text", "text": ["Weber"]}]}),
         ] {

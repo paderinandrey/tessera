@@ -241,10 +241,14 @@ assistant turn back as history. The reasoning reached the provider on the next t
 the name, the IBAN, the e-mail address, the diagnosis and the union the tool result had
 masked: values this gateway had written into it itself, sent by a client doing nothing
 unusual. `reasoning`, `reasoning_content`, `refusal` and the `text` and `summary` of each
-`reasoning_details` entry are masked as message text now. An entry's `data` and
-`signature` are forwarded whole: the first is ciphertext only the provider can read, the
-second the provider's signature over its own text, which masking the text may already have
-invalidated. `audio`, `function_call`, `annotations` and a `tool_call_id` outside a tool
+`reasoning_details` entry are masked as message text now. Each entry is checked against
+the fields its `type` defines — `text` and `signature` on `reasoning.text`, `summary` on
+`reasoning.summary`, `data` on `reasoning.encrypted` — and an unknown type is refused.
+`data` and `signature` must be strings and are forwarded whole: the first is ciphertext only
+the provider can read, the second the provider's signature over its own text. Masking puts
+back the placeholders the provider wrote, so the signed text usually reaches it unchanged;
+where detection reads the restored text differently, the signature no longer matches and the
+provider may refuse the turn, which costs a request and not a value. `audio`, `function_call`, `annotations` and a `tool_call_id` outside a tool
 message pass only empty, which is how an SDK serializes them by default; a populated one is
 refused. A message whose `role` is not one the provider defines is refused.
 It is also what closes two things a caller may miss. Anthropic's **citations** are refused
