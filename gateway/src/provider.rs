@@ -881,7 +881,10 @@ const OPENAI_MESSAGE_TEXT_FIELDS: [&str; 3] = ["refusal", "reasoning", "reasonin
 // an optional `signature`, `reasoning.summary` carries `summary`, and
 // `reasoning.encrypted` carries `data`, which only the provider can read.
 const OPENAI_REASONING_DETAIL_FIELDS: [Field; 8] = [
-    Field::dispatch("type"),
+    Field::one_of(
+        "type",
+        &["reasoning.text", "reasoning.summary", "reasoning.encrypted"],
+    ),
     Field::dispatch("id"),
     Field::dispatch("format"),
     Field::number("index"),
@@ -2356,6 +2359,12 @@ mod tests {
                 "OPENAI_TOOL_MESSAGE_FIELDS",
                 &OPENAI_TOOL_MESSAGE_FIELDS[..],
             ),
+            ("OPENAI_MESSAGE_FIELDS", &OPENAI_MESSAGE_FIELDS[..]),
+            (
+                "OPENAI_REASONING_DETAIL_FIELDS",
+                &OPENAI_REASONING_DETAIL_FIELDS[..],
+            ),
+            ("ANTHROPIC_MESSAGE_FIELDS", &ANTHROPIC_MESSAGE_FIELDS[..]),
             ("content_block_fields(text)", content_block_fields("text")),
             ("content_block_fields(image)", content_block_fields("image")),
             (
@@ -2481,7 +2490,7 @@ mod tests {
             }
         }
         assert_eq!(
-            dispatch, 16,
+            dispatch, 18,
             "each of these is a string this gateway forwards on purpose — the caller's on a \
              request, the model's on a response — so adding one is a decision and not a \
              discovery. It counts entries and not distinct keys, so splitting one list into \
@@ -2723,6 +2732,8 @@ mod tests {
             json!({"role": "assistant", "content": "hi", "reasoning_details": {"text": "Weber"}}),
             json!({"role": "assistant", "content": "hi",
                    "reasoning_details": [{"type": "reasoning.text", "note": "Weber"}]}),
+            json!({"role": "assistant", "content": "hi",
+                   "reasoning_details": [{"type": "Martina Weber", "text": "hi"}]}),
             json!({"role": "assistant", "content": "hi",
                    "reasoning_details": [{"type": "reasoning.text", "text": ["Weber"]}]}),
         ] {
