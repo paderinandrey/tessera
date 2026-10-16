@@ -26,7 +26,8 @@ of surnames that overlap a `PERSON` reading score 0.225–0.299, except `L’Hô
 at 0.380, which stays `TRADE_UNION`; the real special categories score 0.354 or more. The
 `PERSON` score does not separate the two groups — 0.55–0.97 against the surnames, 0.52–0.94
 against the special categories — so letting the higher score win instead would label `homosexuell` and six JSON
-values `PERSON`, moving Article 9 coverage to 45/46 on sentences and 57/84 on documents.
+values `PERSON`, moving Article 9 coverage to 45/46 on sentences and from 63/84 to 57/84 on documents
+(measured before member names were shown, [#109][i109]).
 `Tessier SA` stays `TRADE_UNION`: no `ORG` reading clears its bar, so there is nothing for
 a rule to prefer.
 
