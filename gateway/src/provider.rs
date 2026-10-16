@@ -809,8 +809,9 @@ const OPENAI_TOOL_DEFINITION_FIELDS: [Field; 4] = [
 /// A tool call the client echoes back, and the function inside it. The
 /// arguments live here, so a field beside them is the one place an added key
 /// walks a document past the masker. `id` and `name` are dispatch.
-const OPENAI_TOOL_CALL_FIELDS: [Field; 3] = [
+const OPENAI_TOOL_CALL_FIELDS: [Field; 4] = [
     Field::dispatch("id"),
+    Field::number("index"),
     Field::elsewhere(
         "type",
         "the `type != \"function\"` refusal in this function",
@@ -2587,6 +2588,32 @@ mod tests {
             Anthropic.request_pointers(&body).unwrap(),
             vec![text("/metadata/user_id"), text("/messages/0/content")]
         );
+    }
+
+    #[test]
+    fn openai_admits_a_numeric_index_on_a_tool_call() {
+        let call = |index: Value| {
+            json!({"type": "function", "id": "c1", "index": index,
+                   "function": {"name": "f", "arguments": "{}"}})
+        };
+        let response = json!({"choices": [{"message": {"role": "assistant",
+            "content": null, "tool_calls": [call(json!(0))]}}]});
+        assert_eq!(
+            OpenAi.response_pointers(&response).unwrap(),
+            vec![Slot::Json {
+                pointer: "/choices/0/message/tool_calls/0/function/arguments".to_owned(),
+                embedded: true,
+                shape: Shape::Instance,
+            }]
+        );
+        for smuggled in [json!("Martina Weber"), json!({"owner": "Martina Weber"})] {
+            let request = json!({"messages": [{"role": "assistant", "content": null,
+                "tool_calls": [call(smuggled.clone())]}]});
+            assert!(
+                OpenAi.request_pointers(&request).is_err(),
+                "index {smuggled} was admitted"
+            );
+        }
     }
 
     #[test]
