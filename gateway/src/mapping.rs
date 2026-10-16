@@ -6822,6 +6822,16 @@ mod tests {
     }
 
     #[test]
+    fn a_span_in_the_member_name_of_an_empty_value_is_dropped() {
+        let joined = Joined::in_context(&[(Some("religion"), ""), (Some("b"), "Bern")]);
+        assert_eq!(joined.text(), "religion: \n\nb: Bern");
+        assert_eq!(
+            joined.split(&[span_at("RELIGION", 0, 8)]).unwrap(),
+            vec![Vec::new(), Vec::new()]
+        );
+    }
+
+    #[test]
     fn a_span_from_one_value_into_the_next_member_name_is_still_refused() {
         let joined = Joined::in_context(&[(Some("a"), "Weber"), (Some("b"), "Bern")]);
         assert_eq!(joined.text(), "a: Weber\n\nb: Bern");
