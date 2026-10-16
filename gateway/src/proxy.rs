@@ -2562,6 +2562,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_text_is_forwarded_without_asking_the_detector() {
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains("\"text\":\"\""))
+            .respond_with(ResponseTemplate::new(422))
+            .expect(0)
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&detector)
+            .await;
+        let call_turn = json!({"role": "assistant", "content": "", "tool_calls": [{
+            "id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        for messages in [
+            json!([{"role": "user", "content": ""}]),
+            json!([{"role": "user", "content": "hi"}, call_turn,
+                   {"role": "tool", "tool_call_id": "c1", "content": "ok"}]),
+            json!([{"role": "user", "content": "hi"}, call_turn,
+                   {"role": "tool", "tool_call_id": "c1", "content": ""}]),
+        ] {
+            let upstream = upstream_returning(
+                "/v1/chat/completions",
+                json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+            )
+            .await;
+            let (status, body) = call(
+                state(&detector, &upstream),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": messages}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{messages}: {body}");
+            assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn a_tool_call_id_on_a_non_tool_message_never_reaches_the_upstream() {
         // The allowlist carrying `tool_call_id` is selected by `role ==
         // "tool"`, and the denylist that runs for every message does not carry
