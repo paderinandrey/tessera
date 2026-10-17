@@ -89,7 +89,8 @@ forwarded whole, so an occurrence has exactly one fate and the three numbers
 account for the line.
 
 `unremembered` counts the values this request issued that its session did not
-keep, because the session already held `max_session_values` of them. Such a value
+keep, because the session reached `max_session_values` before or during this
+request. Such a value
 was masked in this request; what it lost is the next turn's protection, where a
 reappearance is masked only if the detector finds it again. It is `0` on a
 request without a session, which remembers nothing by design, and once a session
