@@ -150,10 +150,10 @@ Extended thinking is refused before
 the upstream call rather than at its first streamed block, so the refusal costs no tokens.
 
 **A streamed response the caller declares will be a JSON document is refused the same way.**
-`stream: true` beside any `response_format` other than `{"type": "text"}` is a 400 before
-the upstream call — an unfamiliar type is refused rather than admitted, because a
-`response_format` the gateway cannot read is more likely to declare a document than prose,
-and an omission in this predicate must cost a refusal rather than an injection. The reason is the restoration path: a buffered `content` that parses as a
+`stream: true` beside any `response_format` other than `{"type": "text"}`, or beside
+Anthropic's `output_config.format`, is a 400 before the upstream call. A `response_format`
+type OpenAI does not publish is refused whether or not the request streams, because the body
+allowlist does not admit it. The reason is the restoration path: a buffered `content` that parses as a
 document is restored *structurally*, so a value carrying a `"` — or an apostrophe, which
 closes a string for a permissive reader just as well — lands inside a leaf and is escaped on
 the way out. A delta is a fragment of a document and there is nothing to parse, so the
