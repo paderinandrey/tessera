@@ -94,7 +94,8 @@ pub struct Config {
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
     /// How many values one conversation may remember. Past it, values are still
-    /// masked and still restored — they are simply not remembered.
+    /// masked and still restored in their own request, but not remembered: a
+    /// reappearance in a later turn is masked only if the detector finds it again.
     #[serde(default = "default_max_session_values")]
     pub max_session_values: usize,
     /// How many detection results may be remembered at once. Zero disables the
@@ -370,8 +371,7 @@ fn default_detection_cache_entries() -> usize {
 // 264 + 250 * 46 = 11 764 B, and at the default 10 000 entries the worst-case
 // cache is 10 000 * 11 764 B = 117 640 000 B ≈ 118 MB. A text with more
 // spans than that is real and is still served correctly; it is simply not
-// remembered, the same trade `max_session_values` already makes for a
-// session with too many values.
+// remembered.
 //
 // The 46 B/span figure measured real detector output, where `Span.entity_type`
 // runs a handful of characters (`PERSON`, `IBAN`). It was never a ceiling on

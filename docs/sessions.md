@@ -28,11 +28,14 @@ The table holds real values in memory between requests. It is the only place in 
 gateway where that is true — the detection cache below retains data across requests too,
 but never a value, only a span's type and offsets — so the session table is bounded
 three ways: `session_idle_secs`, `max_sessions` and `max_session_values`. Reaching
-`max_session_values` or the idle TTL costs coreference,
-never protection. The client holds restored text and sends the history again, so a
+`max_session_values` or the idle TTL costs coreference and the re-masking of values the
+session already issued, never the detector's own masking. The client holds restored text and sends the history again, so a
 session that was evicted is rebuilt from scratch by the next request — `[PERSON_3]`
-becomes `[PERSON_1]` and nothing else changes. Past `max_session_values` a value is
-still masked and still restored; it is simply not remembered.
+becomes `[PERSON_1]`. Past `max_session_values` a value is
+still masked and still restored; it is simply not remembered. A reappearance of it in a
+later turn is masked only if the detector finds it again, and a later echo of its
+placeholder is refused because nothing restores it. The `masked` journal line counts such
+values in `unremembered`, so an operator can see a session that has outgrown its bound.
 
 Reaching `max_sessions` is the one bound that can cost a request rather than a
 coreference. A session table is only ever reclaimed from a conversation that has
