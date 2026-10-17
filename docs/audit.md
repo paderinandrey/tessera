@@ -64,7 +64,10 @@ counts — is in exactly one of three states, and two of them are counted.
 does **not** carry the detector's name for them: usually because the type was
 not one this gateway declares, so the value went up as `[REDACTED_n]`, and also
 when the value was already carrying a placeholder issued for another type,
-whether earlier in this request or in an earlier turn of the session.
+whether earlier in this request or in an earlier turn of the session. A finding
+inside a longer value the session already knew went up as part of that value,
+so it is judged by that value's placeholder: `Martina` found as `PERSON` inside
+a known `Martina Weber` is not counted here, and found as `ORG` it is.
 `forwarded` counts the occurrences the provider received verbatim: a span on a
 numeric leaf of a tool document, which this gateway deliberately does not mask,
 because a placeholder there would change the field from a number to a string.

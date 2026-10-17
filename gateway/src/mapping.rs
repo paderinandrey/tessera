@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt;
+use std::sync::OnceLock;
 
+use aho_corasick::AhoCorasick;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -1018,6 +1020,39 @@ pub struct Mapping {
     /// from. `absorb` does not carry it, for the same reason reserved literals
     /// are absent from `order`.
     issued: HashSet<String>,
+    known: OnceLock<Option<KnownValues>>,
+}
+
+#[derive(Debug, Clone)]
+struct KnownValues {
+    automaton: AhoCorasick,
+    types: Vec<String>,
+}
+
+impl KnownValues {
+    fn new(by_value: &HashMap<String, String>) -> Option<Self> {
+        let mut known: Vec<(&str, &str)> = by_value
+            .iter()
+            .filter(|(value, _)| !value.is_empty())
+            .filter_map(|(value, placeholder)| {
+                placeholder_type(placeholder).map(|entity_type| (value.as_str(), entity_type))
+            })
+            .collect();
+        known.sort_by(|a, b| {
+            b.0.chars()
+                .count()
+                .cmp(&a.0.chars().count())
+                .then(a.0.cmp(b.0))
+        });
+        let automaton = AhoCorasick::new(known.iter().map(|(value, _)| value)).ok()?;
+        Some(Self {
+            automaton,
+            types: known
+                .into_iter()
+                .map(|(_, entity_type)| entity_type.to_owned())
+                .collect(),
+        })
+    }
 }
 
 impl Mapping {
@@ -1132,6 +1167,17 @@ impl Mapping {
         if self.by_value.is_empty() || text.is_empty() || check_spans(text, &detected).is_err() {
             return detected;
         }
+        let Some(known) = self.known.get_or_init(|| KnownValues::new(&self.by_value)) else {
+            return detected;
+        };
+        let matches: Vec<(usize, usize, usize)> = known
+            .automaton
+            .find_overlapping_iter(text)
+            .map(|found| (found.pattern().as_usize(), found.start(), found.end()))
+            .collect();
+        if matches.is_empty() {
+            return detected;
+        }
         let mut char_at = vec![0usize; text.len() + 1];
         let mut count = 0;
         for (byte, _) in text.char_indices() {
@@ -1145,61 +1191,45 @@ impl Mapping {
             !(start > 0 && word(chars[start - 1]) && word(chars[start]))
                 && !(end < chars.len() && word(chars[end - 1]) && word(chars[end]))
         };
-
-        let mut known: Vec<(&String, &str)> = self
-            .by_value
-            .iter()
-            .filter(|(value, _)| !value.is_empty())
-            .filter_map(|(value, placeholder)| {
-                placeholder_type(placeholder).map(|entity_type| (value, entity_type))
-            })
+        let mut candidates: Vec<(usize, usize, usize)> = matches
+            .into_iter()
+            .map(|(pattern, start, end)| (pattern, char_at[start], char_at[end]))
+            .filter(|&(_, start, end)| bounded(start, end) && searchable(start, end))
             .collect();
-        known.sort_by(|a, b| {
-            b.0.chars()
-                .count()
-                .cmp(&a.0.chars().count())
-                .then(a.0.cmp(b.0))
-        });
+        candidates.sort_unstable();
 
         let mut taken: BTreeMap<usize, (Span, bool)> = detected
             .into_iter()
             .map(|span| (span.start, (span, true)))
             .collect();
-        for (value, entity_type) in known {
-            for (byte, _) in text.match_indices(value.as_str()) {
-                let start = char_at[byte];
-                let end = char_at[byte + value.len()];
-                if !bounded(start, end) || !searchable(start, end) {
-                    continue;
-                }
-                let overlapping: Vec<usize> = taken
-                    .range(..end)
-                    .rev()
-                    .take_while(|(_, (span, _))| span.end > start)
-                    .map(|(&key, _)| key)
-                    .collect();
-                let displaces = overlapping.iter().all(|key| {
-                    let (span, detected) = &taken[key];
-                    *detected && start <= span.start && span.end <= end
-                });
-                if !displaces {
-                    continue;
-                }
-                for key in overlapping {
-                    taken.remove(&key);
-                }
-                taken.insert(
-                    start,
-                    (
-                        Span {
-                            entity_type: entity_type.to_owned(),
-                            start,
-                            end,
-                        },
-                        false,
-                    ),
-                );
+        for (pattern, start, end) in candidates {
+            let overlapping: Vec<usize> = taken
+                .range(..end)
+                .rev()
+                .take_while(|(_, (span, _))| span.end > start)
+                .map(|(&key, _)| key)
+                .collect();
+            let displaces = overlapping.iter().all(|key| {
+                let (span, detected) = &taken[key];
+                *detected && start <= span.start && span.end <= end
+            });
+            if !displaces {
+                continue;
             }
+            for key in overlapping {
+                taken.remove(&key);
+            }
+            taken.insert(
+                start,
+                (
+                    Span {
+                        entity_type: known.types[pattern].clone(),
+                        start,
+                        end,
+                    },
+                    false,
+                ),
+            );
         }
         taken.into_values().map(|(span, _)| span).collect()
     }
@@ -1223,6 +1253,7 @@ impl Mapping {
                 continue;
             };
             self.by_value.insert(value.clone(), placeholder.clone());
+            self.known = OnceLock::new();
             self.by_placeholder
                 .insert(placeholder.clone(), value.clone());
             self.order.push(placeholder.clone());
@@ -1319,6 +1350,7 @@ impl Mapping {
             }
         };
         self.by_value.insert(value.clone(), placeholder.clone());
+        self.known = OnceLock::new();
         self.by_placeholder.insert(placeholder.clone(), value);
         self.order.push(placeholder.clone());
         self.issued.insert(placeholder.clone());
@@ -4428,6 +4460,44 @@ mod tests {
         let text = "Weber ".repeat(20_000);
         let spans = mapping.with_known_values(&text, Vec::new(), |_, _| true);
         assert_eq!(spans.len(), 20_000);
+    }
+
+    #[test]
+    fn a_longer_known_value_is_found_where_a_shorter_one_ends_first() {
+        let mapping = knowing(&[("PERSON", "Martina"), ("PERSON", "Martina Weber")]);
+        assert_eq!(
+            mapping.with_known_values("Martina Weber kommt", Vec::new(), |_, _| true),
+            vec![span("PERSON", 0, 13)]
+        );
+        assert_eq!(
+            mapping.with_known_values("Martina Webers kommt", Vec::new(), |_, _| true),
+            vec![span("PERSON", 0, 7)]
+        );
+    }
+
+    #[test]
+    fn a_value_issued_after_the_first_search_is_known_to_the_next() {
+        let mut work = knowing(&[("PERSON", "Weber")]);
+        assert_eq!(
+            work.with_known_values("Meier", Vec::new(), |_, _| true),
+            Vec::new()
+        );
+        work.mask("Kunde Meier", &[span("PERSON", 6, 11)]).unwrap();
+        assert_eq!(
+            work.with_known_values("Meier", Vec::new(), |_, _| true),
+            vec![span("PERSON", 0, 5)]
+        );
+
+        let mut session = knowing(&[("PERSON", "Weber")]);
+        assert_eq!(
+            session.with_known_values("Meier", Vec::new(), |_, _| true),
+            Vec::new()
+        );
+        session.absorb(&work, 10);
+        assert_eq!(
+            session.with_known_values("Meier", Vec::new(), |_, _| true),
+            vec![span("PERSON", 0, 5)]
+        );
     }
 
     /// A deterministic generator, so a failure is a bug rather than a Tuesday.

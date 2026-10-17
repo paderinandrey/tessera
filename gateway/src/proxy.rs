@@ -333,6 +333,37 @@ fn count_occurrences(text: &str, spans: &[Span], found: &mut HashMap<(String, St
     }
 }
 
+fn count_covered(
+    text: &str,
+    detected: &[Span],
+    masked: &[Span],
+    covered: &mut HashMap<(String, String), HashMap<String, usize>>,
+) {
+    if detected.is_empty() {
+        return;
+    }
+    let characters: Vec<char> = text.chars().collect();
+    for span in detected {
+        let index = masked.partition_point(|cover| cover.start <= span.start);
+        let Some(cover) = index.checked_sub(1).map(|index| &masked[index]) else {
+            continue;
+        };
+        if (cover.start, cover.end) == (span.start, span.end) || cover.end < span.end {
+            continue;
+        }
+        if let (Some(value), Some(covering)) = (
+            characters.get(span.start..span.end),
+            characters.get(cover.start..cover.end),
+        ) {
+            *covered
+                .entry((span.entity_type.clone(), value.iter().collect()))
+                .or_default()
+                .entry(covering.iter().collect())
+                .or_default() += 1;
+        }
+    }
+}
+
 /// Detect and mask every text the provider pointed at, and report what was
 /// found and what became of it. Shared by both branches of `handle`: inline it
 /// would exist twice and diverge at the first edit.
@@ -407,6 +438,7 @@ async fn mask_all(
     // subtractable: what this map does not hold of a finding's occurrences is
     // exactly what was masked.
     let mut forwarded: HashMap<(String, String), usize> = HashMap::new();
+    let mut covered: HashMap<(String, String), HashMap<String, usize>> = HashMap::new();
     // What this request asked a detection for, which is not the same as what
     // the request holds: a `Slot::Json` asks one detection however many leaves
     // it has, and asks none at all when it has none.
@@ -503,7 +535,8 @@ async fn mask_all(
                 texts += 1;
                 total += detected.len();
                 count_occurrences(&text, &detected, &mut found);
-                let spans = mapping.with_known_values(&text, detected, |_, _| true);
+                let spans = mapping.with_known_values(&text, detected.clone(), |_, _| true);
+                count_covered(&text, &detected, &spans, &mut covered);
                 write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
             }
             // A document's string leaves are detected one at a time and put
@@ -724,11 +757,14 @@ async fn mask_all(
                     }
                 }
                 let mut replacements = Vec::new();
-                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                for ((leaf, spans), detected) in
+                    leaves.iter().zip(&per_leaf).zip(&detected_per_leaf)
+                {
                     // The number's own entry is dropped: the rebuild copies it
                     // through untouched, and `replace_text_leaves` asks for a
                     // replacement per *text* leaf.
                     if let mapping::Leaf::Text(text) = leaf {
+                        count_covered(text, detected, spans, &mut covered);
                         replacements.push(mapping.mask(text, spans)?);
                     }
                 }
@@ -789,8 +825,16 @@ async fn mask_all(
         // under-report `redacted` rather than panic on an evidence line, and
         // `a_line_accounts_for_every_span_it_reports` is what would notice.
         let masked_here = occurrences.saturating_sub(verbatim);
-        if masked_here > 0 && !mapping.named_as(value, entity_type) {
-            redacted += masked_here;
+        let mut inside_known = 0usize;
+        for (covering, count) in covered.get(finding).into_iter().flatten() {
+            inside_known += count;
+            if !mapping.named_as(covering, entity_type) {
+                redacted += count;
+            }
+        }
+        let masked_alone = masked_here.saturating_sub(inside_known);
+        if masked_alone > 0 && !mapping.named_as(value, entity_type) {
+            redacted += masked_alone;
         }
     }
     if mapping.redacted_count() > 0 {
@@ -2793,6 +2837,83 @@ mod tests {
             .filter(|line| line["event"] == "masked")
             .collect();
         assert_eq!(masked[2]["spans"], 0, "{:?}", masked[2]);
+    }
+
+    #[tokio::test]
+    async fn a_finding_inside_a_known_value_is_journalled_under_the_name_that_covered_it() {
+        let rules: &[(&str, &str, &str)] = &[
+            ("Kunde Martina Weber.", "Martina Weber", "PERSON"),
+            ("Martina Weber schreibt", "Martina", "PERSON"),
+            ("Martina Weber ruft", "Martina", "ORG"),
+        ];
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let text = body["text"].as_str().unwrap();
+                let mut spans = Vec::new();
+                for (context, value, entity_type) in rules {
+                    let inner = context[..context.find(value).unwrap()].chars().count();
+                    for (at, _) in text.match_indices(context) {
+                        let start = text[..at].chars().count() + inner;
+                        spans.push(json!({"entity_type": entity_type, "start": start,
+                            "end": start + value.chars().count(), "confidence": 1.0,
+                            "recognizer": "ner:fake", "tier": 2, "boosted": false}));
+                    }
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": spans, "layers_run": ["ner"]}))
+            })
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let headers = session_headers("Bearer k1", "conv-1");
+        let tool_turn = |arguments: &str| {
+            json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": arguments}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}])
+        };
+        for messages in [
+            json!([{"role": "user", "content": "Kunde Martina Weber."}]),
+            json!([{"role": "user", "content": "Martina Weber schreibt"}]),
+            json!([{"role": "user", "content": "Martina Weber ruft an"}]),
+            tool_turn("{\"to\":\"Martina Weber schreibt\"}"),
+        ] {
+            let (status, body) = call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": messages}),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let egress = upstream.received_requests().await.unwrap();
+        for request in &egress[1..] {
+            let sent = String::from_utf8_lossy(&request.body).into_owned();
+            assert!(
+                !sent.contains("Martina") && !sent.contains("Weber"),
+                "{sent}"
+            );
+        }
+        let masked: Vec<Value> = journal(&path)
+            .into_iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked[1]["types"], json!({"PERSON": 1}), "{:?}", masked[1]);
+        assert_eq!(masked[1]["redacted"], 0, "{:?}", masked[1]);
+        assert_eq!(masked[2]["types"], json!({"ORG": 1}), "{:?}", masked[2]);
+        assert_eq!(masked[2]["redacted"], 1, "{:?}", masked[2]);
+        assert_eq!(masked[3]["types"], json!({"PERSON": 1}), "{:?}", masked[3]);
+        assert_eq!(masked[3]["redacted"], 0, "{:?}", masked[3]);
     }
 
     #[tokio::test]
