@@ -128,6 +128,7 @@ impl ProxyError {
             | ProxyError::Mapping(MappingError::MaskCountMismatch(_))
             | ProxyError::Mapping(MappingError::PlaceholderKey(_))
             | ProxyError::Mapping(MappingError::Unrestorable(_))
+            | ProxyError::Mapping(MappingError::UnsafePlace(_))
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -188,6 +189,7 @@ impl ProxyError {
             // question, so the class and the seam that raises it grep to each
             // other.
             ProxyError::Mapping(MappingError::Unrestorable(_)) => "mapping_lossy_document",
+            ProxyError::Mapping(MappingError::UnsafePlace(_)) => "mapping_unsafe_place",
             ProxyError::Upstream(_) => "upstream_failed",
             ProxyError::Session(SessionError::BadId) => "session_bad_id",
             ProxyError::Session(SessionError::Disabled) => "session_disabled",
@@ -9420,6 +9422,7 @@ mod tests {
                 .audit_class(),
             ProxyError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
+            ProxyError::Mapping(MappingError::UnsafePlace("a backtick")).audit_class(),
             ProxyError::Upstream("reset".to_owned()).audit_class(),
             ProxyError::Unauthenticated.audit_class(),
             ProxyError::Session(SessionError::BadId).audit_class(),

@@ -98,7 +98,7 @@ mean *a defect here* are worth knowing by name: `shape_pointer` (a pointer this
 gateway produced did not resolve in a body it had already walked),
 `mapping_unknown_placeholder`, `mapping_bad_span`, `mapping_mask_mismatch` and
 `mapping_placeholder_key`. `shape_response`, `upstream_failed` and
-`mapping_lossy_document` (a document the provider sent that cannot be restored
+`mapping_unsafe_place` (a value the provider put in a streamed response where restoring it could change what surrounds it), `mapping_lossy_document` (a document the provider sent that cannot be restored
 without changing something else in it — a member dropped, a key renamed, a
 number rounded — refused rather than served changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
 `mapping_too_deep`, `mapping_too_large`, `mapping_known_values_overlap`, `tool_too_large`,
