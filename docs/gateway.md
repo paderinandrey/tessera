@@ -29,7 +29,9 @@ known `Martina Weber` does not leave ` Weber` behind; one that only crosses a de
 yields to it. A value inside a longer word (`Weber` in `Weberstrasse`) is left alone, and in
 a JSON document only a leaf's own value is searched, never the member name shown to the
 detector beside it. The journal still counts what the detector found, not what the session
-recognised. A session whose values nest so deeply inside one another that a request would
+recognised. Only a value the session *kept* is known: past `max_session_values` a new value
+is masked in its own request and not remembered, so a later reappearance is masked only if
+the detector finds it again, and the journal's `unremembered` says when that happened. A session whose values nest so deeply inside one another that a request would
 yield over a million overlapping matches is refused (`mapping_known_values_overlap`) rather
 than searched in part. Identifiers outside the
 message content are masked too — OpenAI's `user` and per-message `name`, Anthropic's

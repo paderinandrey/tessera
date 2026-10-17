@@ -456,6 +456,7 @@ struct State {
     types: BTreeMap<String, usize>,
     redacted: usize,
     forwarded: usize,
+    unremembered: usize,
     upstream: bool,
     outcome: Option<(&'static str, u16, Option<&'static str>)>,
 }
@@ -631,6 +632,10 @@ impl Record {
         });
     }
 
+    pub fn unremembered(&self, count: usize) {
+        self.with(|state| state.unremembered = count);
+    }
+
     pub fn streaming(&self) {
         self.with(|state| state.stream = true);
     }
@@ -655,6 +660,7 @@ impl Record {
                 "types": state.types,
                 "redacted": state.redacted,
                 "forwarded": state.forwarded,
+                "unremembered": state.unremembered,
             })
             .to_string()
         });

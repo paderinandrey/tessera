@@ -15,7 +15,7 @@ group the fields for reading; on disk each line serializes its keys in
 alphabetical order, which nothing depends on.
 
 ```json
-{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"documents":2,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0,"forwarded":0}
+{"ts":"2026-08-11T09:14:22.418Z","event":"masked","request":"7f3a9c1e04b25d68","provider":"anthropic","route":"/v1/messages","tenant":"a41f9c02…","session":"3bd7e105…","stream":true,"texts":4,"documents":2,"spans":9,"types":{"PERSON":2,"IBAN":1,"HEALTH":1},"redacted":0,"forwarded":0,"unremembered":0}
 {"ts":"2026-08-11T09:14:37.902Z","event":"outcome","request":"7f3a9c1e04b25d68","tenant":"a41f9c02…","session":"3bd7e105…","upstream":true,"status":200,"result":"completed","error":null,"ms":15484}
 ```
 
@@ -87,6 +87,13 @@ redacted: 0` for a request in which the provider received `[PERSON_1]` as well
 as the digits. A span lands in exactly one leaf and a leaf is masked or
 forwarded whole, so an occurrence has exactly one fate and the three numbers
 account for the line.
+
+`unremembered` counts the values this request issued that its session did not
+keep, because the session already held `max_session_values` of them. Such a value
+was masked in this request; what it lost is the next turn's protection, where a
+reappearance is masked only if the detector finds it again. It is `0` on a
+request without a session, which remembers nothing by design, and once a session
+is full every later request that issues anything new says so.
 
 Both counts describe *this* request. Two turns of a session carrying identical
 traffic write identical lines, and what the session bought across them — the
