@@ -1055,6 +1055,7 @@ async fn handle(
             )
             .await?;
             record.detected(found);
+            record.unremembered(guard.unkept(&work, state.sessions.max_values()));
             // Durable before anything leaves the perimeter, and before the
             // session commits: this is the last expression that can refuse the
             // request, and a request that never left must leave the session
@@ -6777,6 +6778,7 @@ mod tests {
         "types",
         "redacted",
         "forwarded",
+        "unremembered",
     ];
 
     const OUTCOME_FIELDS: &[&str] = &[
@@ -7147,8 +7149,8 @@ mod tests {
                 max_sessions: 8,
                 max_values: 1,
             },
-        )
-        .0;
+        );
+        let (state, _dir, path) = state;
 
         let (status, body) = call_with_headers(
             Arc::clone(&state),
@@ -7174,6 +7176,30 @@ mod tests {
             .unwrap()
             .session;
         assert_eq!(session.mapping.lock().await.len(), 1);
+        drop(session);
+
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber und Meier"}]}),
+            &session_headers("Bearer k1", "conv-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let (status, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber und Meier"}]}),
+            &session_headers("Bearer k1", "conv-2"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let unremembered: Vec<Value> = journal(&path)
+            .into_iter()
+            .filter(|line| line["event"] == "masked")
+            .map(|line| line["unremembered"].clone())
+            .collect();
+        assert_eq!(unremembered, [json!(1), json!(1), json!(1)]);
     }
 
     #[tokio::test]

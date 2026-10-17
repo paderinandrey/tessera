@@ -1271,6 +1271,18 @@ impl Mapping {
     /// The counter moves past pairs that were declined. A number that already
     /// named somebody in a request that reached the provider must never be
     /// issued to a second value, or a later response restores the wrong name.
+    pub fn unkept(&self, other: &Mapping, cap: usize) -> usize {
+        let fresh = other
+            .order
+            .iter()
+            .filter(|placeholder| {
+                !self.by_placeholder.contains_key(*placeholder)
+                    && other.by_placeholder.contains_key(*placeholder)
+            })
+            .count();
+        fresh.saturating_sub(cap.saturating_sub(self.order.len()))
+    }
+
     pub fn absorb(&mut self, other: &Mapping, cap: usize) {
         for placeholder in &other.order {
             if self.by_placeholder.contains_key(placeholder) {
@@ -5398,8 +5410,12 @@ mod tests {
             &[span("PERSON", 0, 5), span("PERSON", 10, 15)],
         )
         .unwrap();
+        assert_eq!(session.unkept(&work, 1), 1);
+        assert_eq!(session.unkept(&work, 2), 0);
         session.absorb(&work, 1);
         assert_eq!(session.len(), 1);
+        assert_eq!(session.unkept(&work, 1), 1);
+        assert_eq!(session.unkept(&work, 2), 0);
         assert_eq!(session.restore("[PERSON_1]").unwrap(), "Weber");
         assert!(session.restore("[PERSON_2]").is_err());
     }
