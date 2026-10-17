@@ -49,7 +49,9 @@ detections and one call, so these are not a count of the detector's traffic.
 named them, and `spans` counts occurrences; the gap between them is a value
 found more than once under the same name within the same request, not anything
 a session did — detection runs over every text on every request whether or not
-one is attached.
+one is attached. A value the session already issued is masked again where the
+detector misses it, and that occurrence is not counted here: these two fields
+describe the detector's findings, not everything that was masked.
 A type name the detector reports that is not one of the twenty-two this gateway
 declares is counted under `unvalidated` rather than written out, since the name
 arrived from outside the perimeter and a name is a place a value can hide.
@@ -62,7 +64,10 @@ counts — is in exactly one of three states, and two of them are counted.
 does **not** carry the detector's name for them: usually because the type was
 not one this gateway declares, so the value went up as `[REDACTED_n]`, and also
 when the value was already carrying a placeholder issued for another type,
-whether earlier in this request or in an earlier turn of the session.
+whether earlier in this request or in an earlier turn of the session. A finding
+inside a longer value the session already knew went up as part of that value,
+so it is judged by that value's placeholder: `Martina` found as `PERSON` inside
+a known `Martina Weber` is not counted here, and found as `ORG` it is.
 `forwarded` counts the occurrences the provider received verbatim: a span on a
 numeric leaf of a tool document, which this gateway deliberately does not mask,
 because a placeholder there would change the field from a number to a string.
@@ -96,7 +101,7 @@ gateway produced did not resolve in a body it had already walked),
 `mapping_lossy_document` (a document the provider sent that cannot be restored
 without changing something else in it — a member dropped, a key renamed, a
 number rounded — refused rather than served changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
-`mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
+`mapping_too_deep`, `mapping_too_large`, `mapping_known_values_overlap`, `tool_too_large`,
 `tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
 `session_disabled`, `session_no_credential`, `caller_not_served` and
 `mapping_literal_already_issued` are the caller's. `caller_not_served` means the

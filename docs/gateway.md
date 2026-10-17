@@ -18,7 +18,20 @@ It accepts the OpenAI shape at `/v1/chat/completions` and the Anthropic shape at
 `/v1/messages`, including Anthropic's separate `system` field and both providers'
 content-part arrays. Detected spans become typed placeholders — `[PERSON_1]`, `[IBAN_2]` —
 and an identical value always gets the same placeholder within a request, because two
-placeholders for one person would tell the model there were two. Identifiers outside the
+placeholders for one person would tell the model there were two. **Within a session, a value
+an earlier turn already masked is masked again wherever it reappears as a whole word**, even
+where the detector does not find it this time: the gateway restores a model's reply in full,
+clients echo replies back as history, and the detector reads the echo in a context it has
+never seen. A live agent run sent `ver.di` up that way — masked in the tool result, restored
+into the model's reasoning, echoed, and missed in the new sentence. A known value that
+contains the spans the detector found there replaces them, so `Martina` detected inside a
+known `Martina Weber` does not leave ` Weber` behind; one that only crosses a detected span
+yields to it. A value inside a longer word (`Weber` in `Weberstrasse`) is left alone, and in
+a JSON document only a leaf's own value is searched, never the member name shown to the
+detector beside it. The journal still counts what the detector found, not what the session
+recognised. A session whose values nest so deeply inside one another that a request would
+yield over a million overlapping matches is refused (`mapping_known_values_overlap`) rather
+than searched in part. Identifiers outside the
 message content are masked too — OpenAI's `user` and per-message `name`, Anthropic's
 `metadata.user_id`. The response is restored before it reaches the client, and an upstream
 error keeps its own status and body so a rate limit still reads as a rate limit.

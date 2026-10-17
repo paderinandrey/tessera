@@ -79,6 +79,7 @@ impl ProxyError {
             | ProxyError::Shape(ShapeError::MalformedDocument(_, _))
             | ProxyError::Mapping(MappingError::TooDeep)
             | ProxyError::Mapping(MappingError::TooLarge)
+            | ProxyError::Mapping(MappingError::KnownValuesOverlap)
             | ProxyError::Mapping(MappingError::LiteralAlreadyIssued(_))
             | ProxyError::Session(SessionError::BadId)
             | ProxyError::Session(SessionError::Disabled)
@@ -172,6 +173,7 @@ impl ProxyError {
             ProxyError::Mapping(MappingError::BadSpan(_)) => "mapping_bad_span",
             ProxyError::Mapping(MappingError::TooDeep) => "mapping_too_deep",
             ProxyError::Mapping(MappingError::TooLarge) => "mapping_too_large",
+            ProxyError::Mapping(MappingError::KnownValuesOverlap) => "mapping_known_values_overlap",
             ProxyError::Mapping(MappingError::LiteralAlreadyIssued(_)) => {
                 "mapping_literal_already_issued"
             }
@@ -333,6 +335,37 @@ fn count_occurrences(text: &str, spans: &[Span], found: &mut HashMap<(String, St
     }
 }
 
+fn count_covered(
+    text: &str,
+    detected: &[Span],
+    masked: &[Span],
+    covered: &mut HashMap<(String, String), HashMap<String, usize>>,
+) {
+    if detected.is_empty() {
+        return;
+    }
+    let characters: Vec<char> = text.chars().collect();
+    for span in detected {
+        let index = masked.partition_point(|cover| cover.start <= span.start);
+        let Some(cover) = index.checked_sub(1).map(|index| &masked[index]) else {
+            continue;
+        };
+        if (cover.start, cover.end) == (span.start, span.end) || cover.end < span.end {
+            continue;
+        }
+        if let (Some(value), Some(covering)) = (
+            characters.get(span.start..span.end),
+            characters.get(cover.start..cover.end),
+        ) {
+            *covered
+                .entry((span.entity_type.clone(), value.iter().collect()))
+                .or_default()
+                .entry(covering.iter().collect())
+                .or_default() += 1;
+        }
+    }
+}
+
 /// Detect and mask every text the provider pointed at, and report what was
 /// found and what became of it. Shared by both branches of `handle`: inline it
 /// would exist twice and diverge at the first edit.
@@ -407,6 +440,7 @@ async fn mask_all(
     // subtractable: what this map does not hold of a finding's occurrences is
     // exactly what was masked.
     let mut forwarded: HashMap<(String, String), usize> = HashMap::new();
+    let mut covered: HashMap<(String, String), HashMap<String, usize>> = HashMap::new();
     // What this request asked a detection for, which is not the same as what
     // the request holds: a `Slot::Json` asks one detection however many leaves
     // it has, and asks none at all when it has none.
@@ -498,10 +532,13 @@ async fn mask_all(
         match slot {
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(body, pointer)?;
-                let spans = detector.detect(&text, credential).await?;
+                let detected = detector.detect(&text, credential).await?;
+                mapping::check_spans(&text, &detected)?;
                 texts += 1;
-                total += spans.len();
-                count_occurrences(&text, &spans, &mut found);
+                total += detected.len();
+                count_occurrences(&text, &detected, &mut found);
+                let spans = mapping.with_known_values(&text, detected.clone(), |_, _| true)?;
+                count_covered(&text, &detected, &spans, &mut covered);
                 write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
             }
             // A document's string leaves are detected one at a time and put
@@ -550,17 +587,23 @@ async fn mask_all(
                 // boundary, refused as `BadSpan("across a joined boundary")` —
                 // the same mechanism as between two strings, and no new
                 // variant.
-                let per_leaf = if let Some(joined) = joined {
-                    let spans = detector.detect(joined.text(), credential).await?;
+                let (per_leaf, detected_per_leaf) = if let Some(joined) = joined {
+                    let detected = detector.detect(joined.text(), credential).await?;
+                    mapping::check_spans(joined.text(), &detected)?;
+                    let detected_per_leaf = joined.split(&detected)?;
+                    let spans =
+                        mapping.with_known_values(joined.text(), detected, |start, end| {
+                            joined.within_a_leaf(start, end)
+                        })?;
                     documents += 1;
                     // Bounds and ordering checked against the text the detector
                     // actually saw, where "past the end" still means something.
                     // After rebasing, an out-of-range span could land plausibly
                     // inside the wrong leaf.
                     mapping::check_spans(joined.text(), &spans)?;
-                    joined.split(&spans)?
+                    (joined.split(&spans)?, detected_per_leaf)
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
                 // `split` returns one entry per leaf of either kind, so this
                 // and the loop below line up with `leaves` position for
@@ -586,7 +629,7 @@ async fn mask_all(
                         "the detector's spans were split across a different number of leaves",
                     )));
                 }
-                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                for (leaf, spans) in leaves.iter().zip(&detected_per_leaf) {
                     let value = match leaf {
                         mapping::Leaf::Text(text) => text,
                         mapping::Leaf::Number(number) => number,
@@ -679,11 +722,13 @@ async fn mask_all(
                 // `?`, so those placeholders would in fact be discarded — but
                 // this check is also strictly cheaper than reaching the same
                 // answer later, and it does not depend on that being true.
-                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                for ((leaf, spans), masked_spans) in
+                    leaves.iter().zip(&detected_per_leaf).zip(&per_leaf)
+                {
                     let mapping::Leaf::Number(number) = leaf else {
                         continue;
                     };
-                    if spans.iter().any(|span| {
+                    if spans.iter().chain(masked_spans).any(|span| {
                         let entity_type = span.entity_type.as_str();
                         !mapping::ENTITY_TYPES.contains(&entity_type)
                             || mapping::DETERMINISTIC_TYPES.contains(&entity_type)
@@ -715,11 +760,14 @@ async fn mask_all(
                     }
                 }
                 let mut replacements = Vec::new();
-                for (leaf, spans) in leaves.iter().zip(&per_leaf) {
+                for ((leaf, spans), detected) in
+                    leaves.iter().zip(&per_leaf).zip(&detected_per_leaf)
+                {
                     // The number's own entry is dropped: the rebuild copies it
                     // through untouched, and `replace_text_leaves` asks for a
                     // replacement per *text* leaf.
                     if let mapping::Leaf::Text(text) = leaf {
+                        count_covered(text, detected, spans, &mut covered);
                         replacements.push(mapping.mask(text, spans)?);
                     }
                 }
@@ -780,8 +828,16 @@ async fn mask_all(
         // under-report `redacted` rather than panic on an evidence line, and
         // `a_line_accounts_for_every_span_it_reports` is what would notice.
         let masked_here = occurrences.saturating_sub(verbatim);
-        if masked_here > 0 && !mapping.named_as(value, entity_type) {
-            redacted += masked_here;
+        let mut inside_known = 0usize;
+        for (covering, count) in covered.get(finding).into_iter().flatten() {
+            inside_known += count;
+            if !mapping.named_as(covering, entity_type) {
+                redacted += count;
+            }
+        }
+        let masked_alone = masked_here.saturating_sub(inside_known);
+        if masked_alone > 0 && !mapping.named_as(value, entity_type) {
+            redacted += masked_alone;
         }
     }
     if mapping.redacted_count() > 0 {
@@ -1585,6 +1641,10 @@ mod tests {
         );
         assert_eq!(
             ProxyError::Mapping(MappingError::TooLarge).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ProxyError::Mapping(MappingError::KnownValuesOverlap).status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -2669,6 +2729,300 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_value_the_session_issued_is_masked_when_detection_misses_it_on_the_echo() {
+        let detector = detector_finding("Mitglied bei ver.di", "ver.di", &["deterministic"]).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant",
+                "content": "ok", "reasoning": "Die Datei nennt [PERSON_1]."}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+        let ask = json!({"role": "user", "content": "Mitglied bei ver.di"});
+        let (status, first) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let reply: Value = serde_json::from_str(&first).unwrap();
+        let echoed = reply["choices"][0]["message"].clone();
+        assert_eq!(echoed["reasoning"], "Die Datei nennt ver.di.");
+
+        let (status, second) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask, echoed,
+                   {"role": "user", "content": "und ver.di?"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let received = upstream.received_requests().await.unwrap();
+        let egress = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(
+            !egress.contains("ver.di"),
+            "a known value went up: {egress}"
+        );
+        assert_eq!(egress.matches("[PERSON_1]").count(), 3, "{egress}");
+
+        let (status, third) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask,
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "send", "arguments": "{\"to\":\"ver.di\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "sent"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{third}");
+        let received = upstream.received_requests().await.unwrap();
+        let egress = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(
+            !egress.contains("ver.di"),
+            "a known value went up in a document: {egress}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_journal_counts_what_the_detector_found_and_not_what_the_session_knew() {
+        let detector = detector_finding("Kunde Weber.", "Weber", &["deterministic"]).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let headers = session_headers("Bearer k1", "conv-1");
+        for text in ["Kunde Weber.", "Weber again"] {
+            let (status, body) = call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": [{"role": "user", "content": text}]}),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let egress = upstream.received_requests().await.unwrap();
+        let second = String::from_utf8_lossy(&egress[1].body).into_owned();
+        assert!(second.contains("[PERSON_1] again"), "{second}");
+        let masked: Vec<Value> = journal(&path)
+            .into_iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked[0]["spans"], 1);
+        assert_eq!(masked[1]["spans"], 0, "{:?}", masked[1]);
+        assert_eq!(masked[1]["types"], json!({}), "{:?}", masked[1]);
+
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"to\":\"Weber\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let egress = upstream.received_requests().await.unwrap();
+        let third = String::from_utf8_lossy(&egress[2].body).into_owned();
+        assert!(!third.contains("Weber"), "{third}");
+        let masked: Vec<Value> = journal(&path)
+            .into_iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked[2]["spans"], 0, "{:?}", masked[2]);
+    }
+
+    #[tokio::test]
+    async fn a_finding_inside_a_known_value_is_journalled_under_the_name_that_covered_it() {
+        let rules: &[(&str, &str, &str)] = &[
+            ("Kunde Martina Weber.", "Martina Weber", "PERSON"),
+            ("Martina Weber schreibt", "Martina", "PERSON"),
+            ("Martina Weber ruft", "Martina", "ORG"),
+        ];
+        let detector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let text = body["text"].as_str().unwrap();
+                let mut spans = Vec::new();
+                for (context, value, entity_type) in rules {
+                    let inner = context[..context.find(value).unwrap()].chars().count();
+                    for (at, _) in text.match_indices(context) {
+                        let start = text[..at].chars().count() + inner;
+                        spans.push(json!({"entity_type": entity_type, "start": start,
+                            "end": start + value.chars().count(), "confidence": 1.0,
+                            "recognizer": "ner:fake", "tier": 2, "boosted": false}));
+                    }
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": spans, "layers_run": ["ner"]}))
+            })
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let headers = session_headers("Bearer k1", "conv-1");
+        let tool_turn = |arguments: &str| {
+            json!([{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": arguments}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}])
+        };
+        for messages in [
+            json!([{"role": "user", "content": "Kunde Martina Weber."}]),
+            json!([{"role": "user", "content": "Martina Weber schreibt"}]),
+            json!([{"role": "user", "content": "Martina Weber ruft an"}]),
+            tool_turn("{\"to\":\"Martina Weber schreibt\"}"),
+        ] {
+            let (status, body) = call_with_headers(
+                Arc::clone(&state),
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": messages}),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let egress = upstream.received_requests().await.unwrap();
+        for request in &egress[1..] {
+            let sent = String::from_utf8_lossy(&request.body).into_owned();
+            assert!(
+                !sent.contains("Martina") && !sent.contains("Weber"),
+                "{sent}"
+            );
+        }
+        let masked: Vec<Value> = journal(&path)
+            .into_iter()
+            .filter(|line| line["event"] == "masked")
+            .collect();
+        assert_eq!(masked[1]["types"], json!({"PERSON": 1}), "{:?}", masked[1]);
+        assert_eq!(masked[1]["redacted"], 0, "{:?}", masked[1]);
+        assert_eq!(masked[2]["types"], json!({"ORG": 1}), "{:?}", masked[2]);
+        assert_eq!(masked[2]["redacted"], 1, "{:?}", masked[2]);
+        assert_eq!(masked[3]["types"], json!({"PERSON": 1}), "{:?}", masked[3]);
+        assert_eq!(masked[3]["redacted"], 0, "{:?}", masked[3]);
+    }
+
+    #[tokio::test]
+    async fn a_known_value_is_not_found_in_the_member_name_a_join_shows_the_detector() {
+        let detector = detector_finding("Kunde name: Bob.", "name: Bob", &["deterministic"]).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+        let ask = json!({"role": "user", "content": "Kunde name: Bob."});
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [ask,
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"name\":\"Bob\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let received = upstream.received_requests().await.unwrap();
+        let egress = String::from_utf8_lossy(&received.last().unwrap().body).into_owned();
+        assert!(
+            egress.contains(r#"{\"name\":\"Bob\"}"#),
+            "a value that never reappeared was masked: {egress}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_number_the_detector_calls_a_card_refuses_even_when_the_session_knew_it_as_a_name() {
+        let detector = MockServer::start().await;
+        let found = |entity_type: &str, start: usize| {
+            ResponseTemplate::new(200).set_body_json(json!({"spans": [
+                {"entity_type": entity_type, "start": start, "end": start + 16,
+                 "confidence": 1.0, "recognizer": "fake", "tier": 1, "boosted": false}],
+                "layers_run": ["deterministic"]}))
+        };
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains("Kunde"))
+            .respond_with(found("PERSON", 6))
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .and(wiremock::matchers::body_string_contains(
+                "card: 4111111111111111",
+            ))
+            .respond_with(found("CREDIT_CARD", 6))
+            .mount(&detector)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"spans": [], "layers_run": ["deterministic"]})),
+            )
+            .mount(&detector)
+            .await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let state = state(&detector, &upstream);
+        let headers = session_headers("Bearer k1", "conv-1");
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "Kunde 4111111111111111."}]}),
+            &headers,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"card\":4111111111111111}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+            &headers,
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -9058,6 +9412,7 @@ mod tests {
             ProxyError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
             ProxyError::Mapping(MappingError::TooDeep).audit_class(),
             ProxyError::Mapping(MappingError::TooLarge).audit_class(),
+            ProxyError::Mapping(MappingError::KnownValuesOverlap).audit_class(),
             ProxyError::Mapping(MappingError::LiteralAlreadyIssued("[PERSON_1]".to_owned()))
                 .audit_class(),
             ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
