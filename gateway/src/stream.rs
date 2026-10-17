@@ -104,6 +104,7 @@ impl StreamError {
             // happened is that restoring the document would have dropped a
             // member or renamed a key, so the class says that.
             StreamError::Mapping(MappingError::Unrestorable(_)) => "stream_lossy_document",
+            StreamError::Mapping(MappingError::UnsafePlace(_)) => "stream_unsafe_place",
             StreamError::Shape(ShapeError::Request(_)) => "stream_shape_request",
             StreamError::Shape(ShapeError::Response(_)) => "stream_shape_response",
             StreamError::Shape(ShapeError::Pointer(_)) => "stream_shape_pointer",
@@ -1256,6 +1257,7 @@ mod audit_class_tests {
                 .audit_class(),
             StreamError::Mapping(MappingError::Unrestorable("two members of the same name"))
                 .audit_class(),
+            StreamError::Mapping(MappingError::UnsafePlace("a backtick")).audit_class(),
             StreamError::Shape(ShapeError::Request("messages")).audit_class(),
             StreamError::Shape(ShapeError::Response("choices")).audit_class(),
             StreamError::Shape(ShapeError::Pointer("/a".to_owned())).audit_class(),
@@ -2745,7 +2747,7 @@ mod buffer_tests {
         let error = buffer
             .push(r#"{"name":"[PERSON_1]"}"#)
             .expect_err("a non-inert value inside an opened structure must not be substituted");
-        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+        assert!(matches!(error, MappingError::UnsafePlace(_)), "{error:?}");
     }
 
     #[test]
@@ -2759,7 +2761,7 @@ mod buffer_tests {
         let error = buffer
             .push(r#""[PERSON_1]"}"#)
             .expect_err("the container opened two fragments ago still encloses this token");
-        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+        assert!(matches!(error, MappingError::UnsafePlace(_)), "{error:?}");
     }
 
     #[test]
@@ -2812,7 +2814,7 @@ mod buffer_tests {
         let error = buffer
             .push(r#"a {"b":1, "c": [PERSON_1]"#)
             .expect_err("a container opened earlier in the same run still encloses this token");
-        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+        assert!(matches!(error, MappingError::UnsafePlace(_)), "{error:?}");
     }
 
     #[test]
@@ -2938,7 +2940,7 @@ mod buffer_tests {
         let error = buffer
             .push("[ORG_1] then [PERSON_2]")
             .expect_err("the first value opened the structure the second is written into");
-        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+        assert!(matches!(error, MappingError::UnsafePlace(_)), "{error:?}");
 
         // And without that first value it is prose, which is what keeps this
         // about the opener rather than about the second value.
@@ -2959,7 +2961,7 @@ mod buffer_tests {
         let error = buffer
             .push(r#""[PERSON_1]""#)
             .expect_err("an unbalanced quote puts the token inside a string");
-        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+        assert!(matches!(error, MappingError::UnsafePlace(_)), "{error:?}");
 
         // And a *balanced* one does not: prose that quoted something earlier is
         // still prose, and this is where the rule stops.
@@ -2979,7 +2981,7 @@ mod buffer_tests {
         let error = buffer
             .push("{/* [ORG_1] */ safe:true}")
             .expect_err("the value closes the comment it was substituted into");
-        assert!(matches!(error, MappingError::Unrestorable(_)), "{error:?}");
+        assert!(matches!(error, MappingError::UnsafePlace(_)), "{error:?}");
 
         // The two characters apart are not the hazard, and refusing them would
         // refuse every German tax number and half the company names.
@@ -3257,7 +3259,7 @@ mod buffer_tests {
                 carrier: "{mail:[EMAIL_1]}",
                 values: &[("uschihiller@example.org", "EMAIL")],
                 refuses: true,
-                why: "the same, and it is the cost #69 is open about",
+                why: "the same; only a JSON declaration recovers it at a bare position",
             },
             Case {
                 carrier: "``[ORG_1]``",
@@ -3614,7 +3616,7 @@ mod buffer_tests {
 
         // Collateral, not a decision: U+2019 closes nothing in any parser and
         // is refused anyway, because the bare rule is a list of what is known
-        // safe. #69 carries this and the fence's own language tag.
+        // safe. Undeclared it stays refused; a `markdown` declaration admits it.
         let typographic = mapped_to(&[("O\u{2019}Brien", "PERSON")]);
         let mut buffer = RestoreBuffer::new(&typographic);
         assert!(buffer.push("```\n[PERSON_1]\n").is_err());
@@ -3952,7 +3954,8 @@ mod buffer_tests {
         // So 14 of 196 again, in both places: every EMAIL on the `@`, both
         // DE_STEUERNUMMER on the `/`, four German company forms on the `&`.
         // Two entity types refused outright, which is a format and not a hard
-        // case within one. #69 is open about it.
+        // case within one. Undeclared that is still the price; a `markdown`
+        // declaration recovers all of it in a region (#69).
         // **The members, not the counts** — and this was a count in the first
         // version, one line below a comment explaining why counts are the wrong
         // shape. Raised in review of #79. Two places admitting a different four
@@ -4055,6 +4058,88 @@ mod buffer_tests {
                 .filter(|(_, v)| v.contains('\'') || v.contains('\u{2019}'))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_markdown_declaration_restores_every_corpus_value_in_a_code_region_and_nothing_else() {
+        let corpus = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../evaluation/corpus/public.jsonl"
+        ));
+        let mut widened_elsewhere = Vec::new();
+        for line in corpus.lines() {
+            let document: serde_json::Value = serde_json::from_str(line).unwrap();
+            let text: Vec<char> = document["text"].as_str().unwrap().chars().collect();
+            for entity in document["entities"].as_array().unwrap() {
+                let kind = entity["entity_type"].as_str().unwrap().to_string();
+                let start = entity["start"].as_u64().unwrap() as usize;
+                let end = entity["end"].as_u64().unwrap() as usize;
+                let value: String = text[start..end].iter().collect();
+                let mapping = mapped_to(&[(&value, &kind)]);
+                for (carrier, restored) in [
+                    (format!("an `[{kind}_1]` x"), format!("an `{value}` x")),
+                    (
+                        format!("```yaml\nname: [{kind}_1]\n```\n"),
+                        format!("```yaml\nname: {value}\n```\n"),
+                    ),
+                ] {
+                    let mut buffer =
+                        RestoreBuffer::declaring(&mapping, crate::mapping::ClientFormat::Markdown);
+                    let out = buffer.push(&carrier).unwrap() + &buffer.finish().unwrap();
+                    assert_eq!(out, restored);
+                }
+                let container = format!("{{value:[{kind}_1]}}");
+                let strict = RestoreBuffer::new(&mapping).push(&container).is_err();
+                let markdown =
+                    RestoreBuffer::declaring(&mapping, crate::mapping::ClientFormat::Markdown)
+                        .push(&container)
+                        .is_err();
+                if strict != markdown {
+                    widened_elsewhere.push(value);
+                }
+            }
+        }
+        assert_eq!(widened_elsewhere, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_markdown_declaration_restores_the_live_address_in_a_code_span() {
+        let mail = mapped_to(&[("martina.weber@example.org", "EMAIL")]);
+        let carrier = "an die Adresse `[EMAIL_1]` eine Erinnerung";
+        let mut strict = RestoreBuffer::new(&mail);
+        assert!(matches!(
+            strict.push(carrier),
+            Err(MappingError::UnsafePlace(_))
+        ));
+        let mut buffer = RestoreBuffer::declaring(&mail, crate::mapping::ClientFormat::Markdown);
+        let out = buffer.push(carrier).unwrap() + &buffer.finish().unwrap();
+        assert_eq!(
+            out,
+            "an die Adresse `martina.weber@example.org` eine Erinnerung"
+        );
+    }
+
+    #[test]
+    fn a_markdown_declaration_refuses_a_value_that_could_end_its_code_region() {
+        for value in ["a`b", "a\nb", "a\rb", "a\u{2028}b", "a\tb"] {
+            let mapping = mapped_to(&[(value, "ORG")]);
+            for carrier in ["x `[ORG_1]` y", "```\n[ORG_1]\n"] {
+                let mut buffer =
+                    RestoreBuffer::declaring(&mapping, crate::mapping::ClientFormat::Markdown);
+                assert!(
+                    matches!(buffer.push(carrier), Err(MappingError::UnsafePlace(_))),
+                    "{value:?} in {carrier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_markdown_declaration_leaves_prose_as_lenient_as_undeclared() {
+        let irish = mapped_to(&[("O'Brien, admin", "PERSON")]);
+        let mut buffer = RestoreBuffer::declaring(&irish, crate::mapping::ClientFormat::Markdown);
+        let out = buffer.push("Kunde [PERSON_1] ruft an").unwrap() + &buffer.finish().unwrap();
+        assert_eq!(out, "Kunde O'Brien, admin ruft an");
     }
 
     #[test]
@@ -4318,8 +4403,14 @@ mod buffer_tests {
                 "{value:?}"
             );
         }
-        assert!(ClientFormat::Json.is_declared() && ClientFormat::Json5.is_declared());
-        assert!(!ClientFormat::Unknown.is_declared());
+        assert!(ClientFormat::Json.is_json_family() && ClientFormat::Json5.is_json_family());
+        assert!(!ClientFormat::Unknown.is_json_family());
+        assert!(!ClientFormat::Markdown.is_json_family());
+        assert!(ClientFormat::Markdown.separators_end_a_string());
+        assert_eq!(
+            ClientFormat::configured(Some(" Markdown ")),
+            ClientFormat::Markdown
+        );
         assert!(!ClientFormat::Json.separators_end_a_string());
         assert!(ClientFormat::Json5.separators_end_a_string());
         assert!(ClientFormat::Unknown.separators_end_a_string());

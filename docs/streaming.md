@@ -8,7 +8,7 @@ A streamed response is restored into text that has already gone past, so a value
 assistant's content as JSON.**
 
 ```toml
-response_format = "json"        # or json5, or jsonc
+response_format = "json"        # or json5, jsonc, or markdown
 ```
 
 On the streamed path a value has to be substituted into text that has already
@@ -22,7 +22,8 @@ cannot be restored means the response is refused rather than served corrupted.
 
 Declaring one of them says a JSON-family parser reads the content, where `@`,
 `&` and `/` cannot act, and those values are restored. It changes nothing in a
-markdown code fence or a comment, whose language nobody has spoken for.
+markdown code fence or a comment, whose language nobody has spoken for; `markdown`
+below is the declaration that speaks for code regions.
 
 **Inside a string it changes one thing, and only for `json5`.** A string ends
 at a raw C0 control for every reader here — JSON forbids U+0000–U+001F
@@ -56,6 +57,35 @@ knows what parses these responses, and the only one who cannot be a stranger.
 
 An unrecognised value is the strict rule rather than an error, so a typo costs
 restorations rather than a guarantee.
+
+### `markdown`: a person reads the reply
+
+```toml
+response_format = "markdown"
+```
+
+**Declare this when a Markdown renderer shows the content to a person and no
+parser reads it as data**, which is the ordinary chat interface. Models put
+addresses, identifiers and names in backticks as a matter of course, and
+undeclared, a value inside `` `…` `` or a ```` ``` ```` fence takes the bare
+rule, because nobody has said which language the region holds. A live agent run
+lost its whole reply that way: ``an die Adresse `[EMAIL_4]` `` was refused.
+
+Declared, a renderer shows a code region literally, so the only way a value
+could change anything is by ending the region. A value there is refused only if
+it carries a backtick, a line break or another control character. Every e-mail
+address, tax number, company form and apostrophe name in the evaluation corpus
+is then restored in a code span and in a fence.
+
+**It widens code regions and nothing else.** A bare position inside braces, a
+comment and a quoted string keep the rules they have undeclared, and prose
+outside them stays as lenient as undeclared prose. It does not tighten prose the
+way `json` does, because it says the content is not a document.
+
+The same warning applies as for `json`, in the other direction. If anything in
+your pipeline parses the content (a tool runner that executes fenced blocks, a
+client that reads JSON out of the reply), do not declare `markdown`: in a fence
+it lets through `'`, `&` and `@`, which a YAML or shell reader acts on.
 
 ## How a stream is restored
 
@@ -159,7 +189,8 @@ differs by place because the ways out do:
   inside `` `…` `` opened a string that is not one and a value carrying backticks injected
   members a backtick-aware repairing parser reads. Both were measured; whichever reading is
   right, a value that can act structurally can act, so the region takes word characters only
-  and closes on the next backtick;
+  and closes on the next backtick. Under `response_format = "markdown"` it refuses only a value
+  carrying a backtick, a line break or another control character;
 - **inside a comment** — `*` or `/`, since a value ending `*` before a carrier `/` is the
   same escape as `*/` in the value itself;
 - **in a bare position** — inside a container but outside any string, only alphanumerics and

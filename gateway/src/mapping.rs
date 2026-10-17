@@ -149,6 +149,12 @@ pub enum MappingError {
              corrupted or with a placeholder in it"
     )]
     Unrestorable(&'static str),
+    #[error(
+        "a value cannot be restored where the upstream put it in a streamed response ({0}); \
+             the response is refused rather than served with a value that could change what \
+             surrounds it"
+    )]
+    UnsafePlace(&'static str),
 }
 
 /// The longest entity type that can be written as a placeholder.
@@ -308,6 +314,9 @@ pub enum ClientFormat {
     /// string additionally ends at U+2028 or U+2029, because those are line
     /// terminators to such a reader.
     Json5,
+    /// A person reads the content through a Markdown renderer, and no parser
+    /// reads it as data.
+    Markdown,
 }
 
 impl ClientFormat {
@@ -336,8 +345,8 @@ impl ClientFormat {
     /// Every rule that widens or tightens on a declaration asks this. Only the
     /// string-break set asks *which* grammar, because that is the one place the
     /// two differ.
-    pub fn is_declared(self) -> bool {
-        !matches!(self, Self::Unknown)
+    pub fn is_json_family(self) -> bool {
+        matches!(self, Self::Json | Self::Json5)
     }
 
     /// Whether a string, for the declared reader, ends at a Unicode line
@@ -359,6 +368,7 @@ impl ClientFormat {
         {
             Some("json" | "jsonc") => Self::Json,
             Some("json5") => Self::Json5,
+            Some("markdown") => Self::Markdown,
             _ => Self::Unknown,
         }
     }
@@ -377,13 +387,16 @@ impl ClientFormat {
 /// Ordered by strictness, the rules are: bare (word characters only) ⊃
 /// JSON-family bare (`@`, `&`, a non-pairing `/`, and only under a declaration)
 /// ⊃ string (no delimiter, no backslash, no line separator, no control) ⊃ prose
-/// (nothing). **Two variants take a different rule under a declaration**, which
-/// is why the table has five rows for six variants. Checking each against
+/// (nothing), with the code-region rule (no backtick, no line break, no
+/// control, and only under `markdown`) beside them. **Three variants take a
+/// different rule under a declaration**, which is why the table has six rows
+/// for six variants. Checking each against
 /// that:
 ///
 /// | the lexer says | rule | where the parser could be instead | holds? |
 /// |---|---|---|---|
 /// | `Bare`, `Ticked`, `Block`, `Line` | bare | anywhere | yes — bare is strictest, so no place can be looser |
+/// | `Ticked`, under `markdown` | code region | in a code span or fence, which only a backtick run or a line ends, or in prose, whose rule is nothing | yes *only because the operator said no parser reads the content* |
 /// | `Bare`, under a declaration | JSON-family bare | anywhere **a JSON-family parser can be**, because the operator said so | yes *only because the operator said so* — see below |
 /// | `Text` | string | at depth 0 only, past a string a repairing parser ended at a line break | yes — that alternative is a top-level position, and a top level has no container to add a member to |
 /// | `Prose`, under a declaration | JSON-family bare | at the top level of the document the operator said this is, including one a repairing reader gave a brace the upstream omitted | yes — the declaration says there is no prose here to be lenient about |
@@ -469,11 +482,10 @@ enum Place {
     /// bare rule cannot admit it. That is the strict reading being right and
     /// still costing something.
     ///
-    /// Two things narrow it and neither is done here. A fence carries its
-    /// language — ```` ```json ```` says the place *is* JSON — and the
-    /// typographic apostrophe U+2019 closes nothing in any parser, so it is
-    /// collateral rather than a decision. Both are #69, because widening an
-    /// allowlist is a measurement and this is the third round on this file.
+    /// A fence's own ```` ```json ```` tag cannot narrow it, because the
+    /// upstream writes the tag (#78). An operator's `markdown` declaration
+    /// does (#69): a renderer shows the region literally, so only a value that
+    /// could end it is refused.
     Ticked(usize),
     /// Inside `/* … */`.
     Block,
@@ -691,7 +703,9 @@ impl StreamStructure {
             Place::Text(delimiter) => match character {
                 '\\' => self.escaped = true,
                 c if c == delimiter => self.place = self.outside(),
-                c if self.breaks_a_string(c) && (self.depth > 0 || self.format.is_declared()) => {
+                c if self.breaks_a_string(c)
+                    && (self.depth > 0 || self.format.is_json_family()) =>
+                {
                     // **Poisoned, not merely left.** Leaving the string was the
                     // #79 fix and it was half of one: it assumed the repairing
                     // parser *terminates* the string at the break. A repairing
@@ -879,7 +893,7 @@ impl StreamStructure {
             // declaration that widens a bare position — so a caller who asks
             // for the widening gets this tightening with it, which is the
             // honest shape of the trade.
-            Place::Prose if self.format.is_declared() && !self.poisoned => {
+            Place::Prose if self.format.is_json_family() && !self.poisoned => {
                 if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
                     None
                 } else {
@@ -967,15 +981,22 @@ impl StreamStructure {
             // being wrong about it costs the caller — which is the difference
             // between a signal and a claim.
             //
-            // Only a bare position widens. A backtick region, a comment and a
-            // poisoned state stay strict even under a declaration: the caller
+            // Only a bare position widens under a JSON declaration. A backtick
+            // region, a comment and a poisoned state stay strict there: the caller
             // said how it reads the *content*, not that every region inside it
             // is that format, and a comment may be one the parser is not in.
-            Place::Bare if self.format.is_declared() && !self.poisoned => {
+            Place::Bare if self.format.is_json_family() && !self.poisoned => {
                 if value.chars().all(json_bare_inert) && !opens_a_comment(value) {
                     None
                 } else {
                     Some("a value that could change the structure it was substituted into")
+                }
+            }
+            Place::Ticked(_) if self.format == ClientFormat::Markdown => {
+                if value.chars().any(ends_a_code_region) {
+                    Some("a value that could end the code span or fence it was substituted into")
+                } else {
+                    None
                 }
             }
             Place::Bare | Place::Ticked(_) | Place::Block | Place::Line => {
@@ -1565,7 +1586,7 @@ impl Mapping {
                         .ok_or_else(|| MappingError::Unknown(candidate.to_owned()))?;
 
                     if let Some(reason) = state.refuses(value) {
-                        return Err(MappingError::Unrestorable(reason));
+                        return Err(MappingError::UnsafePlace(reason));
                     }
                     // **The value's own brackets count — unless the value *is*
                     // the token.** Only text runs updated this at first, so a
@@ -2430,6 +2451,10 @@ fn word_characters_only(value: &str) -> Option<&'static str> {
     } else {
         Some("a value that could change the structure it was substituted into")
     }
+}
+
+fn ends_a_code_region(character: char) -> bool {
+    character == '`' || character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
 }
 
 /// Characters that cannot act inside a JSON string **on the buffered path**.
