@@ -199,8 +199,8 @@ gateway scans is forwarded unmasked* above — a claim about the way up, which t
 before this one are not. **Image and audio parts are forwarded untouched**, including a
 screenshot inside a tool result, which is the same exposure through a different field rather
 than a new one. Nothing here reads pixels, so a photograph of an identity document reaches the
-provider as the client sent it. And **the body level is not allowlisted at all** — see
-below, because that is the other half of the closed-allowlist claim.
+provider as the client sent it. The body level is allowlisted too, which is the other half of
+the closed-allowlist claim; see below.
 
 Tool traffic is masked now, streamed as well as buffered, so what it still refuses is worth
 stating on its own. A
@@ -222,7 +222,7 @@ blocks only. Each position now carries the set its provider publishes for it. `"
 Weber"}` were each admitted by a list and each reached the provider verbatim, under
 comments that stated the shapes correctly. **A field can also be admitted by not being
 refused**, which is the case the allowlist rule does not cover: `tool_choice` and OpenAI's
-`parallel_tool_calls` are body fields, and there is no allowlist at body level for them to
+`parallel_tool_calls` are body fields, and there was no allowlist at body level for them to
 be entries of, so they were admitted by absence from the denylists and read by nothing.
 Both are described now — each provider's published `tool_choice` shapes, and a boolean —
 with one exception stated plainly: OpenAI's newer `tool_choice: {"type": "allowed_tools",
@@ -236,17 +236,49 @@ addressed by nothing and forwarded. It is refused on every other role now, in th
 `if` that selects the allowlist, because a denylist entry would refuse the tool message the
 field belongs to.
 
-**That closure covers the tool structures and the messages, and the body level has no
-allowlist at all.** It is true of a tool definition, a tool call, a tool result, a content
-block and a message, where it was hard-won; it is false one level up. A body field this gateway
-describes no slot for travels to the provider exactly as the caller wrote it — verified for
-OpenAI's `response_format.json_schema.schema`, which is *the same artifact* as a tool's
-`parameters` (a client-authored JSON Schema whose `description`, `enum` and `default` are
-prose the model reads); `prediction.content`, the Predicted Outputs field editor clients
-fill with whole file contents; `metadata`; `stop`; a top-level `safety_identifier`; and
-Anthropic's `stop_sequences`. If you are deciding whether to point an agent at a customer
-folder: the prompt, the tool definitions, the tool arguments, the tool results and every
-field of a message are covered, and the request envelope around them is not.
+**A body field this gateway does not describe is refused.** The closure that covers tool
+definitions, calls, results, content blocks and messages covers the request body too. Each
+provider's published request fields are on a list, read from that provider's SDK: OpenAI's
+Chat Completions and Anthropic's Messages. Each entry says what makes admitting it safe:
+
+- **Shape-checked.** A number, a boolean or one of the provider's own strings is checked
+  as such.
+- **Forwarded as written.** `model`, Anthropic's `inference_geo`, `workspace_id` and
+  `diagnostics.previous_message_id`, OpenAI's `moderation.model`, and a structured-output
+  schema's `name` are strings the caller chose. They go out as written, as a tool's `name`
+  does.
+- **Masked.** `stop`, `stop_sequences`, every value of OpenAI's `metadata`, Anthropic's
+  `metadata.user_id`, `safety_identifier`, `prompt_cache_key` and `prediction.content`
+  are masked like message text. The JSON Schema in `response_format.json_schema` and in
+  Anthropic's `output_config.format` is masked by the same walk as a tool's `parameters`,
+  and counts against the tool bounds.
+
+A stop sequence masked to `[PERSON_1]` still ends the reply where the model writes that
+placeholder.
+
+Two published fields are refused unless null:
+- **OpenAI's `web_search_options`.** A search carries the caller's location, and its reply
+  carries citations this gateway refuses on the next turn.
+- **Anthropic's `container`.** It belongs to code execution, which this gateway does not
+  serve.
+
+A `response_format` type OpenAI does not publish is refused with or without `stream`.
+
+**Extensions of OpenAI-compatible providers are refused.** That covers OpenRouter's
+`provider`, `models`, `route`, `transforms`, `reasoning`, `usage` and `plugins`, the extra
+sampling fields of vLLM and similar servers, and Anthropic's beta-only fields. The gateway
+does not know what stands behind `openai_base`, and a field nothing describes is how every
+leak in this section happened. An extension can be added later, one at a time, with its
+shape checked.
+
+What is left:
+- `metadata` keys travel as written, as a tool's `name` does.
+- Anthropic's `temperature`, `top_k` and `top_p` are admitted as numbers, because older
+  clients still send them, although the current SDK no longer defines them.
+
+If you are deciding whether to point an agent at a customer folder: the prompt, the tool
+definitions, the tool arguments, the tool results, every field of a message and the request
+body around them are covered. Images and audio are not.
 
 **A message field this gateway does not describe is refused.** The message level was open
 until an agent run through OpenRouter showed what that cost: the provider returns the
