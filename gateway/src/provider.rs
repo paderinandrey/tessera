@@ -186,6 +186,8 @@ enum Position {
     System,
     /// A `tool_result` block's own `content`, reached by recursion.
     ToolResult,
+    /// OpenAI's `prediction.content`.
+    Prediction,
 }
 
 /// The block types a provider defines in a position, read from each provider's
@@ -229,6 +231,7 @@ fn admissible_block_types(provider: &str, position: Position) -> &'static [&'sta
         ("anthropic", Position::Message) => &ANTHROPIC_MESSAGE,
         ("anthropic", Position::System) => &ANTHROPIC_SYSTEM,
         ("anthropic", Position::ToolResult) => &ANTHROPIC_TOOL_RESULT,
+        ("openai", Position::Prediction) => &["text"],
         // OpenAI has neither a `system` content array nor a `tool_result`
         // block, so neither position exists for it and neither is reachable —
         // the second only because `tool_result` is off the list above, which is
@@ -411,7 +414,10 @@ fn reject_streamed_json_mode(body: &Value, provider: &'static str) -> Result<(),
     let declared = body
         .get("response_format")
         .filter(|format| !format.is_null())
-        .is_some_and(|format| format.pointer("/type").and_then(Value::as_str) != Some("text"));
+        .is_some_and(|format| format.pointer("/type").and_then(Value::as_str) != Some("text"))
+        || body
+            .pointer("/output_config/format")
+            .is_some_and(|format| !format.is_null());
     if streaming && declared {
         return Err(ShapeError::Unsupported(
             provider,
@@ -918,6 +924,173 @@ const ANTHROPIC_MESSAGE_FIELDS: [Field; 2] = [
     Field::described("content"),
 ];
 
+const OPENAI_STREAM_OPTIONS_FIELDS: [Field; 2] = [
+    Field::boolean("include_usage"),
+    Field::boolean("include_obfuscation"),
+];
+
+const OPENAI_MODERATION_MODE_FIELDS: [Field; 1] = [Field::one_of("mode", &["score", "block"])];
+
+const OPENAI_MODERATION_POLICY_FIELDS: [Field; 2] = [
+    Field::object(
+        "input",
+        "moderation mode field",
+        &OPENAI_MODERATION_MODE_FIELDS,
+    ),
+    Field::object(
+        "output",
+        "moderation mode field",
+        &OPENAI_MODERATION_MODE_FIELDS,
+    ),
+];
+
+const OPENAI_MODERATION_FIELDS: [Field; 2] = [
+    Field::dispatch("model"),
+    Field::object(
+        "policy",
+        "moderation policy field",
+        &OPENAI_MODERATION_POLICY_FIELDS,
+    ),
+];
+
+const OPENAI_PROMPT_CACHE_OPTIONS_FIELDS: [Field; 2] = [
+    Field::one_of("mode", &["implicit", "explicit"]),
+    Field::one_of("ttl", &["30m"]),
+];
+
+const OPENAI_PREDICTION_FIELDS: [Field; 2] = [
+    Field::one_of("type", &["content"]),
+    Field::described("content"),
+];
+
+const OPENAI_JSON_SCHEMA_FIELDS: [Field; 4] = [
+    Field::dispatch("name"),
+    Field::described("description"),
+    Field::described("schema"),
+    Field::boolean("strict"),
+];
+
+const OPENAI_BODY_FIELDS: [Field; 37] = [
+    Field::described("messages"),
+    Field::dispatch("model"),
+    Field::elsewhere("audio", "the `audio` refusal in `request_pointers`"),
+    Field::number("frequency_penalty"),
+    Field::elsewhere("function_call", "`OPENAI_BODY_TOOL_FIELDS`"),
+    Field::elsewhere("functions", "`OPENAI_BODY_TOOL_FIELDS`"),
+    Field::elsewhere("logit_bias", "`logit_bias_names_tokens`"),
+    Field::elsewhere("logprobs", "the `logprobs` refusal in `request_pointers`"),
+    Field::number("max_completion_tokens"),
+    Field::number("max_tokens"),
+    Field::described("metadata"),
+    Field::elsewhere("modalities", "`openai_modalities`"),
+    Field::object("moderation", "moderation field", &OPENAI_MODERATION_FIELDS),
+    Field::number("n"),
+    Field::elsewhere(
+        "parallel_tool_calls",
+        "the `known_value` call in `request_pointers`",
+    ),
+    Field::object("prediction", "prediction field", &OPENAI_PREDICTION_FIELDS),
+    Field::number("presence_penalty"),
+    Field::described("prompt_cache_key"),
+    Field::object(
+        "prompt_cache_options",
+        "prompt_cache_options field",
+        &OPENAI_PROMPT_CACHE_OPTIONS_FIELDS,
+    ),
+    Field::one_of("prompt_cache_retention", &["in_memory", "24h"]),
+    Field::one_of(
+        "reasoning_effort",
+        &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    ),
+    Field::elsewhere("response_format", "`openai_response_format_slots`"),
+    Field::described("safety_identifier"),
+    Field::number("seed"),
+    Field::one_of(
+        "service_tier",
+        &["auto", "default", "flex", "scale", "priority", "fast"],
+    ),
+    Field::described("stop"),
+    Field::boolean("store"),
+    Field::boolean("stream"),
+    Field::object(
+        "stream_options",
+        "stream_options field",
+        &OPENAI_STREAM_OPTIONS_FIELDS,
+    ),
+    Field::number("temperature"),
+    Field::elsewhere("tool_choice", "`known_tool_choice`"),
+    Field::described("tools"),
+    Field::elsewhere(
+        "top_logprobs",
+        "the `top_logprobs` refusal in `request_pointers`",
+    ),
+    Field::number("top_p"),
+    Field::described("user"),
+    Field::one_of("verbosity", &["low", "medium", "high"]),
+    Field::nothing(
+        "web_search_options",
+        "a search's `user_location` and the reply's `annotations`",
+    ),
+];
+
+const ANTHROPIC_METADATA_FIELDS: [Field; 1] = [Field::described("user_id")];
+
+const ANTHROPIC_DIAGNOSTICS_FIELDS: [Field; 1] = [Field::dispatch("previous_message_id")];
+
+const ANTHROPIC_OUTPUT_FORMAT_FIELDS: [Field; 2] = [
+    Field::one_of("type", &["json_schema"]),
+    Field::described("schema"),
+];
+
+const ANTHROPIC_OUTPUT_CONFIG_FIELDS: [Field; 2] = [
+    Field::one_of("effort", &["low", "medium", "high", "xhigh", "max"]),
+    Field::object(
+        "format",
+        "output_config format field",
+        &ANTHROPIC_OUTPUT_FORMAT_FIELDS,
+    ),
+];
+
+const ANTHROPIC_BODY_FIELDS: [Field; 21] = [
+    Field::described("messages"),
+    Field::dispatch("model"),
+    Field::number("max_tokens"),
+    Field::object(
+        "cache_control",
+        "cache_control field",
+        &ANTHROPIC_CACHE_CONTROL_FIELDS,
+    ),
+    Field::nothing(
+        "container",
+        "code execution, which this gateway does not serve",
+    ),
+    Field::object(
+        "diagnostics",
+        "diagnostics field",
+        &ANTHROPIC_DIAGNOSTICS_FIELDS,
+    ),
+    Field::dispatch("inference_geo"),
+    Field::object("metadata", "metadata field", &ANTHROPIC_METADATA_FIELDS),
+    Field::object(
+        "output_config",
+        "output_config field",
+        &ANTHROPIC_OUTPUT_CONFIG_FIELDS,
+    ),
+    Field::one_of("service_tier", &["auto", "standard_only"]),
+    Field::one_of("speed", &["standard", "fast"]),
+    Field::described("stop_sequences"),
+    Field::boolean("stream"),
+    Field::described("system"),
+    // Dropped from the current Anthropic SDK and still sent by older clients.
+    Field::number("temperature"),
+    Field::number("top_k"),
+    Field::number("top_p"),
+    Field::elsewhere("thinking", "the `thinking` refusal in `request_pointers`"),
+    Field::elsewhere("tool_choice", "`known_tool_choice`"),
+    Field::described("tools"),
+    Field::dispatch("workspace_id"),
+];
+
 /// `tool_choice` forces or forbids a call. Which fields are legal depends on
 /// its `type`, so this dispatches on that string to pick a list exactly as
 /// `content_block_fields` does, and for the same reason: one flat list would
@@ -970,12 +1143,11 @@ fn openai_tool_choice_fields(kind: &str) -> &'static [Field] {
 
 /// The whole of `tool_choice`, checked before the upstream call.
 ///
-/// **`Admits` does not express this value and does not need to.** A body field
-/// is on no allowlist — `Admits` answers "why is this *key on this list* safe",
-/// and there is no list at body level for `tool_choice` to be an entry of. So
-/// the union lives at the use site beside `logprobs`, `audio` and `thinking`,
-/// which are the other body fields decided by a named check, and the machinery
-/// does the part it is for: every *object* below here is a list of `Field`s
+/// **`Admits` does not express this value and does not need to.** The body
+/// lists admit `tool_choice` as `Elsewhere`, naming this function, so the union
+/// lives at the use site beside `logprobs`, `audio` and `thinking`, which are
+/// the other body fields decided by a named check, and the machinery does the
+/// part it is for: every *object* below here is a list of `Field`s
 /// read by `known_fields`. Bending a string-or-object union into
 /// `Admits::Object` would have needed a variant meaning "or", and the one thing
 /// the enum's shape is for is that each entry has exactly one answer.
@@ -1235,6 +1407,132 @@ fn reasoning_detail_slots(
         }
     }
     Ok(())
+}
+
+fn json_pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+fn logit_bias_names_tokens(body: &Value) -> Result<(), ShapeError> {
+    match body.get("logit_bias") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(biases))
+            if biases.iter().all(|(token, bias)| {
+                !token.is_empty()
+                    && token.bytes().all(|byte| byte.is_ascii_digit())
+                    && bias.is_number()
+            }) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(ShapeError::Unsupported("openai", "logit_bias")),
+    }
+}
+
+fn openai_modalities(body: &Value) -> Result<(), ShapeError> {
+    let refuse = || ShapeError::Unsupported("openai", "modalities");
+    match body.get("modalities") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(modalities)) => {
+            for modality in modalities {
+                match modality.as_str() {
+                    Some("text") => {}
+                    Some("audio") => return Err(ShapeError::Unsupported("openai", "audio")),
+                    _ => return Err(refuse()),
+                }
+            }
+            Ok(())
+        }
+        Some(_) => Err(refuse()),
+    }
+}
+
+fn string_list_slots(
+    body: &Value,
+    field: &str,
+    single: bool,
+    provider: &'static str,
+    out: &mut Vec<Slot>,
+) -> Result<(), ShapeError> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(_)) if single => {
+            out.push(Slot::text(format!("/{field}")));
+            Ok(())
+        }
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                if !item.is_string() {
+                    return Err(ShapeError::Request(provider));
+                }
+                out.push(Slot::text(format!("/{field}/{index}")));
+            }
+            Ok(())
+        }
+        Some(_) => Err(ShapeError::Request(provider)),
+    }
+}
+
+fn openai_metadata_slots(body: &Value, out: &mut Vec<Slot>) -> Result<(), ShapeError> {
+    match body.get("metadata") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Object(entries)) => {
+            for (key, value) in entries {
+                if !value.is_string() {
+                    return Err(ShapeError::Request("openai"));
+                }
+                out.push(Slot::text(format!("/metadata/{}", json_pointer_token(key))));
+            }
+            Ok(())
+        }
+        Some(_) => Err(ShapeError::Request("openai")),
+    }
+}
+
+fn openai_response_format_slots(body: &Value, out: &mut Vec<Slot>) -> Result<(), ShapeError> {
+    const TYPE: Field = Field::elsewhere("type", "the dispatch on `type` below");
+    const PLAIN: [Field; 1] = [TYPE];
+    const SCHEMA: [Field; 2] = [
+        TYPE,
+        Field::object(
+            "json_schema",
+            "response_format json_schema field",
+            &OPENAI_JSON_SCHEMA_FIELDS,
+        ),
+    ];
+    let Some(format) = body.get("response_format").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let fields: &[Field] = match format.get("type").and_then(Value::as_str) {
+        Some("text" | "json_object") => &PLAIN,
+        Some("json_schema") => &SCHEMA,
+        _ => return Err(ShapeError::Unsupported("openai", "response_format")),
+    };
+    known_fields(format, fields, "response_format field", "openai")?;
+    identifier_pointer(
+        format,
+        "/json_schema/description",
+        "/response_format/json_schema/description".to_owned(),
+        "openai",
+        out,
+    )?;
+    schema_slot(
+        format,
+        "/json_schema/schema",
+        "/response_format/json_schema/schema",
+        out,
+    );
+    Ok(())
+}
+
+fn schema_slot(body: &Value, lookup: &str, pointer: &str, out: &mut Vec<Slot>) {
+    if body.pointer(lookup).is_some_and(|value| !value.is_null()) {
+        out.push(Slot::Json {
+            pointer: pointer.to_owned(),
+            embedded: false,
+            shape: Shape::Schema,
+        });
+    }
 }
 
 fn identifier_pointer(
@@ -1591,9 +1889,12 @@ impl Provider for OpenAi {
             &OPENAI_TOOL_CHOICE_MODES,
             "openai",
         )?;
+        known_fields(body, &OPENAI_BODY_FIELDS, "body field", "openai")?;
+        logit_bias_names_tokens(body)?;
+        openai_modalities(body)?;
         // OpenAI defines this as a boolean and nothing else. It is a tool field
-        // on the tool surface, it is on no allowlist because there is no
-        // allowlist at body level, and nothing read it:
+        // on the tool surface, it was on no allowlist before the body had one,
+        // and nothing read it:
         // `"parallel_tool_calls": {"owner": "Martina Weber"}` reached the
         // upstream verbatim (measured, at 200). Same class as `strict` and
         // `is_error`, found by sweeping the denylists the way the last round
@@ -1624,17 +1925,6 @@ impl Provider for OpenAi {
         if body.get("audio").is_some_and(|value| !value.is_null()) {
             return Err(ShapeError::Unsupported("openai", "audio"));
         }
-        if body
-            .get("modalities")
-            .and_then(Value::as_array)
-            .is_some_and(|modalities| {
-                modalities
-                    .iter()
-                    .any(|modality| modality.as_str() == Some("audio"))
-            })
-        {
-            return Err(ShapeError::Unsupported("openai", "audio"));
-        }
         match body.get("top_logprobs") {
             None | Some(Value::Null) => {}
             Some(Value::Number(count)) if count.as_u64() == Some(0) => {}
@@ -1646,6 +1936,30 @@ impl Provider for OpenAi {
         // forwarding them verbatim would leak exactly what the proxy exists to
         // stop.
         identifier_pointer(body, "/user", "/user".to_owned(), "openai", &mut pointers)?;
+        for field in ["safety_identifier", "prompt_cache_key"] {
+            identifier_pointer(
+                body,
+                &format!("/{field}"),
+                format!("/{field}"),
+                "openai",
+                &mut pointers,
+            )?;
+        }
+        string_list_slots(body, "stop", true, "openai", &mut pointers)?;
+        openai_metadata_slots(body, &mut pointers)?;
+        openai_response_format_slots(body, &mut pointers)?;
+        if let Some(content) = body
+            .pointer("/prediction/content")
+            .filter(|value| !value.is_null())
+        {
+            content_pointers(
+                "/prediction/content",
+                content,
+                "openai",
+                Position::Prediction,
+                &mut pointers,
+            )?;
+        }
         // Explicitly null is an SDK serializing its default, not a request to
         // use tools — the same reading `logprobs` and `audio` already get.
         if let Some(tools) = body.get("tools").filter(|value| !value.is_null()) {
@@ -1971,6 +2285,7 @@ impl Provider for Anthropic {
         // Anthropic publishes no bare-string form, so the empty mode list is
         // the whole of that difference between the providers.
         known_tool_choice(body, anthropic_tool_choice_fields, &[], "anthropic")?;
+        known_fields(body, &ANTHROPIC_BODY_FIELDS, "body field", "anthropic")?;
         let mut pointers = Vec::new();
         // Explicitly null is an SDK serializing its default, not a request to
         // use tools — the same reading `thinking` and `logprobs` already get.
@@ -2015,6 +2330,13 @@ impl Provider for Anthropic {
             "anthropic",
             &mut pointers,
         )?;
+        string_list_slots(body, "stop_sequences", false, "anthropic", &mut pointers)?;
+        schema_slot(
+            body,
+            "/output_config/format/schema",
+            "/output_config/format/schema",
+            &mut pointers,
+        );
         // Explicitly null is an SDK serializing its default, not a request to
         // use X — the same reading `tools`, `thinking` and `content` already
         // get. Without the filter `content_pointers` saw `Value::Null`, could
@@ -2048,16 +2370,8 @@ impl Provider for Anthropic {
                 )?;
             }
         }
-        // Called for both providers though only one has the field today, and
-        // the reason it is inert here has changed twice. It was that the
-        // Messages API asks for structured output through tools and a blanket
-        // refusal of streamed tool traffic caught those outright. That refusal
-        // is gone — the fragments are accumulated and restored structurally
-        // now (#87) — so what makes this inert is only that Anthropic has no
-        // `response_format` field to read. That is a weaker reason than the one
-        // it replaced, and it is why the call stays: the day Anthropic grows
-        // one, the omission would cost silently in the half nobody was looking
-        // at.
+        // Anthropic's `output_config.format` is the declaration OpenAI spells
+        // `response_format`, and this reads both.
         reject_streamed_json_mode(body, "anthropic")?;
         Ok(pointers)
     }
@@ -2392,6 +2706,9 @@ mod tests {
                 &OPENAI_REASONING_ENCRYPTED_FIELDS[..],
             ),
             ("ANTHROPIC_MESSAGE_FIELDS", &ANTHROPIC_MESSAGE_FIELDS[..]),
+            ("OPENAI_BODY_FIELDS", &OPENAI_BODY_FIELDS[..]),
+            ("ANTHROPIC_BODY_FIELDS", &ANTHROPIC_BODY_FIELDS[..]),
+            ("OPENAI_JSON_SCHEMA_FIELDS", &OPENAI_JSON_SCHEMA_FIELDS[..]),
             ("content_block_fields(text)", content_block_fields("text")),
             ("content_block_fields(image)", content_block_fields("image")),
             (
@@ -2517,7 +2834,7 @@ mod tests {
             }
         }
         assert_eq!(
-            dispatch, 24,
+            dispatch, 31,
             "each of these is a string this gateway forwards on purpose — the caller's on a \
              request, the model's on a response — so adding one is a decision and not a \
              discovery. It counts entries and not distinct keys, so splitting one list into \
@@ -4658,8 +4975,8 @@ mod tests {
     #[test]
     fn a_non_boolean_parallel_tool_calls_is_refused_rather_than_forwarded() {
         // The denylist sweep's own finding: a tool field on the tool surface,
-        // constrained to a boolean by OpenAI, on no allowlist because there is
-        // no allowlist at body level, and read by nothing.
+        // constrained to a boolean by OpenAI, on no allowlist before the body
+        // had one, and read by nothing.
         for value in [json!({"owner": "Martina Weber"}), json!("Martina Weber")] {
             let body = json!({
                 "model": "gpt",
@@ -4783,55 +5100,290 @@ mod tests {
     }
 
     #[test]
-    fn a_response_format_this_gateway_has_never_heard_of_is_refused_on_a_stream() {
-        // **The polarity, which is the whole rule.** A first version matched
-        // `json_object | json_schema` — an allowlist of hazards, so a type the
-        // provider adds tomorrow would be admitted, and admitting is the
-        // direction that injects. It had already needed widening once:
-        // `json_schema` was missing from #36's own framing of the fix.
-        //
-        // Inverted, an omission costs a refusal. This test is the difference
-        // between the two rules and the only thing that can tell them apart:
-        // under the allowlist it passes, under the inversion it fails.
+    fn a_response_format_this_gateway_has_never_heard_of_is_refused_streamed_or_not() {
         for kind in ["json_lines", "xml", "yaml", "structured", ""] {
-            let unknown = json!({
-                "model": "gpt", "stream": true,
-                "response_format": {"type": kind},
-                "messages": [{"role": "user", "content": "hallo"}]
-            });
-            assert!(
-                matches!(
-                    OpenAi.request_pointers(&unknown),
-                    Err(ShapeError::Unsupported(
-                        "openai",
-                        "a streamed response declared as a JSON document"
-                    ))
-                ),
-                "response_format {kind:?} was admitted on a stream by a rule that \
-                 cannot know whether it names a document"
-            );
+            for stream in [true, false] {
+                let unknown = json!({
+                    "model": "gpt", "stream": stream,
+                    "response_format": {"type": kind},
+                    "messages": [{"role": "user", "content": "hallo"}]
+                });
+                assert!(
+                    matches!(
+                        OpenAi.request_pointers(&unknown),
+                        Err(ShapeError::Unsupported("openai", "response_format"))
+                    ),
+                    "response_format {kind:?} was admitted with stream {stream}"
+                );
+            }
         }
-
-        // A `response_format` carrying no `type` at all is a declaration this
-        // gateway cannot read, which is the same answer.
         let typeless = json!({
-            "model": "gpt", "stream": true,
+            "model": "gpt",
             "response_format": {"schema": {"a": 1}},
             "messages": [{"role": "user", "content": "hallo"}]
         });
         assert!(matches!(
             OpenAi.request_pointers(&typeless),
-            Err(ShapeError::Unsupported(_, _))
+            Err(ShapeError::Unsupported("openai", "response_format"))
         ));
+    }
 
-        // And none of it fires without `stream: true`, where the buffered path
-        // restores structurally and needs no help.
-        let buffered = json!({
-            "model": "gpt",
-            "response_format": {"type": "json_lines"},
-            "messages": [{"role": "user", "content": "hallo"}]
+    #[test]
+    fn a_body_field_no_entry_describes_is_refused() {
+        let openai = |field: &str, value: Value| {
+            let mut body = json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]});
+            body[field] = value;
+            OpenAi.request_pointers(&body)
+        };
+        let anthropic = |field: &str, value: Value| {
+            let mut body = json!({"model": "claude", "max_tokens": 16,
+                                  "messages": [{"role": "user", "content": "hi"}]});
+            body[field] = value;
+            Anthropic.request_pointers(&body)
+        };
+        for (field, value) in [
+            ("note", json!("Martina Weber")),
+            ("provider", json!({"order": ["Martina Weber"]})),
+            ("models", json!(["Martina Weber"])),
+            ("route", json!("fallback")),
+            ("transforms", json!(["middle-out"])),
+            ("reasoning", json!({"effort": "low"})),
+            ("usage", json!({"include": true})),
+            ("plugins", json!([{"id": "web"}])),
+            ("system", json!("Martina Weber")),
+            ("stop_sequences", json!(["Martina Weber"])),
+        ] {
+            assert!(
+                matches!(
+                    openai(field, value.clone()),
+                    Err(ShapeError::Unsupported("openai", "body field"))
+                ),
+                "openai admitted {field}"
+            );
+        }
+        for (field, value) in [
+            ("note", json!("Martina Weber")),
+            ("user", json!("Martina Weber")),
+            ("stop", json!(["Martina Weber"])),
+            ("user_profile_id", json!("Martina Weber")),
+            ("mcp_servers", json!([{"name": "Martina Weber"}])),
+            ("context_management", json!({"edits": []})),
+            ("response_format", json!({"type": "text"})),
+        ] {
+            assert!(
+                matches!(
+                    anthropic(field, value.clone()),
+                    Err(ShapeError::Unsupported("anthropic", _))
+                ),
+                "anthropic admitted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_field_holding_a_shape_its_provider_does_not_define_is_refused() {
+        let base = json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]});
+        for (field, value) in [
+            ("temperature", json!("Martina Weber")),
+            ("n", json!({"owner": "Martina Weber"})),
+            ("store", json!("Martina Weber")),
+            ("reasoning_effort", json!("Martina Weber")),
+            ("service_tier", json!("Martina Weber")),
+            ("verbosity", json!("Martina Weber")),
+            ("prompt_cache_retention", json!("Martina Weber")),
+            ("stream_options", json!({"note": "Martina Weber"})),
+            ("stream_options", json!({"include_usage": "Martina Weber"})),
+            ("prompt_cache_options", json!({"ttl": "Martina Weber"})),
+            ("moderation", json!({"model": {"owner": "Martina Weber"}})),
+            (
+                "moderation",
+                json!({"model": "m", "policy": {"input": {"mode": "Martina Weber"}}}),
+            ),
+            (
+                "prediction",
+                json!({"type": "Martina Weber", "content": "x"}),
+            ),
+            (
+                "prediction",
+                json!({"type": "content", "content": "x", "note": "Martina Weber"}),
+            ),
+            (
+                "prediction",
+                json!({"type": "content", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}),
+            ),
+            ("logit_bias", json!({"Martina Weber": 1})),
+            ("logit_bias", json!({"50256": "Martina Weber"})),
+            ("modalities", json!("Martina Weber")),
+            ("modalities", json!(["Martina Weber"])),
+            (
+                "web_search_options",
+                json!({"user_location": {"type": "approximate",
+                "approximate": {"city": "Zürich"}}}),
+            ),
+            ("metadata", json!({"owner": {"name": "Martina Weber"}})),
+            ("metadata", json!(["Martina Weber"])),
+            ("stop", json!([{"text": "Martina Weber"}])),
+            ("stop", json!(7)),
+            ("safety_identifier", json!({"owner": "Martina Weber"})),
+            ("prompt_cache_key", json!(["Martina Weber"])),
+            (
+                "response_format",
+                json!({"type": "json_schema", "json_schema": {
+                "name": "r", "note": "Martina Weber"}}),
+            ),
+            (
+                "response_format",
+                json!({"type": "json_object", "json_schema": {"name": "r"}}),
+            ),
+            (
+                "response_format",
+                json!({"type": "json_schema", "json_schema": {
+                "name": {"owner": "Martina Weber"}}}),
+            ),
+        ] {
+            let mut body = base.clone();
+            body[field] = value.clone();
+            assert!(
+                OpenAi.request_pointers(&body).is_err(),
+                "openai admitted {field}: {value}"
+            );
+        }
+        let base = json!({"model": "claude", "max_tokens": 16,
+                          "messages": [{"role": "user", "content": "hi"}]});
+        for (field, value) in [
+            ("max_tokens", json!("Martina Weber")),
+            ("top_k", json!("Martina Weber")),
+            ("stream", json!("Martina Weber")),
+            ("service_tier", json!("Martina Weber")),
+            ("speed", json!("Martina Weber")),
+            ("container", json!("Martina Weber")),
+            ("inference_geo", json!({"owner": "Martina Weber"})),
+            ("workspace_id", json!(["Martina Weber"])),
+            ("diagnostics", json!({"note": "Martina Weber"})),
+            ("metadata", json!({"user_id": "u", "note": "Martina Weber"})),
+            ("cache_control", json!({"type": "Martina Weber"})),
+            ("output_config", json!({"effort": "Martina Weber"})),
+            ("output_config", json!({"note": "Martina Weber"})),
+            (
+                "output_config",
+                json!({"format": {"type": "Martina Weber", "schema": {}}}),
+            ),
+            (
+                "output_config",
+                json!({"format": {"type": "json_schema", "schema": {}, "note": "x"}}),
+            ),
+            ("stop_sequences", json!("Martina Weber")),
+            ("stop_sequences", json!([{"text": "Martina Weber"}])),
+        ] {
+            let mut body = base.clone();
+            body[field] = value.clone();
+            assert!(
+                Anthropic.request_pointers(&body).is_err(),
+                "anthropic admitted {field}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_body_field_each_provider_publishes_is_admitted() {
+        let openai = json!({
+            "model": "gpt", "messages": [{"role": "user", "content": "hi"}],
+            "audio": null, "frequency_penalty": 0.5, "function_call": null, "functions": null,
+            "logit_bias": {"50256": -100}, "logprobs": false, "max_completion_tokens": 64,
+            "max_tokens": 64, "metadata": {"run": "r1"}, "modalities": ["text"],
+            "moderation": {"model": "omni-moderation-latest",
+                           "policy": {"input": {"mode": "score"}, "output": {"mode": "block"}}},
+            "n": 1, "parallel_tool_calls": true,
+            "prediction": {"type": "content", "content": [{"type": "text", "text": "x"}]},
+            "presence_penalty": 0.0, "prompt_cache_key": "k",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "prompt_cache_retention": "24h", "reasoning_effort": "xhigh",
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "reply", "description": "d", "schema": {"type": "object"}, "strict": true}},
+            "safety_identifier": "s", "seed": 7, "service_tier": "flex", "stop": ["x", "y"],
+            "store": false, "stream": false,
+            "stream_options": {"include_usage": true, "include_obfuscation": false},
+            "temperature": 1, "tool_choice": "auto",
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "top_logprobs": 0, "top_p": 1, "user": "u", "verbosity": "low",
+            "web_search_options": null
         });
-        assert!(OpenAi.request_pointers(&buffered).is_ok());
+        assert_eq!(
+            openai.as_object().unwrap().len(),
+            OPENAI_BODY_FIELDS.len(),
+            "a published field is missing from this body"
+        );
+        assert!(slot_pointers(OpenAi.request_pointers(&openai)).contains(&"/stop/1".to_owned()));
+        let anthropic = json!({
+            "model": "claude", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 64,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}, "container": null,
+            "diagnostics": {"previous_message_id": "msg_1"}, "inference_geo": "us",
+            "metadata": {"user_id": "u"},
+            "output_config": {"effort": "max", "format": {"type": "json_schema",
+                                                          "schema": {"type": "object"}}},
+            "service_tier": "standard_only", "speed": "fast", "stop_sequences": ["x"],
+            "stream": false, "system": "s", "temperature": 1, "top_k": 5, "top_p": 1,
+            "thinking": {"type": "disabled"},
+            "tool_choice": {"type": "auto"},
+            "tools": [{"name": "f", "input_schema": {"type": "object"}}],
+            "workspace_id": "wrkspc_1"
+        });
+        assert_eq!(
+            anthropic.as_object().unwrap().len(),
+            ANTHROPIC_BODY_FIELDS.len(),
+            "a published field is missing from this body"
+        );
+        assert!(Anthropic.request_pointers(&anthropic).is_ok());
+    }
+
+    #[test]
+    fn every_text_field_of_the_body_is_a_slot() {
+        let openai = json!({
+            "model": "gpt", "messages": [{"role": "user", "content": "hi"}],
+            "stop": "Weber", "metadata": {"a/b~c": "Weber"},
+            "safety_identifier": "Weber", "prompt_cache_key": "Weber",
+            "prediction": {"type": "content", "content": "Weber"},
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "r", "description": "Weber", "schema": {"type": "object"}}}
+        });
+        let found = slot_pointers(OpenAi.request_pointers(&openai));
+        for pointer in [
+            "/stop",
+            "/metadata/a~1b~0c",
+            "/safety_identifier",
+            "/prompt_cache_key",
+            "/prediction/content",
+            "/response_format/json_schema/description",
+            "/response_format/json_schema/schema",
+        ] {
+            assert!(
+                found.contains(&pointer.to_owned()),
+                "{pointer} in {found:?}"
+            );
+            assert!(openai.pointer(pointer).is_some(), "{pointer} resolves");
+        }
+        let prediction_parts = json!({
+            "model": "gpt", "messages": [{"role": "user", "content": "hi"}],
+            "prediction": {"type": "content", "content": [{"type": "text", "text": "Weber"}]}
+        });
+        assert!(slot_pointers(OpenAi.request_pointers(&prediction_parts))
+            .contains(&"/prediction/content/0/text".to_owned()));
+        let anthropic = json!({
+            "model": "claude", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["x", "Weber"],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        });
+        let found = slot_pointers(Anthropic.request_pointers(&anthropic));
+        for pointer in [
+            "/stop_sequences/0",
+            "/stop_sequences/1",
+            "/output_config/format/schema",
+        ] {
+            assert!(
+                found.contains(&pointer.to_owned()),
+                "{pointer} in {found:?}"
+            );
+        }
     }
 
     #[test]
@@ -4857,15 +5409,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_is_asked_the_same_question_though_it_has_no_field_today() {
-        // Inert on the Messages API, which asks for structured output through
-        // tools — and those are served now rather than refused (#87), so the
-        // only thing making this inert is that Anthropic has no
-        // `response_format` field. It is here so the day Anthropic grows one is
-        // not the day the half nobody watched silently admits it.
+    fn anthropic_output_format_is_the_same_declaration_as_openai_response_format() {
         let declared = json!({
             "model": "claude", "stream": true, "max_tokens": 16,
-            "response_format": {"type": "json_object"},
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
             "messages": [{"role": "user", "content": "hallo"}]
         });
         assert!(matches!(
@@ -4874,6 +5421,24 @@ mod tests {
                 "anthropic",
                 "a streamed response declared as a JSON document"
             ))
+        ));
+        let mut buffered = declared.clone();
+        buffered["stream"] = json!(false);
+        assert!(Anthropic.request_pointers(&buffered).is_ok());
+        let effort_only = json!({
+            "model": "claude", "stream": true, "max_tokens": 16,
+            "output_config": {"effort": "low", "format": null},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(Anthropic.request_pointers(&effort_only).is_ok());
+        let foreign = json!({
+            "model": "claude", "max_tokens": 16,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": "hallo"}]
+        });
+        assert!(matches!(
+            Anthropic.request_pointers(&foreign),
+            Err(ShapeError::Unsupported("anthropic", "body field"))
         ));
     }
 

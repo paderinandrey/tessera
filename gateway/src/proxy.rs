@@ -2734,6 +2734,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_text_field_of_the_body_is_masked_before_the_provider() {
+        let detector = detector_finding_weber().await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}],
+                   "stop": ["Weber"], "metadata": {"owner": "Weber"},
+                   "safety_identifier": "Weber", "prompt_cache_key": "Weber",
+                   "prediction": {"type": "content", "content": "Weber"},
+                   "response_format": {"type": "json_schema", "json_schema": {
+                       "name": "r", "description": "Weber",
+                       "schema": {"type": "object", "description": "Weber"}}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(!sent.contains(SECRET), "{sent}");
+        assert_eq!(sent.matches("[PERSON_1]").count(), 7, "{sent}");
+
+        let upstream = upstream_returning(
+            "/v1/messages",
+            json!({"content": [{"type": "text", "text": "ok"}]}),
+        )
+        .await;
+        let (status, body) = call(
+            state(&detector, &upstream),
+            "/v1/messages",
+            json!({"model": "claude", "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "hi"}],
+                   "stop_sequences": ["Weber"], "metadata": {"user_id": "Weber"},
+                   "output_config": {"format": {"type": "json_schema",
+                       "schema": {"type": "object", "description": "Weber"}}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sent =
+            String::from_utf8(upstream.received_requests().await.unwrap()[0].body.clone()).unwrap();
+        assert!(!sent.contains(SECRET), "{sent}");
+        assert_eq!(sent.matches("[PERSON_1]").count(), 3, "{sent}");
+    }
+
+    #[tokio::test]
+    async fn a_body_field_no_entry_describes_never_reaches_the_upstream() {
+        let detector = detector_returning(json!([])).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"content": "ok", "role": "assistant"}}]}),
+        )
+        .await;
+        let (status, _) = call(
+            state(&detector, &upstream),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}],
+                   "provider": {"order": ["Martina Weber"]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_value_the_session_issued_is_masked_when_detection_misses_it_on_the_echo() {
         let detector = detector_finding("Mitglied bei ver.di", "ver.di", &["deterministic"]).await;
         let upstream = upstream_returning(
