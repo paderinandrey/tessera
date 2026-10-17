@@ -1023,6 +1023,8 @@ pub struct Mapping {
     known: OnceLock<Option<KnownValues>>,
 }
 
+const KNOWN_MATCHES_PER_BYTE: usize = 8;
+
 #[derive(Debug, Clone)]
 struct KnownValues {
     automaton: AhoCorasick,
@@ -1170,12 +1172,7 @@ impl Mapping {
         let Some(known) = self.known.get_or_init(|| KnownValues::new(&self.by_value)) else {
             return detected;
         };
-        let matches: Vec<(usize, usize, usize)> = known
-            .automaton
-            .find_overlapping_iter(text)
-            .map(|found| (found.pattern().as_usize(), found.start(), found.end()))
-            .collect();
-        if matches.is_empty() {
+        if !known.automaton.is_match(text) {
             return detected;
         }
         let mut char_at = vec![0usize; text.len() + 1];
@@ -1191,11 +1188,23 @@ impl Mapping {
             !(start > 0 && word(chars[start - 1]) && word(chars[start]))
                 && !(end < chars.len() && word(chars[end - 1]) && word(chars[end]))
         };
-        let mut candidates: Vec<(usize, usize, usize)> = matches
-            .into_iter()
-            .map(|(pattern, start, end)| (pattern, char_at[start], char_at[end]))
-            .filter(|&(_, start, end)| bounded(start, end) && searchable(start, end))
-            .collect();
+        let budget = text.len().saturating_mul(KNOWN_MATCHES_PER_BYTE) + KNOWN_MATCHES_PER_BYTE;
+        let mut seen = 0usize;
+        let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+        for found in known.automaton.find_overlapping_iter(text) {
+            seen += 1;
+            if seen > budget {
+                tracing::warn!(
+                    budget,
+                    "the session's known values overlap too deeply to search; only the detector's spans are masked"
+                );
+                return detected;
+            }
+            let (start, end) = (char_at[found.start()], char_at[found.end()]);
+            if bounded(start, end) && searchable(start, end) {
+                candidates.push((found.pattern().as_usize(), start, end));
+            }
+        }
         candidates.sort_unstable();
 
         let mut taken: BTreeMap<usize, (Span, bool)> = detected
@@ -4497,6 +4506,26 @@ mod tests {
         assert_eq!(
             session.with_known_values("Meier", Vec::new(), |_, _| true),
             vec![span("PERSON", 0, 5)]
+        );
+    }
+
+    #[test]
+    fn known_values_nested_too_deeply_leave_only_the_detected_spans() {
+        let values: Vec<String> = (1..=64).map(|depth| vec!["x"; depth].join(" ")).collect();
+        let pairs: Vec<(&str, &str)> = values
+            .iter()
+            .map(|value| ("PERSON", value.as_str()))
+            .collect();
+        let mapping = knowing(&pairs);
+        assert_eq!(
+            mapping.with_known_values("x x x", Vec::new(), |_, _| true),
+            vec![span("PERSON", 0, 5)]
+        );
+        let text = "x ".repeat(2_000);
+        let detected = vec![span("PERSON", 0, 1)];
+        assert_eq!(
+            mapping.with_known_values(&text, detected.clone(), |_, _| true),
+            detected
         );
     }
 
