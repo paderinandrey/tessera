@@ -85,6 +85,7 @@ impl StreamError {
             StreamError::Mapping(MappingError::BadSpan(_)) => "stream_bad_span",
             StreamError::Mapping(MappingError::TooDeep) => "stream_too_deep",
             StreamError::Mapping(MappingError::TooLarge) => "stream_too_large",
+            StreamError::Mapping(MappingError::KnownValuesOverlap) => "stream_known_values_overlap",
             // Unreachable on this path — nothing masks on the way back — but
             // matched rather than wildcarded, which is the rule this function
             // states about itself and the reason it caught a probe variant
@@ -1247,6 +1248,7 @@ mod audit_class_tests {
             StreamError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
             StreamError::Mapping(MappingError::TooDeep).audit_class(),
             StreamError::Mapping(MappingError::TooLarge).audit_class(),
+            StreamError::Mapping(MappingError::KnownValuesOverlap).audit_class(),
             StreamError::Mapping(MappingError::LiteralAlreadyIssued("[PERSON_1]".to_owned()))
                 .audit_class(),
             StreamError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),

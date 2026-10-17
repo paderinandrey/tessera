@@ -101,7 +101,7 @@ gateway produced did not resolve in a body it had already walked),
 `mapping_lossy_document` (a document the provider sent that cannot be restored
 without changing something else in it — a member dropped, a key renamed, a
 number rounded — refused rather than served changed) are the provider's; `shape_request`, `shape_unsupported`, `tool_arguments_malformed`,
-`mapping_too_deep`, `mapping_too_large`, `tool_too_large`,
+`mapping_too_deep`, `mapping_too_large`, `mapping_known_values_overlap`, `tool_too_large`,
 `tool_too_many_calls`, `tool_numeric_personal_data`, `session_bad_id`,
 `session_disabled`, `session_no_credential`, `caller_not_served` and
 `mapping_literal_already_issued` are the caller's. `caller_not_served` means the

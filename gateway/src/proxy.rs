@@ -79,6 +79,7 @@ impl ProxyError {
             | ProxyError::Shape(ShapeError::MalformedDocument(_, _))
             | ProxyError::Mapping(MappingError::TooDeep)
             | ProxyError::Mapping(MappingError::TooLarge)
+            | ProxyError::Mapping(MappingError::KnownValuesOverlap)
             | ProxyError::Mapping(MappingError::LiteralAlreadyIssued(_))
             | ProxyError::Session(SessionError::BadId)
             | ProxyError::Session(SessionError::Disabled)
@@ -172,6 +173,7 @@ impl ProxyError {
             ProxyError::Mapping(MappingError::BadSpan(_)) => "mapping_bad_span",
             ProxyError::Mapping(MappingError::TooDeep) => "mapping_too_deep",
             ProxyError::Mapping(MappingError::TooLarge) => "mapping_too_large",
+            ProxyError::Mapping(MappingError::KnownValuesOverlap) => "mapping_known_values_overlap",
             ProxyError::Mapping(MappingError::LiteralAlreadyIssued(_)) => {
                 "mapping_literal_already_issued"
             }
@@ -535,7 +537,7 @@ async fn mask_all(
                 texts += 1;
                 total += detected.len();
                 count_occurrences(&text, &detected, &mut found);
-                let spans = mapping.with_known_values(&text, detected.clone(), |_, _| true);
+                let spans = mapping.with_known_values(&text, detected.clone(), |_, _| true)?;
                 count_covered(&text, &detected, &spans, &mut covered);
                 write_pointer(&mut masked, pointer, &mapping.mask(&text, &spans)?)?;
             }
@@ -589,9 +591,10 @@ async fn mask_all(
                     let detected = detector.detect(joined.text(), credential).await?;
                     mapping::check_spans(joined.text(), &detected)?;
                     let detected_per_leaf = joined.split(&detected)?;
-                    let spans = mapping.with_known_values(joined.text(), detected, |start, end| {
-                        joined.within_a_leaf(start, end)
-                    });
+                    let spans =
+                        mapping.with_known_values(joined.text(), detected, |start, end| {
+                            joined.within_a_leaf(start, end)
+                        })?;
                     documents += 1;
                     // Bounds and ordering checked against the text the detector
                     // actually saw, where "past the end" still means something.
@@ -1638,6 +1641,10 @@ mod tests {
         );
         assert_eq!(
             ProxyError::Mapping(MappingError::TooLarge).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ProxyError::Mapping(MappingError::KnownValuesOverlap).status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -9405,6 +9412,7 @@ mod tests {
             ProxyError::Mapping(MappingError::BadSpan("overlapping")).audit_class(),
             ProxyError::Mapping(MappingError::TooDeep).audit_class(),
             ProxyError::Mapping(MappingError::TooLarge).audit_class(),
+            ProxyError::Mapping(MappingError::KnownValuesOverlap).audit_class(),
             ProxyError::Mapping(MappingError::LiteralAlreadyIssued("[PERSON_1]".to_owned()))
                 .audit_class(),
             ProxyError::Mapping(MappingError::MaskCountMismatch("walks")).audit_class(),
