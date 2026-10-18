@@ -8,7 +8,7 @@ is full, and closes a second, more serious gap Codex found in this design's own
 first draft while it was still in review.
 
 **Traceability:** flagged by Codex on PR #14
-(github.com/paderinandrey/tessera/pull/14), confirmed real against
+(github.com/tileforge/tessera/pull/14), confirmed real against
 `gateway/src/session.rs:188-224` and `gateway/src/proxy.rs:141`, and recorded as a
 tracked follow-up in project memory (`session-store-eviction-followup`). This
 design's own first draft was reviewed by Codex on PR #15 before implementation
