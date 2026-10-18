@@ -103,7 +103,8 @@ against the deployment's own texts.
 
 The tool structures a request newly scans have two bounds of their own, and unlike the
 cache's, exceeding either is a refusal rather than a miss: `max_tool_chars` (default
-20 000) bounds how many characters they send to the detector, and `max_tool_calls`
+50 000, and 20 000 in the shipped container configs, whose detector is two to three times
+slower) bounds how many characters they send to the detector, and `max_tool_calls`
 (default 40) bounds how many detector round-trips they need. Both are denominated in what
 detection costs rather than in what the request weighs. A document is **one call however
 many strings are in it**, so a schema of a thousand short values is a single round-trip;

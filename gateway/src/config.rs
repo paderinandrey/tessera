@@ -79,9 +79,11 @@ pub struct Config {
     /// opened for appending stops the process rather than starting one that
     /// silently proves nothing.
     pub audit_path: String,
-    /// Generous on purpose: full detection costs about a second per 1 200
-    /// characters, and a conversation history is longer than that. Exceeding
-    /// it refuses the request — it never forwards unmasked text.
+    /// Generous on purpose: a tool result is one detector call however long it
+    /// is, so this has to outlast detecting a whole `max_tool_chars` of text
+    /// in one go — measured at 44 s natively for 50 000 characters, and a call
+    /// cut off by this timeout is never cached, so its retry is cut off too.
+    /// Exceeding it refuses the request — it never forwards unmasked text.
     #[serde(default = "default_timeout")]
     pub detector_timeout_secs: u64,
     pub detection_deadline_secs: Option<u64>,
@@ -156,20 +158,22 @@ pub struct Config {
     /// `a_real_tool_payload_fits_the_bounds_this_gateway_ships_with` pins that
     /// figure and fails if this default stops admitting twice it. Those ten are
     /// a floor — a stock session carries about fifteen tools, extrapolating to
-    /// roughly 13 800 characters — so 20 000 covers a stock session with room
-    /// for a small MCP server, and does not pretend to cover an arbitrary one.
+    /// roughly 13 800 characters.
     ///
-    /// **What that costs, stated plainly, because it is not free — and no
-    /// figure here is derived from this ceiling.** What was measured is a
-    /// payload, not a bound: the ten-tool replay below, and what one call
-    /// costs. Turning either into "what 20 000 characters costs" means
-    /// characters over a throughput taken on texts ten to fifty times the size
-    /// of these leaves, where per-call overhead dominates and throughput barely
-    /// applies — the derivation `9f9ce70` on this branch exists to correct, and
-    /// the paragraphs below narrate. So: the wait is seconds rather than
-    /// milliseconds, it is paid on a session's first turn, and slower hardware
-    /// has to lower this rather than inherit it. Anything more precise about
-    /// this ceiling would be arithmetic wearing a measurement's clothes.
+    /// **50 000 since #28, sized for a tool result rather than for the
+    /// definitions.** A `Read` of a 1 500-line file is about 50 KB, and a tool
+    /// result is detected in a single call. Measured on an M3 Pro (11 cores,
+    /// native, fp32): **50 000 characters in about 44 s**, from 20 000 / 40 000 /
+    /// 60 000 in 17.4 / 35.0 / 52.8 s — about 1 140 characters a second and
+    /// linear in size. `detector_timeout_secs` (90) and
+    /// `detection_deadline_secs` (120) are set to admit that call twice over,
+    /// and `the_default_bounds_admit_the_measured_cost_twice_over` asserts it.
+    ///
+    /// **Containerised it is two to three times slower**, and the shipped
+    /// container configs keep 20 000 for that reason: 36.7–41.7 s for 20 000
+    /// characters through the compose detector on the same machine, and
+    /// 141–174 s for 60 000. Slower hardware has to lower this rather than
+    /// inherit it, because the bound admits what the timeout then cuts off.
     ///
     /// Two things were offered as making that tolerable. It is the *first* turn
     /// of a session only: tool definitions are byte-identical every turn after,
@@ -179,10 +183,10 @@ pub struct Config {
     ///
     /// **The caller's patience is not ours to set.** Whatever this number
     /// permits is what the caller waits, and the caller has its own timeout
-    /// that this gateway neither sees nor controls. A client timeout in the
-    /// tens of seconds is the same order as what these bounds permit: at thirty
-    /// it is inside by a hair, at twenty it may give up first, and the failure
-    /// then arrives on its side looking like an outage here.
+    /// that this gateway neither sees nor controls. The OpenAI and Anthropic
+    /// SDKs wait ten minutes, well past the 44 s this bound costs; a client
+    /// with a timeout under a minute gives up first, and the failure then
+    /// arrives on its side looking like an outage here.
     /// `detection_deadline_secs` refuses with a 503 a request that still has a
     /// detector call to start once it has passed, but it defaults to two
     /// minutes, so it turns only a much longer wait into an honest refusal.
@@ -199,9 +203,9 @@ pub struct Config {
     /// same payload is 20 calls rather than 77. The 57 calls that went away
     /// were 265–410 ms each — fifteen to twenty-three seconds of pure overhead,
     /// derived from the two measurements either side of it. **The post-batching
-    /// wall clock has never been replayed.** Every figure for what this gateway
-    /// costs today, at this ceiling or any other, is therefore derived, and is
-    /// labelled so wherever one is quoted.
+    /// wall clock has never been replayed.** Every figure for what that payload
+    /// costs today is therefore derived, and is labelled so wherever one is
+    /// quoted.
     ///
     /// Why it is quoted as a measurement rather than as arithmetic: the first
     /// version of this figure was **derived** — characters divided by a
@@ -214,28 +218,19 @@ pub struct Config {
     /// once already, in a different comment.
     ///
     /// **The native equivalent of that replay is still derived, and is
-    /// labelled as such** because it cannot be measured here: the host
-    /// `detector/.venv` has no `onnxruntime`, so its `/health` reports
-    /// `ner: false` and it runs the deterministic layer alone. **Derived: about
-    /// 15 s**, from the README bench's 80-character row (109 ms, per-call cost
-    /// and almost nothing else, because the price is paid per inference pass
-    /// rather than per character) plus its 1 200-character row for the marginal
-    /// rate. Treat it as an estimate until somebody runs the replay on a host
-    /// with the NER extras installed.
+    /// labelled as such. Derived: about 15 s**, from the README bench's
+    /// 80-character row (109 ms, per-call cost and almost nothing else, because
+    /// the price is paid per inference pass rather than per character) plus its
+    /// 1 200-character row for the marginal rate. Treat it as an estimate until
+    /// somebody replays it natively.
     ///
     /// Per-call overhead is the majority of both figures — 265–410 ms of a call
     /// against the compose detector, 109 ms natively — not a rounding term.
     ///
-    /// These defaults are under review on that evidence, and the number was not
-    /// lowered on the strength of it: a bound below real traffic turns a long
-    /// wait into a refusal of a client that did nothing wrong. One call for a
-    /// document instead of one per string was the fix for the term that
-    /// dominates, and it has landed; what is left for issue #28 is making
-    /// detection fast on a large text, which is a different problem and not a
-    /// number here.
-    ///
-    /// 20 000 rather than 18 000 because the headroom rule above is now
-    /// asserted rather than described, and 18 000 failed it by ten characters.
+    /// One call for a document instead of one per string was the fix for the
+    /// term that dominates on tool definitions. On a tool result throughput
+    /// dominates instead, and #28's parallel window dispatch (#62) and pruned
+    /// span resolution (#133) are what made 50 000 fit.
     ///
     /// **It is not a timeout budget**, and this comment used to say it was
     /// ("one constraint written twice"). `detector_timeout_secs` becomes
@@ -244,8 +239,9 @@ pub struct Config {
     /// stuck call, `detection_deadline_secs` starts no call past it, and this
     /// refuses a tool payload before any of that work starts.
     ///
-    /// Per-call overhead is no longer unmeasured; see above. It is the larger
-    /// half of what both bounds permit.
+    /// Per-call overhead is no longer unmeasured; see above. At both bounds it
+    /// is the smaller part now: forty calls at 109 ms natively are about four
+    /// seconds against the 44 s of one 50 000-character text.
     ///
     /// **It counts characters the detection cache will not answer**, not every
     /// character in the request. Both readings are defensible and only one
@@ -327,7 +323,7 @@ fn default_detector_url() -> String {
     "http://127.0.0.1:8000".to_owned()
 }
 fn default_timeout() -> u64 {
-    30
+    90
 }
 const DEFAULT_DETECTION_DEADLINE_SECS: u64 = 120;
 const MAX_DETECTION_DEADLINE_SECS: u64 = 86_400;
@@ -397,7 +393,7 @@ fn default_max_spans_per_entry() -> usize {
     250
 }
 pub fn default_max_tool_chars() -> usize {
-    20_000
+    50_000
 }
 pub fn default_max_tool_calls() -> usize {
     40
@@ -637,7 +633,7 @@ mod tests {
         let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
         assert_eq!(config.bind, "127.0.0.1:8080");
         assert_eq!(config.detector_url, "http://127.0.0.1:8000");
-        assert_eq!(config.detector_timeout_secs, 30);
+        assert_eq!(config.detector_timeout_secs, 90);
     }
 
     #[test]
@@ -1013,8 +1009,49 @@ mod tests {
     #[test]
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(config.max_tool_chars, 20_000);
+        assert_eq!(config.max_tool_chars, 50_000);
         assert_eq!(config.max_tool_calls, 40);
+    }
+
+    fn assert_admits_twice(config: &Config, one_text_secs: f64, per_call_secs: f64) {
+        assert!(
+            config.detector_timeout_secs as f64 >= 2.0 * one_text_secs,
+            "one text of {} characters took {one_text_secs} s, and a timeout of {} s cuts it \
+             off on every retry",
+            config.max_tool_chars,
+            config.detector_timeout_secs
+        );
+        let at_both_bounds = one_text_secs + config.max_tool_calls as f64 * per_call_secs;
+        assert!(
+            config.detection_deadline_secs() as f64 >= 2.0 * at_both_bounds,
+            "a request at both bounds costs {at_both_bounds} s against a deadline of {} s",
+            config.detection_deadline_secs()
+        );
+    }
+
+    #[test]
+    fn the_default_bounds_admit_the_measured_cost_twice_over() {
+        let config = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(
+            config.max_tool_chars, 50_000,
+            "the size the figure below was measured at"
+        );
+        assert_admits_twice(&config, 50_000.0 / 1_140.0, 0.109);
+    }
+
+    #[test]
+    fn the_container_configs_admit_the_measured_container_cost_twice_over() {
+        for text in [
+            include_str!("../../deploy/tessera.container.toml"),
+            include_str!("../../deploy/tessera.demo.toml"),
+        ] {
+            let config = Config::from_toml(text).expect("a shipped config is valid");
+            assert_eq!(
+                config.max_tool_chars, 20_000,
+                "the size the figure below was measured at"
+            );
+            assert_admits_twice(&config, 41.7, 0.410);
+        }
     }
 
     #[test]

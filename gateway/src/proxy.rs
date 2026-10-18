@@ -1614,7 +1614,7 @@ mod tests {
     /// The production default, so tests exercise the bound callers get rather
     /// than one chosen to make a test convenient. Asserted below rather than
     /// promised here.
-    const TEST_MAX_TOOL_CHARS: usize = 20_000;
+    const TEST_MAX_TOOL_CHARS: usize = 50_000;
     const TEST_MAX_TOOL_CALLS: usize = 40;
     const TEST_DETECTION_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -5017,12 +5017,12 @@ mod tests {
         // and a payload that neither bound had counted.
         //
         // Digits only, so nothing here could be refused by a text leaf
-        // instead. 1 200 leaves of sixteen digits is 19 200 characters plus
-        // 2 398 of separator, against a test ceiling of 20 000.
+        // instead. Leaves of sixteen digits filling 96% of the test ceiling,
+        // which the separators between them push past it.
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let numbers: Vec<Value> = (0..1_200)
+        let numbers: Vec<Value> = (0..TEST_MAX_TOOL_CHARS * 24 / 25 / 16)
             .map(|_| json!(9_007_199_254_740_991i64))
             .collect();
         let (status, body) = call(
@@ -5272,7 +5272,8 @@ mod tests {
         let detector = detector_returning(json!([])).await;
         let upstream = upstream_returning("/v1/messages", json!({"content": []})).await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let properties: serde_json::Map<String, Value> = (0..155)
+        let descriptions = TEST_MAX_TOOL_CHARS / 129;
+        let properties: serde_json::Map<String, Value> = (0..descriptions)
             .map(|n| {
                 (
                     format!("parameter_{n:03}"),
@@ -5290,12 +5291,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hallo"}]
         });
 
-        // 155 descriptions of 100 characters, plus the tool's own one-character
-        // description: 15 501 characters of text against a 20 000 bound, and
-        // well past it once the punctuation around them is charged too. The
-        // count stays under `max_tool_calls` so that only the text/serialized
-        // distinction can decide the verdict.
-        let text: usize = 155 * 100 + 1;
+        // Descriptions of 100 characters filling about three quarters of the
+        // bound, plus the tool's own one-character description, and well past
+        // it once the punctuation around them is charged too. The count stays
+        // under `max_tool_calls` so that only the text/serialized distinction
+        // can decide the verdict.
+        let text: usize = descriptions * 100 + 1;
         assert!(text < TEST_MAX_TOOL_CHARS, "{text} characters of text");
         let serialized = body["tools"][0]["input_schema"].to_string().len();
         assert!(

@@ -13,6 +13,21 @@ text concatenated deterministically from the public corpus:
 | paragraph (1 200 chars, one chunk) | 0.9 ms | 0.3 ms | 544.2 ms | 599.7 ms | 647.9 ms | 1 352 ms | 1 590 ms |
 | document (6 000 chars, several chunks) | 3.7 ms | 2.1 ms | 2 937.9 ms | 2 854.9 ms | 3 268.7 ms | 6 767 ms | 7 150 ms |
 
+**Large texts are linear, and the container is the slow case.** A tool result is detected
+in one call however long it is, so the size that bounds it is the size of one text. Measured
+the same way, fp32, two alternating rounds:
+
+| Characters | Native | Compose detector, same machine |
+|---|---|---|
+| 20 000 | 17.4 s | 36.7–41.7 s |
+| 40 000 | 35.0–35.5 s | 74.5–88.3 s |
+| 60 000 | 52.6–52.8 s | 141.0–174.3 s |
+
+Natively that is about 1 140 characters a second, so 50 000 is about 44 s; this is what
+`max_tool_chars` (50 000) and `detector_timeout_secs` (90) are set from. The compose detector
+is two to three times slower and not linear past 40 000, which is why the shipped container
+configs keep `max_tool_chars` at 20 000. Spans were identical across every run.
+
 **A fourth pass, and it cost what the per-pass claim below says it should.** `person` is
 asked in a call of its own as well as in tier 2's, because sharing one let a competitor take
 the argmax and then fail its own bar, sending whole surnames to the provider (#97). Measured

@@ -4,10 +4,12 @@
 bind = "127.0.0.1:8080"
 detector_url = "http://127.0.0.1:8000"
 
-# Generous on purpose. Full detection costs about a second per 1 200 characters
-# and a conversation history is longer than that; exceeding this refuses the
-# request rather than forwarding unmasked text.
-detector_timeout_secs = 30
+# Generous on purpose. A tool result is one detector call however long it is,
+# so this has to outlast detecting a whole max_tool_chars of text in one go:
+# 50 000 characters took about 44 s natively on an M3 Pro, and 90 admits that
+# twice over. A call this cuts off is never cached, so its retry is cut off too.
+# Exceeding it refuses the request rather than forwarding unmasked text.
+detector_timeout_secs = 90
 
 # How long one request may keep starting detector calls, counted from when the
 # gateway has read its body and including any wait for its session. Past it, a request that still
@@ -143,10 +145,23 @@ max_spans_per_entry = 250
 # characters: 9 005 of text, 50 of numbers, and 138 of the separators the join
 # inserts between leaves, every one of which the detector reads. Those ten are a
 # floor: a stock session carries about fifteen tools, extrapolating to roughly
-# 13 800, so 20 000 covers a stock session with room for a small MCP server and
-# does not pretend to cover an arbitrary one. The test
-# a_real_tool_payload_fits_the_bounds_this_gateway_ships_with pins the figure and
-# fails if this default stops admitting twice it.
+# 13 800. The test a_real_tool_payload_fits_the_bounds_this_gateway_ships_with
+# pins the figure and fails if this default stops admitting twice it.
+#
+# 50 000 SINCE ISSUE #28, SIZED FOR A TOOL RESULT RATHER THAN THE DEFINITIONS. A
+# Read of a 1 500-line file is about 50 KB, and a tool result is detected in a
+# single call. Measured natively on an M3 Pro (11 cores, fp32): 20 000, 40 000
+# and 60 000 characters in 17.4, 35.0 and 52.8 s -- about 1 140 characters a
+# second, linear in size -- so 50 000 is about 44 s. detector_timeout_secs (90)
+# and detection_deadline_secs (120) admit that twice over, adding forty calls at
+# 109 ms for the deadline; the test
+# the_default_bounds_admit_the_measured_cost_twice_over asserts it.
+#
+# CONTAINERISED IT IS TWO TO THREE TIMES SLOWER: 36.7-41.7 s for 20 000
+# characters through the compose detector on the same machine, 141-174 s for
+# 60 000. deploy/tessera.container.toml keeps 20 000 for that reason. Slower
+# hardware has to lower this rather than inherit it, because the bound admits
+# what the timeout then cuts off.
 #
 # What that costs. Two things were offered as making it tolerable: it is the
 # FIRST turn of a session only, since tool definitions are byte-identical
@@ -156,10 +171,10 @@ max_spans_per_entry = 250
 #
 # THE CALLER'S PATIENCE IS NOT OURS TO SET. Whatever this number permits is what
 # the caller waits, and the caller has its own timeout that this gateway neither
-# sees nor controls. At thirty seconds a client is inside these figures by a
-# hair; at twenty it gives up first and the failure arrives on its side looking
-# like an outage here. detection_deadline_secs turns only a much longer wait
-# into an honest refusal.
+# sees nor controls. The OpenAI and Anthropic SDKs wait ten minutes, well past
+# the 44 s this bound costs; a client with a timeout under a minute gives up
+# first and the failure arrives on its side looking like an outage here.
+# detection_deadline_secs turns only a much longer wait into an honest refusal.
 #
 # THE CONTAINERISED COST IS MEASURED, NOT DERIVED. The 77 leaves of the real
 # ten-tool payload were replayed through /detect in sequence, three times,
@@ -180,26 +195,23 @@ max_spans_per_entry = 250
 # by a factor of five and nothing in it would have said so. It landed within 5%
 # of the replay, which is luck rather than method.
 #
-# THE NATIVE FIGURE BELOW IS STILL DERIVED and is labelled so, because it cannot
-# be measured here: the host detector/.venv has no onnxruntime, so its /health
-# reports ner: false and it runs the deterministic layer alone. Derived: about
-# 15 s, from the README bench's 80-character row (109 ms, per-call cost and
-# almost nothing else) plus its 1 200-character row for the marginal rate. An
-# estimate until someone runs the replay on a host with the NER extras.
+# THE NATIVE EQUIVALENT OF THAT REPLAY IS STILL DERIVED and is labelled so:
+# about 15 s, from the README bench's 80-character row (109 ms, per-call cost
+# and almost nothing else) plus its 1 200-character row for the marginal rate.
+# An estimate until someone replays it natively.
 #
-# The number was NOT lowered on the strength of that evidence: a bound below
-# real traffic turns a long wait into a refusal of a client that did nothing
-# wrong. One call per document instead of one per string was the fix, and it has
-# landed; what is left for issue #28 is making detection fast on a large text,
-# which is a different problem and not a number here. 20 000 rather than 18 000
-# because the headroom rule is now asserted rather than described, and 18 000
-# failed it by ten characters.
+# One call per document instead of one per string was the fix for the term that
+# dominates on tool definitions. On a tool result throughput dominates instead,
+# and issue #28's parallel window dispatch (#62) and pruned span resolution
+# (#133) are what made 50 000 fit.
 #
 # It is NOT a timeout budget, and this comment used to say it was.
 # detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
 # detector call on its own and never their sum. Three constraints: the timeout
 # catches a stuck call, detection_deadline_secs starts no call past it, and this
 # refuses a tool payload before that work starts.
+max_tool_chars = 50000
+
 # WHICH CALLERS THIS GATEWAY SERVES.
 #
 # Omit this key and the gateway serves anyone who can reach it, which is what it
@@ -254,8 +266,6 @@ max_spans_per_entry = 250
 # accepted_credentials = [
 #   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 # ]
-
-max_tool_chars = 20000
 
 # How many detector round-trips those structures may need.
 #
