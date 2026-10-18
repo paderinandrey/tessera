@@ -166,10 +166,11 @@ max_spans_per_entry = 250
 # hardware has to lower this rather than inherit it, because the bound admits
 # what the timeout then cuts off.
 #
-# OMITTED, IT IS 50 000 ONLY WHEN detector_timeout_secs IS OMITTED TOO, and the
-# 20 000 it was before issue #28 otherwise. A config that named a timeout was
-# written against the old bound and sized that timeout for it, so it keeps the
-# pair rather than gaining a bound its timeout may cut off.
+# OMITTED, IT IS 50 000 ONLY WHEN detector_timeout_secs AND
+# detection_deadline_secs ARE OMITTED TOO, and the 20 000 it was before issue
+# #28 otherwise. A config that named either was written against the old bound
+# and sized it for that, so it keeps the old bound rather than gaining one its
+# timeout or deadline may cut off.
 #
 # What that costs. Two things were offered as making it tolerable: it is the
 # FIRST turn of a session only, since tool definitions are byte-identical

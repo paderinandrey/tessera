@@ -265,12 +265,12 @@ pub struct Config {
     /// comes to rely on the wider budget will meet the narrow one eventually,
     /// and the narrow one is what they are owed.
     ///
-    /// **Omitted, it is 50 000 only when `detector_timeout_secs` is omitted
-    /// too**, and the 20 000 it was before #28 otherwise. A config that named a
-    /// timeout was written against the old bound and sized that timeout for
-    /// it, on hardware this gateway has not measured, so it keeps the pair
-    /// rather than gaining a bound its timeout may cut off. Read it through
-    /// `max_tool_chars()`.
+    /// **Omitted, it is 50 000 only when `detector_timeout_secs` and
+    /// `detection_deadline_secs` are omitted too**, and the 20 000 it was
+    /// before #28 otherwise. A config that named either was written against
+    /// the old bound and sized it for that, on hardware this gateway has not
+    /// measured, so it keeps the old bound rather than gaining one its timeout
+    /// or deadline may cut off. Read it through `max_tool_chars()`.
     #[serde(default)]
     pub max_tool_chars: Option<usize>,
 
@@ -407,7 +407,7 @@ fn default_max_spans_per_entry() -> usize {
 pub fn default_max_tool_chars() -> usize {
     50_000
 }
-const MAX_TOOL_CHARS_UNDER_A_SHORTER_TIMEOUT: usize = 20_000;
+const MAX_TOOL_CHARS_FOR_A_NAMED_TIMEOUT_OR_DEADLINE: usize = 20_000;
 pub fn default_max_tool_calls() -> usize {
     40
 }
@@ -529,12 +529,13 @@ fn elide_quoted(message: &str) -> String {
 
 impl Config {
     pub fn max_tool_chars(&self) -> usize {
-        self.max_tool_chars
-            .unwrap_or(if self.detector_timeout_secs.is_none() {
+        self.max_tool_chars.unwrap_or(
+            if self.detector_timeout_secs.is_none() && self.detection_deadline_secs.is_none() {
                 default_max_tool_chars()
             } else {
-                MAX_TOOL_CHARS_UNDER_A_SHORTER_TIMEOUT
-            })
+                MAX_TOOL_CHARS_FOR_A_NAMED_TIMEOUT_OR_DEADLINE
+            },
+        )
     }
 
     pub fn detector_timeout_secs(&self) -> u64 {
@@ -1067,6 +1068,12 @@ mod tests {
                 "a config that named a timeout of {timeout} s keeps the bound it was sized for"
             );
         }
+        let deadline = Config::from_toml(&with_audit("detection_deadline_secs = 30")).unwrap();
+        assert_eq!(
+            deadline.max_tool_chars(),
+            20_000,
+            "a config that named a deadline keeps the bound it was sized for"
+        );
         let current = Config::from_toml(&with_audit("")).unwrap();
         assert_eq!(current.max_tool_chars(), 50_000);
         let named = Config::from_toml(&with_audit(

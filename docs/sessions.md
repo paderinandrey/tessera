@@ -104,7 +104,8 @@ against the deployment's own texts.
 The tool structures a request newly scans have two bounds of their own, and unlike the
 cache's, exceeding either is a refusal rather than a miss: `max_tool_chars` (default
 50 000, and 20 000 in the shipped container configs, whose detector is two to three times
-slower) bounds how many characters they send to the detector, and `max_tool_calls`
+slower, or in any config that names `detector_timeout_secs` or `detection_deadline_secs`)
+bounds how many characters they send to the detector, and `max_tool_calls`
 (default 40) bounds how many detector round-trips they need. Both are denominated in what
 detection costs rather than in what the request weighs. A document is **one call however
 many strings are in it**, so a schema of a thousand short values is a single round-trip;
@@ -115,8 +116,8 @@ property names carrying them, which cost it nothing.
 for, and a text already detected under the same credential costs no wait — so it is not
 charged. That matters most for the traffic these bounds were sized against: the ten pinned
 Claude Code tool definitions are byte-identical on every turn, so charging them spent
-9 193 of the 20 000 characters and 20 of the 40 calls **permanently**, leaving about
-10 800 characters for a new tool result for the life of the session. That, rather than a low
+9 193 of what was then a 20 000-character bound and 20 of the 40 calls **permanently**,
+leaving about 10 800 characters for a new tool result for the life of the session. That, rather than a low
 ceiling, is the real mechanism behind "the bounds admit roughly twenty tools".
 
 So what a caller is promised is **this many characters of text the gateway has not seen**,
@@ -124,14 +125,15 @@ and a request can be admitted after a turn that warmed the cache and refused aft
 eviction. The direction is safe — a refusal is what that request already got — but the
 guarantee is the narrow number, not the wide one a warm cache happens to allow.
 
-Both defaults are twice a measurement
-taken on ten real Claude Code tool definitions, which charge 9 193 characters across 20
-calls on the turn that first sees them. That payload is a **floor** and is stated as one: a
-stock session also carries tools the measurement did not, and an MCP server adds more, so a
-large enough tool payload is refused rather than served slowly. Issue #28 — making detection fast on a large text — is
-the work that lifts the ceiling; until it lands, the honest answer to a payload past these
-numbers is a refusal, not a wait long enough that the client's own HTTP timeout would cut
-it off anyway.
+`max_tool_calls` is twice a measurement taken on ten real Claude Code tool definitions,
+which charge 9 193 characters across 20 calls on the turn that first sees them, and both
+bounds admit at least twice that payload. `max_tool_chars` is sized for something larger:
+a tool result is one detector call however long it is, and 50 000 characters — a `Read` of
+a 1 500-line file — took 44–59 s natively, the high end for token-dense text.
+`detector_timeout_secs` (120) and `detection_deadline_secs` (150) admit that twice over;
+`docs/latency.md` has the table. The compose detector is two to three times slower, so the
+shipped container configs keep 20 000. Past these numbers the honest answer is a refusal,
+not a wait long enough that the client's own HTTP timeout would cut it off anyway.
 
 A request refused before the upstream call leaves its session exactly as it was. Asking for a
 session the gateway cannot honour — a malformed id, no credential to namespace it, or
