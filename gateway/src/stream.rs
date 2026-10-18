@@ -718,6 +718,18 @@ impl<'a> StreamRestorer<'a> {
         // index. The envelope is restored now, because it is this event's own
         // and the accumulator has no use for it.
         if slots.iter().any(|slot| slot.run == Run::Document) {
+            if let Some(parts) = self.provider.split_event(&parsed) {
+                let mut out = String::new();
+                for part in parts {
+                    let mut piece = event.clone();
+                    piece.data = Some(part.to_string());
+                    match self.handle(piece) {
+                        Ok(rendered) => out.push_str(&rendered),
+                        Err(error) => return Err(self.keep(out, error)),
+                    }
+                }
+                return Ok(out);
+            }
             // **One event may carry several documents and must not mix kinds.**
             // OpenAI streams parallel tool calls as one `tool_calls` array, so
             // two fragments of two different documents arrive together and both
@@ -726,17 +738,8 @@ impl<'a> StreamRestorer<'a> {
             // are held back, and then the event that finally carries a document
             // would carry that text a second time.
             //
-            // **This is event-wide rather than per choice, and that is the
-            // stricter reading on purpose.** With `n > 1` one could imagine a
-            // chunk whose first choice emits `content` while its second emits
-            // `tool_calls`. It is not a shape this protocol produces — each
-            // chunk carries one choice at array position 0, which
-            // `interleaved_choices_get_distinct_keys_at_the_same_position` and
-            // the key design itself both rest on — so scoping the check per
-            // choice would buy nothing reachable and would cost the simple
-            // rule that an event is emitted once or held once. If OpenAI ever
-            // batches choices, this refuses rather than emitting the text twice
-            // or dropping a document, which is the side to be wrong on.
+            // An event carrying several choices never reaches this point: it
+            // was split above, so the text here is the same choice's.
             if slots.iter().any(|slot| slot.run == Run::Text) {
                 return Err(ShapeError::Response(provider).into());
             }
@@ -972,9 +975,8 @@ impl<'a> StreamRestorer<'a> {
             // that reason** — Anthropic opens one document slot per event, so
             // its groups are single runs, and OpenAI's `finish_reason` ends
             // every run under its choice in one flush. A group cannot span two
-            // choices either, for the same reason the check above is event-wide:
-            // one chunk carries one choice, so the runs an event opens are all
-            // that choice's and all end together. It is here because the
+            // choices either: an event carrying several is split into one per
+            // choice before any group is opened. It is here because the
             // grouping is what makes it unreachable: a provider added later
             // that closes calls one at a time would meet this instead of
             // silently replaying a name, and the direction of that failure is
@@ -1441,6 +1443,164 @@ mod restorer_tests {
 
         assert_eq!(text_for_choice(&rendered, 0), "A Weber one");
         assert_eq!(text_for_choice(&rendered, 1), "B Weber two");
+    }
+
+    /// The name and the arguments the client would have assembled for one
+    /// choice's first tool call, concatenated across every chunk.
+    fn tool_call_for_choice(rendered: &str, index: u64) -> (String, String) {
+        let mut name = String::new();
+        let mut arguments = String::new();
+        for line in rendered.split('\n') {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+                continue;
+            };
+            for choice in choices {
+                if choice.get("index").and_then(Value::as_u64) != Some(index) {
+                    continue;
+                }
+                let Some(calls) = choice
+                    .pointer("/delta/tool_calls")
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                for call in calls {
+                    if let Some(part) = call.pointer("/function/name").and_then(Value::as_str) {
+                        name.push_str(part);
+                    }
+                    if let Some(part) = call.pointer("/function/arguments").and_then(Value::as_str)
+                    {
+                        arguments.push_str(part);
+                    }
+                }
+            }
+        }
+        (name, arguments)
+    }
+
+    #[test]
+    fn one_chunk_carrying_text_for_one_choice_and_a_tool_call_for_another_is_served() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[",
+            "{\"index\":0,\"delta\":{\"content\":\"Hallo [PERSON_1]\"}},",
+            "{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"greet\",\"arguments\":\"{\\\"who\\\":\\\"[PER\"}}]}}",
+            "]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"arguments\":\"SON_1]\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[",
+            "{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"},",
+            "{\"index\":1,\"delta\":{},\"finish_reason\":\"tool_calls\"}",
+            "]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        assert_eq!(text_for_choice(&rendered, 0), "Hallo Weber");
+        let (name, arguments) = tool_call_for_choice(&rendered, 1);
+        assert_eq!(name, "greet");
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap(),
+            json!({"who": "Weber"})
+        );
+        assert!(!rendered.contains("PERSON"), "{rendered}");
+    }
+
+    #[test]
+    fn tool_calls_two_choices_open_in_one_chunk_may_finish_in_separate_ones() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"choices\":[",
+            "{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"greet\",\"arguments\":\"{\\\"who\\\":\"}}]}},",
+            "{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"b\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"greet\",\"arguments\":\"{\\\"who\\\":\"}}]}}",
+            "]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"arguments\":\"\\\"[PERSON_1]\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"arguments\":\"\\\"Anna\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        for (index, who) in [(0, "Weber"), (1, "Anna")] {
+            let (name, arguments) = tool_call_for_choice(&rendered, index);
+            assert_eq!(name, "greet", "choice {index}: {rendered}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&arguments).unwrap(),
+                json!({"who": who}),
+                "choice {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn choices_without_an_index_are_not_split_into_one_run() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let error = restorer
+            .push(
+                concat!(
+                    "data: {\"choices\":[",
+                    "{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"who\\\":\\\"[PER\"}}]}},",
+                    "{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"SON_1]\\\"}\"}}]}}",
+                    "]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"},",
+                    "{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                StreamError::Shape(ShapeError::MalformedDocument(_, _))
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_split_chunk_reports_its_usage_once() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let body = concat!(
+            "data: {\"usage\":{\"total_tokens\":7},\"choices\":[",
+            "{\"index\":0,\"delta\":{\"content\":\"Hallo\"}},",
+            "{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",",
+            "\"function\":{\"name\":\"greet\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}",
+            "]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut rendered = restorer.push(body.as_bytes()).unwrap();
+        rendered.push_str(&restorer.finish().unwrap());
+
+        assert_eq!(rendered.matches("total_tokens").count(), 1, "{rendered}");
+        let carrier: Value = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find(|data| data.contains("total_tokens"))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .unwrap();
+        assert_eq!(carrier.pointer("/choices/0/index"), Some(&json!(1)));
+        assert_eq!(text_for_choice(&rendered, 0), "Hallo");
+        assert_eq!(tool_call_for_choice(&rendered, 1).0, "greet");
     }
 
     #[test]

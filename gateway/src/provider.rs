@@ -37,6 +37,9 @@ pub trait Provider: Send + Sync {
     /// buffer on one would release half a placeholder as ordinary text, and the
     /// client would reassemble the token we were hiding.
     fn stream_terminates(&self, event: &Value) -> Terminates;
+    fn split_event(&self, _event: &Value) -> Option<Vec<Value>> {
+        None
+    }
     /// The header this provider authenticates with. A session is namespaced by
     /// its value: the mapping table is a restoration oracle, and an id alone
     /// would let a guessed id read another caller's values out of it one
@@ -46,7 +49,7 @@ pub trait Provider: Send + Sync {
 
 /// Where text sits in one streamed event, and which run of text it belongs to.
 ///
-/// The two differ, and the difference is load-bearing. OpenAI streams one choice
+/// The two differ, and the difference is load-bearing. OpenAI usually streams one choice
 /// per chunk at array position 0 whatever its logical `index`, so the pointer
 /// alone would give two completions the same hold-back buffer and splice their
 /// fragments together. The pointer addresses this event; the key identifies the
@@ -2230,6 +2233,34 @@ impl Provider for OpenAi {
             }
         }
         Ok(slots)
+    }
+
+    fn split_event(&self, event: &Value) -> Option<Vec<Value>> {
+        let choices = event.get("choices")?.as_array()?;
+        if choices.len() < 2
+            || choices
+                .iter()
+                .any(|choice| choice.get("index").and_then(Value::as_u64).is_none())
+        {
+            return None;
+        }
+        let last = choices.len() - 1;
+        Some(
+            choices
+                .iter()
+                .enumerate()
+                .map(|(at, choice)| {
+                    let mut part = event.clone();
+                    part["choices"] = Value::Array(vec![choice.clone()]);
+                    if at != last {
+                        if let Some(fields) = part.as_object_mut() {
+                            fields.remove("usage");
+                        }
+                    }
+                    part
+                })
+                .collect(),
+        )
     }
 
     fn stream_terminates(&self, event: &Value) -> Terminates {
