@@ -275,7 +275,7 @@ impl AppState {
         Self {
             detector: DetectorClient::new(
                 config.detector_url.clone(),
-                Duration::from_secs(config.detector_timeout_secs),
+                Duration::from_secs(config.detector_timeout_secs()),
                 config.detection_cache_entries,
                 config.max_spans_per_entry,
             ),

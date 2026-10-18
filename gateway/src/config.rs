@@ -84,8 +84,8 @@ pub struct Config {
     /// in one go — measured at 44 s natively for 50 000 characters, and a call
     /// cut off by this timeout is never cached, so its retry is cut off too.
     /// Exceeding it refuses the request — it never forwards unmasked text.
-    #[serde(default = "default_timeout")]
-    pub detector_timeout_secs: u64,
+    #[serde(default)]
+    pub detector_timeout_secs: Option<u64>,
     pub detection_deadline_secs: Option<u64>,
     #[serde(default = "default_openai_base")]
     pub openai_base: String,
@@ -260,11 +260,12 @@ pub struct Config {
     /// comes to rely on the wider budget will meet the narrow one eventually,
     /// and the narrow one is what they are owed.
     ///
-    /// **Omitted, it follows `detector_timeout_secs`**: 50 000 under a timeout
-    /// of 90 s or more, and the 20 000 it was before #28 under a shorter one.
-    /// A config that kept the old 30 s timeout and never named this key keeps
-    /// the pair it was written against, rather than a bound its timeout cuts
-    /// off. Read it through `max_tool_chars()`.
+    /// **Omitted, it is 50 000 only when `detector_timeout_secs` is omitted
+    /// too**, and the 20 000 it was before #28 otherwise. A config that named a
+    /// timeout was written against the old bound and sized that timeout for
+    /// it, on hardware this gateway has not measured, so it keeps the pair
+    /// rather than gaining a bound its timeout may cut off. Read it through
+    /// `max_tool_chars()`.
     #[serde(default)]
     pub max_tool_chars: Option<usize>,
 
@@ -524,11 +525,15 @@ fn elide_quoted(message: &str) -> String {
 impl Config {
     pub fn max_tool_chars(&self) -> usize {
         self.max_tool_chars
-            .unwrap_or(if self.detector_timeout_secs >= default_timeout() {
+            .unwrap_or(if self.detector_timeout_secs.is_none() {
                 default_max_tool_chars()
             } else {
                 MAX_TOOL_CHARS_UNDER_A_SHORTER_TIMEOUT
             })
+    }
+
+    pub fn detector_timeout_secs(&self) -> u64 {
+        self.detector_timeout_secs.unwrap_or(default_timeout())
     }
 
     pub fn detection_deadline_secs(&self) -> u64 {
@@ -538,7 +543,7 @@ impl Config {
 
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let config: Config = toml::from_str(text).map_err(|error| redact(&error, text))?;
-        if config.detector_timeout_secs == 0 {
+        if config.detector_timeout_secs == Some(0) {
             return Err(ConfigError::ZeroTimeout);
         }
         match config.detection_deadline_secs {
@@ -649,7 +654,7 @@ mod tests {
         let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
         assert_eq!(config.bind, "127.0.0.1:8080");
         assert_eq!(config.detector_url, "http://127.0.0.1:8000");
-        assert_eq!(config.detector_timeout_secs, 90);
+        assert_eq!(config.detector_timeout_secs(), 90);
     }
 
     #[test]
@@ -664,7 +669,7 @@ mod tests {
         ))
         .expect("valid config");
         assert_eq!(config.bind, "0.0.0.0:9090");
-        assert_eq!(config.detector_timeout_secs, 5);
+        assert_eq!(config.detector_timeout_secs(), 5);
         assert_eq!(config.openai_base, "https://api.openai.com");
     }
 
@@ -1031,11 +1036,11 @@ mod tests {
 
     fn assert_admits_twice(config: &Config, one_text_secs: f64, per_call_secs: f64) {
         assert!(
-            config.detector_timeout_secs as f64 >= 2.0 * one_text_secs,
+            config.detector_timeout_secs() as f64 >= 2.0 * one_text_secs,
             "one text of {} characters took {one_text_secs} s, and a timeout of {} s cuts it \
              off on every retry",
             config.max_tool_chars(),
-            config.detector_timeout_secs
+            config.detector_timeout_secs()
         );
         let at_both_bounds = one_text_secs + config.max_tool_calls as f64 * per_call_secs;
         assert!(
@@ -1046,14 +1051,18 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_tool_bound_follows_the_timeout_it_is_paired_with() {
-        let legacy = Config::from_toml(&with_audit("detector_timeout_secs = 30")).unwrap();
-        assert_eq!(
-            legacy.max_tool_chars(),
-            20_000,
-            "the pair an old config was written against"
-        );
-        let current = Config::from_toml(&with_audit("detector_timeout_secs = 90")).unwrap();
+    fn an_omitted_tool_bound_is_the_new_one_only_beside_an_omitted_timeout() {
+        for timeout in [30, 90, 300] {
+            let legacy =
+                Config::from_toml(&with_audit(&format!("detector_timeout_secs = {timeout}")))
+                    .unwrap();
+            assert_eq!(
+                legacy.max_tool_chars(),
+                20_000,
+                "a config that named a timeout of {timeout} s keeps the bound it was sized for"
+            );
+        }
+        let current = Config::from_toml(&with_audit("")).unwrap();
         assert_eq!(current.max_tool_chars(), 50_000);
         let named = Config::from_toml(&with_audit(
             "detector_timeout_secs = 30\nmax_tool_chars = 50000",
