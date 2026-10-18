@@ -1549,6 +1549,33 @@ mod restorer_tests {
     }
 
     #[test]
+    fn choices_without_an_index_are_not_split_into_one_run() {
+        let mapping = mapped();
+        let mut restorer = StreamRestorer::new(&OpenAi, &mapping);
+        let error = restorer
+            .push(
+                concat!(
+                    "data: {\"choices\":[",
+                    "{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"who\\\":\\\"[PER\"}}]}},",
+                    "{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"SON_1]\\\"}\"}}]}}",
+                    "]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"},",
+                    "{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                StreamError::Shape(ShapeError::MalformedDocument(_, _))
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_split_chunk_reports_its_usage_once() {
         let mapping = mapped();
         let mut restorer = StreamRestorer::new(&OpenAi, &mapping);

@@ -2237,7 +2237,11 @@ impl Provider for OpenAi {
 
     fn split_event(&self, event: &Value) -> Option<Vec<Value>> {
         let choices = event.get("choices")?.as_array()?;
-        if choices.len() < 2 {
+        if choices.len() < 2
+            || choices
+                .iter()
+                .any(|choice| choice.get("index").and_then(Value::as_u64).is_none())
+        {
             return None;
         }
         let last = choices.len() - 1;
