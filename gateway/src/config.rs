@@ -265,12 +265,13 @@ pub struct Config {
     /// comes to rely on the wider budget will meet the narrow one eventually,
     /// and the narrow one is what they are owed.
     ///
-    /// **Omitted, it is 50 000 only when `detector_timeout_secs` and
-    /// `detection_deadline_secs` are omitted too**, and the 20 000 it was
-    /// before #28 otherwise. A config that named either was written against
-    /// the old bound and sized it for that, on hardware this gateway has not
-    /// measured, so it keeps the old bound rather than gaining one its timeout
-    /// or deadline may cut off. Read it through `max_tool_chars()`.
+    /// **The three move together.** 50 000, a 120 s timeout and a 150 s
+    /// deadline apply only to a config that names neither
+    /// `detector_timeout_secs` nor `detection_deadline_secs`. A config that
+    /// names either was sized against the previous values, on hardware this
+    /// gateway has not measured, so whichever of the three it omits keeps the
+    /// previous value: 20 000, 30 s and 120 s. Read them through the
+    /// accessors of the same names.
     #[serde(default)]
     pub max_tool_chars: Option<usize>,
 
@@ -338,6 +339,8 @@ fn default_timeout() -> u64 {
     120
 }
 const DEFAULT_DETECTION_DEADLINE_SECS: u64 = 150;
+const PREVIOUS_TIMEOUT_SECS: u64 = 30;
+const PREVIOUS_DETECTION_DEADLINE_SECS: u64 = 120;
 const MAX_DETECTION_DEADLINE_SECS: u64 = 86_400;
 fn default_openai_base() -> String {
     "https://api.openai.com".to_owned()
@@ -407,7 +410,7 @@ fn default_max_spans_per_entry() -> usize {
 pub fn default_max_tool_chars() -> usize {
     50_000
 }
-const MAX_TOOL_CHARS_FOR_A_NAMED_TIMEOUT_OR_DEADLINE: usize = 20_000;
+const PREVIOUS_MAX_TOOL_CHARS: usize = 20_000;
 pub fn default_max_tool_calls() -> usize {
     40
 }
@@ -528,23 +531,35 @@ fn elide_quoted(message: &str) -> String {
 }
 
 impl Config {
+    fn names_a_detection_limit(&self) -> bool {
+        self.detector_timeout_secs.is_some() || self.detection_deadline_secs.is_some()
+    }
+
     pub fn max_tool_chars(&self) -> usize {
-        self.max_tool_chars.unwrap_or(
-            if self.detector_timeout_secs.is_none() && self.detection_deadline_secs.is_none() {
-                default_max_tool_chars()
+        self.max_tool_chars
+            .unwrap_or(if self.names_a_detection_limit() {
+                PREVIOUS_MAX_TOOL_CHARS
             } else {
-                MAX_TOOL_CHARS_FOR_A_NAMED_TIMEOUT_OR_DEADLINE
-            },
-        )
+                default_max_tool_chars()
+            })
     }
 
     pub fn detector_timeout_secs(&self) -> u64 {
-        self.detector_timeout_secs.unwrap_or(default_timeout())
+        self.detector_timeout_secs
+            .unwrap_or(if self.names_a_detection_limit() {
+                PREVIOUS_TIMEOUT_SECS
+            } else {
+                default_timeout()
+            })
     }
 
     pub fn detection_deadline_secs(&self) -> u64 {
         self.detection_deadline_secs
-            .unwrap_or(DEFAULT_DETECTION_DEADLINE_SECS)
+            .unwrap_or(if self.names_a_detection_limit() {
+                PREVIOUS_DETECTION_DEADLINE_SECS
+            } else {
+                DEFAULT_DETECTION_DEADLINE_SECS
+            })
     }
 
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -727,7 +742,7 @@ mod tests {
     fn a_config_written_before_the_deadline_existed_still_starts() {
         let config = Config::from_toml(&with_audit("detector_timeout_secs = 300"))
             .expect("a timeout longer than the default deadline is valid");
-        assert_eq!(config.detection_deadline_secs(), 150);
+        assert_eq!(config.detection_deadline_secs(), 120);
     }
 
     #[test]
@@ -1057,25 +1072,32 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_tool_bound_is_the_new_one_only_beside_an_omitted_timeout() {
+    fn the_new_detection_defaults_apply_only_to_a_config_naming_neither_limit() {
+        let current = Config::from_toml(&with_audit("")).unwrap();
+        assert_eq!(
+            (
+                current.max_tool_chars(),
+                current.detector_timeout_secs(),
+                current.detection_deadline_secs()
+            ),
+            (50_000, 120, 150)
+        );
         for timeout in [30, 90, 300] {
             let legacy =
                 Config::from_toml(&with_audit(&format!("detector_timeout_secs = {timeout}")))
                     .unwrap();
             assert_eq!(
-                legacy.max_tool_chars(),
-                20_000,
-                "a config that named a timeout of {timeout} s keeps the bound it was sized for"
+                (legacy.max_tool_chars(), legacy.detection_deadline_secs()),
+                (20_000, 120),
+                "a config that named a timeout of {timeout} s keeps what it was sized against"
             );
         }
         let deadline = Config::from_toml(&with_audit("detection_deadline_secs = 30")).unwrap();
         assert_eq!(
-            deadline.max_tool_chars(),
-            20_000,
-            "a config that named a deadline keeps the bound it was sized for"
+            (deadline.max_tool_chars(), deadline.detector_timeout_secs()),
+            (20_000, 30),
+            "a config that named a deadline keeps what it was sized against"
         );
-        let current = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(current.max_tool_chars(), 50_000);
         let named = Config::from_toml(&with_audit(
             "detector_timeout_secs = 30\nmax_tool_chars = 50000",
         ))
