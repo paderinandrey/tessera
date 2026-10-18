@@ -125,6 +125,13 @@ call's `id`, `type` and `name` arrive in the same chunk as its first `arguments`
 never again — so the event the accumulator keeps is a run's **first**, not its latest, or the
 client receives a finished document belonging to a call it cannot dispatch.
 
+With `n > 1` a chunk usually carries one choice, but OpenAI's chunk reference allows several.
+A chunk that carries tool-call arguments for more than one choice, or arguments for one and
+text for another, is served as one chunk per choice, in the order they arrived, with `usage`
+on the last of them. That is the same response to a client that assembles each choice by its
+`index`, and it lets each choice's calls open and close on their own. A chunk carrying only
+text for several choices is served as it came.
+
 **A document is served when its own run closes, and on no other signal.** A run still held
 when `message_stop` arrives — or `[DONE]`, or an `error` the upstream sent mid-generation —
 never saw the event that closes it, and the stream ends rather than serving it. Truncation
