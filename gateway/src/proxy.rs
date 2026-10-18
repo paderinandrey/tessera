@@ -63,6 +63,11 @@ pub enum ProxyError {
     /// long. A caller who is not served learns that they are not served.
     #[error("this gateway does not serve this caller")]
     Unauthenticated,
+    #[error(
+        "detecting this request took longer than this gateway allows one request; it is \
+         refused rather than forwarded"
+    )]
+    DetectionDeadline,
 }
 
 impl ProxyError {
@@ -99,9 +104,9 @@ impl ProxyError {
             // detector round-trip, and the gateway has no honest number for it.
             // A journal that cannot be written is the same kind of fact about
             // this gateway rather than about the caller.
-            ProxyError::Session(SessionError::Saturated) | ProxyError::Audit(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ProxyError::Session(SessionError::Saturated)
+            | ProxyError::Audit(_)
+            | ProxyError::DetectionDeadline => StatusCode::SERVICE_UNAVAILABLE,
             // Everything the upstream or the detector got wrong, every shape
             // failure on the way back, and this gateway's own internal
             // mapping defects: an unresolvable placeholder, a detector span
@@ -200,6 +205,7 @@ impl ProxyError {
             ProxyError::TooManyToolCalls => "tool_too_many_calls",
             ProxyError::NumericPersonalData => "tool_numeric_personal_data",
             ProxyError::Unauthenticated => "caller_not_served",
+            ProxyError::DetectionDeadline => "detection_deadline",
         }
     }
 }
@@ -258,6 +264,7 @@ pub struct AppState {
     /// detected in a single call. Bounds *calls* where `max_tool_chars` bounds
     /// *size*.
     pub max_tool_calls: usize,
+    pub detection_deadline: Duration,
     /// Which callers this gateway serves. `Callers::Anyone` unless the operator
     /// configured a list, which is what every deployment before #91 was.
     pub callers: crate::auth::Callers,
@@ -286,6 +293,7 @@ impl AppState {
             audit,
             max_tool_chars: config.max_tool_chars,
             max_tool_calls: config.max_tool_calls,
+            detection_deadline: Duration::from_secs(config.detection_deadline_secs()),
             callers: match &config.accepted_credentials {
                 None => crate::auth::Callers::Anyone,
                 Some(accepted) => {
@@ -888,6 +896,7 @@ async fn handle(
     // outcome line is the only line such a request leaves. Read once, so the
     // digest sent here and the one sent below cannot drift apart into two
     // different readings of the same header.
+    let deadline = tokio::time::Instant::now() + state.detection_deadline;
     let credential = crate::session::credential_of(&headers, provider);
     if let Some(credential) = credential {
         record.attribute(state.audit.digest(&[credential]), None);
@@ -1039,21 +1048,30 @@ async fn handle(
             let claimed = state.sessions.acquire(&key)?;
             let mut guard = match claimed.guard {
                 Some(guard) => guard,
-                None => Arc::clone(&claimed.session.mapping).lock_owned().await,
+                None => tokio::time::timeout_at(
+                    deadline,
+                    Arc::clone(&claimed.session.mapping).lock_owned(),
+                )
+                .await
+                .map_err(|_| ProxyError::DetectionDeadline)?,
             };
             let mut work = guard.clone();
             // On the clone, so the boundary is this request's. The session's
             // own copy never carries an issuance record to clear.
             work.begin_request();
-            let (masked, found) = mask_all(
-                provider.name(),
-                &state.detector,
-                &body,
-                &slots,
-                &mut work,
-                credential,
+            let (masked, found) = tokio::time::timeout_at(
+                deadline,
+                mask_all(
+                    provider.name(),
+                    &state.detector,
+                    &body,
+                    &slots,
+                    &mut work,
+                    credential,
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| ProxyError::DetectionDeadline)??;
             record.detected(found);
             record.unremembered(guard.unkept(&work, state.sessions.max_values()));
             // Durable before anything leaves the perimeter, and before the
@@ -1077,15 +1095,19 @@ async fn handle(
         None => {
             let mut work = Mapping::new();
             work.begin_request();
-            let (masked, found) = mask_all(
-                provider.name(),
-                &state.detector,
-                &body,
-                &slots,
-                &mut work,
-                credential,
+            let (masked, found) = tokio::time::timeout_at(
+                deadline,
+                mask_all(
+                    provider.name(),
+                    &state.detector,
+                    &body,
+                    &slots,
+                    &mut work,
+                    credential,
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| ProxyError::DetectionDeadline)??;
             record.detected(found);
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
@@ -1584,6 +1606,7 @@ mod tests {
     /// promised here.
     const TEST_MAX_TOOL_CHARS: usize = 20_000;
     const TEST_MAX_TOOL_CALLS: usize = 40;
+    const TEST_DETECTION_DEADLINE: Duration = Duration::from_secs(60);
 
     #[test]
     fn the_bounds_these_tests_exercise_are_the_bounds_callers_get() {
@@ -1744,6 +1767,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
         (state, dir, path)
@@ -1772,6 +1796,7 @@ mod tests {
             audit,
             max_tool_chars,
             max_tool_calls,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
         (state, dir, path)
@@ -2168,6 +2193,133 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    async fn detector_answering_after(delay: Duration) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/detect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "spans": [],
+                        "layers_run": ["deterministic", "ner"],
+                        "version": "test-version"
+                    }))
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn with_deadline(state: Arc<AppState>, deadline: Duration) -> Arc<AppState> {
+        Arc::new(AppState {
+            detection_deadline: deadline,
+            ..Arc::try_unwrap(state).ok().expect("sole owner")
+        })
+    }
+
+    #[tokio::test]
+    async fn detection_past_the_deadline_is_refused_and_never_reaches_the_upstream() {
+        let detector = detector_answering_after(Duration::from_millis(1500)).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        let (status, served) = call(
+            with_deadline(state, Duration::from_millis(300)),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        let lines = journal(&path);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["error"], "detection_deadline");
+        assert_eq!(lines[0]["upstream"], false);
+    }
+
+    #[tokio::test]
+    async fn detection_past_the_deadline_is_refused_inside_a_session_too() {
+        let detector = detector_answering_after(Duration::from_millis(1500)).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        let (status, served) = call_with_headers(
+            with_deadline(state, Duration::from_millis(300)),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            &session_headers("Bearer k", "s1"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        assert_eq!(journal(&path)[0]["error"], "detection_deadline");
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_at_the_deadline_continues_where_it_stopped() {
+        let detector = detector_answering_after(Duration::from_millis(400)).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let state = with_deadline(state, Duration::from_millis(600));
+        let body = json!({"model": "gpt", "messages": [
+            {"role": "user", "content": "erste Nachricht"},
+            {"role": "user", "content": "zweite Nachricht"},
+        ]});
+
+        let headers = [("authorization", "Bearer k")];
+
+        let (first, _) = call_with_headers(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            body.clone(),
+            &headers,
+        )
+        .await;
+        assert_eq!(first, StatusCode::SERVICE_UNAVAILABLE);
+        let (second, served) =
+            call_with_headers(state, "/v1/chat/completions", body, &headers).await;
+        assert_eq!(second, StatusCode::OK, "{served}");
+
+        assert_eq!(detector.received_requests().await.unwrap().len(), 3);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_session_counts_against_the_deadline() {
+        let detector = detector_returning_expecting(json!([]), Some(0)).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+        let state = with_deadline(state, Duration::from_millis(300));
+        let claimed = state
+            .sessions
+            .acquire(&test_key("s1", "Bearer k"))
+            .expect("a session");
+        let _held = claimed.guard.expect("a fresh session is claimable");
+
+        let (status, served) = tokio::time::timeout(
+            Duration::from_secs(10),
+            call_with_headers(
+                state,
+                "/v1/chat/completions",
+                json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+                &session_headers("Bearer k", "s1"),
+            ),
+        )
+        .await
+        .expect("the deadline answers a request stuck behind its session");
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        assert_eq!(journal(&path)[0]["error"], "detection_deadline");
     }
 
     #[tokio::test]
@@ -5996,6 +6148,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         })
     }
@@ -7078,6 +7231,7 @@ mod tests {
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
 
@@ -7507,6 +7661,7 @@ mod tests {
             audit: Arc::new(crate::audit::failing_audit_for_tests()),
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
 
@@ -7567,6 +7722,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
         call(
@@ -7607,6 +7763,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
         (state, dir, path)
@@ -8210,6 +8367,7 @@ mod tests {
             audit,
             max_tool_chars: TEST_MAX_TOOL_CHARS,
             max_tool_calls: TEST_MAX_TOOL_CALLS,
+            detection_deadline: TEST_DETECTION_DEADLINE,
             callers: crate::auth::Callers::Anyone,
         });
 

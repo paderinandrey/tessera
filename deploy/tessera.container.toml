@@ -11,6 +11,7 @@
 bind = "0.0.0.0:8080"
 detector_url = "http://detector:8000"
 detector_timeout_secs = 30
+detection_deadline_secs = 120
 
 openai_base = "https://api.openai.com"
 anthropic_base = "https://api.anthropic.com"

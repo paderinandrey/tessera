@@ -9,6 +9,19 @@ detector_url = "http://127.0.0.1:8000"
 # request rather than forwarding unmasked text.
 detector_timeout_secs = 30
 
+# How long detecting one request may take in all, waiting for its session
+# included; past it the request is refused with a 503 and nothing is forwarded.
+# Each detector call that finished is remembered by the detection cache, so the
+# same request sent again under the same credential picks up where the refused
+# one stopped (a request with no credential is never cached, and nothing is
+# under detection_cache_entries = 0). Must be at
+# least detector_timeout_secs, or a call the timeout allows could never finish
+# inside it. Two minutes keeps it well under the ten-minute timeouts of the
+# OpenAI and Anthropic SDKs, so a caller hears a refusal it can retry rather
+# than its own timeout. Left out, it is two minutes or detector_timeout_secs,
+# whichever is longer.
+detection_deadline_secs = 120
+
 openai_base = "https://api.openai.com"
 anthropic_base = "https://api.anthropic.com"
 
@@ -137,13 +150,12 @@ max_spans_per_entry = 250
 # faster gateway but a refused one, because a bound below real traffic makes
 # this unusable with the clients it exists for.
 #
-# NOTHING BOUNDS A REQUEST'S WALL CLOCK, and the caller's patience is not ours
-# to set. Whatever this number permits is what the caller waits, and the caller
-# has its own timeout that this gateway neither sees nor controls. At thirty
-# seconds a client is inside these figures by a hair; at twenty it gives up
-# first and the failure arrives on its side looking like an outage here. No
-# cumulative deadline exists anywhere on the request path that would turn that
-# into an honest refusal instead.
+# THE CALLER'S PATIENCE IS NOT OURS TO SET. Whatever this number permits is what
+# the caller waits, and the caller has its own timeout that this gateway neither
+# sees nor controls. At thirty seconds a client is inside these figures by a
+# hair; at twenty it gives up first and the failure arrives on its side looking
+# like an outage here. detection_deadline_secs turns only a much longer wait
+# into an honest refusal.
 #
 # THE CONTAINERISED COST IS MEASURED, NOT DERIVED. The 77 leaves of the real
 # ten-tool payload were replayed through /detect in sequence, three times,
@@ -181,9 +193,10 @@ max_spans_per_entry = 250
 #
 # It is NOT a timeout budget, and this comment used to say it was.
 # detector_timeout_secs becomes reqwest's per-request timeout, so it bounds each
-# detector call on its own and never their sum; no cumulative deadline exists
-# anywhere on the request path. Two constraints: the timeout catches a stuck
-# call, this caps how long a caller waits for the whole request.
+# detector call on its own and never their sum; their sum is
+# detection_deadline_secs. Three constraints: the timeout catches a stuck call,
+# the deadline refuses a request whose detection runs long, and this refuses a
+# tool payload before that work starts.
 # WHICH CALLERS THIS GATEWAY SERVES.
 #
 # Omit this key and the gateway serves anyone who can reach it, which is what it

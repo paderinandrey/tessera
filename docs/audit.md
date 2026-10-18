@@ -125,9 +125,12 @@ never see a placeholder — though that is not what denies the caller the
 knowledge, since they chose the token: an issued one refuses where an unissued
 one is served, so a run of these from one tenant and session is somebody reading
 that one bit;
-`detector_transport`, `detector_status`, `session_saturated` and
+`detector_transport`, `detector_status`, `detection_deadline`, `session_saturated` and
 `audit_write_failed` are this deployment's own machinery rather than anybody's
-mistake. A run of the first group is worth a page; a run of the second is worth
+mistake. `detection_deadline` means detecting one request outlasted
+`detection_deadline_secs`, waiting for its session included; a run of them from
+one tenant and session is a long conversation meeting a cold cache, and each
+attempt leaves more of it detected than the last. A run of the first group is worth a page; a run of the second is worth
 a look at the provider's status. Every class this gateway can write appears in
 one of those four groups, and a test holds this paragraph to the code.
 
