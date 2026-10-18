@@ -1,5 +1,6 @@
 # The gateway's configuration inside the compose stack. Three values differ
-# from gateway/tessera.example.toml, and each has to:
+# from gateway/tessera.example.toml, and each has to (the detection bounds
+# differ too, for the throughput reason given beside them):
 #
 #   - detector_url names the compose service, not loopback;
 #   - audit_path points inside the audit volume, which is also where the
@@ -10,7 +11,10 @@
 
 bind = "0.0.0.0:8080"
 detector_url = "http://detector:8000"
-detector_timeout_secs = 30
+# A tool result is one detector call. Through the compose detector on an
+# M3 Pro, 20 000 characters took 36.7-41.7 s; a call this cuts off is never
+# cached, so its retry is cut off too. 90 admits that twice over.
+detector_timeout_secs = 90
 detection_deadline_secs = 120
 
 openai_base = "https://api.openai.com"
@@ -37,8 +41,10 @@ max_spans_per_entry = 250
 # 9 005 of text, 50 of numbers, 138 of join separators. Replaying that payload
 # leaf by leaf took a measured 54.9 s, a session's first turn, because a call
 # costs 265-410 ms whatever its length; batching a document into one call cuts
-# it to 20 calls from 77. Nothing bounds a request's wall clock, and the
-# caller's own timeout is not ours to set. See gateway/tessera.example.toml.
+# it to 20 calls from 77. The native default is 50 000; this stays at
+# 20 000 because the compose detector is two to three times slower, and a
+# 50 000-character tool result would outlast detector_timeout_secs here.
+# See gateway/tessera.example.toml.
 max_tool_chars = 20000
 # How many detector round-trips those structures may need. A document's leaves
 # are detected in a single call, so this counts one per tool description and one

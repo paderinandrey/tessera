@@ -234,7 +234,8 @@ buffer, which may hold the token that failed.
 
 On a cache miss the gateway asks the detector for every layer it has, so that request
 costs what [latency](latency.md) reports; a hit costs a lookup instead.
-`detector_timeout_secs` defaults to 30 seconds because a tight timeout would turn
-protection into a denial of service. Configuration is
+`detector_timeout_secs` defaults to 120 seconds because a tight timeout would turn
+protection into a denial of service: a tool result is one call however long it is, and
+50 000 characters take 44–59 s natively. Configuration is
 TOML and rejects unknown keys — a typo in a security control should fail loudly rather
 than leave a default in place.
