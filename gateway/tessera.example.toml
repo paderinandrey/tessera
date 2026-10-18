@@ -6,10 +6,11 @@ detector_url = "http://127.0.0.1:8000"
 
 # Generous on purpose. A tool result is one detector call however long it is,
 # so this has to outlast detecting a whole max_tool_chars of text in one go:
-# 50 000 characters took about 44 s natively on an M3 Pro, and 90 admits that
-# twice over. A call this cuts off is never cached, so its retry is cut off too.
-# Exceeding it refuses the request rather than forwarding unmasked text.
-detector_timeout_secs = 90
+# 50 000 characters took 44-59 s natively on an M3 Pro, the high end for
+# token-dense text, and 120 admits that twice over. A call this cuts off is
+# never cached, so its retry is cut off too. Exceeding it refuses the request
+# rather than forwarding unmasked text.
+detector_timeout_secs = 120
 
 # How long one request may keep starting detector calls, counted from when the
 # gateway has read its body and including any wait for its session. Past it, a request that still
@@ -23,10 +24,11 @@ detector_timeout_secs = 90
 # max_spans_per_entry or one the detector did not mark complete, or once an
 # entry is evicted; a request whose work goes uncached starts over each time.
 #
-# Two minutes keeps it well under the ten-minute timeouts of the OpenAI and
-# Anthropic SDKs, so a caller hears a refusal it can retry rather than its own
-# timeout. At most 86400.
-detection_deadline_secs = 120
+# Two and a half minutes admits twice the densest 50 000-character tool result
+# measured (see max_tool_chars), and keeps well under the ten-minute timeouts of
+# the OpenAI and Anthropic SDKs, so a caller hears a refusal it can retry rather
+# than its own timeout. At most 86400.
+detection_deadline_secs = 150
 
 openai_base = "https://api.openai.com"
 anthropic_base = "https://api.anthropic.com"
@@ -152,9 +154,10 @@ max_spans_per_entry = 250
 # Read of a 1 500-line file is about 50 KB, and a tool result is detected in a
 # single call. Measured natively on an M3 Pro (11 cores, fp32): 20 000, 40 000
 # and 60 000 characters in 17.4, 35.0 and 52.8 s -- about 1 140 characters a
-# second, linear in size -- so 50 000 is about 44 s. detector_timeout_secs (90)
-# and detection_deadline_secs (120) admit that twice over, adding forty calls at
-# 109 ms for the deadline; the test
+# second, linear in size -- so 50 000 is about 44 s. Token-dense text costs
+# more: 50 000 characters of Rust source took 49.7-56.5 s and of CJK 51.5-58.8 s.
+# detector_timeout_secs (120) and detection_deadline_secs (150) admit the
+# densest twice over, adding forty calls at 109 ms for the deadline; the test
 # the_default_bounds_admit_the_measured_cost_twice_over asserts it.
 #
 # CONTAINERISED IT IS TWO TO THREE TIMES SLOWER: 36.7-41.7 s for 20 000
@@ -177,7 +180,7 @@ max_spans_per_entry = 250
 # THE CALLER'S PATIENCE IS NOT OURS TO SET. Whatever this number permits is what
 # the caller waits, and the caller has its own timeout that this gateway neither
 # sees nor controls. The OpenAI and Anthropic SDKs wait ten minutes, well past
-# the 44 s this bound costs; a client with a timeout under a minute gives up
+# the minute this bound costs; a client with a timeout under a minute gives up
 # first and the failure arrives on its side looking like an outage here.
 # detection_deadline_secs turns only a much longer wait into an honest refusal.
 #

@@ -81,8 +81,9 @@ pub struct Config {
     pub audit_path: String,
     /// Generous on purpose: a tool result is one detector call however long it
     /// is, so this has to outlast detecting a whole `max_tool_chars` of text
-    /// in one go — measured at 44 s natively for 50 000 characters, and a call
-    /// cut off by this timeout is never cached, so its retry is cut off too.
+    /// in one go — measured at 44–59 s natively for 50 000 characters, and a
+    /// call cut off by this timeout is never cached, so its retry is cut off
+    /// too.
     /// Exceeding it refuses the request — it never forwards unmasked text.
     #[serde(default)]
     pub detector_timeout_secs: Option<u64>,
@@ -163,11 +164,14 @@ pub struct Config {
     /// **50 000 since #28, sized for a tool result rather than for the
     /// definitions.** A `Read` of a 1 500-line file is about 50 KB, and a tool
     /// result is detected in a single call. Measured on an M3 Pro (11 cores,
-    /// native, fp32): **50 000 characters in about 44 s**, from 20 000 / 40 000 /
-    /// 60 000 in 17.4 / 35.0 / 52.8 s — about 1 140 characters a second and
-    /// linear in size. `detector_timeout_secs` (90) and
-    /// `detection_deadline_secs` (120) are set to admit that call twice over,
-    /// and `the_default_bounds_admit_the_measured_cost_twice_over` asserts it.
+    /// native, fp32): **50 000 characters in 44–46 s** of prose, from 20 000 /
+    /// 40 000 / 60 000 in 17.4 / 35.0 / 52.8 s — about 1 140 characters a
+    /// second and linear in size. Token-dense text costs more per character:
+    /// 50 000 characters of Rust source took 49.7–56.5 s and of CJK
+    /// 51.5–58.8 s. `detector_timeout_secs` (120) and
+    /// `detection_deadline_secs` (150) are set to admit the densest of those
+    /// twice over, and `the_default_bounds_admit_the_measured_cost_twice_over`
+    /// asserts it.
     ///
     /// **Containerised it is two to three times slower**, and the shipped
     /// container configs keep 20 000 for that reason: 36.7–41.7 s for 20 000
@@ -184,12 +188,13 @@ pub struct Config {
     /// **The caller's patience is not ours to set.** Whatever this number
     /// permits is what the caller waits, and the caller has its own timeout
     /// that this gateway neither sees nor controls. The OpenAI and Anthropic
-    /// SDKs wait ten minutes, well past the 44 s this bound costs; a client
+    /// SDKs wait ten minutes, well past the minute this bound costs; a client
     /// with a timeout under a minute gives up first, and the failure then
     /// arrives on its side looking like an outage here.
     /// `detection_deadline_secs` refuses with a 503 a request that still has a
-    /// detector call to start once it has passed, but it defaults to two
-    /// minutes, so it turns only a much longer wait into an honest refusal.
+    /// detector call to start once it has passed, but it defaults to two and a
+    /// half minutes, so it turns only a much longer wait into an honest
+    /// refusal.
     ///
     /// **The containerised cost is measured, not derived — and it is the cost
     /// before batching.** The 77 leaves of `mapping`'s real ten-tool payload
@@ -241,7 +246,7 @@ pub struct Config {
     ///
     /// Per-call overhead is no longer unmeasured; see above. At both bounds it
     /// is the smaller part now: forty calls at 109 ms natively are about four
-    /// seconds against the 44 s of one 50 000-character text.
+    /// seconds against the 44–59 s of one 50 000-character text.
     ///
     /// **It counts characters the detection cache will not answer**, not every
     /// character in the request. Both readings are defensible and only one
@@ -330,9 +335,9 @@ fn default_detector_url() -> String {
     "http://127.0.0.1:8000".to_owned()
 }
 fn default_timeout() -> u64 {
-    90
+    120
 }
-const DEFAULT_DETECTION_DEADLINE_SECS: u64 = 120;
+const DEFAULT_DETECTION_DEADLINE_SECS: u64 = 150;
 const MAX_DETECTION_DEADLINE_SECS: u64 = 86_400;
 fn default_openai_base() -> String {
     "https://api.openai.com".to_owned()
@@ -654,7 +659,7 @@ mod tests {
         let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
         assert_eq!(config.bind, "127.0.0.1:8080");
         assert_eq!(config.detector_url, "http://127.0.0.1:8000");
-        assert_eq!(config.detector_timeout_secs(), 90);
+        assert_eq!(config.detector_timeout_secs(), 120);
     }
 
     #[test]
@@ -712,16 +717,16 @@ mod tests {
     }
 
     #[test]
-    fn the_detection_deadline_defaults_to_two_minutes() {
+    fn the_detection_deadline_defaults_to_two_and_a_half_minutes() {
         let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
-        assert_eq!(config.detection_deadline_secs(), 120);
+        assert_eq!(config.detection_deadline_secs(), 150);
     }
 
     #[test]
     fn a_config_written_before_the_deadline_existed_still_starts() {
         let config = Config::from_toml(&with_audit("detector_timeout_secs = 300"))
             .expect("a timeout longer than the default deadline is valid");
-        assert_eq!(config.detection_deadline_secs(), 120);
+        assert_eq!(config.detection_deadline_secs(), 150);
     }
 
     #[test]
@@ -1083,7 +1088,7 @@ mod tests {
             50_000,
             "the size the figure below was measured at"
         );
-        assert_admits_twice(&config, 50_000.0 / 1_140.0, 0.109);
+        assert_admits_twice(&config, 58.8, 0.109);
     }
 
     #[test]

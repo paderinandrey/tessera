@@ -23,8 +23,10 @@ the same way, fp32, two alternating rounds:
 | 40 000 | 35.0–35.5 s | 74.5–88.3 s |
 | 60 000 | 52.6–52.8 s | 141.0–174.3 s |
 
-Natively that is about 1 140 characters a second, so 50 000 is about 44 s; this is what
-`max_tool_chars` (50 000) and `detector_timeout_secs` (90) are set from. The compose detector
+Natively that is about 1 140 characters a second, so 50 000 is about 44 s. Token-dense text
+costs more per character: 50 000 characters took 49.7–56.5 s of Rust source and 51.5–58.8 s of
+CJK. The densest figure is what `max_tool_chars` (50 000), `detector_timeout_secs` (120) and
+`detection_deadline_secs` (150) are set from. The compose detector
 is two to three times slower and not linear past 40 000, which is why the shipped container
 configs keep `max_tool_chars` at 20 000. Spans were identical across every run.
 
