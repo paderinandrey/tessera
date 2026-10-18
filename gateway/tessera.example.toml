@@ -9,8 +9,8 @@ detector_url = "http://127.0.0.1:8000"
 # request rather than forwarding unmasked text.
 detector_timeout_secs = 30
 
-# How long one request may keep starting detector calls, counted from its
-# arrival and including any wait for its session. Past it, a request that still
+# How long one request may keep starting detector calls, counted from when the
+# gateway has read its body and including any wait for its session. Past it, a request that still
 # has text to detect is refused with a 503 and nothing is forwarded. A call
 # already running is not cut off: it finishes within detector_timeout_secs, so
 # one request's detection lasts at most this plus that.

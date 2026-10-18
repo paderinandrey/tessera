@@ -435,8 +435,10 @@ async fn detect_before(
     credential: Option<&[u8]>,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<Span>, ProxyError> {
-    if tokio::time::Instant::now() >= deadline && !detector.would_be_cached(text, credential) {
-        return Err(ProxyError::DetectionDeadline);
+    if tokio::time::Instant::now() >= deadline {
+        return detector
+            .cached(text, credential)
+            .ok_or(ProxyError::DetectionDeadline);
     }
     Ok(detector.detect(text, credential).await?)
 }
@@ -9747,6 +9749,7 @@ mod tests {
             ProxyError::ToolTooLarge.audit_class(),
             ProxyError::TooManyToolCalls.audit_class(),
             ProxyError::NumericPersonalData.audit_class(),
+            ProxyError::DetectionDeadline.audit_class(),
         ]
     }
 

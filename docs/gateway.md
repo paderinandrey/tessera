@@ -329,8 +329,8 @@ identifiers refuse, and so does a type in **neither** half — a label this gate
 recognize is a detector reporting personal data of a kind nobody here can weigh, which is
 not the same thing as a label known to be ungrounded on digits. And a
 request whose tool structures exceed `max_tool_chars` or `max_tool_calls` is refused before
-the detector is called at all. Once `detection_deadline_secs` has passed since a request
-arrived (two minutes by default, waiting for its session included), it starts no further
+the detector is called at all. Once `detection_deadline_secs` has passed since the gateway
+read a request's body (two minutes by default, waiting for its session included), it starts no further
 detector call: a request with text still to detect is refused with a 503 rather than
 forwarded. A call already running is not cut off, so it finishes within
 `detector_timeout_secs` and the detection cache can keep it. Sent again under the same

@@ -101,15 +101,19 @@ impl DetectorClient {
         text.is_empty() || self.cache.contains(credential, text)
     }
 
+    pub fn cached(&self, text: &str, credential: Option<&[u8]>) -> Option<Vec<Span>> {
+        if text.is_empty() {
+            return Some(Vec::new());
+        }
+        self.cache.get(credential, text)
+    }
+
     pub async fn detect(
         &self,
         text: &str,
         credential: Option<&[u8]>,
     ) -> Result<Vec<Span>, DetectorError> {
-        if text.is_empty() {
-            return Ok(Vec::new());
-        }
-        if let Some(spans) = self.cache.get(credential, text) {
+        if let Some(spans) = self.cached(text, credential) {
             return Ok(spans);
         }
         let detection = self.detect_full(text).await?;
