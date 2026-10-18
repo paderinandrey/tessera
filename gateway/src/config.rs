@@ -41,6 +41,10 @@ pub enum ConfigError {
     ZeroSpansPerEntry,
     #[error("max_tool_chars must be greater than zero")]
     ZeroToolChars,
+    #[error("detection_deadline_secs must be greater than zero")]
+    ZeroDeadline,
+    #[error("detection_deadline_secs must be at most 86400, one day")]
+    DeadlineTooLong,
     #[error("max_tool_calls must be greater than zero")]
     ZeroToolCalls,
     #[error(
@@ -80,6 +84,7 @@ pub struct Config {
     /// it refuses the request — it never forwards unmasked text.
     #[serde(default = "default_timeout")]
     pub detector_timeout_secs: u64,
+    pub detection_deadline_secs: Option<u64>,
     #[serde(default = "default_openai_base")]
     pub openai_base: String,
     #[serde(default = "default_anthropic_base")]
@@ -172,14 +177,15 @@ pub struct Config {
     /// gateway but a refused one — a bound below real traffic makes this
     /// unusable with the clients it exists for.
     ///
-    /// **Nothing bounds a request's wall clock, and the caller's patience is
-    /// not ours to set.** Whatever this number permits is what the caller
-    /// waits, and the caller has its own timeout that this gateway neither
-    /// sees nor controls. A client timeout in the tens of seconds is the same
-    /// order as what these bounds permit: at thirty it is inside by a hair, at
-    /// twenty it may give up first, and the failure then arrives on its side
-    /// looking like an outage here. There is no cumulative deadline anywhere on
-    /// the request path that would turn that into an honest refusal instead.
+    /// **The caller's patience is not ours to set.** Whatever this number
+    /// permits is what the caller waits, and the caller has its own timeout
+    /// that this gateway neither sees nor controls. A client timeout in the
+    /// tens of seconds is the same order as what these bounds permit: at thirty
+    /// it is inside by a hair, at twenty it may give up first, and the failure
+    /// then arrives on its side looking like an outage here.
+    /// `detection_deadline_secs` refuses with a 503 a request that still has a
+    /// detector call to start once it has passed, but it defaults to two
+    /// minutes, so it turns only a much longer wait into an honest refusal.
     ///
     /// **The containerised cost is measured, not derived — and it is the cost
     /// before batching.** The 77 leaves of `mapping`'s real ten-tool payload
@@ -234,9 +240,9 @@ pub struct Config {
     /// **It is not a timeout budget**, and this comment used to say it was
     /// ("one constraint written twice"). `detector_timeout_secs` becomes
     /// `reqwest`'s per-request timeout, so it bounds each detector call on its
-    /// own and never their sum; no cumulative deadline exists anywhere on the
-    /// request path. Two constraints — the timeout catches one stuck call, this
-    /// caps how long a caller waits for the whole request.
+    /// own and never their sum. Three constraints — the timeout catches one
+    /// stuck call, `detection_deadline_secs` starts no call past it, and this
+    /// refuses a tool payload before any of that work starts.
     ///
     /// Per-call overhead is no longer unmeasured; see above. It is the larger
     /// half of what both bounds permit.
@@ -323,6 +329,8 @@ fn default_detector_url() -> String {
 fn default_timeout() -> u64 {
     30
 }
+const DEFAULT_DETECTION_DEADLINE_SECS: u64 = 120;
+const MAX_DETECTION_DEADLINE_SECS: u64 = 86_400;
 fn default_openai_base() -> String {
     "https://api.openai.com".to_owned()
 }
@@ -511,10 +519,22 @@ fn elide_quoted(message: &str) -> String {
 }
 
 impl Config {
+    pub fn detection_deadline_secs(&self) -> u64 {
+        self.detection_deadline_secs
+            .unwrap_or(DEFAULT_DETECTION_DEADLINE_SECS)
+    }
+
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let config: Config = toml::from_str(text).map_err(|error| redact(&error, text))?;
         if config.detector_timeout_secs == 0 {
             return Err(ConfigError::ZeroTimeout);
+        }
+        match config.detection_deadline_secs {
+            Some(0) => return Err(ConfigError::ZeroDeadline),
+            Some(deadline) if deadline > MAX_DETECTION_DEADLINE_SECS => {
+                return Err(ConfigError::DeadlineTooLong)
+            }
+            _ => {}
         }
         if config.session_idle_secs > 0 {
             if config.max_sessions == 0 {
@@ -584,6 +604,17 @@ mod tests {
             std::sync::Arc::new(crate::audit::failing_audit_for_tests()),
         );
         assert_eq!(state.response_format, crate::mapping::ClientFormat::Unknown);
+    }
+
+    #[test]
+    fn the_detection_deadline_is_read_from_the_file_and_reaches_the_state() {
+        let config = Config::from_toml(&with_audit("detection_deadline_secs = 45"))
+            .expect("a config setting a deadline is valid");
+        let state = crate::proxy::AppState::from_config(
+            &config,
+            std::sync::Arc::new(crate::audit::failing_audit_for_tests()),
+        );
+        assert_eq!(state.detection_deadline, std::time::Duration::from_secs(45));
     }
 
     #[test]
@@ -661,6 +692,34 @@ mod tests {
     #[test]
     fn a_zero_timeout_is_rejected() {
         assert!(Config::from_toml(&with_audit("detector_timeout_secs = 0")).is_err());
+    }
+
+    #[test]
+    fn the_detection_deadline_defaults_to_two_minutes() {
+        let config = Config::from_toml(&with_audit("")).expect("empty config is valid");
+        assert_eq!(config.detection_deadline_secs(), 120);
+    }
+
+    #[test]
+    fn a_config_written_before_the_deadline_existed_still_starts() {
+        let config = Config::from_toml(&with_audit("detector_timeout_secs = 300"))
+            .expect("a timeout longer than the default deadline is valid");
+        assert_eq!(config.detection_deadline_secs(), 120);
+    }
+
+    #[test]
+    fn a_deadline_of_zero_or_past_a_day_is_rejected() {
+        let zero = Config::from_toml(&with_audit("detection_deadline_secs = 0")).unwrap_err();
+        assert!(matches!(zero, ConfigError::ZeroDeadline), "{zero}");
+        let huge = Config::from_toml(&with_audit("detection_deadline_secs = 9223372036854775807"))
+            .unwrap_err();
+        assert!(matches!(huge, ConfigError::DeadlineTooLong), "{huge}");
+        Config::from_toml(&with_audit("detection_deadline_secs = 86400"))
+            .expect("a deadline of exactly one day is valid");
+        Config::from_toml(&with_audit(
+            "detector_timeout_secs = 30\ndetection_deadline_secs = 5",
+        ))
+        .expect("a deadline shorter than the detector timeout is valid");
     }
 
     #[test]
