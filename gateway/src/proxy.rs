@@ -429,6 +429,18 @@ fn document_detection(
     Ok((leaves, joined))
 }
 
+async fn detect_before(
+    detector: &DetectorClient,
+    text: &str,
+    credential: Option<&[u8]>,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<Span>, ProxyError> {
+    if tokio::time::Instant::now() >= deadline && !detector.would_be_cached(text, credential) {
+        return Err(ProxyError::DetectionDeadline);
+    }
+    Ok(detector.detect(text, credential).await?)
+}
+
 async fn mask_all(
     provider: &'static str,
     detector: &DetectorClient,
@@ -436,6 +448,7 @@ async fn mask_all(
     slots: &[Slot],
     mapping: &mut Mapping,
     credential: Option<&[u8]>,
+    deadline: tokio::time::Instant,
 ) -> Result<(Value, Detected), ProxyError> {
     let mut masked = body.clone();
     let mut total = 0usize;
@@ -542,7 +555,7 @@ async fn mask_all(
         match slot {
             Slot::Text { pointer, .. } => {
                 let text = read_pointer(body, pointer)?;
-                let detected = detector.detect(&text, credential).await?;
+                let detected = detect_before(detector, &text, credential, deadline).await?;
                 mapping::check_spans(&text, &detected)?;
                 texts += 1;
                 total += detected.len();
@@ -598,7 +611,8 @@ async fn mask_all(
                 // the same mechanism as between two strings, and no new
                 // variant.
                 let (per_leaf, detected_per_leaf) = if let Some(joined) = joined {
-                    let detected = detector.detect(joined.text(), credential).await?;
+                    let detected =
+                        detect_before(detector, joined.text(), credential, deadline).await?;
                     mapping::check_spans(joined.text(), &detected)?;
                     let detected_per_leaf = joined.split(&detected)?;
                     let spans =
@@ -1059,19 +1073,16 @@ async fn handle(
             // On the clone, so the boundary is this request's. The session's
             // own copy never carries an issuance record to clear.
             work.begin_request();
-            let (masked, found) = tokio::time::timeout_at(
+            let (masked, found) = mask_all(
+                provider.name(),
+                &state.detector,
+                &body,
+                &slots,
+                &mut work,
+                credential,
                 deadline,
-                mask_all(
-                    provider.name(),
-                    &state.detector,
-                    &body,
-                    &slots,
-                    &mut work,
-                    credential,
-                ),
             )
-            .await
-            .map_err(|_| ProxyError::DetectionDeadline)??;
+            .await?;
             record.detected(found);
             record.unremembered(guard.unkept(&work, state.sessions.max_values()));
             // Durable before anything leaves the perimeter, and before the
@@ -1095,19 +1106,16 @@ async fn handle(
         None => {
             let mut work = Mapping::new();
             work.begin_request();
-            let (masked, found) = tokio::time::timeout_at(
+            let (masked, found) = mask_all(
+                provider.name(),
+                &state.detector,
+                &body,
+                &slots,
+                &mut work,
+                credential,
                 deadline,
-                mask_all(
-                    provider.name(),
-                    &state.detector,
-                    &body,
-                    &slots,
-                    &mut work,
-                    credential,
-                ),
             )
-            .await
-            .map_err(|_| ProxyError::DetectionDeadline)??;
+            .await?;
             record.detected(found);
             // The same ordering with nothing to commit: the journal is still
             // durable before the upstream call, which is what it exists for.
@@ -2220,20 +2228,28 @@ mod tests {
         })
     }
 
+    fn two_messages() -> Value {
+        json!({"model": "gpt", "messages": [
+            {"role": "user", "content": "erste Nachricht"},
+            {"role": "user", "content": "zweite Nachricht"},
+        ]})
+    }
+
     #[tokio::test]
-    async fn detection_past_the_deadline_is_refused_and_never_reaches_the_upstream() {
-        let detector = detector_answering_after(Duration::from_millis(1500)).await;
+    async fn no_detector_call_starts_past_the_deadline_and_nothing_reaches_the_upstream() {
+        let detector = detector_answering_after(Duration::from_millis(800)).await;
         let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
         let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
 
         let (status, served) = call(
             with_deadline(state, Duration::from_millis(300)),
             "/v1/chat/completions",
-            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            two_messages(),
         )
         .await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+        assert_eq!(detector.received_requests().await.unwrap().len(), 1);
         assert!(upstream.received_requests().await.unwrap().is_empty());
         let lines = journal(&path);
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -2242,55 +2258,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detection_past_the_deadline_is_refused_inside_a_session_too() {
-        let detector = detector_answering_after(Duration::from_millis(1500)).await;
+    async fn no_detector_call_starts_past_the_deadline_inside_a_session_either() {
+        let detector = detector_answering_after(Duration::from_millis(800)).await;
         let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
         let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
 
         let (status, served) = call_with_headers(
             with_deadline(state, Duration::from_millis(300)),
             "/v1/chat/completions",
-            json!({"model": "gpt", "messages": [{"role": "user", "content": "Weber schreibt"}]}),
+            two_messages(),
             &session_headers("Bearer k", "s1"),
         )
         .await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+        assert_eq!(detector.received_requests().await.unwrap().len(), 1);
         assert!(upstream.received_requests().await.unwrap().is_empty());
         assert_eq!(journal(&path)[0]["error"], "detection_deadline");
     }
 
     #[tokio::test]
-    async fn a_request_refused_at_the_deadline_continues_where_it_stopped() {
-        let detector = detector_answering_after(Duration::from_millis(400)).await;
+    async fn a_call_running_at_the_deadline_finishes_and_a_retry_continues_from_it() {
+        let detector = detector_answering_after(Duration::from_millis(500)).await;
         let upstream = upstream_returning(
             "/v1/chat/completions",
             json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
         )
         .await;
         let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
-        let state = with_deadline(state, Duration::from_millis(600));
-        let body = json!({"model": "gpt", "messages": [
-            {"role": "user", "content": "erste Nachricht"},
-            {"role": "user", "content": "zweite Nachricht"},
-        ]});
-
+        let state = with_deadline(state, Duration::from_millis(200));
         let headers = [("authorization", "Bearer k")];
 
         let (first, _) = call_with_headers(
             Arc::clone(&state),
             "/v1/chat/completions",
-            body.clone(),
+            two_messages(),
             &headers,
         )
         .await;
         assert_eq!(first, StatusCode::SERVICE_UNAVAILABLE);
         let (second, served) =
-            call_with_headers(state, "/v1/chat/completions", body, &headers).await;
+            call_with_headers(state, "/v1/chat/completions", two_messages(), &headers).await;
         assert_eq!(second, StatusCode::OK, "{served}");
 
-        assert_eq!(detector.received_requests().await.unwrap().len(), 3);
+        assert_eq!(detector.received_requests().await.unwrap().len(), 2);
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_tool_document_is_detected_past_the_deadline() {
+        let detector = detector_answering_after(Duration::from_millis(800)).await;
+        let upstream = upstream_returning("/v1/chat/completions", json!({})).await;
+        let (state, _dir, path) = state_with(&detector, &upstream, test_limits());
+
+        let (status, served) = call(
+            with_deadline(state, Duration::from_millis(300)),
+            "/v1/chat/completions",
+            json!({"model": "gpt", "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "t1", "type": "function",
+                     "function": {"name": "f", "arguments": "{\"who\":\"Weber\"}"}},
+                    {"id": "t2", "type": "function",
+                     "function": {"name": "f", "arguments": "{\"who\":\"Brandt\"}"}}
+                ]},
+            ]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{served}");
+        assert_eq!(detector.received_requests().await.unwrap().len(), 1);
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        assert_eq!(journal(&path)[0]["error"], "detection_deadline");
+    }
+
+    #[tokio::test]
+    async fn a_text_the_cache_answers_is_served_past_the_deadline() {
+        let detector = detector_answering_after(Duration::from_millis(500)).await;
+        let upstream = upstream_returning(
+            "/v1/chat/completions",
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .await;
+        let (state, _dir, _path) = state_with(&detector, &upstream, test_limits());
+        let state = with_deadline(state, Duration::from_millis(200));
+        let headers = [("authorization", "Bearer k")];
+        let warm = json!({"model": "gpt", "messages": [
+            {"role": "user", "content": "zweite Nachricht"},
+        ]});
+
+        let (warmed, _) =
+            call_with_headers(Arc::clone(&state), "/v1/chat/completions", warm, &headers).await;
+        assert_eq!(warmed, StatusCode::OK);
+        let (status, served) =
+            call_with_headers(state, "/v1/chat/completions", two_messages(), &headers).await;
+        assert_eq!(status, StatusCode::OK, "{served}");
+
+        assert_eq!(detector.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

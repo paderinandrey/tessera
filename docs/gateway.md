@@ -329,12 +329,15 @@ identifiers refuse, and so does a type in **neither** half — a label this gate
 recognize is a detector reporting personal data of a kind nobody here can weigh, which is
 not the same thing as a label known to be ungrounded on digits. And a
 request whose tool structures exceed `max_tool_chars` or `max_tool_calls` is refused before
-the detector is called at all. A request whose detection outlasts `detection_deadline_secs`
-(two minutes by default, waiting for its session included) is refused with a 503 rather
-than forwarded. Each detector call that finished before then stays in the detection cache,
-so the same request sent again under the same credential continues where the refused one
-stopped. A request carrying no credential is never cached, and neither is anything under
-`detection_cache_entries = 0`; those start over on every attempt.
+the detector is called at all. Once `detection_deadline_secs` has passed since a request
+arrived (two minutes by default, waiting for its session included), it starts no further
+detector call: a request with text still to detect is refused with a 503 rather than
+forwarded. A call already running is not cut off, so it finishes within
+`detector_timeout_secs` and the detection cache can keep it. Sent again under the same
+credential, the request then continues where the refused one stopped — as far as the cache
+kept its work. Nothing is kept for a request without a credential, under
+`detection_cache_entries = 0`, for an answer past `max_spans_per_entry` or one the detector
+did not mark complete, or after an eviction, and such a request starts over each time.
 
 Placeholders carry the type the detector reported, but only when it is one this gateway
 declares — twenty-two of them, the catalog's eight deterministic identifiers plus the
