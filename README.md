@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/paderinandrey/tessera/actions/workflows/ci.yml"><img src="https://github.com/paderinandrey/tessera/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/tileforge/tessera/actions/workflows/ci.yml"><img src="https://github.com/tileforge/tessera/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
 </p>
 
@@ -149,10 +149,10 @@ are published rather than trimmed:
 
 Article 9 special categories are detected by the same layer at a lower threshold, and
 **Article 9 coverage is 1.0000 (46 of 46)**. That bar was lowered from 0.30 to 0.20 for
-[#109](https://github.com/paderinandrey/tessera/issues/109). A special-category reading that
+[#109](https://github.com/tileforge/tessera/issues/109). A special-category reading that
 overlaps a `PERSON` reading still has to clear 0.30 to name the span, so a surname the model
 half-reads as an ethnicity or a trade union keeps its `PERSON` placeholder
-([#112](https://github.com/paderinandrey/tessera/issues/112)):
+([#112](https://github.com/tileforge/tessera/issues/112)):
 
 | Type | Precision | Recall | F1 |
 |---|---|---|---|
@@ -188,7 +188,7 @@ These figures are advisory — published and checked against the measurement, bu
 the 0.95 target above, which they do not meet. A value of three words or fewer is shown to the
 detector after its member name, `religion: athée`, because the name is often the only thing
 that says what the value is; the name itself is never masked
-([#109](https://github.com/paderinandrey/tessera/issues/109)). 12 of the 46 special-category
+([#109](https://github.com/tileforge/tessera/issues/109)). 12 of the 46 special-category
 values standing alone in a field still go out. Every one of the 26 is named in
 `detector/tests/test_document_corpus.py`, and a new one fails `pytest -m ner`.
 
@@ -197,7 +197,7 @@ The slash form (`125/601/58393`) masks without it. The 13-digit form still needs
 1.5% of millisecond timestamps pass its format check — and in a JSON field the word can come
 from the member name: `{"steuernummer": 9181081508155}` refuses the request, because a JSON
 number with a deterministic type refuses the whole request
-([#104](https://github.com/paderinandrey/tessera/issues/104)).
+([#104](https://github.com/tileforge/tessera/issues/104)).
 
 ## How fast it is
 
@@ -215,7 +215,7 @@ Measured on an Apple M3 Pro (11 cores, CPU only) with the pinned fp32 ONNX weigh
 
 `person` is asked in a call of its own as well as in tier 2's, because sharing one made a
 competitor take the argmax and then fail its own bar — the whole surname went to the
-provider ([#97](https://github.com/paderinandrey/tessera/issues/97)). It costs about what a
+provider ([#97](https://github.com/tileforge/tessera/issues/97)). It costs about what a
 tier-2 pass costs, which is what the per-pass pricing below predicts: a paragraph's median
 went from 896 ms to 1 352 ms measured in one session.
 
@@ -234,7 +234,7 @@ traffic — and the two-container stack all work end to end.
 
 **Not ready for production use:** nothing here has been run in anger, and a caller who is
 served can still learn which placeholders a session has issued, one request at a
-time ([#32](https://github.com/paderinandrey/tessera/issues/32)) — the value itself is
+time ([#32](https://github.com/tileforge/tessera/issues/32)) — the value itself is
 refused rather than handed over, and authentication narrows who can ask without closing the
 question.
 

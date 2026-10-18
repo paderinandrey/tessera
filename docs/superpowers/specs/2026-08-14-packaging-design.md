@@ -16,7 +16,7 @@ One friction we added ourselves: `audit_path` became a required key with no
 default (PR #18), and `gateway/tessera.example.toml` points it at
 `/var/log/tessera/audit.jsonl`. A developer following the README's own quickstart
 now fails at startup, because that directory does not exist and is not writable
-without root. Correct behaviour meeting a bad default — [#21](https://github.com/paderinandrey/tessera/issues/21).
+without root. Correct behaviour meeting a bad default — [#21](https://github.com/tileforge/tessera/issues/21).
 
 ## What this slice is for
 
@@ -208,7 +208,7 @@ host example, each of them load-bearing:
   outside itself.
 
 The host example keeps `127.0.0.1` and gets a default `audit_path` a developer
-can actually write, which closes [#21](https://github.com/paderinandrey/tessera/issues/21).
+can actually write, which closes [#21](https://github.com/tileforge/tessera/issues/21).
 
 Environment-variable overrides are deliberately not added. The config parser
 rejects unknown keys so that a typo in a security control fails loudly; layering

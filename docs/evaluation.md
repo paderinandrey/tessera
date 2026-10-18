@@ -72,8 +72,8 @@ would have read as fully masked, and `Le` is a Vietnamese family name this repos
 protects by name in the trimming rule. Forgiving a convention is a decision somebody writes
 down about a specific entity, not a spelling rule.
 
-[i46]: https://github.com/paderinandrey/tessera/issues/46
-[i97]: https://github.com/paderinandrey/tessera/issues/97
+[i46]: https://github.com/tileforge/tessera/issues/46
+[i97]: https://github.com/tileforge/tessera/issues/97
 
 **Article 9 coverage: 1.0000 (46/46)** — every special-category mention in the
 corpus is caught by at least one Article 9 label, in both languages. Article 9 is split
@@ -250,7 +250,7 @@ found when its leaf is read alone, with or without the name, so it is the joined
 loses them rather than the name that misleads. The named inventory stays the gate, and a
 test holds the evaluator's walk to it member for member, so the two cannot disagree.
 
-[i102]: https://github.com/paderinandrey/tessera/pull/102
-[i104]: https://github.com/paderinandrey/tessera/issues/104
-[i109]: https://github.com/paderinandrey/tessera/issues/109
-[i112]: https://github.com/paderinandrey/tessera/issues/112
+[i102]: https://github.com/tileforge/tessera/pull/102
+[i104]: https://github.com/tileforge/tessera/issues/104
+[i109]: https://github.com/tileforge/tessera/issues/109
+[i112]: https://github.com/tileforge/tessera/issues/112

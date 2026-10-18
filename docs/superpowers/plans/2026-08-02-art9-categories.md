@@ -615,4 +615,4 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ## After the plan
 
-Push `feat/art9-categories`, open a PR to `main`, comment `@codex review`, and keep the fix → tag → wait loop going until Codex posts `Codex Review: Didn't find any major issues.` naming the current HEAD commit. The clean verdict arrives as an issue comment, not a review comment: poll `gh api repos/paderinandrey/tessera/issues/<num>/comments`.
+Push `feat/art9-categories`, open a PR to `main`, comment `@codex review`, and keep the fix → tag → wait loop going until Codex posts `Codex Review: Didn't find any major issues.` naming the current HEAD commit. The clean verdict arrives as an issue comment, not a review comment: poll `gh api repos/tileforge/tessera/issues/<num>/comments`.
