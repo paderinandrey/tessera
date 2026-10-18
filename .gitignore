@@ -29,3 +29,4 @@ gateway/target/
 # Scratch for subagent-driven execution: ledgers, briefs, review packages.
 # Never part of the record — git history is.
 .superpowers/
+docs/superpowers/
