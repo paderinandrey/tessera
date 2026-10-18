@@ -250,6 +250,17 @@ def _resolve_pair(
     return _union(a, b, _more_sensitive(a, b)), "tie-merge-sensitive"
 
 
+def _first_conflict(spans: list[Span]) -> tuple[int, int] | None:
+    for i, a in enumerate(spans):
+        for j in range(i + 1, len(spans)):
+            b = spans[j]
+            if b.start >= a.end:
+                break
+            if _overlaps(a, b):
+                return i, j
+    return None
+
+
 def resolve(
     spans: list[Span],
     *,
@@ -259,15 +270,7 @@ def resolve(
     specificity = specificity or {}
     result = Resolution(spans=sorted(set(spans), key=_sort_key))
     while True:
-        conflict = next(
-            (
-                (i, j)
-                for i in range(len(result.spans))
-                for j in range(i + 1, len(result.spans))
-                if _overlaps(result.spans[i], result.spans[j])
-            ),
-            None,
-        )
+        conflict = _first_conflict(result.spans)
         if conflict is None:
             return result
         i, j = conflict

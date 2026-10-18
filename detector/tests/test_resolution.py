@@ -672,3 +672,55 @@ def test_the_generator_reaches_every_rule() -> None:
         f"never reached: {sorted(RULES - reached)}; "
         f"unknown rules seen: {sorted(reached - RULES)}"
     )
+
+
+def _resolve_by_full_scan(spans: list[Span]) -> tuple[list[Span], list[tuple[str, Span]]]:
+    from tessera_detector import resolution
+
+    result = resolution.Resolution(spans=sorted(set(spans), key=resolution._sort_key))
+    while True:
+        conflict = next(
+            (
+                (i, j)
+                for i in range(len(result.spans))
+                for j in range(i + 1, len(result.spans))
+                if resolution._overlaps(result.spans[i], result.spans[j])
+            ),
+            None,
+        )
+        if conflict is None:
+            return result.spans, [(d.rule, d.kept) for d in result.trace]
+        i, j = conflict
+        a, b = result.spans[i], result.spans[j]
+        kept, rule = resolution._resolve_pair(a, b, SPEC, resolution._is_checksum)
+        dropped = tuple(s for s in (a, b) if s != kept)
+        result.trace.append(resolution.Decision(rule=rule, kept=kept, dropped=dropped))
+        result.spans = sorted(
+            [s for k, s in enumerate(result.spans) if k not in (i, j)] + [kept],
+            key=resolution._sort_key,
+        )
+
+
+def test_the_pruned_scan_resolves_exactly_as_the_full_scan_did() -> None:
+    rng = random.Random(20261018)
+    types = ["IBAN", "FR_NIR", "CREDIT_CARD", "ORG", "PERSON", "LOCATION"]
+    recognizers = ["catalog:x", "ner:gliner", "catalog:y"]
+    for _ in range(3000):
+        spans = []
+        for _ in range(rng.randint(0, 14)):
+            start = rng.randint(0, 60)
+            spans.append(
+                span(
+                    entity_type=rng.choice(types),
+                    start=start,
+                    end=start + rng.randint(1, 15),
+                    confidence=rng.choice([0.5, 0.7, 0.9, 1.0]),
+                    recognizer=rng.choice(recognizers),
+                    tier=rng.randint(1, 3),
+                    boosted=rng.random() < 0.2,
+                )
+            )
+        expected_spans, expected_trace = _resolve_by_full_scan(spans)
+        result = resolve(spans, specificity=SPEC)
+        assert result.spans == expected_spans, spans
+        assert [(d.rule, d.kept) for d in result.trace] == expected_trace, spans
