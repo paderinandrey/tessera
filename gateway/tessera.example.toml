@@ -163,6 +163,11 @@ max_spans_per_entry = 250
 # hardware has to lower this rather than inherit it, because the bound admits
 # what the timeout then cuts off.
 #
+# OMITTED, IT FOLLOWS detector_timeout_secs: 50 000 under a timeout of 90 s or
+# more, and the 20 000 it was before issue #28 under a shorter one. A config that
+# kept the old 30 s timeout and never named this key keeps the pair it was
+# written against.
+#
 # What that costs. Two things were offered as making it tolerable: it is the
 # FIRST turn of a session only, since tool definitions are byte-identical
 # afterwards and the detection cache serves them; and the alternative is not a

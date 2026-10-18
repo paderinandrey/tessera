@@ -291,7 +291,7 @@ impl AppState {
                 max_values: config.max_session_values,
             }),
             audit,
-            max_tool_chars: config.max_tool_chars,
+            max_tool_chars: config.max_tool_chars(),
             max_tool_calls: config.max_tool_calls,
             detection_deadline: Duration::from_secs(config.detection_deadline_secs()),
             callers: match &config.accepted_credentials {

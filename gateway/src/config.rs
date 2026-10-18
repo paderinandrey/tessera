@@ -259,8 +259,14 @@ pub struct Config {
     /// widening — a refusal is what the request got before — but a client who
     /// comes to rely on the wider budget will meet the narrow one eventually,
     /// and the narrow one is what they are owed.
-    #[serde(default = "default_max_tool_chars")]
-    pub max_tool_chars: usize,
+    ///
+    /// **Omitted, it follows `detector_timeout_secs`**: 50 000 under a timeout
+    /// of 90 s or more, and the 20 000 it was before #28 under a shorter one.
+    /// A config that kept the old 30 s timeout and never named this key keeps
+    /// the pair it was written against, rather than a bound its timeout cuts
+    /// off. Read it through `max_tool_chars()`.
+    #[serde(default)]
+    pub max_tool_chars: Option<usize>,
 
     /// How many detector round-trips one request's tool structures may need.
     ///
@@ -395,6 +401,7 @@ fn default_max_spans_per_entry() -> usize {
 pub fn default_max_tool_chars() -> usize {
     50_000
 }
+const MAX_TOOL_CHARS_UNDER_A_SHORTER_TIMEOUT: usize = 20_000;
 pub fn default_max_tool_calls() -> usize {
     40
 }
@@ -515,6 +522,15 @@ fn elide_quoted(message: &str) -> String {
 }
 
 impl Config {
+    pub fn max_tool_chars(&self) -> usize {
+        self.max_tool_chars
+            .unwrap_or(if self.detector_timeout_secs >= default_timeout() {
+                default_max_tool_chars()
+            } else {
+                MAX_TOOL_CHARS_UNDER_A_SHORTER_TIMEOUT
+            })
+    }
+
     pub fn detection_deadline_secs(&self) -> u64 {
         self.detection_deadline_secs
             .unwrap_or(DEFAULT_DETECTION_DEADLINE_SECS)
@@ -543,7 +559,7 @@ impl Config {
         if config.detection_cache_entries > 0 && config.max_spans_per_entry == 0 {
             return Err(ConfigError::ZeroSpansPerEntry);
         }
-        if config.max_tool_chars == 0 {
+        if config.max_tool_chars == Some(0) {
             return Err(ConfigError::ZeroToolChars);
         }
         if config.max_tool_calls == 0 {
@@ -1009,7 +1025,7 @@ mod tests {
     #[test]
     fn the_tool_bounds_have_defaults() {
         let config = Config::from_toml(&with_audit("")).unwrap();
-        assert_eq!(config.max_tool_chars, 50_000);
+        assert_eq!(config.max_tool_chars(), 50_000);
         assert_eq!(config.max_tool_calls, 40);
     }
 
@@ -1018,7 +1034,7 @@ mod tests {
             config.detector_timeout_secs as f64 >= 2.0 * one_text_secs,
             "one text of {} characters took {one_text_secs} s, and a timeout of {} s cuts it \
              off on every retry",
-            config.max_tool_chars,
+            config.max_tool_chars(),
             config.detector_timeout_secs
         );
         let at_both_bounds = one_text_secs + config.max_tool_calls as f64 * per_call_secs;
@@ -1030,10 +1046,32 @@ mod tests {
     }
 
     #[test]
+    fn an_omitted_tool_bound_follows_the_timeout_it_is_paired_with() {
+        let legacy = Config::from_toml(&with_audit("detector_timeout_secs = 30")).unwrap();
+        assert_eq!(
+            legacy.max_tool_chars(),
+            20_000,
+            "the pair an old config was written against"
+        );
+        let current = Config::from_toml(&with_audit("detector_timeout_secs = 90")).unwrap();
+        assert_eq!(current.max_tool_chars(), 50_000);
+        let named = Config::from_toml(&with_audit(
+            "detector_timeout_secs = 30\nmax_tool_chars = 50000",
+        ))
+        .unwrap();
+        assert_eq!(
+            named.max_tool_chars(),
+            50_000,
+            "a key the operator wrote is never overridden"
+        );
+    }
+
+    #[test]
     fn the_default_bounds_admit_the_measured_cost_twice_over() {
         let config = Config::from_toml(&with_audit("")).unwrap();
         assert_eq!(
-            config.max_tool_chars, 50_000,
+            config.max_tool_chars(),
+            50_000,
             "the size the figure below was measured at"
         );
         assert_admits_twice(&config, 50_000.0 / 1_140.0, 0.109);
@@ -1047,7 +1085,8 @@ mod tests {
         ] {
             let config = Config::from_toml(text).expect("a shipped config is valid");
             assert_eq!(
-                config.max_tool_chars, 20_000,
+                config.max_tool_chars(),
+                20_000,
                 "the size the figure below was measured at"
             );
             assert_admits_twice(&config, 41.7, 0.410);
